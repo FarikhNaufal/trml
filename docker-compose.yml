@@ -1,0 +1,15 @@
+services:
+  trml:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trml-bot:latest
+    container_name: trml-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    stop_grace_period: 15s
