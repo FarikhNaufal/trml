@@ -30,6 +30,15 @@ if [ ! -f .env ]; then
   fi
 fi
 
+# Read HTTP_PORT from .env if defined, fallback to 8080
+PORT="8080"
+if [ -f .env ]; then
+  ENV_PORT=$(grep -E '^[[:space:]]*HTTP_PORT=' .env | tail -n 1 | cut -d '=' -f2 | tr -d '\r\n "' || true)
+  if [ -n "$ENV_PORT" ]; then
+    PORT="$ENV_PORT"
+  fi
+fi
+
 # 3. Ensure persistent data directory exists on host
 mkdir -p ./data
 
@@ -38,11 +47,8 @@ echo "🔨 Building Docker image ($IMAGE_NAME)..."
 docker build -t "$IMAGE_NAME" .
 
 # 5. Stop and remove existing container if running
-if [ "$(docker ps -aq -f name=^/${APP_NAME}$)" ]; then
-  echo "🛑 Stopping old container..."
-  docker stop --time 15 "$APP_NAME" || true
-  docker rm "$APP_NAME" || true
-fi
+echo "🛑 Cleaning up previous container (if any)..."
+docker rm -f "$APP_NAME" 2>/dev/null || true
 
 # 6. Run new container with persistent volume and env file
 echo "▶️  Starting new container on port $PORT..."
