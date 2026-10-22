@@ -7,7 +7,7 @@ set -e
 
 APP_NAME="trml-bot"
 IMAGE_NAME="trml-bot:latest"
-PORT="8080"
+PORT="2020"
 
 echo "=========================================="
 echo "🚀 Deploying $APP_NAME..."
