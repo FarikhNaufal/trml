@@ -1,0 +1,407 @@
+package config
+
+import (
+	"bufio"
+	"fmt"
+	"log/slog"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/shopspring/decimal"
+)
+
+type Environment string
+
+const (
+	EnvTestnet Environment = "testnet"
+	EnvMainnet Environment = "mainnet"
+)
+
+type Config struct {
+	Env              Environment
+	APIKey           string
+	SecretKey        string
+	DryRun           bool
+	DatabasePath     string
+	LogLevel         string
+	HTTPPort         string
+
+	// URL Bursa
+	RestBaseURL      string
+	WSPublicURL      string
+	WSMarketURL      string
+	WSPrivateBaseURL string
+	WSAPIOrderURL    string
+
+	// Tipe Order Entry ("MARKET" atau "LIMIT")
+	EntryOrderType   string
+
+	// Parameter Biaya & Slippage
+	MakerFeeRate     decimal.Decimal
+	TakerFeeRate     decimal.Decimal
+	SlippageRate     decimal.Decimal
+
+	// Parameter Risiko Terkunci
+	RiskPerTradePct    decimal.Decimal
+	MaxDailyDrawdown   float64
+	MaxSlots           int
+	MaxSlotMarginFrac  decimal.Decimal
+	MaxMarginAvailFrac decimal.Decimal
+	Leverage           float64
+
+	// Parameter Scanner
+	MinVolume24hUSDT float64
+	MinFallbackRVOL  float64
+	MaxSpreadPct     float64
+
+	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
+	PullbackToleranceATR float64
+	MinBounceZScore      float64
+	LookbackImpulseBars  int
+	RetestLookbackBars   int
+	MinImpulseATR        float64
+	MaxEntryDistanceATR  float64
+	MinOIDeltaPct        float64
+	MinOIDeltaLongPct    float64
+	MinOIDeltaShortPct   float64
+	SLATRMultiplier      float64
+	TPATRMultiplier      float64
+	BreakEvenTriggerATR  float64
+	BTCGateEnabled       bool
+	BTCMax5mDumpPct      float64
+	BTCMax5mPumpPct      float64
+
+	// Batas Waktu & Staleness
+	ScannerInterval   time.Duration
+	MaxBookStaleness  time.Duration
+	MaxMarkStaleness  time.Duration
+	MaxDataStaleness  time.Duration
+	MaxAccountStale   time.Duration
+	MinOIInterval     time.Duration
+	MaxOIInterval     time.Duration
+	MaxOIStaleness    time.Duration
+	LimitOrderTimeout  time.Duration
+	MaxHoldingDuration time.Duration
+	RecvWindowMS       int64
+}
+
+// loadDotEnv membaca file .env secara otomatis ke environment variable proses
+func loadDotEnv(filepath string) {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		val = strings.Trim(val, `"'` + "`")
+
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+		}
+	}
+}
+
+func LoadConfig() (*Config, error) {
+	loadDotEnv(".env")
+
+	envStr := strings.ToLower(getEnv("BINANCE_ENV", "testnet"))
+	var env Environment
+	var restURL, wsPublic, wsMarket, wsPrivate, wsAPI string
+
+	switch envStr {
+	case "mainnet", "prod", "production":
+		env = EnvMainnet
+		restURL = "https://fapi.binance.com"
+		wsPublic = "wss://fstream.binance.com/public/stream"
+		wsMarket = "wss://fstream.binance.com/market/stream"
+		wsPrivate = "wss://fstream.binance.com/private/ws"
+		wsAPI = "wss://ws-fapi.binance.com/ws-fapi/v1"
+	default:
+		env = EnvTestnet
+		restURL = "https://testnet.binancefuture.com"
+		wsPublic = "wss://stream.binancefuture.com/stream"
+		wsMarket = "wss://stream.binancefuture.com/stream"
+		wsPrivate = "wss://stream.binancefuture.com/ws"
+		wsAPI = ""
+	}
+
+	// C4 Fix: Strict validation untuk DRY_RUN_MODE (no silent live execution)
+	dryRunStr := strings.TrimSpace(strings.ToLower(getEnv("DRY_RUN_MODE", "true")))
+	var dryRun bool
+	switch dryRunStr {
+	case "true", "1", "yes":
+		dryRun = true
+	case "false", "0", "no":
+		dryRun = false
+	default:
+		return nil, fmt.Errorf("config: invalid DRY_RUN_MODE '%s' (must be 'true' or 'false')", dryRunStr)
+	}
+
+	apiKey := strings.TrimSpace(getEnv("BINANCE_API_KEY", ""))
+	secretKey := strings.TrimSpace(getEnv("BINANCE_SECRET_KEY", ""))
+
+	// Credential Guard: Jika mode Live aktif, wajib ada API Key & Secret Key non-placeholder
+	if !dryRun {
+		if apiKey == "" || secretKey == "" || strings.Contains(apiKey, "your_binance_api_key") {
+			return nil, fmt.Errorf("config CRITICAL: DRY_RUN_MODE=false (live money) requires valid BINANCE_API_KEY and BINANCE_SECRET_KEY")
+		}
+	}
+
+	dbPath := getEnv("SQLITE_DB_PATH", "./data/trml.db")
+	logLevel := strings.ToUpper(getEnv("LOG_LEVEL", "INFO"))
+
+	makerFee, err := decimal.NewFromString(getEnv("MAKER_FEE_RATE", "0.0002"))
+	if err != nil {
+		return nil, fmt.Errorf("config: invalid MAKER_FEE_RATE: %w", err)
+	}
+	takerFee, err := decimal.NewFromString(getEnv("TAKER_FEE_RATE", "0.0005"))
+	if err != nil {
+		return nil, fmt.Errorf("config: invalid TAKER_FEE_RATE: %w", err)
+	}
+	slippage, err := decimal.NewFromString(getEnv("SLIPPAGE_RATE", "0.0002"))
+	if err != nil {
+		return nil, fmt.Errorf("config: invalid SLIPPAGE_RATE: %w", err)
+	}
+
+	riskPct, err := decimal.NewFromString(getEnv("RISK_PER_TRADE_PCT", "0.01"))
+	if err != nil || riskPct.LessThanOrEqual(decimal.Zero) || riskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid RISK_PER_TRADE_PCT '%s' (must be between 0.001 and 0.05)", getEnv("RISK_PER_TRADE_PCT", "0.01"))
+	}
+
+	marginFrac, err := decimal.NewFromString(getEnv("MAX_SLOT_MARGIN_FRACTION", "0.30"))
+	if err != nil || marginFrac.LessThanOrEqual(decimal.Zero) || marginFrac.GreaterThan(decimal.NewFromFloat(0.50)) {
+		return nil, fmt.Errorf("config: invalid MAX_SLOT_MARGIN_FRACTION '%s' (must be between 0.05 and 0.50)", getEnv("MAX_SLOT_MARGIN_FRACTION", "0.30"))
+	}
+
+	// C5 Fix: Validasi numerik drawdown, slots, leverage
+	ddStr := getEnv("MAX_DAILY_DRAWDOWN_PCT", "-0.03")
+	ddFloat, err := strconv.ParseFloat(ddStr, 64)
+	if err != nil || ddFloat >= 0 || ddFloat < -1.00 {
+		return nil, fmt.Errorf("config: invalid MAX_DAILY_DRAWDOWN_PCT '%s' (must be negative float between -0.01 and -1.00)", ddStr)
+	}
+
+	// Live safety guard: jika mode live (dryRun=false) dan drawdown di-set lebih longgar dari -0.05,
+	// paksa batas pengaman live ke -0.05 (-5.0%) untuk mencegah kerugian fatal uang riil.
+	if !dryRun && ddFloat < -0.05 {
+		slog.Warn("live mode active: clamping MAX_DAILY_DRAWDOWN_PCT to safe live limit of -0.05 (-5%)", "configured", ddFloat)
+		ddFloat = -0.05
+	}
+
+	slotsStr := getEnv("MAX_CONCURRENT_SLOTS", "3")
+	slots, err := strconv.Atoi(slotsStr)
+	if err != nil || slots < 1 || slots > 10 {
+		return nil, fmt.Errorf("config: invalid MAX_CONCURRENT_SLOTS '%s' (must be integer between 1 and 10)", slotsStr)
+	}
+
+	levStr := getEnv("ACCOUNT_LEVERAGE", "5.0")
+	lev, err := strconv.ParseFloat(levStr, 64)
+	if err != nil || lev < 1.0 || lev > 20.0 {
+		return nil, fmt.Errorf("config: invalid ACCOUNT_LEVERAGE '%s' (must be float between 1.0 and 20.0)", levStr)
+	}
+
+	entryOrderType := strings.ToUpper(strings.TrimSpace(getEnv("ENTRY_ORDER_TYPE", "MARKET")))
+	if entryOrderType != "MARKET" && entryOrderType != "LIMIT" {
+		return nil, fmt.Errorf("config: invalid ENTRY_ORDER_TYPE '%s' (must be 'MARKET' or 'LIMIT')", entryOrderType)
+	}
+
+	defaultMinVol := 50_000_000.0
+	if env == EnvTestnet {
+		defaultMinVol = 0.0
+	}
+	minVolStr := getEnv("MIN_VOLUME_24H_USDT", strconv.FormatFloat(defaultMinVol, 'f', 1, 64))
+	minVol, err := strconv.ParseFloat(minVolStr, 64)
+	if err != nil || minVol < 0.0 {
+		return nil, fmt.Errorf("config: invalid MIN_VOLUME_24H_USDT '%s' (must be a non-negative float)", minVolStr)
+	}
+
+	recvWinStr := getEnv("RECV_WINDOW_MS", "5000")
+	recvWin, err := strconv.ParseInt(recvWinStr, 10, 64)
+	if err != nil || recvWin < 1000 || recvWin > 60000 {
+		return nil, fmt.Errorf("config: invalid RECV_WINDOW_MS '%s' (must be integer between 1000 and 60000)", recvWinStr)
+	}
+
+	pullbackTolStr := getEnv("PULLBACK_TOLERANCE_ATR", "0.35")
+	pullbackTol, err := strconv.ParseFloat(pullbackTolStr, 64)
+	if err != nil || pullbackTol <= 0 || pullbackTol > 2.0 {
+		return nil, fmt.Errorf("config: invalid PULLBACK_TOLERANCE_ATR '%s' (must be float between 0.05 and 2.0)", pullbackTolStr)
+	}
+
+	minBounceZStr := getEnv("MIN_BOUNCE_ZSCORE", "1.20")
+	minBounceZ, err := strconv.ParseFloat(minBounceZStr, 64)
+	if err != nil || minBounceZ <= 0 {
+		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
+	}
+
+	lookbackBarsStr := getEnv("LOOKBACK_IMPULSE_BARS", "18")
+	lookbackBars, err := strconv.Atoi(lookbackBarsStr)
+	if err != nil || lookbackBars < 2 || lookbackBars > 100 {
+		return nil, fmt.Errorf("config: invalid LOOKBACK_IMPULSE_BARS '%s' (must be integer between 2 and 100)", lookbackBarsStr)
+	}
+
+	retestLookbackBarsStr := getEnv("RETEST_LOOKBACK_BARS", "4")
+	retestLookbackBars, err := strconv.Atoi(retestLookbackBarsStr)
+	if err != nil || retestLookbackBars < 1 || retestLookbackBars > 20 {
+		return nil, fmt.Errorf("config: invalid RETEST_LOOKBACK_BARS '%s' (must be integer between 1 and 20)", retestLookbackBarsStr)
+	}
+
+	minImpulseATRStr := getEnv("MIN_IMPULSE_ATR", "1.0")
+	minImpulseATR, err := strconv.ParseFloat(minImpulseATRStr, 64)
+	if err != nil || minImpulseATR <= 0 {
+		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR '%s' (must be positive float)", minImpulseATRStr)
+	}
+
+	maxEntryDistStr := getEnv("MAX_ENTRY_DISTANCE_ATR", "0.85")
+	maxEntryDist, err := strconv.ParseFloat(maxEntryDistStr, 64)
+	if err != nil || maxEntryDist <= 0 || maxEntryDist > 5.0 {
+		return nil, fmt.Errorf("config: invalid MAX_ENTRY_DISTANCE_ATR '%s' (must be float between 0.1 and 5.0)", maxEntryDistStr)
+	}
+
+	availMarginFrac, err := decimal.NewFromString(getEnv("MAX_MARGIN_AVAIL_FRAC", "0.90"))
+	if err != nil || availMarginFrac.LessThanOrEqual(decimal.Zero) || availMarginFrac.GreaterThan(decimal.NewFromFloat(1.0)) {
+		return nil, fmt.Errorf("config: invalid MAX_MARGIN_AVAIL_FRAC '%s' (must be between 0.10 and 1.00)", getEnv("MAX_MARGIN_AVAIL_FRAC", "0.90"))
+	}
+
+	minFallbackRVOLStr := getEnv("MIN_FALLBACK_RVOL", "1.20")
+	minFallbackRVOL, err := strconv.ParseFloat(minFallbackRVOLStr, 64)
+	if err != nil || minFallbackRVOL <= 0 {
+		return nil, fmt.Errorf("config: invalid MIN_FALLBACK_RVOL '%s' (must be positive float)", minFallbackRVOLStr)
+	}
+
+	maxSpreadStr := getEnv("MAX_SPREAD_PCT", "0.05")
+	maxSpread, err := strconv.ParseFloat(maxSpreadStr, 64)
+	if err != nil || maxSpread <= 0 || maxSpread > 1.0 {
+		return nil, fmt.Errorf("config: invalid MAX_SPREAD_PCT '%s' (must be float between 0.001 and 1.0)", maxSpreadStr)
+	}
+
+	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.10")
+	minOIDelta, err := strconv.ParseFloat(minOIDeltaStr, 64)
+	if err != nil || minOIDelta < -5.0 || minOIDelta > 10.0 {
+		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaStr)
+	}
+
+	minOIDeltaLongStr := getEnv("MIN_OI_DELTA_LONG_PCT", minOIDeltaStr)
+	minOIDeltaLong, err := strconv.ParseFloat(minOIDeltaLongStr, 64)
+	if err != nil || minOIDeltaLong < -5.0 || minOIDeltaLong > 10.0 {
+		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_LONG_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaLongStr)
+	}
+
+	minOIDeltaShortStr := getEnv("MIN_OI_DELTA_SHORT_PCT", minOIDeltaStr)
+	minOIDeltaShort, err := strconv.ParseFloat(minOIDeltaShortStr, 64)
+	if err != nil || minOIDeltaShort < -5.0 || minOIDeltaShort > 10.0 {
+		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_SHORT_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaShortStr)
+	}
+
+	slMultStr := getEnv("SL_ATR_MULTIPLIER", "1.5")
+	slMult, err := strconv.ParseFloat(slMultStr, 64)
+	if err != nil || slMult <= 0.1 || slMult > 10.0 {
+		return nil, fmt.Errorf("config: invalid SL_ATR_MULTIPLIER '%s' (must be float between 0.1 and 10.0)", slMultStr)
+	}
+
+	tpMultStr := getEnv("TP_ATR_MULTIPLIER", "2.25")
+	tpMult, err := strconv.ParseFloat(tpMultStr, 64)
+	if err != nil || tpMult <= 0.1 || tpMult > 20.0 {
+		return nil, fmt.Errorf("config: invalid TP_ATR_MULTIPLIER '%s' (must be float between 0.1 and 20.0)", tpMultStr)
+	}
+
+	beTriggerStr := getEnv("BREAK_EVEN_TRIGGER_ATR", "1.15")
+	beTrigger, err := strconv.ParseFloat(beTriggerStr, 64)
+	if err != nil || beTrigger <= 0.1 || beTrigger > 10.0 {
+		return nil, fmt.Errorf("config: invalid BREAK_EVEN_TRIGGER_ATR '%s' (must be float between 0.1 and 10.0)", beTriggerStr)
+	}
+
+	btcGateEnabledStr := getEnv("BTC_GATE_ENABLED", "true")
+	btcGateEnabled, err := strconv.ParseBool(btcGateEnabledStr)
+	if err != nil {
+		return nil, fmt.Errorf("config: invalid BTC_GATE_ENABLED '%s' (must be true or false)", btcGateEnabledStr)
+	}
+
+	btcMaxDumpStr := getEnv("BTC_MAX_5M_DUMP_PCT", "0.60")
+	btcMaxDump, err := strconv.ParseFloat(btcMaxDumpStr, 64)
+	if err != nil || btcMaxDump <= 0.05 || btcMaxDump > 10.0 {
+		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_DUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxDumpStr)
+	}
+
+	btcMaxPumpStr := getEnv("BTC_MAX_5M_PUMP_PCT", "0.60")
+	btcMaxPump, err := strconv.ParseFloat(btcMaxPumpStr, 64)
+	if err != nil || btcMaxPump <= 0.05 || btcMaxPump > 10.0 {
+		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_PUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxPumpStr)
+	}
+
+	httpPort := getEnv("HTTP_PORT", "8080")
+
+	return &Config{
+		Env:                  env,
+		APIKey:               apiKey,
+		SecretKey:            secretKey,
+		DryRun:               dryRun,
+		DatabasePath:         dbPath,
+		LogLevel:             logLevel,
+		HTTPPort:             httpPort,
+		EntryOrderType:       entryOrderType,
+		RestBaseURL:          restURL,
+		WSPublicURL:          wsPublic,
+		WSMarketURL:          wsMarket,
+		WSPrivateBaseURL:     wsPrivate,
+		WSAPIOrderURL:        wsAPI,
+		MakerFeeRate:         makerFee,
+		TakerFeeRate:         takerFee,
+		SlippageRate:         slippage,
+		RiskPerTradePct:      riskPct,
+		MaxDailyDrawdown:     ddFloat,
+		MaxSlots:             slots,
+		MaxSlotMarginFrac:    marginFrac,
+		MaxMarginAvailFrac:   availMarginFrac,
+		Leverage:             lev,
+		MinVolume24hUSDT:     minVol,
+		MinFallbackRVOL:      minFallbackRVOL,
+		MaxSpreadPct:         maxSpread,
+		PullbackToleranceATR: pullbackTol,
+		MinBounceZScore:      minBounceZ,
+		LookbackImpulseBars:  lookbackBars,
+		RetestLookbackBars:   retestLookbackBars,
+		MinImpulseATR:        minImpulseATR,
+		MaxEntryDistanceATR:  maxEntryDist,
+		MinOIDeltaPct:        minOIDelta,
+		MinOIDeltaLongPct:    minOIDeltaLong,
+		MinOIDeltaShortPct:   minOIDeltaShort,
+		SLATRMultiplier:      slMult,
+		TPATRMultiplier:      tpMult,
+		BreakEvenTriggerATR:  beTrigger,
+		BTCGateEnabled:       btcGateEnabled,
+		BTCMax5mDumpPct:      btcMaxDump,
+		BTCMax5mPumpPct:      btcMaxPump,
+
+		ScannerInterval:    15 * time.Minute,
+		MaxBookStaleness:   5 * time.Second,
+		MaxMarkStaleness:   15 * time.Second,
+		MaxDataStaleness:   330 * time.Second,
+		MaxAccountStale:    60 * time.Second,
+		MinOIInterval:      1 * time.Minute,
+		MaxOIInterval:      8 * time.Minute,
+		MaxOIStaleness:     330 * time.Second,
+		LimitOrderTimeout:  45 * time.Second,
+		MaxHoldingDuration: 4 * time.Hour,
+		RecvWindowMS:       recvWin,
+	}, nil
+}
+
+func getEnv(key, defaultVal string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultVal
+}

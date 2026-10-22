@@ -1,0 +1,22 @@
+# Environment & Secrets
+.env
+*.env.local
+
+# Binaries & Executables
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Data & SQLite Database
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/

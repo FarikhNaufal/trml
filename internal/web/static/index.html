@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>TRML - Binance USDⓈ-M Futures Bot</title>
+  <meta name="description" content="Ultra-lightweight real-time dashboard and trade ledger for TRML Binance Futures bot.">
+  <meta name="theme-color" content="#0b0e14">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand-group">
+        <div class="brand-info-wrap">
+          <img src="/icon.svg" alt="TRML" class="brand-icon">
+          <div>
+            <div class="brand-title">TR<span>M</span>L FUTURES</div>
+            <div class="brand-subtitle">VWAP Mean Reversion &amp; Delta Momentum</div>
+          </div>
+        </div>
+        <span id="env-badge" class="env-badge env-dryrun">DRY-RUN</span>
+      </div>
+
+      <div class="header-status-group">
+        <div class="status-dot-wrapper">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-text">ONLINE</span>
+        </div>
+        <div id="utc-clock" class="utc-clock">--:--:-- UTC</div>
+        <button id="btn-refresh" class="btn-refresh" title="Refresh Live Data" aria-label="Refresh Data">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          </svg>
+          <span>Refresh</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+
+  <!-- Main Content Container -->
+  <main class="main-container">
+    <!-- KPI Summary Grid -->
+    <section class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-title">
+          <span>Effective Equity</span>
+          <span class="badge badge-time">USDT</span>
+        </div>
+        <div id="kpi-equity" class="kpi-value">$0.00</div>
+        <div id="kpi-balance" class="kpi-sub">Avail: $0.00</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-title">
+          <span>Total Net PnL</span>
+          <span id="kpi-winrate" class="badge badge-time">0.0% WR</span>
+        </div>
+        <div id="kpi-pnl" class="kpi-value">$0.00</div>
+        <div id="kpi-trades-count" class="kpi-sub">0 Closed Trades</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-title">
+          <span>Realized R:R Ratio</span>
+          <span class="badge badge-time">PAYOFF</span>
+        </div>
+        <div id="kpi-rr" class="kpi-value val-yellow">0.00 : 1</div>
+        <div id="kpi-rr-sub" class="kpi-sub">Avg +$0.00 / -$0.00</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-title">
+          <span>Daily Drawdown</span>
+          <span class="badge badge-time">SAFETY</span>
+        </div>
+        <div id="kpi-drawdown" class="kpi-value">0.00%</div>
+        <div id="kpi-drawdown-sub" class="kpi-sub">Breaker: Max 3.00%</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-title">
+          <span>Active Slots</span>
+          <span class="badge badge-time">RISK</span>
+        </div>
+        <div id="kpi-slots" class="kpi-value">0 / 3</div>
+        <div id="kpi-slots-sub" class="kpi-sub">3 Slots Available</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-title">
+          <span>Outcome Breakdown</span>
+          <span class="badge badge-time">RATIO</span>
+        </div>
+        <div id="kpi-outcomes" class="kpi-value kpi-outcomes-val">
+          <span class="val-green">0 TP</span> &bull; <span class="val-yellow">0 BE</span> &bull; <span class="val-red">0 SL</span>
+        </div>
+        <div id="kpi-outcomes-sub" class="kpi-sub">Strict Risk Control</div>
+      </div>
+
+    </section>
+
+    <!-- Active Positions Section -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="panel-title">Active Positions</span>
+          <span id="pos-count-badge" class="panel-badge">0 Open</span>
+        </div>
+      </div>
+      <div id="positions-container" class="positions-grid is-empty">
+        <div class="empty-state">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 6v6l4 2"/>
+          </svg>
+          <div>No active positions open. Scanner is monitoring 10 coins for high-conviction retests.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Watched Coins Radar Section -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="panel-title">Watched Coins Radar</span>
+          <span id="radar-count-badge" class="panel-badge">Top 10 Scanner</span>
+        </div>
+        <div class="panel-controls">
+          <span id="radar-last-scan" class="pagination-info">Last Scan: Just now</span>
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table class="trml-table">
+          <thead>
+            <tr>
+              <th class="sticky-col">Symbol</th>
+              <th>Mark Price</th>
+
+              <th>Session VWAP</th>
+              <th>Distance to VWAP</th>
+              <th>NATR %</th>
+              <th>RVOL</th>
+              <th>Spread %</th>
+              <th>Funding Rate</th>
+            </tr>
+          </thead>
+          <tbody id="radar-tbody">
+            <tr>
+              <td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading scanner radar...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Trade Ledger Section (Paginated) -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="panel-title">Trade Ledger</span>
+          <span id="trades-total-badge" class="panel-badge">0 Records</span>
+        </div>
+        <div class="panel-controls">
+          <div class="filter-group">
+            <button class="filter-pill active" data-filter-trade="ALL">ALL</button>
+            <button class="filter-pill" data-filter-trade="TAKE_PROFIT">TP</button>
+            <button class="filter-pill" data-filter-trade="BREAK_EVEN">BE</button>
+            <button class="filter-pill" data-filter-trade="STOP_LOSS">SL</button>
+          </div>
+          <select id="trade-limit-select" class="select-input" title="Rows per page">
+            <option value="10" selected>10 / page</option>
+            <option value="25">25 / page</option>
+            <option value="50">50 / page</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Desktop View: Table -->
+      <div class="table-responsive responsive-table-hide-mobile">
+        <table class="trml-table">
+          <thead>
+            <tr>
+              <th>Closed At (UTC)</th>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Qty</th>
+              <th>Entry Price</th>
+              <th>Exit Price</th>
+              <th>Net PnL</th>
+              <th>MAE / MFE</th>
+              <th>Hold Duration</th>
+              <th>Exit Reason</th>
+            </tr>
+          </thead>
+          <tbody id="trades-tbody">
+            <tr>
+              <td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading trades...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Mobile View: Card Stream -->
+      <div id="trades-mobile-stream" class="mobile-card-stream">
+        <!-- Rendered by JS on mobile -->
+      </div>
+
+      <!-- Pagination Footer -->
+      <div class="pagination-bar">
+        <div id="trades-page-info" class="pagination-info">Page 1 of 1 (0 Total)</div>
+        <div class="pagination-controls">
+          <button id="trades-btn-prev" class="btn-page" disabled>&larr; Previous</button>
+          <button id="trades-btn-next" class="btn-page" disabled>Next &rarr;</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Signal Audit Log Section (Paginated) -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="panel-title">Signal Audit Feed</span>
+          <span id="signals-total-badge" class="panel-badge">0 Signals</span>
+        </div>
+        <div class="panel-controls">
+          <div class="filter-group">
+            <button class="filter-pill active" data-filter-signal="ALL">ALL</button>
+            <button class="filter-pill" data-filter-signal="APPROVE">APPROVED</button>
+            <button class="filter-pill" data-filter-signal="REJECT">REJECTED</button>
+          </div>
+          <div class="panel-selects-group">
+            <select id="signal-symbol-select" class="select-input" title="Filter by Symbol">
+              <option value="ALL">All Symbols</option>
+            </select>
+            <select id="signal-limit-select" class="select-input" title="Rows per page">
+              <option value="15" selected>15 / page</option>
+              <option value="30">30 / page</option>
+              <option value="50">50 / page</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Desktop View: Table -->
+      <div class="table-responsive responsive-table-hide-mobile">
+        <table class="trml-table">
+          <thead>
+            <tr>
+              <th>Candle Time (UTC)</th>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Close Price</th>
+              <th>Session VWAP</th>
+              <th>Delta Z-Score</th>
+              <th>OI Delta %</th>
+              <th>RVOL</th>
+              <th>Decision</th>
+              <th>Audit Evaluation &amp; Reason</th>
+            </tr>
+          </thead>
+          <tbody id="signals-tbody">
+
+            <tr>
+              <td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading signal audit log...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Mobile View: Card Stream -->
+      <div id="signals-mobile-stream" class="mobile-card-stream">
+        <!-- Rendered by JS on mobile -->
+      </div>
+
+      <!-- Pagination Footer -->
+      <div class="pagination-bar">
+        <div id="signals-page-info" class="pagination-info">Page 1 of 1 (0 Total)</div>
+        <div class="pagination-controls">
+          <button id="signals-btn-prev" class="btn-page" disabled>&larr; Previous</button>
+          <button id="signals-btn-next" class="btn-page" disabled>Next &rarr;</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
