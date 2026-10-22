@@ -341,7 +341,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_PUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxPumpStr)
 	}
 
-	httpPort := getEnv("HTTP_PORT", "8080")
+	httpPort := getEnv("HTTP_PORT", "2020")
 
 	return &Config{
 		Env:                  env,

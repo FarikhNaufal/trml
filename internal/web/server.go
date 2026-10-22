@@ -43,7 +43,7 @@ type Server struct {
 
 func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Port == "" {
-		cfg.Port = "8080"
+		cfg.Port = "2020"
 	}
 	if !strings.HasPrefix(cfg.Port, ":") {
 		cfg.Port = ":" + cfg.Port

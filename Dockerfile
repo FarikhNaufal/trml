@@ -35,10 +35,10 @@ COPY --from=builder /app/bot /app/bot
 RUN mkdir -p /app/data
 
 # Expose web dashboard port
-EXPOSE 8080
+EXPOSE 2020
 
 # Default environment configuration
-ENV HTTP_PORT=8080
+ENV HTTP_PORT=2020
 ENV SQLITE_DB_PATH=/app/data/trml.db
 
 # Run bot entrypoint

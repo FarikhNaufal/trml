@@ -30,8 +30,8 @@ if [ ! -f .env ]; then
   fi
 fi
 
-# Read HTTP_PORT from .env if defined, fallback to 8080
-PORT="8080"
+# Read HTTP_PORT from .env if defined, fallback to 2020
+PORT="2020"
 if [ -f .env ]; then
   ENV_PORT=$(grep -E '^[[:space:]]*HTTP_PORT=' .env | tail -n 1 | cut -d '=' -f2 | tr -d '\r\n "' || true)
   if [ -n "$ENV_PORT" ]; then
