@@ -402,6 +402,8 @@ function renderTrades(trades) {
       reasonBadge = '<span class="badge badge-sl">STOP LOSS</span>';
     }
 
+    const roeVal = typeof t.roe_pct === 'number' && !isNaN(t.roe_pct) ? t.roe_pct : 0;
+
     // Desktop Row
     tableHtml += `
       <tr>
@@ -411,7 +413,10 @@ function renderTrades(trades) {
         <td>${escapeHtml(t.qty)}</td>
         <td>${escapeHtml(t.entry_price)}</td>
         <td>${escapeHtml(t.exit_price)}</td>
-        <td class="${pnlClass}"><strong>${formatSignedUSD(t.net_pnl_usdt)}</strong></td>
+        <td class="${pnlClass}">
+          <strong>${formatSignedUSD(t.net_pnl_usdt)}</strong>
+          <span style="font-size: 11px; opacity: 0.85; margin-left: 3px;">(${formatSignedPct(roeVal)})</span>
+        </td>
         <td>-${(t.mae_pct || 0).toFixed(2)}% / +${(t.mfe_pct || 0).toFixed(2)}%</td>
         <td>${formatDuration(t.duration_sec)}</td>
         <td>${reasonBadge}</td>
@@ -431,7 +436,9 @@ function renderTrades(trades) {
 
         <div class="stream-card-row">
           <span class="stream-card-label">Net PnL</span>
-          <span class="${pnlClass}" style="font-size:15px; font-weight:700;">${formatSignedUSD(t.net_pnl_usdt)}</span>
+          <span class="${pnlClass}" style="font-size:15px; font-weight:700;">
+            ${formatSignedUSD(t.net_pnl_usdt)} <span style="font-size:12px; font-weight:500; opacity:0.85;">(${formatSignedPct(roeVal)})</span>
+          </span>
         </div>
 
         <div class="stream-card-row">

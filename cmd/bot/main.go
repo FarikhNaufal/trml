@@ -99,7 +99,7 @@ func main() {
 	repo := storage.NewRepository(db)
 
 	// Inisialisasi Dedicated Read-Only Web Reader (Zero Lock Contention)
-	webReader, err := web.OpenReadOnlyReader(cfg.DatabasePath)
+	webReader, err := web.OpenReadOnlyReader(cfg.DatabasePath, cfg.Leverage)
 	if err != nil {
 		slog.Error("failed to initialize read-only web reader", "path", cfg.DatabasePath, "err", err)
 		os.Exit(1)

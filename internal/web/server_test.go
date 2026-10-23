@@ -222,6 +222,14 @@ func TestServerEndpoints(t *testing.T) {
 	if tradesResp["total"].(float64) != 2 {
 		t.Errorf("expected 2 trades, got %v", tradesResp["total"])
 	}
+	tradesList, ok := tradesResp["trades"].([]any)
+	if !ok || len(tradesList) != 2 {
+		t.Fatalf("expected 2 trade items, got %v", tradesList)
+	}
+	firstTrade := tradesList[0].(map[string]any)
+	if firstTrade["roe_pct"] == nil || firstTrade["price_change_pct"] == nil {
+		t.Errorf("expected roe_pct and price_change_pct to be present, got %v", firstTrade)
+	}
 
 	// 7. Test Signals Endpoint
 	req = httptest.NewRequest("GET", "/api/signals?page=1&limit=10", nil)

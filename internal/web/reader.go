@@ -13,20 +13,22 @@ import (
 )
 
 type TradeItem struct {
-	ClientOrderID string  `json:"client_order_id"`
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"`
-	Qty           string  `json:"qty"`
-	EntryPrice    string  `json:"entry_price"`
-	ExitPrice     string  `json:"exit_price"`
-	NetPnLUSDT    float64 `json:"net_pnl_usdt"`
-	MAEPct        float64 `json:"mae_pct"`
-	MFEPct        float64 `json:"mfe_pct"`
-	ExitReason    string  `json:"exit_reason"`
-	OpenedAtUTC   string  `json:"opened_at_utc"`
-	ClosedAtUTC   string  `json:"closed_at_utc"`
-	DurationSec   int64   `json:"duration_sec"`
-	SignalAuditID int64   `json:"signal_audit_id"`
+	ClientOrderID  string  `json:"client_order_id"`
+	Symbol         string  `json:"symbol"`
+	Side           string  `json:"side"`
+	Qty            string  `json:"qty"`
+	EntryPrice     string  `json:"entry_price"`
+	ExitPrice      string  `json:"exit_price"`
+	NetPnLUSDT     float64 `json:"net_pnl_usdt"`
+	PriceChangePct float64 `json:"price_change_pct"`
+	ROEPct         float64 `json:"roe_pct"`
+	MAEPct         float64 `json:"mae_pct"`
+	MFEPct         float64 `json:"mfe_pct"`
+	ExitReason     string  `json:"exit_reason"`
+	OpenedAtUTC    string  `json:"opened_at_utc"`
+	ClosedAtUTC    string  `json:"closed_at_utc"`
+	DurationSec    int64   `json:"duration_sec"`
+	SignalAuditID  int64   `json:"signal_audit_id"`
 }
 
 type SignalItem struct {
@@ -63,10 +65,11 @@ type StatsItem struct {
 }
 
 type WebReader struct {
-	db *sql.DB
+	db       *sql.DB
+	leverage float64
 }
 
-func OpenReadOnlyReader(dbPath string) (*WebReader, error) {
+func OpenReadOnlyReader(dbPath string, leverage ...float64) (*WebReader, error) {
 	sep := "?"
 	if strings.Contains(dbPath, "?") {
 		sep = "&"
@@ -81,7 +84,12 @@ func OpenReadOnlyReader(dbPath string) (*WebReader, error) {
 	db.SetMaxOpenConns(4)
 	db.SetConnMaxLifetime(time.Hour)
 
-	return &WebReader{db: db}, nil
+	lev := 8.0
+	if len(leverage) > 0 && leverage[0] > 0 {
+		lev = leverage[0]
+	}
+
+	return &WebReader{db: db, leverage: lev}, nil
 }
 
 func (r *WebReader) Close() error {
@@ -156,6 +164,30 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 			return nil, 0, fmt.Errorf("scan trade row: %w", err)
 		}
 		it.NetPnLUSDT, _ = strconv.ParseFloat(pnlStr, 64)
+
+		entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
+		exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
+		qtyF, _ := strconv.ParseFloat(it.Qty, 64)
+
+		if entryF > 0 {
+			if strings.ToUpper(it.Side) == "LONG" {
+				it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
+			} else {
+				it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
+			}
+
+			lev := r.leverage
+			if lev <= 0 {
+				lev = 8.0
+			}
+			notional := entryF * qtyF
+			if notional > 0 {
+				initialMargin := notional / lev
+				it.ROEPct = (it.NetPnLUSDT / initialMargin) * 100.0
+			} else {
+				it.ROEPct = it.PriceChangePct * lev
+			}
+		}
 
 		tOpen, err1 := time.Parse(time.RFC3339Nano, it.OpenedAtUTC)
 		tClose, err2 := time.Parse(time.RFC3339Nano, it.ClosedAtUTC)
