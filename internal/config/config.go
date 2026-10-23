@@ -56,6 +56,8 @@ type Config struct {
 	MinVolume24hUSDT float64
 	MinFallbackRVOL  float64
 	MaxSpreadPct     float64
+	MinNATRPct       float64
+	MaxNATRPct       float64
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
 	PullbackToleranceATR float64
@@ -271,7 +273,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR '%s' (must be positive float)", minImpulseATRStr)
 	}
 
-	maxEntryDistStr := getEnv("MAX_ENTRY_DISTANCE_ATR", "0.85")
+	maxEntryDistStr := getEnv("MAX_ENTRY_DISTANCE_ATR", "1.00")
 	maxEntryDist, err := strconv.ParseFloat(maxEntryDistStr, 64)
 	if err != nil || maxEntryDist <= 0 || maxEntryDist > 5.0 {
 		return nil, fmt.Errorf("config: invalid MAX_ENTRY_DISTANCE_ATR '%s' (must be float between 0.1 and 5.0)", maxEntryDistStr)
@@ -292,6 +294,18 @@ func LoadConfig() (*Config, error) {
 	maxSpread, err := strconv.ParseFloat(maxSpreadStr, 64)
 	if err != nil || maxSpread <= 0 || maxSpread > 1.0 {
 		return nil, fmt.Errorf("config: invalid MAX_SPREAD_PCT '%s' (must be float between 0.001 and 1.0)", maxSpreadStr)
+	}
+
+	minNATRStr := getEnv("MIN_NATR_PCT", "0.35")
+	minNATR, err := strconv.ParseFloat(minNATRStr, 64)
+	if err != nil || minNATR <= 0 || minNATR > 10.0 {
+		return nil, fmt.Errorf("config: invalid MIN_NATR_PCT '%s' (must be float between 0.01 and 10.0)", minNATRStr)
+	}
+
+	maxNATRStr := getEnv("MAX_NATR_PCT", "2.50")
+	maxNATR, err := strconv.ParseFloat(maxNATRStr, 64)
+	if err != nil || maxNATR < minNATR || maxNATR > 20.0 {
+		return nil, fmt.Errorf("config: invalid MAX_NATR_PCT '%s' (must be float >= MIN_NATR_PCT and <= 20.0)", maxNATRStr)
 	}
 
 	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.10")
@@ -377,6 +391,8 @@ func LoadConfig() (*Config, error) {
 		MinVolume24hUSDT:     minVol,
 		MinFallbackRVOL:      minFallbackRVOL,
 		MaxSpreadPct:         maxSpread,
+		MinNATRPct:           minNATR,
+		MaxNATRPct:           maxNATR,
 		PullbackToleranceATR: pullbackTol,
 		MinBounceZScore:      minBounceZ,
 		LookbackImpulseBars:  lookbackBars,

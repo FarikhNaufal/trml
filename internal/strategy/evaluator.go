@@ -127,7 +127,7 @@ func EvaluateSignal(
 	// Filter Anti-Chasing: Batasi jarak maksimal penutupan candle dari garis VWAP
 	maxEntryDistATR := cfg.MaxEntryDistanceATR
 	if maxEntryDistATR <= 0 {
-		maxEntryDistATR = 0.85
+		maxEntryDistATR = 1.00
 	}
 	distFromVWAP := math.Abs(latest.Close - vwap)
 	if distFromVWAP > maxEntryDistATR*atr14 {
@@ -340,14 +340,24 @@ func EvaluateSignal(
 			return model.OrderIntent{}, false, "BTC_FLASH_PUMP", fmt.Sprintf("BTC_5M_PUMP_%.2f%%_MAX_%.2f%%", btc5mChangePct, maxPump)
 		}
 
-		// TIER 2: Asymmetric Directional Bias Khusus Posisi SHORT (Soft Veto)
-		// Posisi SHORT hanya diizinkan jika tren BTC memang tidak bullish kuat.
+		// TIER 2: Symmetric Directional Bias (Soft Veto)
+		// 1. Posisi SHORT hanya diizinkan jika tren BTC memang tidak bullish kuat.
 		// Jika BTC berada di atas EMA dan di atas Session VWAP, veto posisi SHORT altcoin!
 		if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
 			btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
 			btcVWAP := btcSnap.CurrentSessionVWAP
 			if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
 				return model.OrderIntent{}, false, "BTC_TREND_BULLISH_SHORT_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_ABOVE_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+			}
+		}
+
+		// 2. Posisi LONG hanya diizinkan jika tren BTC tidak bearish lemah/menurun.
+		// Jika BTC berada di bawah EMA dan di bawah Session VWAP, veto posisi LONG altcoin!
+		if targetSide == model.SideLong && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
+			btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
+			btcVWAP := btcSnap.CurrentSessionVWAP
+			if latestBTC.Close < btcEMA && (btcVWAP <= 0 || latestBTC.Close < btcVWAP) {
+				return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
 			}
 		}
 	}

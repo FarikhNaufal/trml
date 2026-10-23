@@ -706,8 +706,8 @@ func TestEvaluateSignalBTCMacroGateFlashDumpVetoLong(t *testing.T) {
 		t.Errorf("expected subReason to contain BTC_5M_DUMP, got %s", subReasonDump)
 	}
 
-	// 3. Jika BTC normal / tenang (Open 84000, Close 83950 = -0.06%), Long harus DISETUJUI (idiosinkronik altcoin)
-	btcCandles[54].Close = 83950.0
+	// 3. Jika BTC normal / tenang (Open 84000, Close 84010 = +0.01%, tidak bearish), Long harus DISETUJUI (idiosinkronik altcoin)
+	btcCandles[54].Close = 84010.0
 	btcSnapNormal := model.MarketSnapshot{
 		Symbol:             "BTCUSDT",
 		ClosedCandles:      btcCandles,
@@ -831,6 +831,115 @@ func TestEvaluateSignalBTCMacroGateTrendBullishVetoShort(t *testing.T) {
 		t.Errorf("expected subReason to contain BTC_CLOSE, got %s", subReasonShort)
 	}
 }
+
+func TestEvaluateSignalBTCMacroGateTrendBearishVetoLong(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := EvaluatorConfig{
+		MaxSlots:              3,
+		MaxBookStaleness:      5 * time.Second,
+		MaxMarkStaleness:      15 * time.Second,
+		MaxDataStaleness:      330 * time.Second,
+		MinOIInterval:         4 * time.Minute,
+		MaxOIInterval:         7 * time.Minute,
+		MaxOIStaleness:        300 * time.Second,
+		MaxSpreadPct:          0.05,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		EMAPeriod:             50,
+		ATRPeriod:             14,
+		DeltaZScoreWindow:     50,
+		MinBarDeltaZScore:     1.20,
+		MinOIDeltaPct:         -0.10,
+		MaxAdverseFundingRate: 0.0005,
+		PullbackToleranceATR:  0.35,
+		MinBounceZScore:       1.20,
+		LookbackImpulseBars:   12,
+		MinImpulseATR:         1.0,
+		BTCGateEnabled:        true,
+		BTCMax5mDumpPct:       0.60,
+		BTCMax5mPumpPct:       0.60,
+		Sizing: SizingConfig{
+			RiskPerTradePct:       decimal.NewFromFloat(0.01),
+			MaxSlotMarginFraction: decimal.NewFromFloat(0.30),
+			AccountLeverage:       5.0,
+			SLMultiplier:          1.5,
+			TPMultiplier:          2.25,
+		},
+	}
+
+	// 1. Setup Altcoin Long yang valid
+	candles := make([]model.Candle, 60)
+	deltas := make([]float64, 60)
+	for i := 0; i < 60; i++ {
+		p := 100.0 + float64(i)*0.1
+		candles[i] = model.Candle{
+			OpenTime:  now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:      p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
+			VolumeBase: 1000.0,
+		}
+		deltas[i] = 100.0 + float64(i%7)*15.0
+	}
+	candles[50].High = 110.0 // Prior bullish impulse
+	candles[58].Low = 104.5  // Retest VWAP
+	candles[59] = model.Candle{
+		OpenTime:  now.Add(-5 * time.Minute),
+		CloseTime: now,
+		Open:      105.0, High: 106.0, Low: 104.9, Close: 105.8,
+		VolumeBase: 2000.0,
+	}
+	deltas[59] = 200.0
+
+	altSnapLong := model.MarketSnapshot{
+		Symbol:              "NEARUSDT",
+		BestBid:             105.78,
+		BestAsk:             105.80,
+		BookUpdatedAt:       now,
+		MarkPriceUpdatedAt:  now,
+		FundingUpdatedAt:    now,
+		CurrentSessionVWAP:  104.5,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: deltas,
+		PrevOpenInterest:   1000.0,
+		CurrOpenInterest:   1050.0,
+		PrevOIUpdatedAt:    now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:    now,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+
+	// 2. BTC sedang Bearish Downtrend (Close 82000 < EMA 84000 dan < VWAP 84200)
+	btcCandlesBear := make([]model.Candle, 55)
+	for i := 0; i < 55; i++ {
+		p := 85000.0 - float64(i)*50.0 // Tren turun perlahan
+		btcCandlesBear[i] = model.Candle{
+			OpenTime:  now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:      p, High: p + 10.0, Low: p - 30.0, Close: p - 20.0,
+			VolumeBase: 100.0,
+		}
+	}
+	btcSnapBear := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		ClosedCandles:      btcCandlesBear,
+		CurrentSessionVWAP: 84200.0, // VWAP di atas Close
+		Now:                now,
+	}
+
+	// Sinyal LONG altcoin harus di-VETO oleh Tier 2 (BTC_TREND_BEARISH_LONG_VETO)
+	_, okLong, reasonLong, subReasonLong := EvaluateSignal(altSnapLong, &btcSnapBear, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if okLong || reasonLong != "BTC_TREND_BEARISH_LONG_VETO" {
+		t.Fatalf("expected BTC_TREND_BEARISH_LONG_VETO for Long during bearish BTC, got ok=%v, reason=%s", okLong, reasonLong)
+	}
+	if !strings.Contains(subReasonLong, "BTC_CLOSE") {
+		t.Errorf("expected subReason to contain BTC_CLOSE, got %s", subReasonLong)
+	}
+}
+
 
 
 
