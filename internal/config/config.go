@@ -44,6 +44,7 @@ type Config struct {
 	SlippageRate     decimal.Decimal
 
 	// Parameter Risiko Terkunci
+	InitialEquity      decimal.Decimal
 	RiskPerTradePct    decimal.Decimal
 	MaxDailyDrawdown   float64
 	MaxSlots           int
@@ -175,6 +176,12 @@ func LoadConfig() (*Config, error) {
 	slippage, err := decimal.NewFromString(getEnv("SLIPPAGE_RATE", "0.0002"))
 	if err != nil {
 		return nil, fmt.Errorf("config: invalid SLIPPAGE_RATE: %w", err)
+	}
+
+	initEqStr := getEnv("INITIAL_EQUITY", "1000.0")
+	initEq, err := decimal.NewFromString(initEqStr)
+	if err != nil || initEq.LessThanOrEqual(decimal.Zero) {
+		initEq = decimal.NewFromFloat(1000.0)
 	}
 
 	riskPct, err := decimal.NewFromString(getEnv("RISK_PER_TRADE_PCT", "0.01"))
@@ -360,6 +367,7 @@ func LoadConfig() (*Config, error) {
 		MakerFeeRate:         makerFee,
 		TakerFeeRate:         takerFee,
 		SlippageRate:         slippage,
+		InitialEquity:        initEq,
 		RiskPerTradePct:      riskPct,
 		MaxDailyDrawdown:     ddFloat,
 		MaxSlots:             slots,

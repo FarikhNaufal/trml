@@ -183,7 +183,10 @@ func main() {
 
 	if cfg.DryRun {
 		slog.Info("initializing Heuristic Dry-Run Volume-Through-Limit Simulator")
-		initialEquity := decimal.NewFromFloat(1000.0)
+		initialEquity := cfg.InitialEquity
+		if initialEquity.LessThanOrEqual(decimal.Zero) {
+			initialEquity = decimal.NewFromFloat(1000.0)
+		}
 
 		now := time.Now().UTC()
 		epochDay := now.Unix() / 86400
