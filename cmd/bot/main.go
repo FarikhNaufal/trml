@@ -291,33 +291,19 @@ func main() {
 	// 6. Mulai Background Workers
 	var wg sync.WaitGroup
 
-	// Worker 1: Periodic 15-minute Scanner & Maintenance
+	// Worker 1: Periodic 15-minute Scanner
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// Initial startup maintenance: pangkas sinyal reject > 7 hari
-		if pruned, err := engine.repo.PruneOldSignalAuditLogs(ctx, 7); err == nil && pruned > 0 {
-			slog.Info("initial signal audit log maintenance completed", "prunedRejectedSignals", pruned)
-		}
-
 		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
-		scanCount := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				scanCount++
 				slog.Info("running periodic market scan...")
 				engine.runMarketScan(ctx)
-
-				// Jalankan pembersihan berkala setiap 4 siklus scan (~1 jam)
-				if scanCount%4 == 0 {
-					if pruned, err := engine.repo.PruneOldSignalAuditLogs(ctx, 7); err == nil && pruned > 0 {
-						slog.Info("periodic signal audit log maintenance completed", "prunedRejectedSignals", pruned)
-					}
-				}
 			}
 		}
 	}()
@@ -363,7 +349,25 @@ func main() {
 		}
 	}()
 
-	// Worker 5: Monorepo PWA & Web Dashboard Server (Zero Lock Contention)
+	// Worker 5: Daily Database Maintenance & Pruning (24 jam sekali, terisolasi dari scanner)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if pruned, err := engine.repo.PruneOldSignalAuditLogs(ctx, 7); err == nil && pruned > 0 {
+					slog.Info("daily signal audit log maintenance completed", "prunedRejectedSignals", pruned)
+				}
+			}
+		}
+	}()
+
+	// Worker 6: Monorepo PWA & Web Dashboard Server (Zero Lock Contention)
 	var webServer *web.Server
 	if cfg.HTTPPort != "" {
 		envStr := "DRY-RUN"
