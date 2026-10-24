@@ -1,8 +1,8 @@
-const CACHE_NAME = 'trml-shell-v1';
+const CACHE_NAME = 'trml-shell-v2';
 const STATIC_ASSETS = [
   '/',
-  '/style.css',
-  '/app.js',
+  '/style.css?v=2',
+  '/app.js?v=2',
   '/manifest.json',
   '/icon.svg'
 ];
@@ -33,10 +33,10 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Shell assets: Stale-while-revalidate strategy
+  // Shell assets: Network-first strategy (always fetch fresh, fallback to cache if offline)
   event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      const fetchPromise = fetch(event.request).then((networkResponse) => {
+    fetch(event.request)
+      .then((networkResponse) => {
         if (networkResponse && networkResponse.status === 200) {
           const responseToCache = networkResponse.clone();
           caches.open(CACHE_NAME).then((cache) => {
@@ -44,9 +44,7 @@ self.addEventListener('fetch', (event) => {
           });
         }
         return networkResponse;
-      }).catch(() => cachedResponse);
-
-      return cachedResponse || fetchPromise;
-    })
+      })
+      .catch(() => caches.match(event.request))
   );
 });

@@ -271,6 +271,11 @@ function renderScanner(data) {
     lastScanEl.textContent = `Last Scan: ${formatTimeUTC(data.scanned_at_utc)}`;
   }
 
+  const countBadge = document.getElementById('radar-count-badge');
+  if (countBadge && data.coins && data.coins.length > 0) {
+    countBadge.textContent = `Top ${data.coins.length} Scanner`;
+  }
+
   if (!tbody) return;
 
   const coins = data.coins || [];
@@ -522,19 +527,20 @@ function formatAuditReason(decision, code, subReason) {
 
   if (cleaned.includes('|')) {
     const parts = cleaned.split('|').map(p => p.trim()).filter(p => p.length > 0);
-    return parts.map(p => {
+    const pills = parts.map(p => {
       const label = labelMap[p] || formatSubParam(p);
       return `<span class="audit-pill">${escapeHtml(label)}</span>`;
-    }).join(' ');
+    }).join('');
+    return `<div class="audit-reason-wrap">${pills}</div>`;
   }
 
   if (cleaned.length > 0) {
     const label = labelMap[cleaned] || formatSubParam(cleaned);
-    return `<span class="audit-pill">${escapeHtml(label)}</span>`;
+    return `<div class="audit-reason-wrap"><span class="audit-pill">${escapeHtml(label)}</span></div>`;
   }
 
   const codeLabel = labelMap[code] || (code ? code.replace(/_/g, ' ') : 'Setup Incomplete');
-  return `<span class="audit-pill">${escapeHtml(codeLabel)}</span>`;
+  return `<div class="audit-reason-wrap"><span class="audit-pill">${escapeHtml(codeLabel)}</span></div>`;
 }
 
 function formatSubParam(str) {
@@ -618,7 +624,7 @@ function renderSignals(signals) {
         <td>${s.oi_delta_pct ? formatSignedPct(s.oi_delta_pct) : '--'}</td>
         <td>${s.rvol ? s.rvol.toFixed(2) : '--'}</td>
         <td>${decBadge}</td>
-        <td style="max-width: 380px;">${reasonHtml}</td>
+        <td class="col-audit-reason">${reasonHtml}</td>
       </tr>
     `;
 
@@ -817,7 +823,9 @@ document.addEventListener('DOMContentLoaded', () => {
   // Register PWA Service Worker
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js').catch((err) => {
+      navigator.serviceWorker.register('/sw.js?v=2').then((reg) => {
+        reg.update();
+      }).catch((err) => {
         console.warn('Service worker registration failed:', err);
       });
     });

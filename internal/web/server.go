@@ -68,7 +68,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to create sub filesystem for static: %w", err)
 	}
 	fileServer := http.FileServer(http.FS(subFS))
-	mux.Handle("/", fileServer)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.HasSuffix(path, ".js") || strings.HasSuffix(path, ".css") || path == "/" || path == "/index.html" {
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		}
+		fileServer.ServeHTTP(w, r)
+	})
 
 	s.httpServer = &http.Server{
 		Addr:         cfg.Port,

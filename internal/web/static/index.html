@@ -9,7 +9,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=2">
 </head>
 <body>
   <!-- Header -->
@@ -125,7 +125,7 @@
       <div class="panel-header">
         <div class="panel-title-group">
           <span class="panel-title">Watched Coins Radar</span>
-          <span id="radar-count-badge" class="panel-badge">Top 10 Scanner</span>
+          <span id="radar-count-badge" class="panel-badge">Top 20 Scanner</span>
         </div>
         <div class="panel-controls">
           <span id="radar-last-scan" class="pagination-info">Last Scan: Just now</span>
@@ -257,7 +257,7 @@
               <th>OI Delta %</th>
               <th>RVOL</th>
               <th>Decision</th>
-              <th>Audit Evaluation &amp; Reason</th>
+              <th class="col-audit-reason-th">Audit Evaluation &amp; Reason</th>
             </tr>
           </thead>
           <tbody id="signals-tbody">
@@ -285,6 +285,6 @@
     </section>
   </main>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=2"></script>
 </body>
 </html>
