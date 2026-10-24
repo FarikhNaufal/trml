@@ -301,7 +301,7 @@ function renderScanner(data) {
 
     html += `
       <tr>
-        <td class="sticky-col"><strong>${escapeHtml(c.symbol)}</strong></td>
+        <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(c.symbol)}</strong></td>
         <td>${c.mark_price ? c.mark_price.toFixed(4) : '--'}</td>
 
         <td>${c.session_vwap ? c.session_vwap.toFixed(4) : '--'}</td>
@@ -407,8 +407,8 @@ function renderTrades(trades) {
     // Desktop Row
     tableHtml += `
       <tr>
+        <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(t.symbol)}</strong></td>
         <td>${formatTimeUTC(t.closed_at_utc)}</td>
-        <td><strong>${escapeHtml(t.symbol)}</strong></td>
         <td><span class="pos-side-pill ${sideClass}">${escapeHtml(t.side)}</span></td>
         <td>${escapeHtml(t.qty)}</td>
         <td>${escapeHtml(t.entry_price)}</td>
@@ -609,8 +609,8 @@ function renderSignals(signals) {
     // Desktop Row
     tableHtml += `
       <tr>
+        <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(s.symbol)}</strong></td>
         <td>${formatTimeUTC(s.candle_open_time_utc)}</td>
-        <td><strong>${escapeHtml(s.symbol)}</strong></td>
         <td><span class="pos-side-pill ${sideClass}">${escapeHtml(s.side)}</span></td>
         <td>${s.close_price ? s.close_price.toFixed(4) : '--'}</td>
         <td>${s.session_vwap ? s.session_vwap.toFixed(4) : '--'}</td>

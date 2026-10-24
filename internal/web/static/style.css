@@ -466,10 +466,28 @@ body {
 .table-responsive {
   width: 100%;
   overflow-x: auto;
+  position: relative;
+  background: var(--bg-surface);
+  -webkit-overflow-scrolling: touch;
+}
+.table-responsive::-webkit-scrollbar {
+  height: 6px;
+}
+.table-responsive::-webkit-scrollbar-track {
+  background: var(--bg-surface-elevated);
+}
+.table-responsive::-webkit-scrollbar-thumb {
+  background: var(--border-hover);
+  border-radius: var(--radius-sm);
+}
+.table-responsive::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
 }
 .trml-table {
   width: 100%;
-  border-collapse: collapse;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
   text-align: left;
   font-size: 13px;
 }
@@ -490,8 +508,9 @@ body {
   color: var(--text-primary);
   font-family: var(--font-mono);
   white-space: nowrap;
+  background: var(--bg-surface);
 }
-.trml-table tbody tr:hover {
+.trml-table tbody tr:hover td {
   background: var(--bg-surface-hover);
 }
 
@@ -585,19 +604,26 @@ body {
   margin-top: 8px;
 }
 
-/* Sticky Column for Mobile Radar */
+/* Pinned / Sticky Symbol Column across all tables */
+.col-sticky-symbol,
 .sticky-col {
   position: sticky;
   left: 0;
-  background: var(--bg-surface-elevated);
+  min-width: 105px;
   z-index: 2;
-  box-shadow: 2px 0 4px rgba(0, 0, 0, 0.25);
+  background: var(--bg-surface) !important;
+  border-right: 1px solid var(--border-subtle) !important;
+  box-shadow: 4px 0 8px -2px rgba(0, 0, 0, 0.45);
 }
-tbody .sticky-col {
-  background: var(--bg-surface);
+th.col-sticky-symbol,
+th.sticky-col {
+  z-index: 4;
+  background: var(--bg-surface-elevated) !important;
 }
+tbody tr:hover td.col-sticky-symbol,
+tbody tr:hover .col-sticky-symbol,
 tbody tr:hover .sticky-col {
-  background: var(--bg-surface-hover);
+  background: var(--bg-surface-hover) !important;
 }
 
 /* Pagination Bar */
