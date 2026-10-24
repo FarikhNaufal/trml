@@ -215,6 +215,7 @@ func main() {
 			EntryOrderType:        cfg.EntryOrderType,
 		}
 		engine.dryRunBroker = broker.NewDryRunBroker(initialEquity, dryRunCfg)
+		defer engine.dryRunBroker.Close()
 		engine.dryRunBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
@@ -227,7 +228,7 @@ func main() {
 			_ = repo.SaveDailyState(context.Background(), epochDay, startEq, totEq, breakerHit)
 		}
 
-		engine.dryRunBroker.OnPositionSavedFn = func(pos *broker.VirtualOpenPosition) {
+		engine.dryRunBroker.OnPositionSavedFn = func(pos broker.VirtualOpenPosition) {
 			_ = repo.SaveDryRunPosition(context.Background(), storage.StoredDryRunPosition{
 				ClientOrderID:    pos.ClientOrderID,
 				Symbol:           pos.Symbol,

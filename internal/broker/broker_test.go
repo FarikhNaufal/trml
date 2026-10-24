@@ -862,6 +862,208 @@ func TestLiveBrokerEntryAndExitPriceAndPnLCapture(t *testing.T) {
 	}
 }
 
+func TestDryRunBrokerPersistence_FIFOOrdering(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:            3,
+		AccountLeverage:     5.0,
+		EntryOrderType:      "MARKET",
+		BreakEvenTriggerATR: 1.0,
+		TakerFeeRate:        0.0005,
+	}
+	b := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
+	defer b.Close()
+
+	events := make([]PositionEvent, 0)
+	doneChan := make(chan struct{}, 10)
+
+	b.OnPositionSavedFn = func(pos VirtualOpenPosition) {
+		events = append(events, PositionEvent{Type: PositionEventSave, Pos: pos})
+		doneChan <- struct{}{}
+	}
+	b.OnPositionDeletedFn = func(idOrSym string) {
+		events = append(events, PositionEvent{Type: PositionEventDelete, ClientOrderIDOrSymbol: idOrSym})
+		doneChan <- struct{}{}
+	}
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "ORDER_FIFO_1",
+		Symbol:        "NEARUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromInt(10),
+		LimitPrice:    decimal.NewFromFloat(5.0),
+		SLPrice:       decimal.NewFromFloat(4.5),
+		TPPrice:       decimal.NewFromFloat(6.0),
+		ATRAtEntry:    decimal.NewFromFloat(0.5),
+		CreatedAt:     now,
+		SignalAuditID: 4369,
+	}
+
+	// 1. Submit Market Entry -> triggers PositionEventSave
+	ok, err := b.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("submit market entry failed: %v", err)
+	}
+
+	// Wait for event 1
+	select {
+	case <-doneChan:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for save event")
+	}
+
+	// 2. Trigger Break-Even -> triggers PositionEventSave (update)
+	// Entry 5.0, ATR 0.5, BreakEvenTrigger 1.0 -> trigger dist 0.5 -> markPrice 5.6 triggers BE
+	b.OnRealtimeTick("NEARUSDT", 5.6, 5.61, 5.6, 5.6, 1.0, true, now.Add(time.Second))
+
+	select {
+	case <-doneChan:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for break-even save event")
+	}
+
+	// 3. Trigger Take Profit -> triggers PositionEventDelete
+	b.OnRealtimeTick("NEARUSDT", 6.0, 6.01, 6.0, 6.0, 1.0, true, now.Add(2*time.Second))
+
+	select {
+	case <-doneChan:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for delete event")
+	}
+
+	// Verify exact FIFO event sequence: [Save (open), Save (be moved), Delete (tp hit)]
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+	if events[0].Type != PositionEventSave || events[0].Pos.ClientOrderID != "ORDER_FIFO_1" || events[0].Pos.IsBreakEvenMoved {
+		t.Errorf("event 0 mismatch: %+v", events[0])
+	}
+	if events[1].Type != PositionEventSave || !events[1].Pos.IsBreakEvenMoved {
+		t.Errorf("event 1 mismatch: expected break-even true, got %+v", events[1])
+	}
+	if events[2].Type != PositionEventDelete || events[2].ClientOrderIDOrSymbol != "ORDER_FIFO_1" {
+		t.Errorf("event 2 mismatch: expected delete ORDER_FIFO_1, got %+v", events[2])
+	}
+}
+
+func TestDryRunBrokerPersistence_RestoreAccounting(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:        3,
+		AccountLeverage: 5.0,
+		TakerFeeRate:    0.0005,
+	}
+	b := NewDryRunBroker(decimal.NewFromFloat(100.0), cfg)
+	defer b.Close()
+
+	now := time.Now().UTC()
+	pos := &VirtualOpenPosition{
+		ClientOrderID:    "ORDER_RESTORE_ACCT",
+		Symbol:           "NEARUSDT",
+		Side:             model.SideLong,
+		Qty:              decimal.NewFromInt(10),
+		EntryPrice:       decimal.NewFromFloat(10.0), // notional = 100
+		EntryFee:         decimal.NewFromFloat(0.05), // entryFee = 0.05
+		CurrentSLPrice:   decimal.NewFromFloat(9.0),
+		TPPrice:          decimal.NewFromFloat(12.0),
+		ATRAtEntry:       decimal.NewFromFloat(0.5),
+		LastMarkPrice:    decimal.NewFromFloat(10.0),
+		MarkUpdatedAt:    now,
+		OpenTime:         now,
+		IsBreakEvenMoved: false,
+		SignalAuditID:    100,
+	}
+
+	// Restore position: RealizedEquityUSDT must be debited by pos.EntryFee ($0.05)
+	b.RestoreOpenPosition(pos)
+	if !b.RealizedEquityUSDT.Equal(decimal.NewFromFloat(99.95)) {
+		t.Errorf("expected RealizedEquity 99.95, got %s", b.RealizedEquityUSDT)
+	}
+
+	// Idempotent test: calling RestoreOpenPosition again for same symbol must NOT double-deduct
+	b.RestoreOpenPosition(pos)
+	if !b.RealizedEquityUSDT.Equal(decimal.NewFromFloat(99.95)) {
+		t.Errorf("expected RealizedEquity to remain 99.95 on duplicate restore, got %s", b.RealizedEquityUSDT)
+	}
+
+	// Close position with TP at 12.0 (Gross PnL = (12 - 10) * 10 = $20, Exit Fee = 12 * 10 * 0.0005 = $0.06)
+	// Addition to RealizedEquity = grossPnL - exitFee = $20 - $0.06 = $19.94
+	// Final RealizedEquity = $99.95 + $19.94 = $119.89
+	// Net PnL = $20 - $0.05 - $0.06 = $19.89
+	// Start Equity $100 + Net PnL $19.89 = $119.89!
+	b.closePositionLocked(pos, decimal.NewFromFloat(12.0), 0.0005, "TAKE_PROFIT")
+
+	if !b.RealizedEquityUSDT.Equal(decimal.NewFromFloat(119.89)) {
+		t.Errorf("accounting discrepancy: expected 119.89, got %s", b.RealizedEquityUSDT)
+	}
+}
+
+func TestDryRunBrokerPersistence_PeriodicCheckpoint(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:       3,
+		EntryOrderType: "MARKET",
+	}
+	b := NewDryRunBroker(decimal.NewFromFloat(500.0), cfg)
+	defer b.Close()
+
+	savedPositions := make([]VirtualOpenPosition, 0)
+	saveChan := make(chan struct{}, 10)
+
+	b.OnPositionSavedFn = func(pos VirtualOpenPosition) {
+		savedPositions = append(savedPositions, pos)
+		saveChan <- struct{}{}
+	}
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "ORDER_CHECKPOINT",
+		Symbol:        "NEARUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromInt(10),
+		LimitPrice:    decimal.NewFromFloat(5.0),
+		SLPrice:       decimal.NewFromFloat(5.5),
+		TPPrice:       decimal.NewFromFloat(4.0),
+		ATRAtEntry:    decimal.NewFromFloat(0.2),
+		CreatedAt:     now,
+	}
+
+	_, _ = b.SubmitLimitEntry(intent)
+
+	// Consume initial save event
+	select {
+	case <-saveChan:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for initial save")
+	}
+
+	// Price moves in our favor to 4.80 (MFE = (5 - 4.8)/5 * 100 = 4%)
+	b.OnRealtimeTick("NEARUSDT", 4.79, 4.80, 4.80, 4.80, 1.0, true, now.Add(time.Second))
+
+	// Calling CheckTimeouts within 1s should NOT trigger periodic checkpoint yet (interval 5s)
+	b.CheckTimeouts(now.Add(time.Second))
+	select {
+	case <-saveChan:
+		t.Fatalf("unexpected save event before 5s checkpoint interval")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Calling CheckTimeouts after 6s SHOULD trigger periodic checkpoint
+	b.CheckTimeouts(now.Add(6 * time.Second))
+	select {
+	case <-saveChan:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for periodic checkpoint save event")
+	}
+
+	lastSaved := savedPositions[len(savedPositions)-1]
+	if !lastSaved.LastMarkPrice.Equal(decimal.NewFromFloat(4.80)) {
+		t.Errorf("expected LastMarkPrice 4.80, got %s", lastSaved.LastMarkPrice)
+	}
+	if lastSaved.MaxMFE <= 0 {
+		t.Errorf("expected positive MaxMFE, got %f", lastSaved.MaxMFE)
+	}
+}
+
+
 
 
 

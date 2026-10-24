@@ -69,6 +69,19 @@ type TradeClosedRecord struct {
 	SignalAuditID int64
 }
 
+type PositionEventType int
+
+const (
+	PositionEventSave PositionEventType = iota
+	PositionEventDelete
+)
+
+type PositionEvent struct {
+	Type                  PositionEventType
+	Pos                   VirtualOpenPosition
+	ClientOrderIDOrSymbol string
+}
+
 type DryRunBroker struct {
 	Mu                    sync.Mutex
 	Cfg                   DryRunConfig
@@ -79,15 +92,65 @@ type DryRunBroker struct {
 	PendingOrders         map[string]*VirtualPendingOrder
 	OpenPositions         map[string]*VirtualOpenPosition
 	OnTradeClosedFn       func(rec TradeClosedRecord)
-	OnPositionSavedFn     func(pos *VirtualOpenPosition)
+	OnPositionSavedFn     func(pos VirtualOpenPosition)
 	OnPositionDeletedFn   func(clientOrderIDOrSymbol string)
+
+	eventChan        chan PositionEvent
+	eventStop        chan struct{}
+	lastPeriodicSync time.Time
 }
 
 // RestoreOpenPosition memulihkan posisi virtual dari database ke memory saat startup
+// dan menyesuaikan saldo realized equity dengan entryFee posisi agar akuntansi presisi
 func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
+	if _, exists := d.OpenPositions[pos.Symbol]; !exists {
+		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(pos.EntryFee)
+	}
 	d.OpenPositions[pos.Symbol] = pos
+}
+
+func (d *DryRunBroker) enqueuePositionEvent(evt PositionEvent) {
+	if d.eventChan == nil {
+		return
+	}
+	select {
+	case d.eventChan <- evt:
+	default:
+		slog.Warn("dryrun: persistence event channel full, dropping event", "type", evt.Type)
+	}
+}
+
+func (d *DryRunBroker) startEventWorker() {
+	go func() {
+		for {
+			select {
+			case <-d.eventStop:
+				for len(d.eventChan) > 0 {
+					evt := <-d.eventChan
+					d.dispatchPositionEvent(evt)
+				}
+				return
+			case evt := <-d.eventChan:
+				d.dispatchPositionEvent(evt)
+			}
+		}
+	}()
+}
+
+func (d *DryRunBroker) dispatchPositionEvent(evt PositionEvent) {
+	if evt.Type == PositionEventSave && d.OnPositionSavedFn != nil {
+		d.OnPositionSavedFn(evt.Pos)
+	} else if evt.Type == PositionEventDelete && d.OnPositionDeletedFn != nil {
+		d.OnPositionDeletedFn(evt.ClientOrderIDOrSymbol)
+	}
+}
+
+func (d *DryRunBroker) Close() {
+	if d.eventStop != nil {
+		close(d.eventStop)
+	}
 }
 
 func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBroker {
@@ -115,13 +178,18 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 	if cfg.MaxMarkStaleness <= 0 {
 		cfg.MaxMarkStaleness = 15 * time.Second
 	}
-	return &DryRunBroker{
+	broker := &DryRunBroker{
 		Cfg:                cfg,
 		SessionStartEquity: initialEquity,
 		RealizedEquityUSDT: initialEquity,
 		PendingOrders:      make(map[string]*VirtualPendingOrder),
 		OpenPositions:      make(map[string]*VirtualOpenPosition),
+		eventChan:          make(chan PositionEvent, 256),
+		eventStop:          make(chan struct{}),
+		lastPeriodicSync:   time.Now().UTC(),
 	}
+	broker.startEventWorker()
+	return broker
 }
 
 func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
@@ -175,9 +243,10 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 		}
 		d.OpenPositions[intent.Symbol] = pos
 
-		if d.OnPositionSavedFn != nil {
-			go d.OnPositionSavedFn(pos)
-		}
+		d.enqueuePositionEvent(PositionEvent{
+			Type: PositionEventSave,
+			Pos:  *pos,
+		})
 
 		slog.Info("dryrun: market entry FILLED",
 			"symbol", intent.Symbol,
@@ -357,9 +426,10 @@ func (d *DryRunBroker) OnRealtimeTick(
 			if !pos.IsBreakEvenMoved && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(beTriggerDist) {
 				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
 				pos.IsBreakEvenMoved = true
-				if d.OnPositionSavedFn != nil {
-					go d.OnPositionSavedFn(pos)
-				}
+				d.enqueuePositionEvent(PositionEvent{
+					Type: PositionEventSave,
+					Pos:  *pos,
+				})
 			}
 			if triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice) {
 				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
@@ -380,9 +450,10 @@ func (d *DryRunBroker) OnRealtimeTick(
 			if !pos.IsBreakEvenMoved && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(beTriggerDist) {
 				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
 				pos.IsBreakEvenMoved = true
-				if d.OnPositionSavedFn != nil {
-					go d.OnPositionSavedFn(pos)
-				}
+				d.enqueuePositionEvent(PositionEvent{
+					Type: PositionEventSave,
+					Pos:  *pos,
+				})
 			}
 			if triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice) {
 				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
@@ -431,9 +502,10 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 		pos.Qty = ord.FilledQty
 		pos.EntryFee = entryFee
 	}
-	if d.OnPositionSavedFn != nil {
-		go d.OnPositionSavedFn(pos)
-	}
+	d.enqueuePositionEvent(PositionEvent{
+		Type: PositionEventSave,
+		Pos:  *pos,
+	})
 }
 
 func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, reason string) {
@@ -476,9 +548,10 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 
 	delete(d.OpenPositions, pos.Symbol)
 
-	if d.OnPositionDeletedFn != nil {
-		go d.OnPositionDeletedFn(clientOrderID)
-	}
+	d.enqueuePositionEvent(PositionEvent{
+		Type:                  PositionEventDelete,
+		ClientOrderIDOrSymbol: clientOrderID,
+	})
 
 	if d.OnTradeClosedFn != nil {
 		go d.OnTradeClosedFn(rec)
@@ -587,6 +660,21 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 					d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING")
 					delete(d.PendingOrders, sym)
 				}
+			}
+		}
+	}
+
+	// Sinkronisasi periodik MAE, MFE, dan Mark Price terkini ke SQLite setiap 5 detik
+	if len(d.OpenPositions) > 0 {
+		if d.lastPeriodicSync.IsZero() {
+			d.lastPeriodicSync = now
+		} else if now.Sub(d.lastPeriodicSync) >= 5*time.Second {
+			d.lastPeriodicSync = now
+			for _, pos := range d.OpenPositions {
+				d.enqueuePositionEvent(PositionEvent{
+					Type: PositionEventSave,
+					Pos:  *pos,
+				})
 			}
 		}
 	}
