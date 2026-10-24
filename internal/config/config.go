@@ -58,6 +58,7 @@ type Config struct {
 	MaxSpreadPct     float64
 	MinNATRPct       float64
 	MaxNATRPct       float64
+	MaxWatchedCoins  int
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
 	PullbackToleranceATR float64
@@ -308,6 +309,12 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_NATR_PCT '%s' (must be float >= MIN_NATR_PCT and <= 20.0)", maxNATRStr)
 	}
 
+	maxWatchedStr := getEnv("MAX_WATCHED_COINS", "20")
+	maxWatched, err := strconv.Atoi(maxWatchedStr)
+	if err != nil || maxWatched < 1 || maxWatched > 50 {
+		return nil, fmt.Errorf("config: invalid MAX_WATCHED_COINS '%s' (must be integer between 1 and 50)", maxWatchedStr)
+	}
+
 	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.10")
 	minOIDelta, err := strconv.ParseFloat(minOIDeltaStr, 64)
 	if err != nil || minOIDelta < -5.0 || minOIDelta > 10.0 {
@@ -393,6 +400,7 @@ func LoadConfig() (*Config, error) {
 		MaxSpreadPct:         maxSpread,
 		MinNATRPct:           minNATR,
 		MaxNATRPct:           maxNATR,
+		MaxWatchedCoins:      maxWatched,
 		PullbackToleranceATR: pullbackTol,
 		MinBounceZScore:      minBounceZ,
 		LookbackImpulseBars:  lookbackBars,

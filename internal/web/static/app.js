@@ -192,7 +192,7 @@ function renderActivePositions(positions) {
           <circle cx="12" cy="12" r="10"/>
           <path d="M12 6v6l4 2"/>
         </svg>
-        <div>No active positions open. Scanner is monitoring 10 coins for high-conviction retests.</div>
+        <div>No active positions open. Scanner is monitoring top liquid coins for high-conviction retests.</div>
       </div>
     `;
     return;

@@ -29,6 +29,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.RetestLookbackBars != 4 {
 		t.Errorf("expected 4 retest lookback bars, got %d", cfg.RetestLookbackBars)
 	}
+	if cfg.MaxWatchedCoins != 20 {
+		t.Errorf("expected 20 max watched coins, got %d", cfg.MaxWatchedCoins)
+	}
 }
 
 func TestLoadConfigMainnet(t *testing.T) {
