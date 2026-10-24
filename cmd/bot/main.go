@@ -349,20 +349,30 @@ func main() {
 		}
 	}()
 
-	// Worker 5: Daily Database Maintenance & Pruning (24 jam sekali, terisolasi dari scanner)
+	// Worker 5: Daily Database Maintenance & Pruning (Setiap hari tepat pukul 00:05 UTC / 07:05 WIB)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
+		now := time.Now().UTC()
+		nextRun := time.Date(now.Year(), now.Month(), now.Day(), 0, 5, 0, 0, time.UTC)
+		if !now.Before(nextRun) {
+			nextRun = nextRun.Add(24 * time.Hour)
+		}
+		delay := time.Until(nextRun)
+		slog.Info("daily database maintenance scheduled", "nextRunUTC", nextRun.Format(time.RFC3339), "waitDuration", delay.Round(time.Minute))
+
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				if pruned, err := engine.repo.PruneOldSignalAuditLogs(ctx, 7); err == nil && pruned > 0 {
 					slog.Info("daily signal audit log maintenance completed", "prunedRejectedSignals", pruned)
 				}
+				timer.Reset(24 * time.Hour)
 			}
 		}
 	}()
