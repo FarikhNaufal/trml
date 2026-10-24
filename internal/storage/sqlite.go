@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS signal_audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_signal_audit_log_symbol_time ON signal_audit_log (symbol, candle_open_time_utc);
 CREATE INDEX IF NOT EXISTS idx_signal_audit_log_created_at ON signal_audit_log (created_at_utc);
+CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);
 CREATE INDEX IF NOT EXISTS idx_trade_ledger_symbol ON trade_ledger (symbol);
 CREATE INDEX IF NOT EXISTS idx_trade_ledger_closed_at ON trade_ledger (closed_at_utc);
 `
@@ -145,6 +146,7 @@ func OpenDB(dbPath string) (*DB, error) {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE trade_ledger ADD COLUMN signal_audit_id INTEGER NOT NULL DEFAULT 0;`)
 	}
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)
+	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);`)
 
 	// Schema version check / user_version migration guard
 	var userVersion int

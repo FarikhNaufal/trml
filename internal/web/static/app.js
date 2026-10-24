@@ -820,6 +820,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }, 5000);
 
+  // Page visibility awareness: pause polling when tab is hidden, resume immediately when visible
+  document.addEventListener('visibilitychange', () => {
+    state.isPollingActive = !document.hidden;
+    if (state.isPollingActive) {
+      // Refresh instant saat tab dibuka kembali
+      fetchSummary();
+      fetchScanner();
+    }
+  });
+
   // Register PWA Service Worker
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {

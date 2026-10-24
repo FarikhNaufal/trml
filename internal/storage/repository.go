@@ -15,6 +15,7 @@ type Repository interface {
 	GetDailyState(ctx context.Context, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
 	LogTrade(ctx context.Context, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64) error
 	LogSignalAudit(ctx context.Context, candleOpenTime time.Time, symbol, side string, closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64, decision, rejectReason, rejectSubReason string) (int64, error)
+	PruneOldSignalAuditLogs(ctx context.Context, olderThanDays int) (int64, error)
 }
 
 type SQLiteRepository struct {
@@ -188,4 +189,24 @@ func (r *SQLiteRepository) LogSignalAudit(
 		return 0, nil
 	}
 	return id, nil
+}
+
+// PruneOldSignalAuditLogs menghapus log sinyal REJECT yang lebih tua dari olderThanDays (default 7 hari).
+// Sinyal APPROVE/APPROVED dan trade_ledger tidak pernah dihapus untuk menjaga integritas audit.
+func (r *SQLiteRepository) PruneOldSignalAuditLogs(ctx context.Context, olderThanDays int) (int64, error) {
+	if olderThanDays <= 0 {
+		olderThanDays = 7
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -olderThanDays).Format(time.RFC3339Nano)
+	query := `
+	DELETE FROM signal_audit_log
+	WHERE decision IN ('REJECT', 'REJECTED')
+	  AND created_at_utc < ?;
+	`
+	res, err := r.db.conn.ExecContext(ctx, query, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("storage: failed to prune old signal audit logs: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	return rowsAffected, nil
 }
