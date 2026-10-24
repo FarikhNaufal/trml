@@ -79,6 +79,15 @@ type DryRunBroker struct {
 	PendingOrders         map[string]*VirtualPendingOrder
 	OpenPositions         map[string]*VirtualOpenPosition
 	OnTradeClosedFn       func(rec TradeClosedRecord)
+	OnPositionSavedFn     func(pos *VirtualOpenPosition)
+	OnPositionDeletedFn   func(clientOrderIDOrSymbol string)
+}
+
+// RestoreOpenPosition memulihkan posisi virtual dari database ke memory saat startup
+func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	d.OpenPositions[pos.Symbol] = pos
 }
 
 func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBroker {
@@ -148,7 +157,7 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			now = time.Now().UTC()
 		}
 
-		d.OpenPositions[intent.Symbol] = &VirtualOpenPosition{
+		pos := &VirtualOpenPosition{
 			ClientOrderID:    intent.ClientOrderID,
 			Symbol:           intent.Symbol,
 			Side:             intent.Side,
@@ -163,6 +172,11 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			OpenTime:         now,
 			IsBreakEvenMoved: false,
 			SignalAuditID:    intent.SignalAuditID,
+		}
+		d.OpenPositions[intent.Symbol] = pos
+
+		if d.OnPositionSavedFn != nil {
+			go d.OnPositionSavedFn(pos)
 		}
 
 		slog.Info("dryrun: market entry FILLED",
@@ -343,6 +357,9 @@ func (d *DryRunBroker) OnRealtimeTick(
 			if !pos.IsBreakEvenMoved && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(beTriggerDist) {
 				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
 				pos.IsBreakEvenMoved = true
+				if d.OnPositionSavedFn != nil {
+					go d.OnPositionSavedFn(pos)
+				}
 			}
 			if triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice) {
 				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
@@ -363,6 +380,9 @@ func (d *DryRunBroker) OnRealtimeTick(
 			if !pos.IsBreakEvenMoved && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(beTriggerDist) {
 				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
 				pos.IsBreakEvenMoved = true
+				if d.OnPositionSavedFn != nil {
+					go d.OnPositionSavedFn(pos)
+				}
 			}
 			if triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice) {
 				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
@@ -390,7 +410,7 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 	pos, exists := d.OpenPositions[ord.Intent.Symbol]
 	entryFee := ord.Intent.LimitPrice.Mul(ord.FilledQty).Mul(decimal.NewFromFloat(d.Cfg.MakerFeeRate))
 	if !exists {
-		d.OpenPositions[ord.Intent.Symbol] = &VirtualOpenPosition{
+		pos = &VirtualOpenPosition{
 			ClientOrderID:    ord.Intent.ClientOrderID,
 			Symbol:           ord.Intent.Symbol,
 			Side:             ord.Intent.Side,
@@ -406,9 +426,13 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 			IsBreakEvenMoved: false,
 			SignalAuditID:    ord.Intent.SignalAuditID,
 		}
+		d.OpenPositions[ord.Intent.Symbol] = pos
 	} else {
 		pos.Qty = ord.FilledQty
 		pos.EntryFee = entryFee
+	}
+	if d.OnPositionSavedFn != nil {
+		go d.OnPositionSavedFn(pos)
 	}
 }
 
@@ -451,6 +475,10 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	}
 
 	delete(d.OpenPositions, pos.Symbol)
+
+	if d.OnPositionDeletedFn != nil {
+		go d.OnPositionDeletedFn(clientOrderID)
+	}
 
 	if d.OnTradeClosedFn != nil {
 		go d.OnTradeClosedFn(rec)

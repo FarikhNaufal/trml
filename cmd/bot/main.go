@@ -226,6 +226,60 @@ func main() {
 			engine.dryRunBroker.Mu.Unlock()
 			_ = repo.SaveDailyState(context.Background(), epochDay, startEq, totEq, breakerHit)
 		}
+
+		engine.dryRunBroker.OnPositionSavedFn = func(pos *broker.VirtualOpenPosition) {
+			_ = repo.SaveDryRunPosition(context.Background(), storage.StoredDryRunPosition{
+				ClientOrderID:    pos.ClientOrderID,
+				Symbol:           pos.Symbol,
+				Side:             string(pos.Side),
+				Qty:              pos.Qty,
+				EntryPrice:       pos.EntryPrice,
+				EntryFee:         pos.EntryFee,
+				CurrentSLPrice:   pos.CurrentSLPrice,
+				TPPrice:          pos.TPPrice,
+				ATRAtEntry:       pos.ATRAtEntry,
+				LastMarkPrice:    pos.LastMarkPrice,
+				MarkUpdatedAt:    pos.MarkUpdatedAt,
+				OpenedAt:         pos.OpenTime,
+				IsBreakEvenMoved: pos.IsBreakEvenMoved,
+				SignalAuditID:    pos.SignalAuditID,
+				MaxMAE:           pos.MaxMAE,
+				MaxMFE:           pos.MaxMFE,
+			})
+		}
+
+		engine.dryRunBroker.OnPositionDeletedFn = func(clientOrderIDOrSymbol string) {
+			_ = repo.DeleteDryRunPosition(context.Background(), clientOrderIDOrSymbol)
+		}
+
+		// Pulihkan posisi terbuka dry-run dari database jika ada (tahan restart/rebuild)
+		if storedPositions, err := repo.GetAllDryRunPositions(ctx); err == nil && len(storedPositions) > 0 {
+			for _, sp := range storedPositions {
+				engine.dryRunBroker.RestoreOpenPosition(&broker.VirtualOpenPosition{
+					ClientOrderID:    sp.ClientOrderID,
+					Symbol:           sp.Symbol,
+					Side:             model.Side(sp.Side),
+					Qty:              sp.Qty,
+					EntryPrice:       sp.EntryPrice,
+					EntryFee:         sp.EntryFee,
+					CurrentSLPrice:   sp.CurrentSLPrice,
+					TPPrice:          sp.TPPrice,
+					ATRAtEntry:       sp.ATRAtEntry,
+					LastMarkPrice:    sp.LastMarkPrice,
+					MarkUpdatedAt:    sp.MarkUpdatedAt,
+					OpenTime:         sp.OpenedAt,
+					IsBreakEvenMoved: sp.IsBreakEvenMoved,
+					SignalAuditID:    sp.SignalAuditID,
+					MaxMAE:           sp.MaxMAE,
+					MaxMFE:           sp.MaxMFE,
+				})
+				slog.Info("restored dry-run active position from database",
+					"symbol", sp.Symbol, "clientOrderID", sp.ClientOrderID, "side", sp.Side,
+					"qty", sp.Qty, "entryPrice", sp.EntryPrice, "slPrice", sp.CurrentSLPrice,
+					"tpPrice", sp.TPPrice, "signalAuditID", sp.SignalAuditID)
+			}
+		}
+
 		engine.broker = engine.dryRunBroker
 	} else {
 		slog.Info("initializing Binance Live Execution Broker")

@@ -145,4 +145,60 @@ func TestSQLiteRepository(t *testing.T) {
 	if countOldApprove != 1 {
 		t.Fatalf("old APPROVE row should not have been pruned, count=%d", countOldApprove)
 	}
+
+	// 5. Test Dry-Run Position Persistence (Save, GetAll, Upsert, Delete)
+	pos1 := StoredDryRunPosition{
+		ClientOrderID:    "SIM-NEARUSDT-12345",
+		Symbol:           "NEARUSDT",
+		Side:             "SHORT",
+		Qty:              decimal.NewFromInt(39),
+		EntryPrice:       decimal.NewFromFloat(4.4600),
+		EntryFee:         decimal.NewFromFloat(0.08697),
+		CurrentSLPrice:   decimal.NewFromFloat(4.5050),
+		TPPrice:          decimal.NewFromFloat(4.3930),
+		ATRAtEntry:       decimal.NewFromFloat(0.02967),
+		LastMarkPrice:    decimal.NewFromFloat(4.4800),
+		MarkUpdatedAt:    now,
+		OpenedAt:         now,
+		IsBreakEvenMoved: false,
+		SignalAuditID:    4369,
+		MaxMAE:           0.45,
+		MaxMFE:           0.10,
+	}
+
+	if err := repo.SaveDryRunPosition(ctx, pos1); err != nil {
+		t.Fatalf("failed to save dry-run position: %v", err)
+	}
+
+	positions, err := repo.GetAllDryRunPositions(ctx)
+	if err != nil {
+		t.Fatalf("failed to get dry-run positions: %v", err)
+	}
+	if len(positions) != 1 {
+		t.Fatalf("expected 1 position, got %d", len(positions))
+	}
+	if positions[0].Symbol != "NEARUSDT" || positions[0].ClientOrderID != "SIM-NEARUSDT-12345" || positions[0].SignalAuditID != 4369 {
+		t.Fatalf("unexpected position data: %+v", positions[0])
+	}
+
+	// Update break-even
+	pos1.CurrentSLPrice = decimal.NewFromFloat(4.4550)
+	pos1.IsBreakEvenMoved = true
+	if err := repo.SaveDryRunPosition(ctx, pos1); err != nil {
+		t.Fatalf("failed to upsert dry-run position: %v", err)
+	}
+
+	positionsAfterUpdate, _ := repo.GetAllDryRunPositions(ctx)
+	if len(positionsAfterUpdate) != 1 || !positionsAfterUpdate[0].IsBreakEvenMoved || !positionsAfterUpdate[0].CurrentSLPrice.Equal(decimal.NewFromFloat(4.4550)) {
+		t.Fatalf("upsert failed: %+v", positionsAfterUpdate[0])
+	}
+
+	// Delete
+	if err := repo.DeleteDryRunPosition(ctx, "SIM-NEARUSDT-12345"); err != nil {
+		t.Fatalf("failed to delete dry-run position: %v", err)
+	}
+	positionsAfterDelete, _ := repo.GetAllDryRunPositions(ctx)
+	if len(positionsAfterDelete) != 0 {
+		t.Fatalf("expected 0 positions after delete, got %d", len(positionsAfterDelete))
+	}
 }
