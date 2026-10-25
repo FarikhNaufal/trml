@@ -379,6 +379,15 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	activeSlots := 0
+	if s.cfg.Broker != nil {
+		activeSlots = len(s.cfg.Broker.GetActivePositions())
+	}
+	maxSlots := s.cfg.MaxSlots
+	if maxSlots <= 0 {
+		maxSlots = 3
+	}
+
 	payload := map[string]any{
 		"timestamp_utc": time.Now().UTC().Format(time.RFC3339),
 		"metrics": map[string]any{
@@ -390,6 +399,8 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 			"wins_tp":             stats.WinsCount,
 			"break_even":          stats.BreakEvenCount,
 			"losses_sl":           stats.LossesCount,
+			"active_slots":        activeSlots,
+			"max_slots":           maxSlots,
 		},
 		"filter_bottlenecks": rejectionCounts,
 		"recent_trades":      recentTrades,
