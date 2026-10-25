@@ -443,6 +443,7 @@ func main() {
 			Port:              cfg.HTTPPort,
 			Env:               envStr,
 			MaxSlots:          cfg.MaxSlots,
+			MaxDailyDrawdown:  cfg.MaxDailyDrawdown,
 			Reader:            webReader,
 			Broker:            engine.broker,
 			GetScannerCoinsFn: engine.getScannerCoins,

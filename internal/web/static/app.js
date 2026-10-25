@@ -863,6 +863,8 @@ let currentModalTitle = '';
 let currentModalBaseUrl = '';
 let lastExecutiveSummaryData = null;
 let lastExecutiveSummaryTime = 0;
+let lastPatternMinerData = null;
+let lastPatternMinerTime = 0;
 
 async function openAIModal(title, url, triggerBtn) {
   const modal = document.getElementById('ai-modal');
@@ -885,9 +887,11 @@ async function openAIModal(title, url, triggerBtn) {
   if (titleEl) titleEl.textContent = title;
   if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite';
 
-  // Check 30s in-memory cache for executive debrief if not force refresh
+  // Check in-memory cache for executive debrief (30s) or pattern miner (3m) if not force refresh
   const isExecutive = url.includes('/api/ai/executive-summary');
+  const isPatternMiner = url.includes('/api/ai/pattern-miner');
   const isForceRefresh = url.includes('refresh=true');
+
   if (isExecutive && !isForceRefresh && lastExecutiveSummaryData && (Date.now() - lastExecutiveSummaryTime < 30000)) {
     if (loadingEl) {
       loadingEl.classList.add('hidden');
@@ -900,6 +904,27 @@ async function openAIModal(title, url, triggerBtn) {
     }
     state.currentAIMarkdown = lastExecutiveSummaryData.text || '';
     if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite | In-Memory (30s)';
+    modal.classList.remove('hidden');
+    modal.setAttribute('aria-hidden', 'false');
+    if (triggerBtn) {
+      triggerBtn.classList.remove('is-loading');
+      triggerBtn.disabled = false;
+    }
+    return;
+  }
+
+  if (isPatternMiner && !isForceRefresh && lastPatternMinerData && (Date.now() - lastPatternMinerTime < 180000)) {
+    if (loadingEl) {
+      loadingEl.classList.add('hidden');
+      loadingEl.style.display = 'none';
+    }
+    if (contentEl) {
+      contentEl.innerHTML = renderMarkdown(lastPatternMinerData.text);
+      contentEl.classList.remove('hidden');
+      contentEl.style.display = 'block';
+    }
+    state.currentAIMarkdown = lastPatternMinerData.text || '';
+    if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite | In-Memory (3m)';
     modal.classList.remove('hidden');
     modal.setAttribute('aria-hidden', 'false');
     if (triggerBtn) {
@@ -958,6 +983,10 @@ async function openAIModal(title, url, triggerBtn) {
         lastExecutiveSummaryData = data;
         lastExecutiveSummaryTime = Date.now();
       }
+      if (isPatternMiner && data.text) {
+        lastPatternMinerData = data;
+        lastPatternMinerTime = Date.now();
+      }
     }
   } catch (err) {
     console.error('AI modal fetch error:', err);
@@ -1003,6 +1032,15 @@ function setupAIEvents() {
     headerAIBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       openAIModal('📊 AI Executive Debrief (24 Jam)', '/api/ai/executive-summary', headerAIBtn);
+    });
+  }
+
+  // 1b. Trade Ledger Header AI Button (Pattern Miner)
+  const patternMinerBtn = document.getElementById('btn-pattern-miner');
+  if (patternMinerBtn) {
+    patternMinerBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openAIModal('🔬 Pattern Miner: Audit Pola Kelemahan', '/api/ai/pattern-miner', patternMinerBtn);
     });
   }
 

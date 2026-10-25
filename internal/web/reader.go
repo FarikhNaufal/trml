@@ -20,6 +20,10 @@ type TradeItem struct {
 	Qty            string  `json:"qty"`
 	EntryPrice     string  `json:"entry_price"`
 	ExitPrice      string  `json:"exit_price"`
+	SLPriceInitial string  `json:"sl_price_initial"`
+	TPPriceInitial string  `json:"tp_price_initial"`
+	PlannedSLPct   float64 `json:"planned_sl_pct"`
+	PlannedTPPct   float64 `json:"planned_tp_pct"`
 	NetPnLUSDT     float64 `json:"net_pnl_usdt"`
 	PriceChangePct float64 `json:"price_change_pct"`
 	ROEPct         float64 `json:"roe_pct"`
@@ -64,6 +68,20 @@ type StatsItem struct {
 	AvgWinUSDT      float64 `json:"avg_win_usdt"`
 	AvgLossUSDT     float64 `json:"avg_loss_usdt"`
 	RealizedRR      float64 `json:"realized_rr"`
+}
+
+type SignalAuditSummary struct {
+	TotalEvaluated   int             `json:"total_evaluated"`
+	TotalApproved    int             `json:"total_approved"`
+	TotalRejected    int             `json:"total_rejected"`
+	RejectionRatePct float64         `json:"rejection_rate_pct"`
+	TopRejections    []RejectionStat `json:"top_rejections"`
+}
+
+type RejectionStat struct {
+	ReasonCode string  `json:"reason_code"`
+	Count      int     `json:"count"`
+	Pct        float64 `json:"pct"`
 }
 
 type WebReader struct {
@@ -128,7 +146,6 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		}
 	}
 
-
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = " WHERE " + strings.Join(whereClauses, " AND ")
@@ -141,7 +158,8 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 	}
 
 	query := `
-		SELECT client_order_id, symbol, side, qty, entry_price, exit_price, 
+		SELECT client_order_id, symbol, side, qty, entry_price, exit_price,
+		       COALESCE(sl_price_initial, ''), COALESCE(tp_price_initial, ''),
 		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
 		       COALESCE(ai_autopsy, '')
 		FROM trade_ledger` + whereSQL + `
@@ -161,6 +179,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		var pnlStr string
 		err := rows.Scan(
 			&it.ClientOrderID, &it.Symbol, &it.Side, &it.Qty, &it.EntryPrice, &it.ExitPrice,
+			&it.SLPriceInitial, &it.TPPriceInitial,
 			&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
 			&it.AIAutopsy,
 		)
@@ -172,12 +191,26 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
 		exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
 		qtyF, _ := strconv.ParseFloat(it.Qty, 64)
+		slF, _ := strconv.ParseFloat(it.SLPriceInitial, 64)
+		tpF, _ := strconv.ParseFloat(it.TPPriceInitial, 64)
 
 		if entryF > 0 {
 			if strings.ToUpper(it.Side) == "LONG" {
 				it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
+				if slF > 0 {
+					it.PlannedSLPct = math.Abs((entryF - slF) / entryF) * 100.0
+				}
+				if tpF > 0 {
+					it.PlannedTPPct = math.Abs((tpF - entryF) / entryF) * 100.0
+				}
 			} else {
 				it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
+				if slF > 0 {
+					it.PlannedSLPct = math.Abs((slF - entryF) / entryF) * 100.0
+				}
+				if tpF > 0 {
+					it.PlannedTPPct = math.Abs((entryF - tpF) / entryF) * 100.0
+				}
 			}
 
 			lev := r.leverage
@@ -209,6 +242,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID string) (*TradeItem, error) {
 	query := `
 		SELECT client_order_id, symbol, side, qty, entry_price, exit_price,
+		       COALESCE(sl_price_initial, ''), COALESCE(tp_price_initial, ''),
 		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
 		       COALESCE(ai_autopsy, '')
 		FROM trade_ledger
@@ -219,6 +253,7 @@ func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID s
 	var pnlStr string
 	err := r.db.QueryRowContext(ctx, query, clientOrderID).Scan(
 		&it.ClientOrderID, &it.Symbol, &it.Side, &it.Qty, &it.EntryPrice, &it.ExitPrice,
+		&it.SLPriceInitial, &it.TPPriceInitial,
 		&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
 		&it.AIAutopsy,
 	)
@@ -233,12 +268,26 @@ func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID s
 	entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
 	exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
 	qtyF, _ := strconv.ParseFloat(it.Qty, 64)
+	slF, _ := strconv.ParseFloat(it.SLPriceInitial, 64)
+	tpF, _ := strconv.ParseFloat(it.TPPriceInitial, 64)
 
 	if entryF > 0 {
 		if strings.ToUpper(it.Side) == "LONG" {
 			it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
+			if slF > 0 {
+				it.PlannedSLPct = math.Abs((entryF - slF) / entryF) * 100.0
+			}
+			if tpF > 0 {
+				it.PlannedTPPct = math.Abs((tpF - entryF) / entryF) * 100.0
+			}
 		} else {
 			it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
+			if slF > 0 {
+				it.PlannedSLPct = math.Abs((slF - entryF) / entryF) * 100.0
+			}
+			if tpF > 0 {
+				it.PlannedTPPct = math.Abs((entryF - tpF) / entryF) * 100.0
+			}
 		}
 
 		lev := r.leverage
@@ -385,3 +434,86 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 
 	return stats, nil
 }
+
+// GetSignalAuditSummary mengagregasi seluruh log evaluasi sinyal secara akurat
+func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSummary, error) {
+	var summary SignalAuditSummary
+	if r.db == nil {
+		return summary, errors.New("reader: database not available")
+	}
+
+	// 1. Agregasi total evaluasi, approved, rejected
+	rows, err := r.db.QueryContext(ctx, `SELECT decision, COUNT(*) FROM signal_audit_log GROUP BY decision`)
+	if err != nil {
+		return summary, fmt.Errorf("query decision counts: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dec string
+		var cnt int
+		if err := rows.Scan(&dec, &cnt); err == nil {
+			summary.TotalEvaluated += cnt
+			u := strings.ToUpper(strings.TrimSpace(dec))
+			if u == "APPROVE" || u == "APPROVED" {
+				summary.TotalApproved += cnt
+			} else {
+				summary.TotalRejected += cnt
+			}
+		}
+	}
+
+	if summary.TotalEvaluated > 0 {
+		summary.RejectionRatePct = (float64(summary.TotalRejected) / float64(summary.TotalEvaluated)) * 100.0
+	}
+
+	// 2. Ambil top 5 reject reasons
+	rejRows, err := r.db.QueryContext(ctx, `
+		SELECT reject_reason_code, COUNT(*) as cnt 
+		FROM signal_audit_log 
+		WHERE decision IN ('REJECT', 'REJECTED')
+		GROUP BY reject_reason_code 
+		ORDER BY cnt DESC 
+		LIMIT 5
+	`)
+	if err == nil {
+		defer rejRows.Close()
+		for rejRows.Next() {
+			var code string
+			var count int
+			if err := rejRows.Scan(&code, &count); err == nil {
+				if code == "" {
+					code = "UNKNOWN"
+				}
+				pct := 0.0
+				if summary.TotalRejected > 0 {
+					pct = (float64(count) / float64(summary.TotalRejected)) * 100.0
+				}
+				summary.TopRejections = append(summary.TopRejections, RejectionStat{
+					ReasonCode: code,
+					Count:      count,
+					Pct:        pct,
+				})
+			}
+		}
+	}
+
+	return summary, nil
+}
+
+// GetTradesForPatternMiner mengambil riwayat trade untuk penambangan pola AI tanpa memuat teks autopsy lama
+func (r *WebReader) GetTradesForPatternMiner(ctx context.Context, limit int) ([]TradeItem, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	items, _, err := r.GetTradesPaginated(ctx, 1, limit, "ALL")
+	if err != nil {
+		return nil, err
+	}
+	// Kosongkan teks autopsy lama agar hemat token prompt
+	for i := range items {
+		items[i].AIAutopsy = ""
+	}
+	return items, nil
+}
+

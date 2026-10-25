@@ -32,6 +32,7 @@ type ServerConfig struct {
 	Port              string
 	Env               string
 	MaxSlots          int
+	MaxDailyDrawdown  float64
 	Reader            *WebReader
 	Broker            broker.ExecutionBroker
 	GetScannerCoinsFn func() []ScannerCoinDTO
@@ -82,6 +83,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/api/ai/executive-summary", s.requireAuth(s.aiRateLimit(s.handleAIExecutiveSummary)))
 	mux.HandleFunc("/api/ai/position-health", s.requireAuth(s.aiRateLimit(s.handleAIPositionHealth)))
 	mux.HandleFunc("/api/ai/trade-autopsy", s.requireAuth(s.aiRateLimit(s.handleAITradeAutopsy)))
+	mux.HandleFunc("/api/ai/pattern-miner", s.requireAuth(s.aiRateLimit(s.handleAIPatternMiner)))
 
 	// 2. Static File Server (Embedded PWA Assets)
 	subFS, err := fs.Sub(StaticFS, "static")
@@ -355,28 +357,31 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 	}
 
 	var equityF float64
+	dailyDrawdownPct := 0.0
 	if s.cfg.Broker != nil {
 		eqDec := s.cfg.Broker.GetEffectiveTotalEquityUSDT()
 		equityF, _ = eqDec.Float64()
+		dailyDrawdownPct = s.cfg.Broker.GetDailyTotalDrawdownPct()
 	}
 
-	// Ambil riwayat trade terakhir
+	maxDailyDrawdown := s.cfg.MaxDailyDrawdown
+	if maxDailyDrawdown <= 0 {
+		maxDailyDrawdown = 3.0
+	}
+
+	// Ambil riwayat trade terakhir (kosongkan AIAutopsy agar hemat token prompt)
 	var recentTrades []TradeItem
 	if s.cfg.Reader != nil {
 		recentTrades, _, _ = s.cfg.Reader.GetTradesPaginated(ctx, 1, 6, "ALL")
+		for i := range recentTrades {
+			recentTrades[i].AIAutopsy = ""
+		}
 	}
 
-	// Agregasi top rejection reasons dari signal audit
-	rejectionCounts := make(map[string]int)
+	// Agregasi sinyal komprehensif dari signal audit log
+	var auditSummary SignalAuditSummary
 	if s.cfg.Reader != nil {
-		signals, _, _ := s.cfg.Reader.GetSignalsPaginated(ctx, 1, 50, "REJECT", "")
-		for _, sig := range signals {
-			code := sig.RejectReasonCode
-			if code == "" {
-				code = "UNKNOWN"
-			}
-			rejectionCounts[code]++
-		}
+		auditSummary, _ = s.cfg.Reader.GetSignalAuditSummary(ctx)
 	}
 
 	activeSlots := 0
@@ -391,19 +396,21 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 	payload := map[string]any{
 		"timestamp_utc": time.Now().UTC().Format(time.RFC3339),
 		"metrics": map[string]any{
-			"equity_usdt":         equityF,
-			"total_closed_trades": stats.TotalTrades,
-			"net_pnl_usdt":        stats.TotalNetPnLUSDT,
-			"win_rate_pct":        stats.WinRatePct,
-			"realized_rr":         stats.RealizedRR,
-			"wins_tp":             stats.WinsCount,
-			"break_even":          stats.BreakEvenCount,
-			"losses_sl":           stats.LossesCount,
-			"active_slots":        activeSlots,
-			"max_slots":           maxSlots,
+			"equity_usdt":            equityF,
+			"total_closed_trades":    stats.TotalTrades,
+			"net_pnl_usdt":           stats.TotalNetPnLUSDT,
+			"win_rate_pct":           stats.WinRatePct,
+			"realized_rr":            stats.RealizedRR,
+			"wins_tp":                stats.WinsCount,
+			"break_even":             stats.BreakEvenCount,
+			"losses_sl":              stats.LossesCount,
+			"active_slots":           activeSlots,
+			"max_slots":              maxSlots,
+			"daily_drawdown_pct":     dailyDrawdownPct,
+			"max_daily_drawdown_pct": maxDailyDrawdown,
 		},
-		"filter_bottlenecks": rejectionCounts,
-		"recent_trades":      recentTrades,
+		"signal_audit_summary": auditSummary,
+		"recent_trades":        recentTrades,
 	}
 
 	aiResp := s.gemini.GenerateExecutiveDebrief(ctx, payload)
@@ -459,6 +466,34 @@ func (s *Server) handleAIPositionHealth(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	// Kalkulasi matematis jarak persentase ke target TP dan batas SL
+	var distToTPPct, distToSLPct, tpProgressPct float64
+	if targetPos.EntryPrice > 0 && targetPos.MarkPrice > 0 {
+		if strings.ToUpper(targetPos.Side) == "LONG" {
+			if targetPos.TPPrice > 0 {
+				distToTPPct = ((targetPos.TPPrice - targetPos.MarkPrice) / targetPos.MarkPrice) * 100.0
+				totalTPDist := targetPos.TPPrice - targetPos.EntryPrice
+				if totalTPDist > 0 {
+					tpProgressPct = ((targetPos.MarkPrice - targetPos.EntryPrice) / totalTPDist) * 100.0
+				}
+			}
+			if targetPos.SLPrice > 0 {
+				distToSLPct = ((targetPos.MarkPrice - targetPos.SLPrice) / targetPos.MarkPrice) * 100.0
+			}
+		} else { // SHORT
+			if targetPos.TPPrice > 0 {
+				distToTPPct = ((targetPos.MarkPrice - targetPos.TPPrice) / targetPos.MarkPrice) * 100.0
+				totalTPDist := targetPos.EntryPrice - targetPos.TPPrice
+				if totalTPDist > 0 {
+					tpProgressPct = ((targetPos.EntryPrice - targetPos.MarkPrice) / totalTPDist) * 100.0
+				}
+			}
+			if targetPos.SLPrice > 0 {
+				distToSLPct = ((targetPos.SLPrice - targetPos.MarkPrice) / targetPos.MarkPrice) * 100.0
+			}
+		}
+	}
+
 	payload := map[string]any{
 		"symbol":              ai.SanitizePromptInput(targetPos.Symbol),
 		"side":                targetPos.Side,
@@ -468,6 +503,9 @@ func (s *Server) handleAIPositionHealth(w http.ResponseWriter, r *http.Request) 
 		"unrealized_roe_pct":  targetPos.UnrealizedROEPct,
 		"sl_price":            targetPos.SLPrice,
 		"tp_price":            targetPos.TPPrice,
+		"dist_to_tp_pct":      distToTPPct,
+		"dist_to_sl_pct":      distToSLPct,
+		"tp_progress_pct":     tpProgressPct,
 		"is_break_even_moved": targetPos.IsBreakEven,
 		"duration_sec":        targetPos.DurationSec,
 		"session_vwap":        sessionVWAP,
@@ -537,20 +575,24 @@ func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := map[string]any{
-		"client_order_id": ai.SanitizePromptInput(trade.ClientOrderID),
-		"symbol":          ai.SanitizePromptInput(trade.Symbol),
-		"side":            trade.Side,
-		"qty":             trade.Qty,
-		"entry_price":     trade.EntryPrice,
-		"exit_price":      trade.ExitPrice,
-		"net_pnl_usdt":    trade.NetPnLUSDT,
-		"roe_pct":         trade.ROEPct,
-		"exit_reason":     ai.SanitizePromptInput(trade.ExitReason),
-		"mae_pct":         trade.MAEPct,
-		"mfe_pct":         trade.MFEPct,
-		"duration_sec":    trade.DurationSec,
-		"opened_at_utc":   trade.OpenedAtUTC,
-		"closed_at_utc":   trade.ClosedAtUTC,
+		"client_order_id":  ai.SanitizePromptInput(trade.ClientOrderID),
+		"symbol":           ai.SanitizePromptInput(trade.Symbol),
+		"side":             trade.Side,
+		"qty":              trade.Qty,
+		"entry_price":      trade.EntryPrice,
+		"exit_price":       trade.ExitPrice,
+		"sl_price_initial": trade.SLPriceInitial,
+		"tp_price_initial": trade.TPPriceInitial,
+		"planned_sl_pct":   trade.PlannedSLPct,
+		"planned_tp_pct":   trade.PlannedTPPct,
+		"net_pnl_usdt":     trade.NetPnLUSDT,
+		"roe_pct":          trade.ROEPct,
+		"exit_reason":      ai.SanitizePromptInput(trade.ExitReason),
+		"mae_pct":          trade.MAEPct,
+		"mfe_pct":          trade.MFEPct,
+		"duration_sec":     trade.DurationSec,
+		"opened_at_utc":    trade.OpenedAtUTC,
+		"closed_at_utc":    trade.ClosedAtUTC,
 	}
 
 	aiResp := s.gemini.GenerateTradeAutopsy(ctx, payload)
@@ -562,6 +604,46 @@ func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	writeJSON(w, http.StatusOK, aiResp)
+}
+
+func (s *Server) handleAIPatternMiner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer cancel()
+
+	var stats StatsItem
+	var auditSummary SignalAuditSummary
+	var trades []TradeItem
+
+	if s.cfg.Reader != nil {
+		stats, _ = s.cfg.Reader.GetOverallStats(ctx)
+		auditSummary, _ = s.cfg.Reader.GetSignalAuditSummary(ctx)
+		trades, _ = s.cfg.Reader.GetTradesForPatternMiner(ctx, 50)
+	}
+
+	payload := map[string]any{
+		"timestamp_utc": time.Now().UTC().Format(time.RFC3339),
+		"overall_performance": map[string]any{
+			"total_trades":  stats.TotalTrades,
+			"net_pnl_usdt": stats.TotalNetPnLUSDT,
+			"win_rate_pct": stats.WinRatePct,
+			"realized_rr":  stats.RealizedRR,
+			"wins_tp":      stats.WinsCount,
+			"break_even":   stats.BreakEvenCount,
+			"losses_sl":    stats.LossesCount,
+			"avg_win_usdt": stats.AvgWinUSDT,
+			"avg_loss_usdt": stats.AvgLossUSDT,
+		},
+		"signal_audit_summary": auditSummary,
+		"historical_trades":    trades,
+	}
+
+	aiResp := s.gemini.GeneratePatternMiner(ctx, payload)
 	writeJSON(w, http.StatusOK, aiResp)
 }
 

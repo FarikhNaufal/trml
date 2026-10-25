@@ -57,8 +57,8 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		qty TEXT NOT NULL,
 		entry_price TEXT NOT NULL,
 		exit_price TEXT NOT NULL,
-		sl_price TEXT NOT NULL,
-		tp_price TEXT NOT NULL,
+		sl_price_initial TEXT NOT NULL,
+		tp_price_initial TEXT NOT NULL,
 		net_pnl_usdt TEXT NOT NULL,
 		exit_reason TEXT NOT NULL,
 		opened_at_utc TEXT NOT NULL,
@@ -91,6 +91,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		created_at_utc TEXT NOT NULL
 	);
 	`
+
 	if _, err := db.Exec(createSchema); err != nil {
 		t.Fatalf("failed to exec schema: %v", err)
 	}
@@ -101,7 +102,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 
 	// Seed 2 trades
 	_, err = db.Exec(`
-		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price, tp_price, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, mae_pct, mfe_pct, signal_audit_id, created_at_utc)
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, mae_pct, mfe_pct, signal_audit_id, created_at_utc)
 		VALUES 
 		('ORD_1', 'ETHUSDT', 'LONG', '1.5', '3000', '3050', '2950', '3050', '75.0', 'TAKE_PROFIT', ?, ?, 0.2, 1.8, 101, ?),
 		('ORD_2', 'SOLUSDT', 'SHORT', '10', '150', '153', '153', '140', '-30.0', 'STOP_LOSS', ?, ?, 2.1, 0.4, 102, ?);
@@ -304,7 +305,7 @@ func TestAuthAndAIEndpoints(t *testing.T) {
 	// Insert test trade
 	_, err := db.Exec(`
 		INSERT INTO trade_ledger (
-			client_order_id, symbol, side, qty, entry_price, exit_price, sl_price, tp_price,
+			client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial,
 			net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, mae_pct, mfe_pct, signal_audit_id, ai_autopsy, created_at_utc
 		) VALUES (
 			'TRML_TEST_123', 'BTCUSDT', 'LONG', '0.05', '65000', '67000', '64000', '67000',
@@ -393,6 +394,15 @@ func TestAuthAndAIEndpoints(t *testing.T) {
 	}
 	if autopsyResp["text"] != "Cached autopsy text from DB" {
 		t.Errorf("expected cached autopsy text, got %v", autopsyResp["text"])
+	}
+
+	// 6b. Test Pattern Miner endpoint (with PIN auth, fallback client)
+	req = httptest.NewRequest("GET", "/api/ai/pattern-miner", nil)
+	req.Header.Set("X-TRML-PIN", "123456")
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for pattern miner, got %d", rec.Code)
 	}
 
 	// 7. Test PIN lockout after 5 consecutive failed attempts
