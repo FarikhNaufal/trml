@@ -59,10 +59,19 @@ PANDUAN MENJELASKAN KE ORANG AWAM:
 3. Terjemahkan "MFE" (Maximum Favorable Excursion): Jelaskan sebagai "potensi keuntungan tertinggi yang sempat disentuh harga".
 4. Terjemahkan "Chasing": Jelaskan sebagai "posisi diambil saat harga sudah terlanjur lari jauh dari nilai wajar (VWAP)".
 5. Terjemahkan "False bounce": Jelaskan sebagai "pantulan harga sesaat yang kehabisan tenaga dorong".
+6. Akar Penyebab: Jelaskan faktor pemicu utama mengapa trade ini ditutup (contoh: Momentum Mulus Menembus Target, Kehabisan Tenaga Dorong Jelang TP, Pantulan Semu / False Bounce, Penolakan Keras Volatilitas Tinggi, atau Risiko Statistik Terukur).
+
+PANTANGAN MUTLAK:
+- DILARANG menyebut indikator luar (RSI, MACD, Fibonacci, Berita).
+- DILARANG menyalahkan pasar secara emosional; gunakan analisis logis dan berbasis data objektif.
 
 FORMAT OUTPUT (MARKDOWN):
 ### 📖 Cerita Alur Trade
 [Ceritakan dengan runtut apa yang terjadi: titik masuk bot, bagaimana harga sempat bergerak memberi keuntungan atau tekanan, dan mengapa trade ini akhirnya ditutup.]
+
+### 🎯 Mengapa Hasil Ini Terjadi? (Akar Penyebab)
+* **Kategori Pergerakan:** [Pilih salah satu: Momentum Mulus Menembus Target / Kehabisan Tenaga Dorong (Reversal Jelang TP) / Pantulan Semu (False Bounce) / Penolakan Keras (Volatilitas Tinggi) / Risiko Statistik Terukur]
+* **Penjelasan:** [1-2 kalimat bahasa manusia yang menjelaskan secara logis penyebab harga bergerak menyentuh SL, TP, atau pengaman Break-Even berdasarkan data MAE/MFE]
 
 ### 🔍 Analisa Risiko & Pengaman Modal
 * **Potensi Keuntungan Sempat Sentuh:** [Sebutkan MFE dalam %]
@@ -70,7 +79,7 @@ FORMAT OUTPUT (MARKDOWN):
 * **Hasil Akhir:** [Jelaskan apakah Profit Penuh, Rugi Terukur, atau Modal Diselamatkan Impas (Break-Even)]
 
 ### 💡 Pelajaran & Evaluasi
-[1-2 kalimat kesimpulan bersahabat: mengapa hasil ini terjadi dan apa pelajaran strategi untuk kedepannya.]`
+[1-2 kalimat kesimpulan bersahabat: evaluasi kedisiplinan dan saran strategi untuk kedepannya.]`
 
 // GenerateExecutiveDebrief memanggil AI untuk ulasan 24 jam bot
 func (c *GeminiClient) GenerateExecutiveDebrief(ctx context.Context, payload any) AIResponse {
@@ -78,7 +87,7 @@ func (c *GeminiClient) GenerateExecutiveDebrief(ctx context.Context, payload any
 	if err != nil {
 		return AIResponse{Error: "FAILED_TO_MARSHAL_PAYLOAD", Source: "fallback"}
 	}
-	userPrompt := fmt.Sprintf("Berikut data performa dan audit sinyal bot TRML 24 jam terakhir:\n```json\n%s\n```\nBerikan analisa ringkas dan tajam sesuai instruksi sistem.", string(jsonBytes))
+	userPrompt := fmt.Sprintf("Berikut data performa dan audit sinyal bot TRML 24 jam terakhir:\n```json\n%s\n```\nBerikan analisa yang mendidik dan mudah dipahami sesuai instruksi sistem.", string(jsonBytes))
 	return c.GenerateContent(ctx, "executive-summary", SystemPromptExecutive, userPrompt)
 }
 
@@ -88,7 +97,7 @@ func (c *GeminiClient) GeneratePositionHealth(ctx context.Context, payload any) 
 	if err != nil {
 		return AIResponse{Error: "FAILED_TO_MARSHAL_PAYLOAD", Source: "fallback"}
 	}
-	userPrompt := fmt.Sprintf("Berikut data telemetri posisi aktif yang sedang berjalan:\n```json\n%s\n```\nBerikan diagnosa kesehatan posisi singkat.", string(jsonBytes))
+	userPrompt := fmt.Sprintf("Berikut data telemetri posisi aktif yang sedang berjalan:\n```json\n%s\n```\nBerikan diagnosa kesehatan posisi yang jelas dan menenangkan sesuai instruksi sistem.", string(jsonBytes))
 	return c.GenerateContent(ctx, "position-health", SystemPromptPositionHealth, userPrompt)
 }
 
@@ -98,6 +107,6 @@ func (c *GeminiClient) GenerateTradeAutopsy(ctx context.Context, payload any) AI
 	if err != nil {
 		return AIResponse{Error: "FAILED_TO_MARSHAL_PAYLOAD", Source: "fallback"}
 	}
-	userPrompt := fmt.Sprintf("Berikut data trade yang telah ditutup:\n```json\n%s\n```\nBerikan bedah eksekusi (autopsy) satu paragraf padat.", string(jsonBytes))
+	userPrompt := fmt.Sprintf("Berikut data trade yang telah ditutup:\n```json\n%s\n```\nBerikan bedah eksekusi (autopsy) yang lengkap, mendidik, dan ramah awam sesuai panduan sistem.", string(jsonBytes))
 	return c.GenerateContent(ctx, "trade-autopsy", SystemPromptTradeAutopsy, userPrompt)
 }
