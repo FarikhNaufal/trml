@@ -155,25 +155,29 @@ func (c *GeminiClient) GenerateContent(ctx context.Context, endpointName, system
 	var resp *http.Response
 	var lastErr error
 
+retryLoop:
 	for attempt := 1; attempt <= 2; attempt++ {
 		httpReq, reqErr := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(jsonBytes))
 		if reqErr != nil {
 			lastErr = reqErr
-			break
+			break retryLoop
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 
 		resp, lastErr = c.httpClient.Do(httpReq)
 		if lastErr == nil && resp.StatusCode < 500 {
-			break
+			break retryLoop
 		}
 
 		if attempt == 1 {
+			if lastErr == nil && resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
 			slog.Warn("ai_gemini: transient error, retrying in 250ms", "attempt", attempt, "err", lastErr)
 			select {
 			case <-callCtx.Done():
 				lastErr = callCtx.Err()
-				break
+				break retryLoop
 			case <-time.After(250 * time.Millisecond):
 			}
 		}
@@ -194,6 +198,11 @@ func (c *GeminiClient) GenerateContent(ctx context.Context, endpointName, system
 		return AIResponse{Error: "GEMINI_UNAVAILABLE", Source: "fallback"}
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		slog.Warn("ai_gemini: upstream rate limited", "status", resp.StatusCode)
+		return AIResponse{Error: "RATE_LIMITED", Source: "fallback"}
+	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -217,6 +226,11 @@ func (c *GeminiClient) GenerateContent(ctx context.Context, endpointName, system
 			return AIResponse{Error: "RATE_LIMITED", Source: "fallback"}
 		}
 		return AIResponse{Error: gResp.Error.Message, Source: "fallback"}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Error("ai_gemini: unexpected HTTP status", "status", resp.StatusCode, "body", string(bodyBytes))
+		return AIResponse{Error: fmt.Sprintf("HTTP_%d", resp.StatusCode), Source: "fallback"}
 	}
 
 	if len(gResp.Candidates) == 0 || len(gResp.Candidates[0].Content.Parts) == 0 {

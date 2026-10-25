@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,12 @@ func NewIPRateLimiter(rateRPM int, burst int) *IPRateLimiter {
 }
 
 func (limiter *IPRateLimiter) getClientIP(r *http.Request) string {
+	if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
+		return strings.TrimSpace(cf)
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return strings.TrimSpace(realIP)
+	}
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded != "" {
 		parts := strings.Split(forwarded, ",")
@@ -140,6 +147,19 @@ func (limiter *IPRateLimiter) ResetFailedPIN(ip string) {
 	}
 }
 
+func (limiter *IPRateLimiter) IsBlocked(ip string) (bool, time.Duration) {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+
+	if b, exists := limiter.clients[ip]; exists {
+		now := time.Now()
+		if now.Before(b.blockedUntil) {
+			return true, b.blockedUntil.Sub(now)
+		}
+	}
+	return false, 0
+}
+
 func (s *Server) isPINConfigured() bool {
 	return strings.TrimSpace(s.cfg.DashboardPIN) != ""
 }
@@ -164,6 +184,25 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		var ip string
+		if s.rateLimiter != nil {
+			ip = s.rateLimiter.getClientIP(r)
+			if blocked, wait := s.rateLimiter.IsBlocked(ip); blocked {
+				seconds := int(wait.Seconds())
+				if seconds < 1 {
+					seconds = 1
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				w.WriteHeader(http.StatusTooManyRequests)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":   "TOO_MANY_FAILED_ATTEMPTS",
+					"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
+				})
+				return
+			}
+		}
+
 		pin := r.Header.Get("X-TRML-PIN")
 		if pin == "" {
 			if cookie, err := r.Cookie("trml_pin"); err == nil {
@@ -175,6 +214,9 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		if !s.validatePIN(pin) {
+			if s.rateLimiter != nil && ip != "" && pin != "" {
+				s.rateLimiter.RecordFailedPIN(ip)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{
@@ -204,7 +246,7 @@ func (s *Server) aiRateLimit(next http.HandlerFunc) http.HandlerFunc {
 				seconds = 1
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Retry-After", string(rune(seconds)))
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
 			w.WriteHeader(http.StatusTooManyRequests)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"error":   "RATE_LIMITED",

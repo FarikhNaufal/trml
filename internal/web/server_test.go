@@ -394,5 +394,37 @@ func TestAuthAndAIEndpoints(t *testing.T) {
 	if autopsyResp["text"] != "Cached autopsy text from DB" {
 		t.Errorf("expected cached autopsy text, got %v", autopsyResp["text"])
 	}
+
+	// 7. Test PIN lockout after 5 consecutive failed attempts
+	testIP := "192.168.1.200:54321"
+	for i := 0; i < 4; i++ {
+		req = httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(`{"pin":"000000"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = testIP
+		rec = httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for attempt %d, got %d", i+1, rec.Code)
+		}
+	}
+	// 5th attempt -> triggers block (HTTP 429)
+	req = httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(`{"pin":"000000"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = testIP
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on 5th failed attempt, got %d", rec.Code)
+	}
+
+	// 6th attempt while blocked (even with correct PIN) -> must reject immediately with HTTP 429
+	req = httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(`{"pin":"123456"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = testIP
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 while blocked even with correct PIN, got %d", rec.Code)
+	}
 }
 

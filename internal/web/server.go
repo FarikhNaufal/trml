@@ -293,6 +293,19 @@ func (s *Server) handleVerifyPIN(w http.ResponseWriter, r *http.Request) {
 
 	ip := s.rateLimiter.getClientIP(r)
 
+	if blocked, wait := s.rateLimiter.IsBlocked(ip); blocked {
+		seconds := int(wait.Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error":   "TOO_MANY_FAILED_ATTEMPTS",
+			"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
+		})
+		return
+	}
+
 	var req struct {
 		PIN string `json:"pin"`
 	}

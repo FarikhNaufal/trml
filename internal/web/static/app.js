@@ -32,7 +32,11 @@ async function authFetch(url, options = {}) {
   options.headers = options.headers || {};
   const pin = localStorage.getItem('trml_pin');
   if (pin) {
-    options.headers['X-TRML-PIN'] = pin;
+    if (options.headers instanceof Headers) {
+      options.headers.set('X-TRML-PIN', pin);
+    } else {
+      options.headers['X-TRML-PIN'] = pin;
+    }
   }
   const res = await fetch(url, options);
   if (res.status === 401 && state.pinRequired) {
@@ -855,6 +859,8 @@ function startClock() {
 
 // 7. AI Copilot Controller & Universal Modal
 let currentAITriggerBtn = null;
+let lastExecutiveSummaryData = null;
+let lastExecutiveSummaryTime = 0;
 
 async function openAIModal(title, url, triggerBtn) {
   const modal = document.getElementById('ai-modal');
@@ -873,6 +879,26 @@ async function openAIModal(title, url, triggerBtn) {
 
   if (titleEl) titleEl.textContent = title;
   if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash';
+
+  // Check 30s in-memory cache for executive debrief to save tokens and avoid rate limit
+  const isExecutive = url === '/api/ai/executive-summary';
+  if (isExecutive && lastExecutiveSummaryData && (Date.now() - lastExecutiveSummaryTime < 30000)) {
+    if (loadingEl) loadingEl.classList.add('hidden');
+    if (contentEl) {
+      contentEl.innerHTML = renderMarkdown(lastExecutiveSummaryData.text);
+      contentEl.classList.remove('hidden');
+    }
+    state.currentAIMarkdown = lastExecutiveSummaryData.text || '';
+    if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash | In-Memory (30s)';
+    modal.classList.remove('hidden');
+    modal.setAttribute('aria-hidden', 'false');
+    if (triggerBtn) {
+      triggerBtn.classList.remove('is-loading');
+      triggerBtn.disabled = false;
+    }
+    return;
+  }
+
   if (loadingEl) loadingEl.classList.remove('hidden');
   if (contentEl) {
     contentEl.classList.add('hidden');
@@ -887,11 +913,18 @@ async function openAIModal(title, url, triggerBtn) {
     const data = await res.json();
 
     if (!res.ok || data.error) {
-      const errMsg = data.error === 'RATE_LIMITED'
-        ? 'Batas panggilan tercapai (10 req/menit). Silakan tunggu 1 menit sebelum mencoba kembali.'
-        : (data.error === 'GEMINI_TIMEOUT'
-          ? 'Waktu permintaan AI habis (timeout 8 detik). Silakan coba kembali.'
-          : (data.message || data.error || 'Gagal memuat analisis AI.'));
+      let errMsg = data.message || data.error || 'Gagal memuat analisis AI.';
+      if (data.error === 'RATE_LIMITED' || res.status === 429) {
+        errMsg = 'Batas panggilan tercapai (10 req/menit). Silakan tunggu 1 menit sebelum mencoba kembali.';
+      } else if (data.error === 'GEMINI_TIMEOUT') {
+        errMsg = 'Waktu permintaan AI habis (timeout 8 detik). Silakan coba kembali.';
+      } else if (data.error === 'GEMINI_API_KEY_NOT_CONFIGURED') {
+        errMsg = 'GEMINI_API_KEY belum dikonfigurasi di file .env server bot.';
+      } else if (data.error === 'POSITION_NOT_FOUND') {
+        errMsg = 'Posisi aktif tidak ditemukan atau sudah ditutup.';
+      } else if (data.error === 'TRADE_NOT_FOUND') {
+        errMsg = 'Data trade tidak ditemukan di database.';
+      }
 
       state.currentAIMarkdown = errMsg;
       if (contentEl) {
@@ -906,6 +939,10 @@ async function openAIModal(title, url, triggerBtn) {
       if (badgeEl) {
         badgeEl.textContent = data.source === 'cache' ? 'gemini-2.5-flash | Local Cache' : 'gemini-2.5-flash | Live';
       }
+      if (isExecutive && data.text) {
+        lastExecutiveSummaryData = data;
+        lastExecutiveSummaryTime = Date.now();
+      }
     }
   } catch (err) {
     console.error('AI modal fetch error:', err);
@@ -917,11 +954,11 @@ async function openAIModal(title, url, triggerBtn) {
   } finally {
     if (loadingEl) loadingEl.classList.add('hidden');
     if (contentEl) contentEl.classList.remove('hidden');
-    if (currentAITriggerBtn) {
-      currentAITriggerBtn.classList.remove('is-loading');
-      currentAITriggerBtn.disabled = false;
-      currentAITriggerBtn = null;
+    if (triggerBtn) {
+      triggerBtn.classList.remove('is-loading');
+      triggerBtn.disabled = false;
     }
+    currentAITriggerBtn = null;
   }
 }
 
@@ -1072,7 +1109,11 @@ function updatePinDots() {
   });
 }
 
+let isVerifyingPIN = false;
+
 async function verifyEnteredPIN() {
+  if (isVerifyingPIN) return;
+  isVerifyingPIN = true;
   const errEl = document.getElementById('pin-error-msg');
   try {
     const res = await fetch('/api/auth/verify', {
@@ -1102,6 +1143,8 @@ async function verifyEnteredPIN() {
       errEl.textContent = 'Gagal verifikasi PIN ke server.';
       errEl.classList.remove('hidden');
     }
+  } finally {
+    isVerifyingPIN = false;
   }
 }
 
