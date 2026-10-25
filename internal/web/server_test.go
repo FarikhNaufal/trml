@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,6 +66,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		mae_pct REAL NOT NULL DEFAULT 0.0,
 		mfe_pct REAL NOT NULL DEFAULT 0.0,
 		signal_audit_id INTEGER NOT NULL DEFAULT 0,
+		ai_autopsy TEXT NOT NULL DEFAULT '',
 		created_at_utc TEXT NOT NULL
 	);
 
@@ -294,3 +296,103 @@ func stringContains(s, substr string) bool {
 	}
 	return false
 }
+
+func TestAuthAndAIEndpoints(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert test trade
+	_, err := db.Exec(`
+		INSERT INTO trade_ledger (
+			client_order_id, symbol, side, qty, entry_price, exit_price, sl_price, tp_price,
+			net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, mae_pct, mfe_pct, signal_audit_id, ai_autopsy, created_at_utc
+		) VALUES (
+			'TRML_TEST_123', 'BTCUSDT', 'LONG', '0.05', '65000', '67000', '64000', '67000',
+			'100.0', 'TAKE_PROFIT', '2026-10-25T10:00:00Z', '2026-10-25T10:30:00Z', 0.5, 3.2, 1, 'Cached autopsy text from DB', '2026-10-25T10:30:00Z'
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to insert test trade: %v", err)
+	}
+
+	reader := &WebReader{db: db, leverage: 8.0}
+	server, err := NewServer(ServerConfig{
+		Port:         ":2020",
+		Env:          "DRY-RUN",
+		MaxSlots:     3,
+		Reader:       reader,
+		Broker:       &mockBroker{},
+		DashboardPIN: "123456",
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	// 1. Check Auth Status (unprotected)
+	req := httptest.NewRequest("GET", "/api/auth/status", nil)
+	rec := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for /api/auth/status, got %d", rec.Code)
+	}
+	var authStatus map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &authStatus)
+	if authStatus["pin_required"] != true {
+		t.Errorf("expected pin_required = true, got %v", authStatus["pin_required"])
+	}
+
+	// 2. Access summary without PIN -> should get 401
+	req = httptest.NewRequest("GET", "/api/summary", nil)
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for /api/summary without PIN, got %d", rec.Code)
+	}
+
+	// 3. Verify PIN with wrong PIN -> should get 401
+	verifyBody := `{"pin":"999999"}`
+	req = httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(verifyBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong PIN, got %d", rec.Code)
+	}
+
+	// 4. Verify PIN with correct PIN -> should get 200
+	verifyBody = `{"pin":"123456"}`
+	req = httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(verifyBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for correct PIN, got %d", rec.Code)
+	}
+
+	// 5. Access summary with valid PIN header -> should get 200
+	req = httptest.NewRequest("GET", "/api/summary", nil)
+	req.Header.Set("X-TRML-PIN", "123456")
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 with X-TRML-PIN header, got %d", rec.Code)
+	}
+
+	// 6. Test Trade Autopsy reading from cache
+	req = httptest.NewRequest("GET", "/api/ai/trade-autopsy?client_order_id=TRML_TEST_123", nil)
+	req.Header.Set("X-TRML-PIN", "123456")
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for trade autopsy, got %d", rec.Code)
+	}
+	var autopsyResp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &autopsyResp)
+	if autopsyResp["source"] != "cache" {
+		t.Errorf("expected source = cache, got %v", autopsyResp["source"])
+	}
+	if autopsyResp["text"] != "Cached autopsy text from DB" {
+		t.Errorf("expected cached autopsy text, got %v", autopsyResp["text"])
+	}
+}
+

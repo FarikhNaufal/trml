@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -29,6 +30,7 @@ type TradeItem struct {
 	ClosedAtUTC    string  `json:"closed_at_utc"`
 	DurationSec    int64   `json:"duration_sec"`
 	SignalAuditID  int64   `json:"signal_audit_id"`
+	AIAutopsy      string  `json:"ai_autopsy"`
 }
 
 type SignalItem struct {
@@ -140,7 +142,8 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 
 	query := `
 		SELECT client_order_id, symbol, side, qty, entry_price, exit_price, 
-		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id
+		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
+		       COALESCE(ai_autopsy, '')
 		FROM trade_ledger` + whereSQL + `
 		ORDER BY rowid DESC
 		LIMIT ? OFFSET ?;
@@ -159,6 +162,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		err := rows.Scan(
 			&it.ClientOrderID, &it.Symbol, &it.Side, &it.Qty, &it.EntryPrice, &it.ExitPrice,
 			&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
+			&it.AIAutopsy,
 		)
 		if err != nil {
 			return nil, 0, fmt.Errorf("scan trade row: %w", err)
@@ -199,6 +203,64 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 	}
 
 	return items, total, nil
+}
+
+// GetTradeByClientOrderID mencari 1 data trade berdasarkan client_order_id
+func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID string) (*TradeItem, error) {
+	query := `
+		SELECT client_order_id, symbol, side, qty, entry_price, exit_price,
+		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
+		       COALESCE(ai_autopsy, '')
+		FROM trade_ledger
+		WHERE client_order_id = ?
+		LIMIT 1;
+	`
+	var it TradeItem
+	var pnlStr string
+	err := r.db.QueryRowContext(ctx, query, clientOrderID).Scan(
+		&it.ClientOrderID, &it.Symbol, &it.Side, &it.Qty, &it.EntryPrice, &it.ExitPrice,
+		&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
+		&it.AIAutopsy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("scan trade by id: %w", err)
+	}
+	it.NetPnLUSDT, _ = strconv.ParseFloat(pnlStr, 64)
+
+	entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
+	exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
+	qtyF, _ := strconv.ParseFloat(it.Qty, 64)
+
+	if entryF > 0 {
+		if strings.ToUpper(it.Side) == "LONG" {
+			it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
+		} else {
+			it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
+		}
+
+		lev := r.leverage
+		if lev <= 0 {
+			lev = 8.0
+		}
+		notional := entryF * qtyF
+		if notional > 0 {
+			initialMargin := notional / lev
+			it.ROEPct = (it.NetPnLUSDT / initialMargin) * 100.0
+		} else {
+			it.ROEPct = it.PriceChangePct * lev
+		}
+	}
+
+	tOpen, err1 := time.Parse(time.RFC3339Nano, it.OpenedAtUTC)
+	tClose, err2 := time.Parse(time.RFC3339Nano, it.ClosedAtUTC)
+	if err1 == nil && err2 == nil {
+		it.DurationSec = int64(tClose.Sub(tOpen).Seconds())
+	}
+
+	return &it, nil
 }
 
 func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, decisionFilter, symbolFilter string) ([]SignalItem, int, error) {

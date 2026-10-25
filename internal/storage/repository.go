@@ -38,6 +38,8 @@ type Repository interface {
 	SaveDryRunPosition(ctx context.Context, pos StoredDryRunPosition) error
 	DeleteDryRunPosition(ctx context.Context, symbol string) error
 	GetAllDryRunPositions(ctx context.Context) ([]StoredDryRunPosition, error)
+	UpdateTradeAutopsy(ctx context.Context, clientOrderID, autopsy string) error
+	GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error)
 }
 
 type SQLiteRepository struct {
@@ -372,4 +374,33 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	}
 	return results, nil
 }
+
+// UpdateTradeAutopsy menyimpan hasil analisis AI post-trade autopsy ke tabel trade_ledger
+func (r *SQLiteRepository) UpdateTradeAutopsy(ctx context.Context, clientOrderID, autopsy string) error {
+	query := `UPDATE trade_ledger SET ai_autopsy = ? WHERE client_order_id = ?;`
+	res, err := r.db.conn.ExecContext(ctx, query, autopsy, clientOrderID)
+	if err != nil {
+		return fmt.Errorf("storage: failed to update trade autopsy: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("storage: trade not found with client_order_id %s", clientOrderID)
+	}
+	return nil
+}
+
+// GetTradeAutopsy mengambil hasil analisis AI yang sudah tersimpan di database jika ada
+func (r *SQLiteRepository) GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error) {
+	query := `SELECT ai_autopsy FROM trade_ledger WHERE client_order_id = ?;`
+	var autopsy string
+	err := r.db.conn.QueryRowContext(ctx, query, clientOrderID).Scan(&autopsy)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("storage: failed to get trade autopsy: %w", err)
+	}
+	return autopsy, nil
+}
+
 

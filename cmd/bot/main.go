@@ -459,6 +459,12 @@ func main() {
 				}
 				return false
 			},
+			Repo:             engine.repo,
+			DashboardPIN:     cfg.DashboardPIN,
+			GeminiAPIKey:     cfg.GeminiAPIKey,
+			GeminiModel:      cfg.GeminiModel,
+			GeminiTimeoutSec: cfg.GeminiTimeoutSec,
+			AIRateLimitRPM:   cfg.AIRateLimitRPM,
 		})
 		if err != nil {
 			slog.Error("failed to create web server", "err", err)

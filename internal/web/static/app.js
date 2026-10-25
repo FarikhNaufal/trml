@@ -22,8 +22,43 @@ const state = {
   },
   knownSymbols: new Set(),
   isPollingActive: true,
-  lastSummary: null
+  lastSummary: null,
+  pinRequired: false,
+  currentAIMarkdown: ''
 };
+
+// Authenticated Fetch wrapper menyematkan header X-TRML-PIN jika ada
+async function authFetch(url, options = {}) {
+  options.headers = options.headers || {};
+  const pin = localStorage.getItem('trml_pin');
+  if (pin) {
+    options.headers['X-TRML-PIN'] = pin;
+  }
+  const res = await fetch(url, options);
+  if (res.status === 401 && state.pinRequired) {
+    showPinScreen('Sesi kedaluwarsa atau PIN tidak valid.');
+  }
+  return res;
+}
+
+// Lightweight Markdown Renderer (Anti-XSS Sanitized)
+function renderMarkdown(md) {
+  if (!md) return '';
+  let html = md
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
+  html = html.replace(/^## (.*$)/gim, '<h3>$1</h3>');
+  html = html.replace(/^# (.*$)/gim, '<h3>$1</h3>');
+  html = html.replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>');
+  html = html.replace(/^\s*[-*]\s+(.*$)/gim, '<li>$1</li>');
+  html = html.replace(/(<li>.*<\/li>)/gim, '<ul>$1</ul>');
+  html = html.replace(/<\/ul>\s*<ul>/gim, '');
+  html = html.replace(/\n\n/gim, '</p><p>');
+  html = html.replace(/\n/gim, '<br>');
+  return `<p>${html}</p>`;
+}
 
 // Utilities
 function escapeHtml(str) {
@@ -93,7 +128,7 @@ function updateConnectionStatus(isOnline) {
 // 1. Fetch Summary & KPIs
 async function fetchSummary() {
   try {
-    const res = await fetch('/api/summary');
+    const res = await authFetch('/api/summary');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.lastSummary = data;
@@ -215,8 +250,16 @@ function renderActivePositions(positions) {
             <span class="pos-side-pill ${sideClass}">${escapeHtml(pos.side)}</span>
             ${beBadge}
           </div>
-          <div class="pos-pnl-pill ${pnlClass}">
-            ${formatSignedUSD(pos.unrealized_pnl)} (${formatSignedPct(pos.unrealized_roe_pct)})
+          <div style="display:flex; align-items:center; gap:8px;">
+            <div class="pos-pnl-pill ${pnlClass}">
+              ${formatSignedUSD(pos.unrealized_pnl)} (${formatSignedPct(pos.unrealized_roe_pct)})
+            </div>
+            <button class="btn-ai-action btn-ai-position" data-symbol="${escapeHtml(pos.symbol)}" title="In-Flight Position Health Check" aria-label="In-Flight Position Health Check">
+              <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
+                <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
+              </svg>
+            </button>
           </div>
         </div>
 
@@ -255,7 +298,7 @@ function renderActivePositions(positions) {
 // 2. Fetch Scanner Radar
 async function fetchScanner() {
   try {
-    const res = await fetch('/api/scanner');
+    const res = await authFetch('/api/scanner');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     renderScanner(data);
@@ -352,7 +395,7 @@ async function fetchTrades() {
       limit: state.trades.limit,
       status: state.trades.filter
     });
-    const res = await fetch(`/api/trades?${params.toString()}`);
+    const res = await authFetch(`/api/trades?${params.toString()}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.trades.total = data.total || 0;
@@ -425,6 +468,14 @@ function renderTrades(trades) {
         <td>-${(t.mae_pct || 0).toFixed(2)}% / +${(t.mfe_pct || 0).toFixed(2)}%</td>
         <td>${formatDuration(t.duration_sec)}</td>
         <td>${reasonBadge}</td>
+        <td style="text-align: center;">
+          <button class="btn-ai-action btn-ai-autopsy" data-order-id="${escapeHtml(t.client_order_id)}" title="Post-Trade AI Autopsy" aria-label="Post-Trade AI Autopsy">
+            <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
+              <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
+            </svg>
+          </button>
+        </td>
       </tr>
     `;
 
@@ -436,7 +487,15 @@ function renderTrades(trades) {
             <strong>${escapeHtml(t.symbol)}</strong>
             <span class="pos-side-pill ${sideClass}">${escapeHtml(t.side)}</span>
           </div>
-          <div>${reasonBadge}</div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            ${reasonBadge}
+            <button class="btn-ai-action btn-ai-autopsy" data-order-id="${escapeHtml(t.client_order_id)}" title="Post-Trade AI Autopsy" aria-label="Post-Trade AI Autopsy">
+              <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
+                <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
+              </svg>
+            </button>
+          </div>
         </div>
 
         <div class="stream-card-row">
@@ -477,7 +536,7 @@ async function fetchSignals() {
       decision: state.signals.decision,
       symbol: state.signals.symbol
     });
-    const res = await fetch(`/api/signals?${params.toString()}`);
+    const res = await authFetch(`/api/signals?${params.toString()}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.signals.total = data.total || 0;
@@ -794,28 +853,372 @@ function startClock() {
   setInterval(tick, 1000);
 }
 
-// 7. Initialize Application
+// 7. AI Copilot Controller & Universal Modal
+let currentAITriggerBtn = null;
+
+async function openAIModal(title, url, triggerBtn) {
+  const modal = document.getElementById('ai-modal');
+  const titleEl = document.getElementById('ai-modal-title');
+  const loadingEl = document.getElementById('ai-modal-loading');
+  const contentEl = document.getElementById('ai-modal-content');
+  const badgeEl = document.getElementById('ai-modal-badge');
+
+  if (!modal) return;
+
+  currentAITriggerBtn = triggerBtn;
+  if (triggerBtn) {
+    triggerBtn.classList.add('is-loading');
+    triggerBtn.disabled = true;
+  }
+
+  if (titleEl) titleEl.textContent = title;
+  if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash';
+  if (loadingEl) loadingEl.classList.remove('hidden');
+  if (contentEl) {
+    contentEl.classList.add('hidden');
+    contentEl.innerHTML = '';
+  }
+
+  modal.classList.remove('hidden');
+  modal.setAttribute('aria-hidden', 'false');
+
+  try {
+    const res = await authFetch(url);
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      const errMsg = data.error === 'RATE_LIMITED'
+        ? 'Batas panggilan tercapai (10 req/menit). Silakan tunggu 1 menit sebelum mencoba kembali.'
+        : (data.error === 'GEMINI_TIMEOUT'
+          ? 'Waktu permintaan AI habis (timeout 8 detik). Silakan coba kembali.'
+          : (data.message || data.error || 'Gagal memuat analisis AI.'));
+
+      state.currentAIMarkdown = errMsg;
+      if (contentEl) {
+        contentEl.innerHTML = `<div style="color:var(--sell-red); padding:10px 0;"><strong>Error:</strong> ${escapeHtml(errMsg)}</div>`;
+      }
+      if (badgeEl) badgeEl.textContent = 'Error';
+    } else {
+      state.currentAIMarkdown = data.text || '';
+      if (contentEl) {
+        contentEl.innerHTML = renderMarkdown(data.text);
+      }
+      if (badgeEl) {
+        badgeEl.textContent = data.source === 'cache' ? 'gemini-2.5-flash | Local Cache' : 'gemini-2.5-flash | Live';
+      }
+    }
+  } catch (err) {
+    console.error('AI modal fetch error:', err);
+    state.currentAIMarkdown = 'Gagal menghubungi server TRML.';
+    if (contentEl) {
+      contentEl.innerHTML = `<div style="color:var(--sell-red); padding:10px 0;">Gagal menghubungi server. Pastikan koneksi bot aktif.</div>`;
+    }
+    if (badgeEl) badgeEl.textContent = 'Offline';
+  } finally {
+    if (loadingEl) loadingEl.classList.add('hidden');
+    if (contentEl) contentEl.classList.remove('hidden');
+    if (currentAITriggerBtn) {
+      currentAITriggerBtn.classList.remove('is-loading');
+      currentAITriggerBtn.disabled = false;
+      currentAITriggerBtn = null;
+    }
+  }
+}
+
+function closeAIModal() {
+  const modal = document.getElementById('ai-modal');
+  if (modal) {
+    modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+  if (currentAITriggerBtn) {
+    currentAITriggerBtn.classList.remove('is-loading');
+    currentAITriggerBtn.disabled = false;
+    currentAITriggerBtn = null;
+  }
+}
+
+function setupAIEvents() {
+  // 1. Header AI Button (Executive Debrief)
+  const headerAIBtn = document.getElementById('btn-ai-executive');
+  if (headerAIBtn) {
+    headerAIBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openAIModal('📊 AI Executive Debrief (24 Jam)', '/api/ai/executive-summary', headerAIBtn);
+    });
+  }
+
+  // 2. Delegated Click on Active Position Health Button
+  const posContainer = document.getElementById('positions-container');
+  if (posContainer) {
+    posContainer.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn-ai-position');
+      if (btn) {
+        e.stopPropagation();
+        const symbol = btn.dataset.symbol;
+        if (symbol) {
+          openAIModal(`🩺 In-Flight Health Check: ${symbol}`, `/api/ai/position-health?symbol=${encodeURIComponent(symbol)}`, btn);
+        }
+      }
+    });
+  }
+
+  // 3. Delegated Click on Trade Ledger Autopsy Button (Desktop & Mobile)
+  const tradeTbody = document.getElementById('trades-tbody');
+  if (tradeTbody) {
+    tradeTbody.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn-ai-autopsy');
+      if (btn) {
+        e.stopPropagation();
+        const orderId = btn.dataset.orderId;
+        if (orderId) {
+          openAIModal(`🔬 Post-Trade Autopsy: ${orderId}`, `/api/ai/trade-autopsy?client_order_id=${encodeURIComponent(orderId)}`, btn);
+        }
+      }
+    });
+  }
+
+  const tradeStream = document.getElementById('trades-mobile-stream');
+  if (tradeStream) {
+    tradeStream.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn-ai-autopsy');
+      if (btn) {
+        e.stopPropagation();
+        const orderId = btn.dataset.orderId;
+        if (orderId) {
+          openAIModal(`🔬 Post-Trade Autopsy: ${orderId}`, `/api/ai/trade-autopsy?client_order_id=${encodeURIComponent(orderId)}`, btn);
+        }
+      }
+    });
+  }
+
+  // 4. Modal Close & Copy Events
+  const closeBtn = document.getElementById('ai-modal-close');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', closeAIModal);
+  }
+
+  const modal = document.getElementById('ai-modal');
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        closeAIModal();
+      }
+    });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAIModal();
+    }
+  });
+
+  const copyBtn = document.getElementById('ai-modal-copy-btn');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      if (!state.currentAIMarkdown) return;
+      try {
+        await navigator.clipboard.writeText(state.currentAIMarkdown);
+        const origHtml = copyBtn.innerHTML;
+        copyBtn.innerHTML = '<span>Tersalin!</span>';
+        setTimeout(() => {
+          copyBtn.innerHTML = origHtml;
+        }, 2000);
+      } catch (err) {
+        console.warn('Failed to copy to clipboard:', err);
+      }
+    });
+  }
+}
+
+// 8. PIN Security Authentication Controller
+let enteredPinDigits = '';
+
+function showPinScreen(errMsg) {
+  const pinScreen = document.getElementById('pin-screen');
+  const errEl = document.getElementById('pin-error-msg');
+  if (pinScreen) {
+    pinScreen.classList.remove('hidden');
+    pinScreen.setAttribute('aria-hidden', 'false');
+  }
+  if (errEl) {
+    if (errMsg) {
+      errEl.textContent = errMsg;
+      errEl.classList.remove('hidden');
+    } else {
+      errEl.classList.add('hidden');
+    }
+  }
+  enteredPinDigits = '';
+  updatePinDots();
+}
+
+function hidePinScreen() {
+  const pinScreen = document.getElementById('pin-screen');
+  if (pinScreen) {
+    pinScreen.classList.add('hidden');
+    pinScreen.setAttribute('aria-hidden', 'true');
+  }
+}
+
+function updatePinDots() {
+  const dots = document.querySelectorAll('#pin-dots .pin-dot');
+  dots.forEach((dot, idx) => {
+    if (idx < enteredPinDigits.length) {
+      dot.classList.add('filled');
+    } else {
+      dot.classList.remove('filled');
+    }
+  });
+}
+
+async function verifyEnteredPIN() {
+  const errEl = document.getElementById('pin-error-msg');
+  try {
+    const res = await fetch('/api/auth/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: enteredPinDigits })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === 'ok') {
+      localStorage.setItem('trml_pin', enteredPinDigits);
+      hidePinScreen();
+      // Start initial polling
+      fetchSummary();
+      fetchScanner();
+      fetchTrades();
+      fetchSignals();
+    } else {
+      enteredPinDigits = '';
+      updatePinDots();
+      if (errEl) {
+        errEl.textContent = data.message || 'PIN yang dimasukkan salah.';
+        errEl.classList.remove('hidden');
+      }
+    }
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = 'Gagal verifikasi PIN ke server.';
+      errEl.classList.remove('hidden');
+    }
+  }
+}
+
+function setupPINKeypad() {
+  const keypad = document.querySelector('.pin-keypad');
+  if (!keypad) return;
+
+  keypad.addEventListener('click', (e) => {
+    const btn = e.target.closest('.pin-key');
+    if (!btn) return;
+    const key = btn.dataset.key;
+
+    if (key === 'clear') {
+      enteredPinDigits = '';
+      updatePinDots();
+    } else if (key === 'backspace') {
+      if (enteredPinDigits.length > 0) {
+        enteredPinDigits = enteredPinDigits.slice(0, -1);
+        updatePinDots();
+      }
+    } else if (key && key.length === 1 && enteredPinDigits.length < 6) {
+      enteredPinDigits += key;
+      updatePinDots();
+      if (enteredPinDigits.length === 6) {
+        verifyEnteredPIN();
+      }
+    }
+  });
+
+  // Support keyboard numeric typing on desktop
+  document.addEventListener('keydown', (e) => {
+    const pinScreen = document.getElementById('pin-screen');
+    if (pinScreen && !pinScreen.classList.contains('hidden')) {
+      if (e.key >= '0' && e.key <= '9') {
+        if (enteredPinDigits.length < 6) {
+          enteredPinDigits += e.key;
+          updatePinDots();
+          if (enteredPinDigits.length === 6) {
+            verifyEnteredPIN();
+          }
+        }
+      } else if (e.key === 'Backspace') {
+        if (enteredPinDigits.length > 0) {
+          enteredPinDigits = enteredPinDigits.slice(0, -1);
+          updatePinDots();
+        }
+      } else if (e.key === 'Escape' || e.key === 'c' || e.key === 'C') {
+        enteredPinDigits = '';
+        updatePinDots();
+      }
+    }
+  });
+}
+
+async function checkAuthAndStart() {
+  try {
+    const res = await fetch('/api/auth/status');
+    const data = await res.json();
+    state.pinRequired = !!data.pin_required;
+
+    if (state.pinRequired) {
+      const storedPin = localStorage.getItem('trml_pin');
+      if (storedPin) {
+        const verifyRes = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin: storedPin })
+        });
+        if (verifyRes.ok) {
+          hidePinScreen();
+          fetchSummary();
+          fetchScanner();
+          fetchTrades();
+          fetchSignals();
+          return;
+        }
+      }
+      showPinScreen();
+      return;
+    }
+
+    // No PIN required -> start immediately
+    hidePinScreen();
+    fetchSummary();
+    fetchScanner();
+    fetchTrades();
+    fetchSignals();
+  } catch (err) {
+    console.warn('Auth status check failed, starting in fallback mode:', err);
+    fetchSummary();
+    fetchScanner();
+    fetchTrades();
+    fetchSignals();
+  }
+}
+
+// 9. Initialize Application
 document.addEventListener('DOMContentLoaded', () => {
   startClock();
   setupEvents();
+  setupAIEvents();
+  setupPINKeypad();
 
-  // Initial fetches
-  fetchSummary();
-  fetchScanner();
-  fetchTrades();
-  fetchSignals();
+  // Initial Auth & Boot
+  checkAuthAndStart();
 
   // Background Polling
   // High-frequency polling (every 3 seconds for summary & positions)
   setInterval(() => {
-    if (state.isPollingActive) {
+    if (state.isPollingActive && (!state.pinRequired || localStorage.getItem('trml_pin'))) {
       fetchSummary();
     }
   }, 3000);
 
   // Scanner radar polling (every 5 seconds)
   setInterval(() => {
-    if (state.isPollingActive) {
+    if (state.isPollingActive && (!state.pinRequired || localStorage.getItem('trml_pin'))) {
       fetchScanner();
     }
   }, 5000);
@@ -823,8 +1226,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Page visibility awareness: pause polling when tab is hidden, resume immediately when visible
   document.addEventListener('visibilitychange', () => {
     state.isPollingActive = !document.hidden;
-    if (state.isPollingActive) {
-      // Refresh instant saat tab dibuka kembali
+    if (state.isPollingActive && (!state.pinRequired || localStorage.getItem('trml_pin'))) {
       fetchSummary();
       fetchScanner();
     }
@@ -833,7 +1235,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Register PWA Service Worker
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js?v=2').then((reg) => {
+      navigator.serviceWorker.register('/sw.js?v=3').then((reg) => {
         reg.update();
       }).catch((err) => {
         console.warn('Service worker registration failed:', err);

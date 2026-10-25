@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS trade_ledger (
     exit_reason          TEXT NOT NULL,
     opened_at_utc        TEXT NOT NULL,
     closed_at_utc        TEXT NOT NULL,
-    signal_audit_id      INTEGER NOT NULL DEFAULT 0
+    signal_audit_id      INTEGER NOT NULL DEFAULT 0,
+    ai_autopsy           TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS signal_audit_log (
@@ -164,6 +165,11 @@ func OpenDB(dbPath string) (*DB, error) {
 	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('trade_ledger') WHERE name = 'signal_audit_id';`).Scan(&colCount)
 	if colCount == 0 {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE trade_ledger ADD COLUMN signal_audit_id INTEGER NOT NULL DEFAULT 0;`)
+	}
+	// Migrasi otomatis kolom ai_autopsy di trade_ledger jika belum ada
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('trade_ledger') WHERE name = 'ai_autopsy';`).Scan(&colCount)
+	if colCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE trade_ledger ADD COLUMN ai_autopsy TEXT NOT NULL DEFAULT '';`)
 	}
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);`)

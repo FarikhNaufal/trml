@@ -89,6 +89,13 @@ type Config struct {
 	LimitOrderTimeout  time.Duration
 	MaxHoldingDuration time.Duration
 	RecvWindowMS       int64
+
+	// Keamanan Dashboard & AI Copilot
+	DashboardPIN     string
+	GeminiAPIKey     string
+	GeminiModel      string
+	GeminiTimeoutSec int
+	AIRateLimitRPM   int
 }
 
 // loadDotEnv membaca file .env secara otomatis ke environment variable proses
@@ -370,6 +377,21 @@ func LoadConfig() (*Config, error) {
 	}
 
 	httpPort := getEnv("HTTP_PORT", "2020")
+	dashPIN := strings.TrimSpace(getEnv("DASHBOARD_PIN", ""))
+	geminiKey := strings.TrimSpace(getEnv("GEMINI_API_KEY", ""))
+	geminiModel := strings.TrimSpace(getEnv("GEMINI_MODEL", "gemini-2.5-flash"))
+
+	geminiTimeoutStr := getEnv("GEMINI_TIMEOUT_SEC", "8")
+	geminiTimeout, err := strconv.Atoi(geminiTimeoutStr)
+	if err != nil || geminiTimeout <= 0 {
+		geminiTimeout = 8
+	}
+
+	aiRateLimitStr := getEnv("AI_RATE_LIMIT_RPM", "10")
+	aiRateLimit, err := strconv.Atoi(aiRateLimitStr)
+	if err != nil || aiRateLimit <= 0 {
+		aiRateLimit = 10
+	}
 
 	return &Config{
 		Env:                  env,
@@ -428,6 +450,12 @@ func LoadConfig() (*Config, error) {
 		LimitOrderTimeout:  45 * time.Second,
 		MaxHoldingDuration: 4 * time.Hour,
 		RecvWindowMS:       recvWin,
+
+		DashboardPIN:     dashPIN,
+		GeminiAPIKey:     geminiKey,
+		GeminiModel:      geminiModel,
+		GeminiTimeoutSec: geminiTimeout,
+		AIRateLimitRPM:   aiRateLimit,
 	}, nil
 }
 

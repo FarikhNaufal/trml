@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"trml/internal/ai"
 	"trml/internal/broker"
+	"trml/internal/storage"
 )
 
 type ScannerCoinDTO struct {
@@ -34,11 +36,19 @@ type ServerConfig struct {
 	Broker            broker.ExecutionBroker
 	GetScannerCoinsFn func() []ScannerCoinDTO
 	IsCircuitBreaker  func() bool
+	Repo              storage.Repository
+	DashboardPIN      string
+	GeminiAPIKey      string
+	GeminiModel       string
+	GeminiTimeoutSec  int
+	AIRateLimitRPM    int
 }
 
 type Server struct {
-	cfg        ServerConfig
-	httpServer *http.Server
+	cfg         ServerConfig
+	httpServer  *http.Server
+	rateLimiter *IPRateLimiter
+	gemini      *ai.GeminiClient
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
@@ -50,17 +60,28 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg: cfg,
+		cfg:         cfg,
+		rateLimiter: NewIPRateLimiter(cfg.AIRateLimitRPM, 3),
+		gemini:      ai.NewGeminiClient(cfg.GeminiAPIKey, cfg.GeminiModel, cfg.GeminiTimeoutSec),
 	}
 
 	mux := http.NewServeMux()
 
-	// 1. API Endpoints
-	mux.HandleFunc("/api/summary", s.handleSummary)
-	mux.HandleFunc("/api/scanner", s.handleScanner)
-	mux.HandleFunc("/api/trades", s.handleTrades)
-	mux.HandleFunc("/api/signals", s.handleSignals)
+	// 1. Auth & Status Endpoints
+	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("/api/auth/verify", s.handleVerifyPIN)
+
+	// 2. Core Dashboard Endpoints (Protected by PIN if configured)
+	mux.HandleFunc("/api/summary", s.requireAuth(s.handleSummary))
+	mux.HandleFunc("/api/scanner", s.requireAuth(s.handleScanner))
+	mux.HandleFunc("/api/trades", s.requireAuth(s.handleTrades))
+	mux.HandleFunc("/api/signals", s.requireAuth(s.handleSignals))
 	mux.HandleFunc("/health", s.handleHealth)
+
+	// 3. AI Copilot Endpoints (Protected by PIN + Token Bucket Rate Limit)
+	mux.HandleFunc("/api/ai/executive-summary", s.requireAuth(s.aiRateLimit(s.handleAIExecutiveSummary)))
+	mux.HandleFunc("/api/ai/position-health", s.requireAuth(s.aiRateLimit(s.handleAIPositionHealth)))
+	mux.HandleFunc("/api/ai/trade-autopsy", s.requireAuth(s.aiRateLimit(s.handleAITradeAutopsy)))
 
 	// 2. Static File Server (Embedded PWA Assets)
 	subFS, err := fs.Sub(StaticFS, "static")
@@ -256,6 +277,266 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pin_required": s.isPINConfigured(),
+	})
+}
+
+func (s *Server) handleVerifyPIN(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ip := s.rateLimiter.getClientIP(r)
+
+	var req struct {
+		PIN string `json:"pin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "BAD_REQUEST",
+			"message": "Format request tidak valid.",
+		})
+		return
+	}
+
+	if !s.validatePIN(req.PIN) {
+		isBlocked := s.rateLimiter.RecordFailedPIN(ip)
+		if isBlocked {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error":   "TOO_MANY_FAILED_ATTEMPTS",
+				"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
+			})
+			return
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "INVALID_PIN",
+			"message": "PIN yang dimasukkan salah.",
+		})
+		return
+	}
+
+	s.rateLimiter.ResetFailedPIN(ip)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "PIN berhasil diverifikasi.",
+	})
+}
+
+func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	var stats StatsItem
+	if s.cfg.Reader != nil {
+		stats, _ = s.cfg.Reader.GetOverallStats(ctx)
+	}
+
+	var equityF float64
+	if s.cfg.Broker != nil {
+		eqDec := s.cfg.Broker.GetEffectiveTotalEquityUSDT()
+		equityF, _ = eqDec.Float64()
+	}
+
+	// Ambil riwayat trade terakhir
+	var recentTrades []TradeItem
+	if s.cfg.Reader != nil {
+		recentTrades, _, _ = s.cfg.Reader.GetTradesPaginated(ctx, 1, 6, "ALL")
+	}
+
+	// Agregasi top rejection reasons dari signal audit
+	rejectionCounts := make(map[string]int)
+	if s.cfg.Reader != nil {
+		signals, _, _ := s.cfg.Reader.GetSignalsPaginated(ctx, 1, 50, "REJECT", "")
+		for _, sig := range signals {
+			code := sig.RejectReasonCode
+			if code == "" {
+				code = "UNKNOWN"
+			}
+			rejectionCounts[code]++
+		}
+	}
+
+	payload := map[string]any{
+		"timestamp_utc": time.Now().UTC().Format(time.RFC3339),
+		"metrics": map[string]any{
+			"equity_usdt":         equityF,
+			"total_closed_trades": stats.TotalTrades,
+			"net_pnl_usdt":        stats.TotalNetPnLUSDT,
+			"win_rate_pct":        stats.WinRatePct,
+			"realized_rr":         stats.RealizedRR,
+			"wins_tp":             stats.WinsCount,
+			"break_even":          stats.BreakEvenCount,
+			"losses_sl":           stats.LossesCount,
+		},
+		"filter_bottlenecks": rejectionCounts,
+		"recent_trades":      recentTrades,
+	}
+
+	aiResp := s.gemini.GenerateExecutiveDebrief(ctx, payload)
+	writeJSON(w, http.StatusOK, aiResp)
+}
+
+func (s *Server) handleAIPositionHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	symbol := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("symbol")))
+	if symbol == "" {
+		writeJSON(w, http.StatusBadRequest, ai.AIResponse{
+			Error:  "SYMBOL_REQUIRED",
+			Source: "fallback",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	var targetPos *broker.ActivePositionDTO
+	if s.cfg.Broker != nil {
+		positions := s.cfg.Broker.GetActivePositions()
+		for i := range positions {
+			if positions[i].Symbol == symbol {
+				targetPos = &positions[i]
+				break
+			}
+		}
+	}
+
+	if targetPos == nil {
+		writeJSON(w, http.StatusNotFound, ai.AIResponse{
+			Error:  "POSITION_NOT_FOUND",
+			Source: "fallback",
+		})
+		return
+	}
+
+	var sessionVWAP, distVWAPPct float64
+	if s.cfg.GetScannerCoinsFn != nil {
+		coins := s.cfg.GetScannerCoinsFn()
+		for _, c := range coins {
+			if c.Symbol == symbol {
+				sessionVWAP = c.SessionVWAP
+				distVWAPPct = c.DistVWAPPct
+				break
+			}
+		}
+	}
+
+	payload := map[string]any{
+		"symbol":              ai.SanitizePromptInput(targetPos.Symbol),
+		"side":                targetPos.Side,
+		"entry_price":         targetPos.EntryPrice,
+		"mark_price":          targetPos.MarkPrice,
+		"unrealized_pnl_usdt": targetPos.UnrealizedPnL,
+		"unrealized_roe_pct":  targetPos.UnrealizedROEPct,
+		"sl_price":            targetPos.SLPrice,
+		"tp_price":            targetPos.TPPrice,
+		"is_break_even_moved": targetPos.IsBreakEven,
+		"duration_sec":        targetPos.DurationSec,
+		"session_vwap":        sessionVWAP,
+		"dist_to_vwap_pct":    distVWAPPct,
+	}
+
+	aiResp := s.gemini.GeneratePositionHealth(ctx, payload)
+	writeJSON(w, http.StatusOK, aiResp)
+}
+
+func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	clientOrderID := strings.TrimSpace(r.URL.Query().Get("client_order_id"))
+	if clientOrderID == "" {
+		writeJSON(w, http.StatusBadRequest, ai.AIResponse{
+			Error:  "CLIENT_ORDER_ID_REQUIRED",
+			Source: "fallback",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	// 1. Cek cache di SQLite terlebih dahulu
+	if s.cfg.Repo != nil {
+		if cachedAutopsy, err := s.cfg.Repo.GetTradeAutopsy(ctx, clientOrderID); err == nil && cachedAutopsy != "" {
+			writeJSON(w, http.StatusOK, ai.AIResponse{
+				Text:   cachedAutopsy,
+				Source: "cache",
+			})
+			return
+		}
+	}
+
+	// 2. Ambil detail trade dari reader
+	if s.cfg.Reader == nil {
+		writeJSON(w, http.StatusInternalServerError, ai.AIResponse{
+			Error:  "READER_UNAVAILABLE",
+			Source: "fallback",
+		})
+		return
+	}
+
+	trade, err := s.cfg.Reader.GetTradeByClientOrderID(ctx, clientOrderID)
+	if err != nil || trade == nil {
+		writeJSON(w, http.StatusNotFound, ai.AIResponse{
+			Error:  "TRADE_NOT_FOUND",
+			Source: "fallback",
+		})
+		return
+	}
+
+	// Jika di TradeItem sudah ada ai_autopsy
+	if trade.AIAutopsy != "" {
+		writeJSON(w, http.StatusOK, ai.AIResponse{
+			Text:   trade.AIAutopsy,
+			Source: "cache",
+		})
+		return
+	}
+
+	payload := map[string]any{
+		"client_order_id": ai.SanitizePromptInput(trade.ClientOrderID),
+		"symbol":          ai.SanitizePromptInput(trade.Symbol),
+		"side":            trade.Side,
+		"qty":             trade.Qty,
+		"entry_price":     trade.EntryPrice,
+		"exit_price":      trade.ExitPrice,
+		"net_pnl_usdt":    trade.NetPnLUSDT,
+		"roe_pct":         trade.ROEPct,
+		"exit_reason":     ai.SanitizePromptInput(trade.ExitReason),
+		"mae_pct":         trade.MAEPct,
+		"mfe_pct":         trade.MFEPct,
+		"duration_sec":    trade.DurationSec,
+		"opened_at_utc":   trade.OpenedAtUTC,
+		"closed_at_utc":   trade.ClosedAtUTC,
+	}
+
+	aiResp := s.gemini.GenerateTradeAutopsy(ctx, payload)
+
+	// Simpan ke SQLite jika pemanggilan AI berhasil
+	if aiResp.Text != "" && s.cfg.Repo != nil {
+		if err := s.cfg.Repo.UpdateTradeAutopsy(ctx, clientOrderID, aiResp.Text); err != nil {
+			slog.Warn("web server: failed to cache ai autopsy into sqlite", "clientOrderID", clientOrderID, "err", err)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, aiResp)
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data any) {

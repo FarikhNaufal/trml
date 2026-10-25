@@ -9,7 +9,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css?v=2">
+  <link rel="stylesheet" href="/style.css?v=3">
 </head>
 <body>
   <!-- Header -->
@@ -32,6 +32,12 @@
           <span id="status-text">ONLINE</span>
         </div>
         <div id="utc-clock" class="utc-clock">--:--:-- UTC</div>
+        <button id="btn-ai-executive" class="btn-ai-action" title="AI Executive Debrief" aria-label="AI Executive Debrief">
+          <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
+            <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
+          </svg>
+        </button>
         <button id="btn-refresh" class="btn-refresh" title="Refresh Live Data" aria-label="Refresh Data">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
@@ -192,11 +198,12 @@
               <th>MAE / MFE</th>
               <th>Hold Duration</th>
               <th>Exit Reason</th>
+              <th style="text-align: center; width: 44px;">AI</th>
             </tr>
           </thead>
           <tbody id="trades-tbody">
             <tr>
-              <td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading trades...</td>
+              <td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading trades...</td>
             </tr>
           </tbody>
         </table>
@@ -285,6 +292,78 @@
     </section>
   </main>
 
-  <script src="/app.js?v=2"></script>
+  <!-- Universal AI Copilot Modal -->
+  <div id="ai-modal" class="ai-modal-overlay hidden" aria-hidden="true">
+    <div class="ai-modal-card">
+      <div class="ai-modal-header">
+        <div class="ai-modal-title-group">
+          <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
+            <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
+          </svg>
+          <span id="ai-modal-title">AI Copilot Analysis</span>
+        </div>
+        <button id="ai-modal-close" class="ai-modal-close-btn" aria-label="Close modal">&times;</button>
+      </div>
+
+      <div id="ai-modal-body" class="ai-modal-body">
+        <div id="ai-modal-loading" class="ai-modal-loading">
+          <div class="ai-spinner"></div>
+          <div>Menganalisis data orderflow &amp; eksekusi TRML...</div>
+        </div>
+        <div id="ai-modal-content" class="ai-markdown-content hidden"></div>
+      </div>
+
+      <div class="ai-modal-footer">
+        <span id="ai-modal-badge" class="ai-source-badge">gemini-2.5-flash</span>
+        <button id="ai-modal-copy-btn" class="btn-copy-ai" title="Copy to clipboard">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+          </svg>
+          <span>Salin</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- PIN Authentication Screen (shown if DASHBOARD_PIN configured) -->
+  <div id="pin-screen" class="pin-screen-overlay hidden" aria-hidden="true">
+    <div class="pin-card">
+      <div class="pin-brand">
+        <img src="/icon.svg" alt="TRML" class="pin-brand-icon">
+        <div class="pin-brand-title">TR<span>M</span>L SECURITY</div>
+        <div class="pin-brand-sub">Masukkan 6-Digit PIN untuk Mengakses Dashboard</div>
+      </div>
+
+      <div class="pin-dots-container" id="pin-dots">
+        <span class="pin-dot"></span>
+        <span class="pin-dot"></span>
+        <span class="pin-dot"></span>
+        <span class="pin-dot"></span>
+        <span class="pin-dot"></span>
+        <span class="pin-dot"></span>
+      </div>
+
+      <div id="pin-error-msg" class="pin-error hidden">PIN tidak valid</div>
+
+      <div class="pin-keypad">
+        <button class="pin-key" data-key="1">1</button>
+        <button class="pin-key" data-key="2">2</button>
+        <button class="pin-key" data-key="3">3</button>
+        <button class="pin-key" data-key="4">4</button>
+        <button class="pin-key" data-key="5">5</button>
+        <button class="pin-key" data-key="6">6</button>
+        <button class="pin-key" data-key="7">7</button>
+        <button class="pin-key" data-key="8">8</button>
+        <button class="pin-key" data-key="9">9</button>
+        <button class="pin-key pin-key-fn" data-key="clear">C</button>
+        <button class="pin-key" data-key="0">0</button>
+        <button class="pin-key pin-key-fn" data-key="backspace">&larr;</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js?v=3"></script>
 </body>
 </html>
