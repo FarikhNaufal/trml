@@ -883,7 +883,7 @@ async function openAIModal(title, url, triggerBtn) {
   }
 
   if (titleEl) titleEl.textContent = title;
-  if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash';
+  if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite';
 
   // Check 30s in-memory cache for executive debrief if not force refresh
   const isExecutive = url.includes('/api/ai/executive-summary');
@@ -899,7 +899,7 @@ async function openAIModal(title, url, triggerBtn) {
       contentEl.style.display = 'block';
     }
     state.currentAIMarkdown = lastExecutiveSummaryData.text || '';
-    if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash | In-Memory (30s)';
+    if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite | In-Memory (30s)';
     modal.classList.remove('hidden');
     modal.setAttribute('aria-hidden', 'false');
     if (triggerBtn) {
@@ -952,7 +952,7 @@ async function openAIModal(title, url, triggerBtn) {
         contentEl.innerHTML = renderMarkdown(data.text);
       }
       if (badgeEl) {
-        badgeEl.textContent = data.source === 'cache' ? 'gemini-2.5-flash | Local Cache' : 'gemini-2.5-flash | Live';
+        badgeEl.textContent = data.source === 'cache' ? 'gemini-3.5-flash-lite | Local Cache' : 'gemini-3.5-flash-lite | Live';
       }
       if (isExecutive && data.text) {
         lastExecutiveSummaryData = data;
