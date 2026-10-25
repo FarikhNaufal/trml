@@ -381,10 +381,10 @@ func LoadConfig() (*Config, error) {
 	geminiKey := strings.TrimSpace(getEnv("GEMINI_API_KEY", ""))
 	geminiModel := strings.TrimSpace(getEnv("GEMINI_MODEL", "gemini-2.5-flash"))
 
-	geminiTimeoutStr := getEnv("GEMINI_TIMEOUT_SEC", "8")
+	geminiTimeoutStr := getEnv("GEMINI_TIMEOUT_SEC", "25")
 	geminiTimeout, err := strconv.Atoi(geminiTimeoutStr)
 	if err != nil || geminiTimeout <= 0 {
-		geminiTimeout = 8
+		geminiTimeout = 25
 	}
 
 	aiRateLimitStr := getEnv("AI_RATE_LIMIT_RPM", "10")

@@ -30,7 +30,7 @@ func NewGeminiClient(apiKey, model string, timeoutSec int) *GeminiClient {
 		model = "gemini-2.5-flash"
 	}
 	if timeoutSec <= 0 {
-		timeoutSec = 8
+		timeoutSec = 25
 	}
 	return &GeminiClient{
 		apiKey:  strings.TrimSpace(apiKey),
@@ -72,8 +72,7 @@ type geminiContent struct {
 }
 
 type geminiGenConfig struct {
-	Temperature     float64 `json:"temperature"`
-	MaxOutputTokens int     `json:"maxOutputTokens"`
+	Temperature float64 `json:"temperature"`
 }
 
 type geminiRequest struct {
@@ -126,8 +125,7 @@ func (c *GeminiClient) GenerateContent(ctx context.Context, endpointName, system
 			},
 		},
 		GenerationConfig: &geminiGenConfig{
-			Temperature:     0.2,
-			MaxOutputTokens: 600,
+			Temperature: 0.2,
 		},
 	}
 

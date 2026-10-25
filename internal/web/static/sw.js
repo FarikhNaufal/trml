@@ -1,8 +1,8 @@
-const CACHE_NAME = 'trml-shell-v3';
+const CACHE_NAME = 'trml-shell-v4';
 const STATIC_ASSETS = [
   '/',
-  '/style.css?v=3',
-  '/app.js?v=3',
+  '/style.css?v=4',
+  '/app.js?v=4',
   '/manifest.json',
   '/icon.svg'
 ];

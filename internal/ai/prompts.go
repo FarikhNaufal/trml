@@ -21,15 +21,15 @@ PANTANGAN MUTLAK:
 - DILARANG menghitung ulang angka matematika. Seluruh angka di JSON adalah data mutlak.
 - Bahasa: Bahasa Indonesia profesional, tegas, objektif.
 
-Format Output (Maksimal 120 kata, Markdown):
+Format Output (Markdown):
 ### 📊 Kesehatan Portofolio & Eksekusi
-[Ulas ringkas PnL, Winrate, dan Realized RR target 1:1.5]
+[Ulas PnL, Winrate, dan Realized RR target 1:1.5 secara objektif dan tuntas]
 
 ### 🎯 Diagnosa Filter Sinyal
 [Ulas alasan penolakan sinyal terbanyak, apakah filter bot efektif mencegah overtrading]
 
-### 💡 Evaluasi Disiplin
-[1-2 kalimat catatan penting untuk evaluasi strategi]`
+### 💡 Evaluasi Disiplin & Rekomendasi
+[Catatan penting dan rekomendasi evaluasi strategi]`
 
 const SystemPromptPositionHealth = `Anda adalah TRML Real-Time Position Monitor.
 Tugas Anda menilai kesehatan posisi trading yang SEDANG BERJALAN berdasarkan data JSON terlampir.
@@ -39,20 +39,20 @@ Fokus Analisis:
 2. Trailing Break-Even: Seberapa dekat harga ke pemicu Break-Even (1.15 ATR) untuk mengunci risiko ke 0.
 3. Integritas Struktur: Posisi terhadap garis Session VWAP dan konfirmasi delta volume terkini.
 
-Format Output (Maksimal 2 paragraf pendek, total maksimal 75 kata):
-[Paragraf 1: Progres profit, jarak menuju TP, dan evaluasi pemicu Break-Even]
-[Paragraf 2: Integritas posisi terhadap VWAP dan kekuatan orderflow terkini]`
+Format Output (Markdown):
+[Ulas progres profit, jarak menuju target TP atau risiko ke SL, serta evaluasi pemicu Break-Even]
+[Ulas integritas posisi terhadap Session VWAP dan konfirmasi delta orderflow terkini]`
 
 const SystemPromptTradeAutopsy = `Anda adalah TRML Trade Autopsy Auditor.
 Tugas Anda membedah trade yang SUDAH SELESAI (Take Profit, Break Even, atau Stop Loss).
 
 Fokus Analisis:
 1. Hubungan Entry vs VWAP: Apakah entry disiplin di dekat VWAP (<=0.60 ATR) atau mengejar harga (chasing).
-2. Perilaku Orderflow & Volume: Mengapa trade ini menang atau mengapa terkena SL.
+2. Perilaku Orderflow & Volume: Mengapa trade ini menang atau mengapa terkena SL / Break Even.
 3. Konfirmasi MAE/MFE: Evaluasi floating minus maksimum (MAE) dan potensi profit maksimum (MFE).
 
-Format Output (Maksimal 1 paragraf padat, maksimal 60 kata):
-[Satu paragraf tajam yang merangkum penyebab utama hasil trade berdasarkan data entry, VWAP, dan MFE/MAE]`
+Format Output (Markdown):
+[Bedah tuntas dan runtut penyebab utama hasil trade ini berdasarkan data entry, VWAP, perilaku orderflow delta, serta rasio MFE vs MAE hingga ditutup]`
 
 // GenerateExecutiveDebrief memanggil AI untuk ulasan 24 jam bot
 func (c *GeminiClient) GenerateExecutiveDebrief(ctx context.Context, payload any) AIResponse {

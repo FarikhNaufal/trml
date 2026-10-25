@@ -859,6 +859,8 @@ function startClock() {
 
 // 7. AI Copilot Controller & Universal Modal
 let currentAITriggerBtn = null;
+let currentModalTitle = '';
+let currentModalBaseUrl = '';
 let lastExecutiveSummaryData = null;
 let lastExecutiveSummaryTime = 0;
 
@@ -871,7 +873,10 @@ async function openAIModal(title, url, triggerBtn) {
 
   if (!modal) return;
 
+  currentModalTitle = title;
+  currentModalBaseUrl = url;
   currentAITriggerBtn = triggerBtn;
+
   if (triggerBtn) {
     triggerBtn.classList.add('is-loading');
     triggerBtn.disabled = true;
@@ -880,13 +885,18 @@ async function openAIModal(title, url, triggerBtn) {
   if (titleEl) titleEl.textContent = title;
   if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash';
 
-  // Check 30s in-memory cache for executive debrief to save tokens and avoid rate limit
-  const isExecutive = url === '/api/ai/executive-summary';
-  if (isExecutive && lastExecutiveSummaryData && (Date.now() - lastExecutiveSummaryTime < 30000)) {
-    if (loadingEl) loadingEl.classList.add('hidden');
+  // Check 30s in-memory cache for executive debrief if not force refresh
+  const isExecutive = url.includes('/api/ai/executive-summary');
+  const isForceRefresh = url.includes('refresh=true');
+  if (isExecutive && !isForceRefresh && lastExecutiveSummaryData && (Date.now() - lastExecutiveSummaryTime < 30000)) {
+    if (loadingEl) {
+      loadingEl.classList.add('hidden');
+      loadingEl.style.display = 'none';
+    }
     if (contentEl) {
       contentEl.innerHTML = renderMarkdown(lastExecutiveSummaryData.text);
       contentEl.classList.remove('hidden');
+      contentEl.style.display = 'block';
     }
     state.currentAIMarkdown = lastExecutiveSummaryData.text || '';
     if (badgeEl) badgeEl.textContent = 'gemini-2.5-flash | In-Memory (30s)';
@@ -899,9 +909,14 @@ async function openAIModal(title, url, triggerBtn) {
     return;
   }
 
-  if (loadingEl) loadingEl.classList.remove('hidden');
+  // Ensure loading spinner is visible and content is hidden during fetch
+  if (loadingEl) {
+    loadingEl.classList.remove('hidden');
+    loadingEl.style.display = 'flex';
+  }
   if (contentEl) {
     contentEl.classList.add('hidden');
+    contentEl.style.display = 'none';
     contentEl.innerHTML = '';
   }
 
@@ -917,7 +932,7 @@ async function openAIModal(title, url, triggerBtn) {
       if (data.error === 'RATE_LIMITED' || res.status === 429) {
         errMsg = 'Batas panggilan tercapai (10 req/menit). Silakan tunggu 1 menit sebelum mencoba kembali.';
       } else if (data.error === 'GEMINI_TIMEOUT') {
-        errMsg = 'Waktu permintaan AI habis (timeout 8 detik). Silakan coba kembali.';
+        errMsg = 'Waktu permintaan AI habis (timeout 25 detik). Silakan coba kembali.';
       } else if (data.error === 'GEMINI_API_KEY_NOT_CONFIGURED') {
         errMsg = 'GEMINI_API_KEY belum dikonfigurasi di file .env server bot.';
       } else if (data.error === 'POSITION_NOT_FOUND') {
@@ -952,8 +967,14 @@ async function openAIModal(title, url, triggerBtn) {
     }
     if (badgeEl) badgeEl.textContent = 'Offline';
   } finally {
-    if (loadingEl) loadingEl.classList.add('hidden');
-    if (contentEl) contentEl.classList.remove('hidden');
+    if (loadingEl) {
+      loadingEl.classList.add('hidden');
+      loadingEl.style.display = 'none';
+    }
+    if (contentEl) {
+      contentEl.classList.remove('hidden');
+      contentEl.style.display = 'block';
+    }
     if (triggerBtn) {
       triggerBtn.classList.remove('is-loading');
       triggerBtn.disabled = false;
@@ -1064,6 +1085,21 @@ function setupAIEvents() {
       } catch (err) {
         console.warn('Failed to copy to clipboard:', err);
       }
+    });
+  }
+
+  const refreshBtn = document.getElementById('ai-modal-refresh-btn');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => {
+      if (!currentModalBaseUrl) return;
+      const sep = currentModalBaseUrl.includes('?') ? '&' : '?';
+      const refreshUrl = currentModalBaseUrl + sep + 'refresh=true';
+      // Clear in-memory cache if executive debrief
+      if (currentModalBaseUrl.includes('executive-summary')) {
+        lastExecutiveSummaryData = null;
+        lastExecutiveSummaryTime = 0;
+      }
+      openAIModal(currentModalTitle, refreshUrl, currentAITriggerBtn);
     });
   }
 }
@@ -1278,7 +1314,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Register PWA Service Worker
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js?v=3').then((reg) => {
+      navigator.serviceWorker.register('/sw.js?v=4').then((reg) => {
         reg.update();
       }).catch((err) => {
         console.warn('Service worker registration failed:', err);

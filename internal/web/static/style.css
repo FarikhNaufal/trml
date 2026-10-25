@@ -1028,6 +1028,15 @@ tbody tr:hover .sticky-col {
   line-height: 1.65;
 }
 
+.hidden {
+  display: none !important;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
 .ai-modal-loading {
   display: flex;
   flex-direction: column;
@@ -1039,6 +1048,10 @@ tbody tr:hover .sticky-col {
   font-size: 13px;
 }
 
+.ai-modal-loading.hidden {
+  display: none !important;
+}
+
 .ai-spinner {
   width: 34px;
   height: 34px;
@@ -1046,6 +1059,7 @@ tbody tr:hover .sticky-col {
   border-top-color: #a855f7;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+  box-shadow: 0 0 12px rgba(168, 85, 247, 0.25);
 }
 
 .ai-markdown-content h3 {
@@ -1084,6 +1098,13 @@ tbody tr:hover .sticky-col {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
+}
+
+.ai-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .ai-source-badge {
@@ -1096,7 +1117,7 @@ tbody tr:hover .sticky-col {
   border-radius: var(--radius-sm);
 }
 
-.btn-copy-ai {
+.btn-ai-footer-action {
   background: var(--bg-surface-hover);
   border: 1px solid var(--border-subtle);
   color: var(--text-primary);
@@ -1110,9 +1131,15 @@ tbody tr:hover .sticky-col {
   transition: all 0.2s;
 }
 
-.btn-copy-ai:hover {
+.btn-ai-footer-action:hover {
   background: var(--border-hover);
   color: #f3e8ff;
+  border-color: rgba(168, 85, 247, 0.4);
+}
+
+.btn-ai-footer-action:disabled {
+  opacity: 0.5;
+  pointer-events: none;
 }
 
 /* ==============================================================================

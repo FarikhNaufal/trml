@@ -346,7 +346,7 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	var stats StatsItem
@@ -414,7 +414,7 @@ func (s *Server) handleAIPositionHealth(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	var targetPos *broker.ActivePositionDTO
@@ -482,11 +482,13 @@ func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	// 1. Cek cache di SQLite terlebih dahulu
-	if s.cfg.Repo != nil {
+	forceRefresh := r.URL.Query().Get("refresh") == "true"
+
+	// 1. Cek cache di SQLite terlebih dahulu jika bukan force refresh
+	if !forceRefresh && s.cfg.Repo != nil {
 		if cachedAutopsy, err := s.cfg.Repo.GetTradeAutopsy(ctx, clientOrderID); err == nil && cachedAutopsy != "" {
 			writeJSON(w, http.StatusOK, ai.AIResponse{
 				Text:   cachedAutopsy,
@@ -514,8 +516,8 @@ func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Jika di TradeItem sudah ada ai_autopsy
-	if trade.AIAutopsy != "" {
+	// Jika di TradeItem sudah ada ai_autopsy dan bukan force refresh
+	if !forceRefresh && trade.AIAutopsy != "" {
 		writeJSON(w, http.StatusOK, ai.AIResponse{
 			Text:   trade.AIAutopsy,
 			Source: "cache",
