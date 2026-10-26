@@ -379,7 +379,7 @@ func LoadConfig() (*Config, error) {
 	httpPort := getEnv("HTTP_PORT", "2020")
 	dashPIN := strings.TrimSpace(getEnv("DASHBOARD_PIN", ""))
 	geminiKey := strings.TrimSpace(getEnv("GEMINI_API_KEY", ""))
-	geminiModel := strings.TrimSpace(getEnv("GEMINI_MODEL", "gemini-3.5-flash-lite"))
+	geminiModel := strings.TrimSpace(getEnv("GEMINI_MODEL", "gemini-2.5-flash"))
 
 	geminiTimeoutStr := getEnv("GEMINI_TIMEOUT_SEC", "25")
 	geminiTimeout, err := strconv.Atoi(geminiTimeoutStr)

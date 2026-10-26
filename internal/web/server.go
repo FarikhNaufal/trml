@@ -104,8 +104,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	s.httpServer = &http.Server{
 		Addr:         cfg.Port,
 		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 

@@ -599,6 +599,26 @@ func (d *DryRunBroker) GetEffectiveTotalEquityUSDT() decimal.Decimal {
 	return d.calculateEffectiveEquityLocked()
 }
 
+// GetRealizedEquityUSDT mengembalikan realized equity saat ini di memory
+func (d *DryRunBroker) GetRealizedEquityUSDT() decimal.Decimal {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	return d.RealizedEquityUSDT
+}
+
+// GetPureRealizedEquityClosedTradesUSDT mengembalikan realized equity murni dari seluruh trade yang telah ditutup
+// (RealizedEquityUSDT ditambah kembali seluruh entry fee dari posisi yang masih terbuka) agar tidak terjadi
+// double-deduction fee atau distorsi floating PnL saat state dipulihkan setelah restart.
+func (d *DryRunBroker) GetPureRealizedEquityClosedTradesUSDT() decimal.Decimal {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	pure := d.RealizedEquityUSDT
+	for _, pos := range d.OpenPositions {
+		pure = pure.Add(pos.EntryFee)
+	}
+	return pure
+}
+
 func (d *DryRunBroker) GetAvailableBalanceUSDT() decimal.Decimal {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()

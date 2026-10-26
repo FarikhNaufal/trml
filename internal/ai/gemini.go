@@ -27,7 +27,7 @@ type GeminiClient struct {
 
 func NewGeminiClient(apiKey, model string, timeoutSec int) *GeminiClient {
 	if model == "" {
-		model = "gemini-3.5-flash-lite"
+		model = "gemini-2.5-flash"
 	}
 	if timeoutSec <= 0 {
 		timeoutSec = 25

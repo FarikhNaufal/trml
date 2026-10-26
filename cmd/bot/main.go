@@ -219,13 +219,13 @@ func main() {
 		engine.dryRunBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
-			totEq := engine.dryRunBroker.GetEffectiveTotalEquityUSDT()
+			pureRealEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
 			epochDay := time.Now().UTC().Unix() / 86400
 			engine.dryRunBroker.Mu.Lock()
 			startEq := engine.dryRunBroker.SessionStartEquity
 			breakerHit := engine.dryRunBroker.CircuitBreakerTripped
 			engine.dryRunBroker.Mu.Unlock()
-			_ = repo.SaveDailyState(context.Background(), epochDay, startEq, totEq, breakerHit)
+			_ = repo.SaveDailyState(context.Background(), epochDay, startEq, pureRealEq, breakerHit)
 		}
 
 		engine.dryRunBroker.OnPositionSavedFn = func(pos broker.VirtualOpenPosition) {
