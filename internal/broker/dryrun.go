@@ -301,9 +301,17 @@ func (d *DryRunBroker) OnRealtimeTick(
 
 			entryF, _ := pos.EntryPrice.Float64()
 			if entryF > 0 {
+				refFavPrice := markPrice
+				if tradePrice > 0 {
+					if pos.Side == model.SideLong && tradePrice > refFavPrice {
+						refFavPrice = tradePrice
+					} else if pos.Side == model.SideShort && tradePrice < refFavPrice {
+						refFavPrice = tradePrice
+					}
+				}
 				if pos.Side == model.SideLong {
-					if markPrice > entryF {
-						favPct := ((markPrice - entryF) / entryF) * 100.0
+					if refFavPrice > entryF {
+						favPct := ((refFavPrice - entryF) / entryF) * 100.0
 						if favPct > pos.MaxMFE {
 							pos.MaxMFE = favPct
 						}
@@ -315,8 +323,8 @@ func (d *DryRunBroker) OnRealtimeTick(
 						}
 					}
 				} else {
-					if markPrice < entryF {
-						favPct := ((entryF - markPrice) / entryF) * 100.0
+					if refFavPrice < entryF {
+						favPct := ((entryF - refFavPrice) / entryF) * 100.0
 						if favPct > pos.MaxMFE {
 							pos.MaxMFE = favPct
 						}
@@ -422,6 +430,15 @@ func (d *DryRunBroker) OnRealtimeTick(
 			return
 		}
 
+		chartPriceDec := decimal.Zero
+		if tradePrice > 0 {
+			chartPriceDec = decimal.NewFromFloat(tradePrice)
+		} else if pos.Side == model.SideLong && bestBid > 0 {
+			chartPriceDec = decimal.NewFromFloat(bestBid)
+		} else if pos.Side == model.SideShort && bestAsk > 0 {
+			chartPriceDec = decimal.NewFromFloat(bestAsk)
+		}
+
 		if pos.Side == model.SideLong {
 			if !pos.IsBreakEvenMoved && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(beTriggerDist) {
 				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
@@ -441,7 +458,9 @@ func (d *DryRunBroker) OnRealtimeTick(
 				delete(d.PendingOrders, symbol)
 				return
 			}
-			if triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) {
+			isTPHit := triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) ||
+				(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
+			if isTPHit {
 				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
 				delete(d.PendingOrders, symbol)
 				return
@@ -465,7 +484,9 @@ func (d *DryRunBroker) OnRealtimeTick(
 				delete(d.PendingOrders, symbol)
 				return
 			}
-			if triggerRefPrice.LessThanOrEqual(pos.TPPrice) {
+			isTPHit := triggerRefPrice.LessThanOrEqual(pos.TPPrice) ||
+				(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
+			if isTPHit {
 				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
 				delete(d.PendingOrders, symbol)
 				return

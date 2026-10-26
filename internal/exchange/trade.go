@@ -121,7 +121,11 @@ func (c *Client) PlaceAlgoOrder(
 	params.Set("orderType", orderType) // STOP_MARKET / TAKE_PROFIT_MARKET
 	params.Set("triggerPrice", triggerPrice.String())
 	params.Set("quantity", qty.String())
-	params.Set("workingType", "MARK_PRICE")
+	workingType := "MARK_PRICE"
+	if orderType == "TAKE_PROFIT_MARKET" {
+		workingType = "CONTRACT_PRICE"
+	}
+	params.Set("workingType", workingType)
 	params.Set("reduceOnly", "true")
 	params.Set("clientAlgoId", clientAlgoID)
 
