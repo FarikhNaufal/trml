@@ -76,6 +76,9 @@ type Config struct {
 	BTCGateEnabled       bool
 	BTCMax5mDumpPct      float64
 	BTCMax5mPumpPct      float64
+	AllowedSide          string
+	MaxFrenzyRVOL        float64
+	MaxCounterImpulseATR float64
 
 	// Batas Waktu & Staleness
 	ScannerInterval   time.Duration
@@ -376,6 +379,23 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_PUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxPumpStr)
 	}
 
+	allowedSide := strings.ToUpper(strings.TrimSpace(getEnv("ALLOWED_SIDE", "AUTO")))
+	if allowedSide != "AUTO" && allowedSide != "SHORT_ONLY" && allowedSide != "LONG_ONLY" && allowedSide != "BOTH" {
+		return nil, fmt.Errorf("config: invalid ALLOWED_SIDE '%s' (must be 'AUTO', 'SHORT_ONLY', 'LONG_ONLY', or 'BOTH')", allowedSide)
+	}
+
+	maxFrenzyRVOLStr := getEnv("MAX_FRENZY_RVOL", "2.50")
+	maxFrenzyRVOL, err := strconv.ParseFloat(maxFrenzyRVOLStr, 64)
+	if err != nil || maxFrenzyRVOL <= 0 {
+		return nil, fmt.Errorf("config: invalid MAX_FRENZY_RVOL '%s' (must be positive float)", maxFrenzyRVOLStr)
+	}
+
+	maxCounterImpulseATRStr := getEnv("MAX_COUNTER_IMPULSE_ATR", "1.50")
+	maxCounterImpulseATR, err := strconv.ParseFloat(maxCounterImpulseATRStr, 64)
+	if err != nil || maxCounterImpulseATR <= 0 {
+		return nil, fmt.Errorf("config: invalid MAX_COUNTER_IMPULSE_ATR '%s' (must be positive float)", maxCounterImpulseATRStr)
+	}
+
 	httpPort := getEnv("HTTP_PORT", "2020")
 	dashPIN := strings.TrimSpace(getEnv("DASHBOARD_PIN", ""))
 	geminiKey := strings.TrimSpace(getEnv("GEMINI_API_KEY", ""))
@@ -438,6 +458,9 @@ func LoadConfig() (*Config, error) {
 		BTCGateEnabled:       btcGateEnabled,
 		BTCMax5mDumpPct:      btcMaxDump,
 		BTCMax5mPumpPct:      btcMaxPump,
+		AllowedSide:          allowedSide,
+		MaxFrenzyRVOL:        maxFrenzyRVOL,
+		MaxCounterImpulseATR: maxCounterImpulseATR,
 
 		ScannerInterval:    15 * time.Minute,
 		MaxBookStaleness:   5 * time.Second,

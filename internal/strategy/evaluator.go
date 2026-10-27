@@ -42,9 +42,12 @@ type EvaluatorConfig struct {
 	EntryOrderType       string
 
 	// Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
-	BTCGateEnabled  bool
-	BTCMax5mDumpPct float64
-	BTCMax5mPumpPct float64
+	BTCGateEnabled       bool
+	BTCMax5mDumpPct      float64
+	BTCMax5mPumpPct      float64
+	AllowedSide          string
+	MaxFrenzyRVOL        float64
+	MaxCounterImpulseATR float64
 
 	Sizing SizingConfig
 }
@@ -315,6 +318,43 @@ func EvaluateSignal(
 		return model.OrderIntent{}, false, "CONDITIONS_NOT_MET", subReason
 	}
 
+	// KONFIRMASI 5B: Filter Arah Eksekusi (ALLOWED_SIDE)
+	allowedSide := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
+	if allowedSide == "SHORT_ONLY" && targetSide == model.SideLong {
+		return model.OrderIntent{}, false, "SIDE_DISABLED_SHORT_ONLY", "LONG_DISABLED_BY_CONFIG"
+	}
+	if allowedSide == "LONG_ONLY" && targetSide == model.SideShort {
+		return model.OrderIntent{}, false, "SIDE_DISABLED_LONG_ONLY", "SHORT_DISABLED_BY_CONFIG"
+	}
+
+	// KONFIRMASI 5C: Proteksi Anti-Frenzy / Explosive Counter-Impulse Filter
+	maxFrenzyRVOL := cfg.MaxFrenzyRVOL
+	if maxFrenzyRVOL <= 0 {
+		maxFrenzyRVOL = 2.50
+	}
+	maxCounterImpulseATR := cfg.MaxCounterImpulseATR
+	if maxCounterImpulseATR <= 0 {
+		maxCounterImpulseATR = 1.50
+	}
+
+	rvol := indicator.CalculateRVOL(snap.ClosedCandles, 20)
+	if rvol >= maxFrenzyRVOL {
+		checkLookback := 3
+		if len(snap.ClosedCandles) < checkLookback {
+			checkLookback = len(snap.ClosedCandles)
+		}
+		for i := len(snap.ClosedCandles) - checkLookback; i < len(snap.ClosedCandles); i++ {
+			c := snap.ClosedCandles[i]
+			barRange := c.High - c.Low
+			if targetSide == model.SideShort && c.Close > c.Open && barRange >= (maxCounterImpulseATR*atr14) {
+				return model.OrderIntent{}, false, "EXPLOSIVE_PUMP_FRENZY", fmt.Sprintf("RVOL_%.2f_AND_EXPANSION_BAR_%.2f_ATR", rvol, barRange/atr14)
+			}
+			if targetSide == model.SideLong && c.Close < c.Open && barRange >= (maxCounterImpulseATR*atr14) {
+				return model.OrderIntent{}, false, "PANIC_DUMP_FRENZY", fmt.Sprintf("RVOL_%.2f_AND_DUMP_BAR_%.2f_ATR", rvol, barRange/atr14)
+			}
+		}
+	}
+
 	// KONFIRMASI 6: Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
 	if cfg.BTCGateEnabled && btcSnap != nil && len(btcSnap.ClosedCandles) > 0 && snap.Symbol != "BTCUSDT" {
 		latestBTC := btcSnap.ClosedCandles[len(btcSnap.ClosedCandles)-1]
@@ -341,23 +381,28 @@ func EvaluateSignal(
 		}
 
 		// TIER 2: Symmetric Directional Bias (Soft Veto)
-		// 1. Posisi SHORT hanya diizinkan jika tren BTC memang tidak bullish kuat.
-		// Jika BTC berada di atas EMA dan di atas Session VWAP, veto posisi SHORT altcoin!
-		if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
-			btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
-			btcVWAP := btcSnap.CurrentSessionVWAP
-			if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
-				return model.OrderIntent{}, false, "BTC_TREND_BULLISH_SHORT_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_ABOVE_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+		// Aktif secara otomatis jika AllowedSide bernilai "AUTO" (default).
+		// Jika user secara manual mengatur AllowedSide="BOTH", maka Tier 2 di-bypass
+		// (Tier 1 Flash Crash Circuit Breaker tetap aktif menjaga keamanan).
+		if allowedSide == "AUTO" || allowedSide == "" {
+			// 1. Posisi SHORT hanya diizinkan jika tren BTC memang tidak bullish kuat.
+			// Jika BTC berada di atas EMA dan di atas Session VWAP, veto posisi SHORT altcoin!
+			if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
+				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
+				btcVWAP := btcSnap.CurrentSessionVWAP
+				if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
+					return model.OrderIntent{}, false, "BTC_TREND_BULLISH_SHORT_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_ABOVE_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+				}
 			}
-		}
 
-		// 2. Posisi LONG hanya diizinkan jika tren BTC tidak bearish lemah/menurun.
-		// Jika BTC berada di bawah EMA dan di bawah Session VWAP, veto posisi LONG altcoin!
-		if targetSide == model.SideLong && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
-			btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
-			btcVWAP := btcSnap.CurrentSessionVWAP
-			if latestBTC.Close < btcEMA && (btcVWAP <= 0 || latestBTC.Close < btcVWAP) {
-				return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+			// 2. Posisi LONG hanya diizinkan jika tren BTC tidak bearish lemah/menurun.
+			// Jika BTC berada di bawah EMA atau di bawah Session VWAP, veto posisi LONG altcoin!
+			if targetSide == model.SideLong && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
+				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
+				btcVWAP := btcSnap.CurrentSessionVWAP
+				if latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP) {
+					return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_OR_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+				}
 			}
 		}
 	}

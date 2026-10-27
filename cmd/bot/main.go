@@ -153,6 +153,9 @@ func main() {
 			BTCGateEnabled:       cfg.BTCGateEnabled,
 			BTCMax5mDumpPct:      cfg.BTCMax5mDumpPct,
 			BTCMax5mPumpPct:      cfg.BTCMax5mPumpPct,
+			AllowedSide:          cfg.AllowedSide,
+			MaxFrenzyRVOL:        cfg.MaxFrenzyRVOL,
+			MaxCounterImpulseATR: cfg.MaxCounterImpulseATR,
 			Sizing: strategy.SizingConfig{
 				RiskPerTradePct:               cfg.RiskPerTradePct,
 				MaxSlotMarginFraction:         cfg.MaxSlotMarginFrac,

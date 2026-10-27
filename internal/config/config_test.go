@@ -32,6 +32,15 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MaxWatchedCoins != 20 {
 		t.Errorf("expected 20 max watched coins, got %d", cfg.MaxWatchedCoins)
 	}
+	if cfg.AllowedSide != "AUTO" {
+		t.Errorf("expected default AllowedSide AUTO, got %s", cfg.AllowedSide)
+	}
+	if cfg.MaxFrenzyRVOL != 2.50 {
+		t.Errorf("expected default MaxFrenzyRVOL 2.50, got %f", cfg.MaxFrenzyRVOL)
+	}
+	if cfg.MaxCounterImpulseATR != 1.50 {
+		t.Errorf("expected default MaxCounterImpulseATR 1.50, got %f", cfg.MaxCounterImpulseATR)
+	}
 }
 
 func TestLoadConfigMainnet(t *testing.T) {
@@ -95,6 +104,55 @@ func TestValidationErrors(t *testing.T) {
 		t.Errorf("expected error for RECV_WINDOW_MS < 1000")
 	}
 	_ = os.Unsetenv("RECV_WINDOW_MS")
+
+	// 6. Invalid ALLOWED_SIDE
+	_ = os.Setenv("ALLOWED_SIDE", "SIDEWAYS")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Errorf("expected error for invalid ALLOWED_SIDE")
+	}
+	_ = os.Unsetenv("ALLOWED_SIDE")
+
+	// 7. Invalid MAX_FRENZY_RVOL
+	_ = os.Setenv("MAX_FRENZY_RVOL", "-1.0")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Errorf("expected error for negative MAX_FRENZY_RVOL")
+	}
+	_ = os.Unsetenv("MAX_FRENZY_RVOL")
+
+	// 8. Invalid MAX_COUNTER_IMPULSE_ATR
+	_ = os.Setenv("MAX_COUNTER_IMPULSE_ATR", "abc")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Errorf("expected error for non-numeric MAX_COUNTER_IMPULSE_ATR")
+	}
+	_ = os.Unsetenv("MAX_COUNTER_IMPULSE_ATR")
+}
+
+func TestAllowedSideAndFrenzyConfig(t *testing.T) {
+	_ = os.Setenv("ALLOWED_SIDE", "short_only")
+	_ = os.Setenv("MAX_FRENZY_RVOL", "3.25")
+	_ = os.Setenv("MAX_COUNTER_IMPULSE_ATR", "1.75")
+	defer func() {
+		_ = os.Unsetenv("ALLOWED_SIDE")
+		_ = os.Unsetenv("MAX_FRENZY_RVOL")
+		_ = os.Unsetenv("MAX_COUNTER_IMPULSE_ATR")
+	}()
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AllowedSide != "SHORT_ONLY" {
+		t.Errorf("expected SHORT_ONLY (uppercased), got %s", cfg.AllowedSide)
+	}
+	if cfg.MaxFrenzyRVOL != 3.25 {
+		t.Errorf("expected 3.25, got %f", cfg.MaxFrenzyRVOL)
+	}
+	if cfg.MaxCounterImpulseATR != 1.75 {
+		t.Errorf("expected 1.75, got %f", cfg.MaxCounterImpulseATR)
+	}
 }
 
 func TestMaxDailyDrawdownDryRunAndLiveClamping(t *testing.T) {

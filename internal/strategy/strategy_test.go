@@ -940,6 +940,322 @@ func TestEvaluateSignalBTCMacroGateTrendBearishVetoLong(t *testing.T) {
 	}
 }
 
+func helperCreateValidLongSnapshot(now time.Time) (model.MarketSnapshot, EvaluatorConfig) {
+	cfg := EvaluatorConfig{
+		MaxSlots:              3,
+		MaxBookStaleness:      5 * time.Second,
+		MaxMarkStaleness:      15 * time.Second,
+		MaxDataStaleness:      330 * time.Second,
+		MinOIInterval:         4 * time.Minute,
+		MaxOIInterval:         7 * time.Minute,
+		MaxOIStaleness:        300 * time.Second,
+		MaxSpreadPct:          0.05,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		EMAPeriod:             50,
+		ATRPeriod:             14,
+		DeltaZScoreWindow:     50,
+		MinBarDeltaZScore:     1.20,
+		MinOIDeltaPct:         0.20,
+		MaxAdverseFundingRate: 0.0005,
+		PullbackToleranceATR:  0.35,
+		MinBounceZScore:       1.20,
+		LookbackImpulseBars:   12,
+		MinImpulseATR:         1.0,
+		BTCGateEnabled:        false,
+		AllowedSide:           "BOTH",
+		MaxFrenzyRVOL:         2.50,
+		MaxCounterImpulseATR:  1.50,
+		Sizing: SizingConfig{
+			RiskPerTradePct:       decimal.NewFromFloat(0.01),
+			MaxSlotMarginFraction: decimal.NewFromFloat(0.30),
+			AccountLeverage:       5.0,
+			SLMultiplier:          1.0,
+			TPMultiplier:          2.0,
+			MakerFeeRate:          decimal.NewFromFloat(0.0002),
+			TakerFeeRate:          decimal.NewFromFloat(0.0005),
+			SlippageRate:          decimal.NewFromFloat(0.0002),
+		},
+	}
+
+	candles := make([]model.Candle, 60)
+	barDeltas := make([]float64, 60)
+	for i := 0; i < 60; i++ {
+		candles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(-60+i) * 5 * time.Minute),
+			CloseTime:  now.Add(time.Duration(-59+i) * 5 * time.Minute),
+			Open:       95.0 + float64(i)*0.15,
+			High:       96.0 + float64(i)*0.15,
+			Low:        94.5 + float64(i)*0.15,
+			Close:      95.5 + float64(i)*0.15,
+			VolumeBase: 1000.0,
+		}
+		barDeltas[i] = 100.0 + float64(i%7)*15.0
+	}
+
+	vwap := 105.0
+	candles[55].High = 107.5
+	candles[55].Close = 107.0
+
+	candles[59].Open = 105.1
+	candles[59].Low = 104.9
+	candles[59].High = 106.0
+	candles[59].Close = 105.8
+	candles[59].VolumeBase = 1000.0
+	barDeltas[59] = 2000.0
+
+	snap := model.MarketSnapshot{
+		Symbol:              "SOLUSDT",
+		BestBid:             105.70,
+		BestAsk:             105.72,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           105.71,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  vwap,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+	return snap, cfg
+}
+
+func helperCreateValidShortSnapshot(now time.Time) (model.MarketSnapshot, EvaluatorConfig) {
+	cfg := EvaluatorConfig{
+		MaxSlots:              3,
+		MaxBookStaleness:      5 * time.Second,
+		MaxMarkStaleness:      15 * time.Second,
+		MaxDataStaleness:      330 * time.Second,
+		MinOIInterval:         4 * time.Minute,
+		MaxOIInterval:         7 * time.Minute,
+		MaxOIStaleness:        300 * time.Second,
+		MaxSpreadPct:          0.05,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		EMAPeriod:             50,
+		ATRPeriod:             14,
+		DeltaZScoreWindow:     50,
+		MinBarDeltaZScore:     1.20,
+		MinOIDeltaPct:         -0.10,
+		MaxAdverseFundingRate: 0.0005,
+		PullbackToleranceATR:  0.35,
+		MinBounceZScore:       1.20,
+		LookbackImpulseBars:   12,
+		MinImpulseATR:         1.0,
+		BTCGateEnabled:        false,
+		AllowedSide:           "BOTH",
+		MaxFrenzyRVOL:         2.50,
+		MaxCounterImpulseATR:  1.50,
+		Sizing: SizingConfig{
+			RiskPerTradePct:       decimal.NewFromFloat(0.01),
+			MaxSlotMarginFraction: decimal.NewFromFloat(0.30),
+			AccountLeverage:       5.0,
+			SLMultiplier:          1.0,
+			TPMultiplier:          2.0,
+			MakerFeeRate:          decimal.NewFromFloat(0.0002),
+			TakerFeeRate:          decimal.NewFromFloat(0.0005),
+			SlippageRate:          decimal.NewFromFloat(0.0002),
+		},
+	}
+
+	candles := make([]model.Candle, 60)
+	barDeltas := make([]float64, 60)
+	for i := 0; i < 60; i++ {
+		candles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(-60+i) * 5 * time.Minute),
+			CloseTime:  now.Add(time.Duration(-59+i) * 5 * time.Minute),
+			Open:       115.0 - float64(i)*0.25,
+			High:       115.5 - float64(i)*0.25,
+			Low:        114.0 - float64(i)*0.25,
+			Close:      114.5 - float64(i)*0.25,
+			VolumeBase: 1000.0,
+		}
+		barDeltas[i] = -100.0 - float64(i%7)*15.0
+	}
+
+	vwap := 100.0
+	candles[55].Low = 97.0
+	candles[55].Close = 97.5
+
+	candles[59].Open = 99.9
+	candles[59].High = 100.2
+	candles[59].Low = 99.0
+	candles[59].Close = 99.2
+	candles[59].VolumeBase = 1000.0
+	barDeltas[59] = -2000.0
+
+	snap := model.MarketSnapshot{
+		Symbol:              "SOLUSDT",
+		BestBid:             99.28,
+		BestAsk:             99.30,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           99.29,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         -0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  vwap,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+	return snap, cfg
+}
+
+func TestEvaluateSignal_AllowedSide(t *testing.T) {
+	now := time.Now().UTC()
+
+	// 1. SHORT_ONLY blocks LONG
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+	cfgLong.AllowedSide = "SHORT_ONLY"
+	_, ok, reason, subReason := EvaluateSignal(snapLong, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if ok || reason != "SIDE_DISABLED_SHORT_ONLY" || subReason != "LONG_DISABLED_BY_CONFIG" {
+		t.Fatalf("expected SIDE_DISABLED_SHORT_ONLY, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+
+	// 2. LONG_ONLY blocks SHORT
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	cfgShort.AllowedSide = "LONG_ONLY"
+	_, ok, reason, subReason = EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if ok || reason != "SIDE_DISABLED_LONG_ONLY" || subReason != "SHORT_DISABLED_BY_CONFIG" {
+		t.Fatalf("expected SIDE_DISABLED_LONG_ONLY, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+
+	// 3. BOTH allows SHORT
+	cfgShort.AllowedSide = "BOTH"
+	_, ok, reason, _ = EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if !ok || reason != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SIGNAL_APPROVED with BOTH, got ok=%v, reason=%s", ok, reason)
+	}
+}
+
+func TestEvaluateSignal_AntiFrenzyPumpVeto(t *testing.T) {
+	now := time.Now().UTC()
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	cfgShort.MaxFrenzyRVOL = 2.50
+	cfgShort.MaxCounterImpulseATR = 1.50
+
+	// Buat candle i=58 menjadi green expansion bar yang besar (> 1.5 * ATR)
+	// ATR rata-rata ~1.5, jadi expansion 3.5 sudah > 2.0x ATR
+	snapShort.ClosedCandles[58].Open = 96.0
+	snapShort.ClosedCandles[58].Close = 99.8
+	snapShort.ClosedCandles[58].High = 100.0
+	snapShort.ClosedCandles[58].Low = 95.8
+	// RVOL lonjak di atas 2.50 (misal 3.50)
+	snapShort.ClosedCandles[59].VolumeBase = 3500.0
+
+	_, ok, reason, subReason := EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if ok || reason != "EXPLOSIVE_PUMP_FRENZY" {
+		t.Fatalf("expected EXPLOSIVE_PUMP_FRENZY, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+	if !strings.Contains(subReason, "RVOL_") || !strings.Contains(subReason, "EXPANSION_BAR_") {
+		t.Errorf("expected subReason to contain RVOL_ and EXPANSION_BAR_, got %s", subReason)
+	}
+}
+
+func TestEvaluateSignal_AntiFrenzyDumpVeto(t *testing.T) {
+	now := time.Now().UTC()
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+	cfgLong.MaxFrenzyRVOL = 2.50
+	cfgLong.MaxCounterImpulseATR = 1.50
+
+	// Buat candle i=58 menjadi red dump bar yang besar (> 1.5 * ATR)
+	snapLong.ClosedCandles[58].Open = 108.0
+	snapLong.ClosedCandles[58].Close = 103.5
+	snapLong.ClosedCandles[58].High = 108.2
+	snapLong.ClosedCandles[58].Low = 103.3
+	// RVOL lonjak di atas 2.50
+	snapLong.ClosedCandles[59].VolumeBase = 3500.0
+
+	_, ok, reason, subReason := EvaluateSignal(snapLong, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if ok || reason != "PANIC_DUMP_FRENZY" {
+		t.Fatalf("expected PANIC_DUMP_FRENZY, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+	if !strings.Contains(subReason, "RVOL_") || !strings.Contains(subReason, "DUMP_BAR_") {
+		t.Errorf("expected subReason to contain RVOL_ and DUMP_BAR_, got %s", subReason)
+	}
+}
+
+func TestEvaluateSignal_BTCGate_BearishLongVeto_OrCondition(t *testing.T) {
+	now := time.Now().UTC()
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+	cfgLong.AllowedSide = "AUTO"
+	cfgLong.BTCGateEnabled = true
+	cfgLong.BTCMax5mDumpPct = 0.60
+	cfgLong.BTCMax5mPumpPct = 0.60
+
+	// 1. Kasus A: BTC berada di bawah EMA (83000 < 84000), meskipun di atas VWAP (83000 > 82000)
+	btcCandlesA := make([]model.Candle, 55)
+	for i := 0; i < 55; i++ {
+		p := 85000.0 - float64(i)*50.0 // Tren turun, Close terakhir ~82300, EMA ~84000
+		btcCandlesA[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:       p, High: p + 10.0, Low: p - 30.0, Close: p - 20.0,
+			VolumeBase: 100.0,
+		}
+	}
+	btcSnapA := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		ClosedCandles:      btcCandlesA,
+		CurrentSessionVWAP: 82000.0, // VWAP di bawah close (close > VWAP), tapi close < EMA
+		Now:                now,
+	}
+
+	_, okA, reasonA, _ := EvaluateSignal(snapLong, &btcSnapA, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if okA || reasonA != "BTC_TREND_BEARISH_LONG_VETO" {
+		t.Fatalf("expected BTC_TREND_BEARISH_LONG_VETO when BTC below EMA (even if above VWAP), got ok=%v, reason=%s", okA, reasonA)
+	}
+
+	// 2. Kasus B: BTC berada di atas EMA (85000 > 84000), tapi di bawah VWAP (85000 < 86000)
+	btcCandlesB := make([]model.Candle, 55)
+	for i := 0; i < 55; i++ {
+		p := 83000.0 + float64(i)*50.0 // Tren naik perlahan, EMA ~84000, Close ~85700
+		btcCandlesB[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:       p, High: p + 30.0, Low: p - 10.0, Close: p + 20.0,
+			VolumeBase: 100.0,
+		}
+	}
+	btcSnapB := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		ClosedCandles:      btcCandlesB,
+		CurrentSessionVWAP: 87000.0, // VWAP di atas close (close < VWAP), meskipun close > EMA
+		Now:                now,
+	}
+
+	_, okB, reasonB, _ := EvaluateSignal(snapLong, &btcSnapB, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if okB || reasonB != "BTC_TREND_BEARISH_LONG_VETO" {
+		t.Fatalf("expected BTC_TREND_BEARISH_LONG_VETO when BTC below VWAP (even if above EMA), got ok=%v, reason=%s", okB, reasonB)
+	}
+
+	// 3. Kasus C: ALLOWED_SIDE="BOTH" mengizinkan LONG meskipun tren BTC bearish (Tier 2 di-bypass)
+	cfgLong.AllowedSide = "BOTH"
+	_, okC, reasonC, _ := EvaluateSignal(snapLong, &btcSnapA, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if !okC || reasonC != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SIGNAL_APPROVED when ALLOWED_SIDE=BOTH (bypassing Tier 2 soft veto), got ok=%v, reason=%s", okC, reasonC)
+	}
+}
+
 
 
 
