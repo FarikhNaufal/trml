@@ -249,7 +249,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid ENTRY_ORDER_TYPE '%s' (must be 'MARKET' or 'LIMIT')", entryOrderType)
 	}
 
-	defaultMinVol := 40_000_000.0
+	defaultMinVol := 35_000_000.0
 	if env == EnvTestnet {
 		defaultMinVol = 0.0
 	}
@@ -324,13 +324,13 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_FALLBACK_RVOL '%s' (must be positive float)", minFallbackRVOLStr)
 	}
 
-	maxSpreadStr := getEnv("MAX_SPREAD_PCT", "0.05")
+	maxSpreadStr := getEnv("MAX_SPREAD_PCT", "0.06")
 	maxSpread, err := strconv.ParseFloat(maxSpreadStr, 64)
 	if err != nil || maxSpread <= 0 || maxSpread > 1.0 {
 		return nil, fmt.Errorf("config: invalid MAX_SPREAD_PCT '%s' (must be float between 0.001 and 1.0)", maxSpreadStr)
 	}
 
-	minNATRStr := getEnv("MIN_NATR_PCT", "0.45")
+	minNATRStr := getEnv("MIN_NATR_PCT", "0.35")
 	minNATR, err := strconv.ParseFloat(minNATRStr, 64)
 	if err != nil || minNATR <= 0 || minNATR > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_NATR_PCT '%s' (must be float between 0.01 and 10.0)", minNATRStr)
