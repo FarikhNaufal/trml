@@ -138,3 +138,64 @@ func TestScannerFallbackFilter(t *testing.T) {
 		t.Fatalf("expected BTCUSDT selected via fallback, got %v", selectedMod)
 	}
 }
+
+func TestScannerVWAPProximityFilter(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := ScannerConfig{
+		MinVolume24hUSDT:      50_000_000,
+		MaxSpreadPct:          0.05,
+		MinRVOL:               1.0,
+		RVOLLookback:          20,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.0,
+		MaxScannerVWAPDistATR: 2.50,
+		ATRPeriod:             14,
+		EMAPeriod:             50,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        100,
+		DeltaWindow:           50,
+	}
+
+	filters := map[string]model.ExchangeFilter{
+		"PUMPUSDT": {
+			TickSize: decimal.NewFromFloat(0.01),
+			StepSize: decimal.NewFromFloat(1.0),
+		},
+	}
+	volMap := map[string]float64{"PUMPUSDT": 100_000_000}
+	bookMap := map[string]model.BookQuote{
+		"PUMPUSDT": {BestBid: 150.0, BestAsk: 150.01},
+	}
+
+	// 101 candle dengan harga naik drastis di candle terakhir menjauhi Session VWAP
+	// VWAP berada di ~100, tapi harga melonjak ke 150 (ATR = 10 -> Dist = 5 ATR > 2.50)
+	candlesFar := make([]model.Candle, 101)
+	for i := 0; i < 101; i++ {
+		tOpen := now.Add(time.Duration(i-101) * 5 * time.Minute)
+		tClose := tOpen.Add(5 * time.Minute)
+		price := 100.0
+		if i == 100 {
+			price = 150.0 // Melonjak jauh
+		}
+		candlesFar[i] = model.Candle{
+			OpenTime:        tOpen,
+			CloseTime:       tClose,
+			Open:            price,
+			High:            price + 5.0,
+			Low:             price - 5.0,
+			Close:           price,
+			VolumeBase:      1000.0,
+			QuoteVolumeUSDT: 100_000,
+		}
+	}
+	candlesFar[100].VolumeBase = 3000.0 // High RVOL
+
+	activeStates := make(map[string]*model.SymbolState)
+	selected := RunBulkMarketScanner(cfg, activeStates, filters, volMap, bookMap, func(sym string, limit int) []model.Candle {
+		return candlesFar
+	}, now)
+
+	if len(selected) != 0 {
+		t.Fatalf("expected PUMPUSDT to be filtered out due to VWAP distance > 2.50 ATR, got %v", selected)
+	}
+}

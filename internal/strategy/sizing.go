@@ -62,14 +62,10 @@ func BuildSafeDecimalOrderIntent(
 	if tp1Mult <= 0 {
 		tp1Mult = 1.20
 	}
+	// TP1 adalah mekanisme de-risking cepat (Scale-Out 50% + Geser SL ke BE).
+	// Jarak TP1 HARUS selalu mengacu murni pada volatilitas alami koin (ATR14)
+	// dan TIDAK BOLEH digelembungkan oleh slDist floor agar selalu realistis disentuh pada swing awal.
 	tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
-	// Jika ada floor pada slDist, sesuaikan tp1Dist proporsional
-	if cfg.SLMultiplier > 0 {
-		minTP1Dist := slDist.Mul(decimal.NewFromFloat(tp1Mult / cfg.SLMultiplier))
-		if tp1Dist.LessThan(minTP1Dist) {
-			tp1Dist = minTP1Dist
-		}
-	}
 
 	var slPrice, tpPrice, tp1Price decimal.Decimal
 	if side == model.SideLong {

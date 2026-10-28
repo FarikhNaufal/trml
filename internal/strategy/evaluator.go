@@ -37,6 +37,7 @@ type EvaluatorConfig struct {
 	MinBounceZScore        float64
 	MinBounceZScoreLong    float64
 	MinBounceZScoreShort   float64
+	MinEMA200DistanceATR   float64
 	LookbackImpulseBars    int
 	RetestLookbackBars     int
 	MinImpulseATR          float64
@@ -243,14 +244,20 @@ func EvaluateSignal(
 	oiValidLong := (oiDeltaPct >= minOIDeltaLong) || (barDeltaZScore >= 0.80) || (natrPct >= 0.70)
 	oiValidShort := (oiDeltaPct >= minOIDeltaShort) || (barDeltaZScore <= -0.80) || (natrPct >= 0.70)
 
-	longValid := (latest.Close > ema200) &&
+	// Filter Tren Struktural & Anti-Chop EMA200: Jarak Close ke EMA200 minimal MinEMA200DistanceATR
+	// untuk menghindari eksekusi sinyal palsu saat harga sedang bolak-balik menempel di kawat EMA200 yang mendatar.
+	minEMADist := cfg.MinEMA200DistanceATR * atr14
+	emaTrendLong := (latest.Close > ema200) && (minEMADist <= 0 || (latest.Close-ema200) >= minEMADist)
+	emaTrendShort := (latest.Close < ema200) && (minEMADist <= 0 || (ema200-latest.Close) >= minEMADist)
+
+	longValid := emaTrendLong &&
 		hasPriorBullishImpulse &&
 		longTestedVWAP &&
 		longBounce &&
 		oiValidLong &&
 		(snap.FundingRate <= cfg.MaxAdverseFundingRate)
 
-	shortValid := (latest.Close < ema200) &&
+	shortValid := emaTrendShort &&
 		hasPriorBearishImpulse &&
 		shortTestedVWAP &&
 		shortBounce &&
@@ -280,6 +287,8 @@ func EvaluateSignal(
 		var longFails []string
 		if latest.Close <= ema200 {
 			longFails = append(longFails, "TREND_BELOW_EMA200")
+		} else if !emaTrendLong {
+			longFails = append(longFails, "EMA200_CHOP_ZONE")
 		}
 		if !hasPriorBullishImpulse {
 			longFails = append(longFails, "NO_PRIOR_IMPULSE")
@@ -306,6 +315,8 @@ func EvaluateSignal(
 		var shortFails []string
 		if latest.Close >= ema200 {
 			shortFails = append(shortFails, "TREND_ABOVE_EMA200")
+		} else if !emaTrendShort {
+			shortFails = append(shortFails, "EMA200_CHOP_ZONE")
 		}
 		if !hasPriorBearishImpulse {
 			shortFails = append(shortFails, "NO_PRIOR_IMPULSE")

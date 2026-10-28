@@ -63,6 +63,15 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MaxHoldingDuration != 4*time.Hour {
 		t.Errorf("expected default MaxHoldingDuration 4h, got %v", cfg.MaxHoldingDuration)
 	}
+	if cfg.MinNATRPct != 0.75 {
+		t.Errorf("expected default MinNATRPct 0.75, got %f", cfg.MinNATRPct)
+	}
+	if cfg.MaxScannerVWAPDistATR != 2.50 {
+		t.Errorf("expected default MaxScannerVWAPDistATR 2.50, got %f", cfg.MaxScannerVWAPDistATR)
+	}
+	if cfg.MinEMA200DistanceATR != 0.15 {
+		t.Errorf("expected default MinEMA200DistanceATR 0.15, got %f", cfg.MinEMA200DistanceATR)
+	}
 }
 
 func TestLoadConfigMainnet(t *testing.T) {

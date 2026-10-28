@@ -386,8 +386,19 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 }
 
 func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
+	// Agregasikan metrik per setup posisi (menggabungkan tiket partial _TP1 dan Runner menjadi 1 setup utuh)
+	// agar Win Rate, Avg Win, dan Realized R:R tidak terdistorsi ke bawah oleh pembagian lot.
 	query := `
-		SELECT exit_reason, net_pnl_usdt FROM trade_ledger;
+		SELECT 
+			CASE 
+				WHEN signal_audit_id > 0 THEN CAST(signal_audit_id AS TEXT)
+				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
+				ELSE client_order_id 
+			END AS setup_id,
+			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
+			MAX(exit_reason) AS last_exit_reason
+		FROM trade_ledger
+		GROUP BY setup_id;
 	`
 	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
@@ -399,15 +410,15 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 	var totalWinVal, totalLossVal float64
 
 	for rows.Next() {
-		var reason, pnlStr string
-		if err := rows.Scan(&reason, &pnlStr); err != nil {
+		var setupID, reason string
+		var pnl float64
+		if err := rows.Scan(&setupID, &pnl, &reason); err != nil {
 			continue
 		}
-		pnl, _ := strconv.ParseFloat(pnlStr, 64)
 		stats.TotalTrades++
 		stats.TotalNetPnLUSDT += pnl
 
-		if reason == "TAKE_PROFIT" || reason == "PROFIT_LOCK" || reason == "PARTIAL_TAKE_PROFIT" || reason == "TRAILING_STOP" || pnl > 0.005 {
+		if pnl > 0.005 || reason == "TAKE_PROFIT" || reason == "PROFIT_LOCK" || reason == "PARTIAL_TAKE_PROFIT" || reason == "TRAILING_STOP" {
 			stats.WinsCount++
 			totalWinVal += pnl
 		} else if reason == "BREAK_EVEN" || (reason != "STOP_LOSS" && math.Abs(pnl) <= 0.05) {

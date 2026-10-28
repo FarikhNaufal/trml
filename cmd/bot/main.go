@@ -147,6 +147,7 @@ func main() {
 			MinBounceZScore:        cfg.MinBounceZScore,
 			MinBounceZScoreLong:    cfg.MinBounceZScoreLong,
 			MinBounceZScoreShort:   cfg.MinBounceZScoreShort,
+			MinEMA200DistanceATR:   cfg.MinEMA200DistanceATR,
 			LookbackImpulseBars:    cfg.LookbackImpulseBars,
 			RetestLookbackBars:     cfg.RetestLookbackBars,
 			MinImpulseATR:          cfg.MinImpulseATR,
@@ -174,18 +175,19 @@ func main() {
 			},
 		},
 		scannerCfg: scanner.ScannerConfig{
-			MinVolume24hUSDT: cfg.MinVolume24hUSDT,
-			MaxSpreadPct:     cfg.MaxSpreadPct,
-			MinRVOL:          1.80,
-			MinFallbackRVOL:  cfg.MinFallbackRVOL,
-			RVOLLookback:     20,
-			MinNATRPct:       cfg.MinNATRPct,
-			MaxNATRPct:       cfg.MaxNATRPct,
-			ATRPeriod:        14,
-			EMAPeriod:        200,
-			MaxWatchedCoins:  cfg.MaxWatchedCoins,
-			BootstrapCount:   1000,
-			DeltaWindow:      50,
+			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
+			MaxSpreadPct:          cfg.MaxSpreadPct,
+			MinRVOL:               1.80,
+			MinFallbackRVOL:       cfg.MinFallbackRVOL,
+			RVOLLookback:          20,
+			MinNATRPct:            cfg.MinNATRPct,
+			MaxNATRPct:            cfg.MaxNATRPct,
+			MaxScannerVWAPDistATR: cfg.MaxScannerVWAPDistATR,
+			ATRPeriod:             14,
+			EMAPeriod:             200,
+			MaxWatchedCoins:       cfg.MaxWatchedCoins,
+			BootstrapCount:        1000,
+			DeltaWindow:           50,
 		},
 	}
 
@@ -288,6 +290,7 @@ func main() {
 					EntryPrice:       sp.EntryPrice,
 					EntryFee:         sp.EntryFee,
 					CurrentSLPrice:   sp.CurrentSLPrice,
+					InitialSLPrice:   sp.InitialSLPrice,
 					TPPrice:          sp.TPPrice,
 					TP1Price:         sp.TP1Price,
 					IsTP1Hit:         sp.IsTP1Hit,
@@ -684,7 +687,7 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 		vwap := st.CurrentSessionVWAP
 		spread := 0.0
 		if st.BestBid > 0 && st.BestAsk > 0 {
-			spread = (st.BestAsk - st.BestBid) / st.BestBid
+			spread = ((st.BestAsk - st.BestBid) / st.BestBid) * 100.0
 		}
 		funding := st.FundingRate
 		candleLen := len(st.ClosedCandles)

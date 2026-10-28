@@ -27,6 +27,7 @@ type VirtualOpenPosition struct {
 	EntryPrice       decimal.Decimal
 	EntryFee         decimal.Decimal
 	CurrentSLPrice   decimal.Decimal
+	InitialSLPrice   decimal.Decimal
 	TPPrice          decimal.Decimal
 	TP1Price         decimal.Decimal
 	IsTP1Hit         bool
@@ -257,6 +258,7 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			EntryPrice:       fillPrice,
 			EntryFee:         entryFee,
 			CurrentSLPrice:   intent.SLPrice,
+			InitialSLPrice:   intent.SLPrice,
 			TPPrice:          intent.TPPrice,
 			TP1Price:         intent.TP1Price,
 			ATRAtEntry:       intent.ATRAtEntry,
@@ -693,6 +695,7 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 			EntryPrice:       ord.Intent.LimitPrice,
 			EntryFee:         entryFee,
 			CurrentSLPrice:   ord.Intent.SLPrice,
+			InitialSLPrice:   ord.Intent.SLPrice,
 			TPPrice:          ord.Intent.TPPrice,
 			TP1Price:         ord.Intent.TP1Price,
 			ATRAtEntry:       ord.Intent.ATRAtEntry,
@@ -767,6 +770,14 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 
 	now := time.Now().UTC()
 	if d.OnTradeClosedFn != nil {
+		slPriceTP1 := pos.InitialSLPrice
+		if slPriceTP1.IsZero() {
+			slPriceTP1 = pos.CurrentSLPrice
+		}
+		tpPriceTP1 := pos.TP1Price
+		if tpPriceTP1.IsZero() {
+			tpPriceTP1 = pos.TPPrice
+		}
 		tradeRec := TradeClosedRecord{
 			ClientOrderID: fmt.Sprintf("%s_TP1", pos.ClientOrderID),
 			Symbol:        pos.Symbol,
@@ -774,8 +785,8 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 			Qty:           closeQty,
 			EntryPrice:    pos.EntryPrice,
 			ExitPrice:     exitPrice,
-			SLPrice:       pos.CurrentSLPrice,
-			TPPrice:       pos.TPPrice,
+			SLPrice:       slPriceTP1,
+			TPPrice:       tpPriceTP1,
 			NetPnL:        netPnL,
 			MAE:           pos.MaxMAE,
 			MFE:           pos.MaxMFE,
@@ -822,6 +833,11 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 		clientOrderID = fmt.Sprintf("SIM-%s-%d", pos.Symbol, pos.OpenTime.UnixNano())
 	}
 
+	slToLog := pos.InitialSLPrice
+	if slToLog.IsZero() {
+		slToLog = pos.CurrentSLPrice
+	}
+
 	rec := TradeClosedRecord{
 		ClientOrderID: clientOrderID,
 		Symbol:        pos.Symbol,
@@ -829,7 +845,7 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 		Qty:           pos.Qty,
 		EntryPrice:    pos.EntryPrice,
 		ExitPrice:     exitPrice,
-		SLPrice:       pos.CurrentSLPrice,
+		SLPrice:       slToLog,
 		TPPrice:       pos.TPPrice,
 		NetPnL:        netPnL,
 		MAE:           pos.MaxMAE,

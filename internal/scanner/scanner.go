@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -11,18 +12,19 @@ import (
 )
 
 type ScannerConfig struct {
-	MinVolume24hUSDT float64
-	MaxSpreadPct     float64
-	MinRVOL          float64
-	MinFallbackRVOL  float64
-	RVOLLookback     int
-	MinNATRPct       float64
-	MaxNATRPct       float64
-	ATRPeriod        int
-	EMAPeriod        int
-	MaxWatchedCoins  int
-	BootstrapCount   int
-	DeltaWindow      int
+	MinVolume24hUSDT      float64
+	MaxSpreadPct          float64
+	MinRVOL               float64
+	MinFallbackRVOL       float64
+	RVOLLookback          int
+	MinNATRPct            float64
+	MaxNATRPct            float64
+	MaxScannerVWAPDistATR float64
+	ATRPeriod             int
+	EMAPeriod             int
+	MaxWatchedCoins       int
+	BootstrapCount        int
+	DeltaWindow           int
 }
 
 func RunBulkMarketScanner(
@@ -76,6 +78,18 @@ func RunBulkMarketScanner(
 		natrPct := (atr14 / lastClose) * 100.0
 		if natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
 			continue
+		}
+
+		// Filter Kedekatan VWAP: Tolak koin yang sudah terbang/jatuh terlalu jauh dari Session VWAP
+		// (misal > 2.50x ATR) agar slot radar 20 koin tidak disia-siakan untuk koin yang mustahil pullback.
+		if cfg.MaxScannerVWAPDistATR > 0 && atr14 > 0 {
+			sessionVWAP := indicator.CalculateSessionVWAP(validKlines)
+			if sessionVWAP > 0 {
+				distFromVWAP := math.Abs(lastClose - sessionVWAP)
+				if (distFromVWAP / atr14) > cfg.MaxScannerVWAPDistATR {
+					continue
+				}
+			}
 		}
 
 		rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)

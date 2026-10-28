@@ -56,13 +56,15 @@ type Config struct {
 	MinVolume24hUSDT float64
 	MinFallbackRVOL  float64
 	MaxSpreadPct     float64
-	MinNATRPct       float64
-	MaxNATRPct       float64
-	MaxWatchedCoins  int
+	MinNATRPct            float64
+	MaxNATRPct            float64
+	MaxScannerVWAPDistATR float64
+	MaxWatchedCoins       int
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
 	PullbackToleranceATR float64
 	MinBounceZScore      float64
+	MinEMA200DistanceATR float64
 	LookbackImpulseBars  int
 	RetestLookbackBars   int
 	MinImpulseATR        float64
@@ -281,6 +283,12 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
 	}
 
+	minEMA200DistStr := getEnv("MIN_EMA200_DISTANCE_ATR", "0.15")
+	minEMA200Dist, err := strconv.ParseFloat(minEMA200DistStr, 64)
+	if err != nil || minEMA200Dist < 0 || minEMA200Dist > 5.0 {
+		return nil, fmt.Errorf("config: invalid MIN_EMA200_DISTANCE_ATR '%s' (must be float between 0.0 and 5.0)", minEMA200DistStr)
+	}
+
 	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "0.40")
 	minBounceZLong, err := strconv.ParseFloat(minBounceZLongStr, 64)
 	if err != nil || minBounceZLong <= 0 {
@@ -334,7 +342,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_SPREAD_PCT '%s' (must be float between 0.001 and 1.0)", maxSpreadStr)
 	}
 
-	minNATRStr := getEnv("MIN_NATR_PCT", "0.35")
+	minNATRStr := getEnv("MIN_NATR_PCT", "0.75")
 	minNATR, err := strconv.ParseFloat(minNATRStr, 64)
 	if err != nil || minNATR <= 0 || minNATR > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_NATR_PCT '%s' (must be float between 0.01 and 10.0)", minNATRStr)
@@ -344,6 +352,12 @@ func LoadConfig() (*Config, error) {
 	maxNATR, err := strconv.ParseFloat(maxNATRStr, 64)
 	if err != nil || maxNATR < minNATR || maxNATR > 20.0 {
 		return nil, fmt.Errorf("config: invalid MAX_NATR_PCT '%s' (must be float >= MIN_NATR_PCT and <= 20.0)", maxNATRStr)
+	}
+
+	maxScannerVWAPDistStr := getEnv("MAX_SCANNER_VWAP_DIST_ATR", "2.50")
+	maxScannerVWAPDist, err := strconv.ParseFloat(maxScannerVWAPDistStr, 64)
+	if err != nil || maxScannerVWAPDist < 0 || maxScannerVWAPDist > 20.0 {
+		return nil, fmt.Errorf("config: invalid MAX_SCANNER_VWAP_DIST_ATR '%s' (must be float between 0.0 and 20.0)", maxScannerVWAPDistStr)
 	}
 
 	maxWatchedStr := getEnv("MAX_WATCHED_COINS", "20")
@@ -538,11 +552,13 @@ func LoadConfig() (*Config, error) {
 		MinVolume24hUSDT:     minVol,
 		MinFallbackRVOL:      minFallbackRVOL,
 		MaxSpreadPct:         maxSpread,
-		MinNATRPct:           minNATR,
-		MaxNATRPct:           maxNATR,
-		MaxWatchedCoins:      maxWatched,
+		MinNATRPct:               minNATR,
+		MaxNATRPct:               maxNATR,
+		MaxScannerVWAPDistATR:    maxScannerVWAPDist,
+		MaxWatchedCoins:          maxWatched,
 		PullbackToleranceATR:     pullbackTol,
 		MinBounceZScore:          minBounceZ,
+		MinEMA200DistanceATR:     minEMA200Dist,
 		MinBounceZScoreLong:      minBounceZLong,
 		MinBounceZScoreShort:     minBounceZShort,
 		LookbackImpulseBars:      lookbackBars,

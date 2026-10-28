@@ -22,3 +22,26 @@ func CalculateRVOL(candles []model.Candle, lookback int) float64 {
 	}
 	return latestVol / avgPrevVol
 }
+
+// CalculateSessionVWAP menghitung Session VWAP (Midnight 00:00 UTC) dari candle tertutup.
+// Hanya candle dari hari UTC yang sama dengan candle terakhir yang diakumulasikan.
+func CalculateSessionVWAP(candles []model.Candle) float64 {
+	if len(candles) == 0 {
+		return 0.0
+	}
+	latest := candles[len(candles)-1]
+	currentEpochDay := latest.OpenTime.UTC().Unix() / 86400
+
+	var cumPV, cumVol float64
+	for _, c := range candles {
+		if c.OpenTime.UTC().Unix()/86400 == currentEpochDay {
+			typical := (c.High + c.Low + c.Close) / 3.0
+			cumPV += typical * c.VolumeBase
+			cumVol += c.VolumeBase
+		}
+	}
+	if cumVol <= 0 {
+		return 0.0
+	}
+	return cumPV / cumVol
+}

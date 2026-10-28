@@ -19,6 +19,7 @@ type StoredDryRunPosition struct {
 	EntryPrice       decimal.Decimal
 	EntryFee         decimal.Decimal
 	CurrentSLPrice   decimal.Decimal
+	InitialSLPrice   decimal.Decimal
 	TPPrice          decimal.Decimal
 	TP1Price         decimal.Decimal
 	IsTP1Hit         bool
@@ -269,16 +270,17 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 	query := `
 	INSERT INTO dryrun_open_positions (
 		client_order_id, symbol, side, qty, initial_qty, entry_price, entry_fee,
-		current_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
+		current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 		mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
 		signal_audit_id, max_mae, max_mfe
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
 		qty = excluded.qty,
 		initial_qty = excluded.initial_qty,
 		tp1_price = excluded.tp1_price,
 		is_tp1_hit = excluded.is_tp1_hit,
 		current_sl_price = excluded.current_sl_price,
+		initial_sl_price = CASE WHEN dryrun_open_positions.initial_sl_price = '' THEN excluded.initial_sl_price ELSE dryrun_open_positions.initial_sl_price END,
 		last_mark_price = excluded.last_mark_price,
 		mark_updated_at_utc = excluded.mark_updated_at_utc,
 		is_breakeven_moved = excluded.is_breakeven_moved,
@@ -309,6 +311,11 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		initQtyStr = pos.Qty.String()
 	}
 
+	initSLStr := pos.InitialSLPrice.String()
+	if pos.InitialSLPrice.IsZero() {
+		initSLStr = pos.CurrentSLPrice.String()
+	}
+
 	_, err := r.db.conn.ExecContext(
 		ctx,
 		query,
@@ -320,6 +327,7 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		pos.EntryPrice.String(),
 		pos.EntryFee.String(),
 		pos.CurrentSLPrice.String(),
+		initSLStr,
 		pos.TPPrice.String(),
 		pos.TP1Price.String(),
 		tpHitInt,
@@ -353,7 +361,7 @@ func (r *SQLiteRepository) DeleteDryRunPosition(ctx context.Context, clientOrder
 func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredDryRunPosition, error) {
 	query := `
 	SELECT symbol, client_order_id, side, qty, initial_qty, entry_price, entry_fee,
-	       current_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
+	       current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 	       mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
 	       signal_audit_id, max_mae, max_mfe
 	FROM dryrun_open_positions;
@@ -367,7 +375,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	var results []StoredDryRunPosition
 	for rows.Next() {
 		var p StoredDryRunPosition
-		var qtyStr, initQtyStr, entryStr, feeStr, slStr, tpStr, tp1Str, atrStr, markStr string
+		var qtyStr, initQtyStr, entryStr, feeStr, slStr, initSLStr, tpStr, tp1Str, atrStr, markStr string
 		var markTimeStr, openTimeStr string
 		var beInt, tpHitInt int
 
@@ -380,6 +388,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 			&entryStr,
 			&feeStr,
 			&slStr,
+			&initSLStr,
 			&tpStr,
 			&tp1Str,
 			&tpHitInt,
@@ -405,6 +414,10 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 		p.EntryPrice, _ = decimal.NewFromString(entryStr)
 		p.EntryFee, _ = decimal.NewFromString(feeStr)
 		p.CurrentSLPrice, _ = decimal.NewFromString(slStr)
+		p.InitialSLPrice, _ = decimal.NewFromString(initSLStr)
+		if p.InitialSLPrice.IsZero() {
+			p.InitialSLPrice = p.CurrentSLPrice
+		}
 		p.TPPrice, _ = decimal.NewFromString(tpStr)
 		p.TP1Price, _ = decimal.NewFromString(tp1Str)
 		p.IsTP1Hit = (tpHitInt == 1)

@@ -1556,8 +1556,9 @@ func TestBuildSafeDecimalOrderIntent_StopDistanceFloorAndTP1(t *testing.T) {
 		t.Errorf("expected TPPrice %s with R:R preservation, got %s", expectedTP, intent.TPPrice)
 	}
 
-	// Verifikasi TP1Price: entry 100.0 + 1.20 = 101.20
-	expectedTP1 := decimal.NewFromFloat(101.20)
+	// Verifikasi TP1Price: Pure ATR-based scale-out (entry 100.0 + 1.20 * 0.35 = 100.42)
+	// Tidak boleh tergelembungkan oleh floor SL agar selalu realistis disentuh pada swing awal
+	expectedTP1 := decimal.NewFromFloat(100.42)
 	if !intent.TP1Price.Equal(expectedTP1) {
 		t.Errorf("expected TP1Price %s, got %s", expectedTP1, intent.TP1Price)
 	}
