@@ -314,7 +314,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_MARGIN_AVAIL_FRAC '%s' (must be between 0.10 and 1.00)", getEnv("MAX_MARGIN_AVAIL_FRAC", "0.90"))
 	}
 
-	minFallbackRVOLStr := getEnv("MIN_FALLBACK_RVOL", "1.20")
+	minFallbackRVOLStr := getEnv("MIN_FALLBACK_RVOL", "0.60")
 	minFallbackRVOL, err := strconv.ParseFloat(minFallbackRVOLStr, 64)
 	if err != nil || minFallbackRVOL <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_FALLBACK_RVOL '%s' (must be positive float)", minFallbackRVOLStr)
