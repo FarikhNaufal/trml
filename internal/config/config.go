@@ -271,13 +271,13 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid PULLBACK_TOLERANCE_ATR '%s' (must be float between 0.05 and 2.0)", pullbackTolStr)
 	}
 
-	minBounceZStr := getEnv("MIN_BOUNCE_ZSCORE", "1.00")
+	minBounceZStr := getEnv("MIN_BOUNCE_ZSCORE", "0.40")
 	minBounceZ, err := strconv.ParseFloat(minBounceZStr, 64)
 	if err != nil || minBounceZ <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
 	}
 
-	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "1.00")
+	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "0.40")
 	minBounceZLong, err := strconv.ParseFloat(minBounceZLongStr, 64)
 	if err != nil || minBounceZLong <= 0 {
 		minBounceZLong = minBounceZ
@@ -301,7 +301,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid RETEST_LOOKBACK_BARS '%s' (must be integer between 1 and 20)", retestLookbackBarsStr)
 	}
 
-	minImpulseATRStr := getEnv("MIN_IMPULSE_ATR", "1.0")
+	minImpulseATRStr := getEnv("MIN_IMPULSE_ATR", "0.6")
 	minImpulseATR, err := strconv.ParseFloat(minImpulseATRStr, 64)
 	if err != nil || minImpulseATR <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR '%s' (must be positive float)", minImpulseATRStr)
@@ -348,19 +348,19 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_WATCHED_COINS '%s' (must be integer between 1 and 50)", maxWatchedStr)
 	}
 
-	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.10")
+	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.00")
 	minOIDelta, err := strconv.ParseFloat(minOIDeltaStr, 64)
 	if err != nil || minOIDelta < -5.0 || minOIDelta > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaStr)
 	}
 
-	minOIDeltaLongStr := getEnv("MIN_OI_DELTA_LONG_PCT", minOIDeltaStr)
+	minOIDeltaLongStr := getEnv("MIN_OI_DELTA_LONG_PCT", "0.00")
 	minOIDeltaLong, err := strconv.ParseFloat(minOIDeltaLongStr, 64)
 	if err != nil || minOIDeltaLong < -5.0 || minOIDeltaLong > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_LONG_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaLongStr)
 	}
 
-	minOIDeltaShortStr := getEnv("MIN_OI_DELTA_SHORT_PCT", minOIDeltaStr)
+	minOIDeltaShortStr := getEnv("MIN_OI_DELTA_SHORT_PCT", "-0.02")
 	minOIDeltaShort, err := strconv.ParseFloat(minOIDeltaShortStr, 64)
 	if err != nil || minOIDeltaShort < -5.0 || minOIDeltaShort > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_SHORT_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaShortStr)
@@ -446,10 +446,10 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_PUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxPumpStr)
 	}
 
-	btcPersistenceBarsStr := getEnv("BTC_GATE_PERSISTENCE_BARS", "3")
+	btcPersistenceBarsStr := getEnv("BTC_GATE_PERSISTENCE_BARS", "1")
 	btcPersistenceBars, err := strconv.Atoi(btcPersistenceBarsStr)
 	if err != nil || btcPersistenceBars < 1 || btcPersistenceBars > 20 {
-		btcPersistenceBars = 3
+		btcPersistenceBars = 1
 	}
 
 	allowedSide := strings.ToUpper(strings.TrimSpace(getEnv("ALLOWED_SIDE", "AUTO")))

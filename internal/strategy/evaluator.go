@@ -234,18 +234,23 @@ func EvaluateSignal(
 		minOIDeltaShort = cfg.MinOIDeltaPct
 	}
 
+	// Soft OI Bypass: Jika orderflow bounce solid (Z-Score >= 0.80) atau volatilitas dinamis (NATR >= 0.70%),
+	// jangan biarkan keterlambatan update API Open Interest Binance mematikan setup pantulan valid!
+	oiValidLong := (oiDeltaPct >= minOIDeltaLong) || (barDeltaZScore >= 0.80) || (natrPct >= 0.70)
+	oiValidShort := (oiDeltaPct >= minOIDeltaShort) || (barDeltaZScore <= -0.80) || (natrPct >= 0.70)
+
 	longValid := (latest.Close > ema200) &&
 		hasPriorBullishImpulse &&
 		longTestedVWAP &&
 		longBounce &&
-		(oiDeltaPct >= minOIDeltaLong) &&
+		oiValidLong &&
 		(snap.FundingRate <= cfg.MaxAdverseFundingRate)
 
 	shortValid := (latest.Close < ema200) &&
 		hasPriorBearishImpulse &&
 		shortTestedVWAP &&
 		shortBounce &&
-		(oiDeltaPct >= minOIDeltaShort) &&
+		oiValidShort &&
 		(snap.FundingRate >= -cfg.MaxAdverseFundingRate)
 
 	var targetSide model.Side
@@ -287,7 +292,7 @@ func EvaluateSignal(
 		if !(barDeltaZScore >= minBounceZLong) {
 			longFails = append(longFails, "WEAK_DELTA_ZSCORE")
 		}
-		if !(oiDeltaPct >= minOIDeltaLong) {
+		if !oiValidLong {
 			longFails = append(longFails, "LOW_OI_DELTA")
 		}
 		if snap.FundingRate > cfg.MaxAdverseFundingRate {
@@ -313,7 +318,7 @@ func EvaluateSignal(
 		if !(barDeltaZScore <= -minBounceZShort) {
 			shortFails = append(shortFails, "WEAK_DELTA_ZSCORE")
 		}
-		if !(oiDeltaPct >= minOIDeltaShort) {
+		if !oiValidShort {
 			shortFails = append(shortFails, "LOW_OI_DELTA")
 		}
 		if snap.FundingRate < -cfg.MaxAdverseFundingRate {
