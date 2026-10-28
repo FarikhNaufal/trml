@@ -201,4 +201,62 @@ func TestSQLiteRepository(t *testing.T) {
 	if len(positionsAfterDelete) != 0 {
 		t.Fatalf("expected 0 positions after delete, got %d", len(positionsAfterDelete))
 	}
+
+	// 6. Test Live Position Persistence (TD-01)
+	livePos := StoredLivePosition{
+		Symbol:         "BTCUSDT",
+		Side:           "SHORT",
+		Qty:            decimal.NewFromFloat(0.05),
+		EntryPrice:     decimal.NewFromFloat(81000.0),
+		SLOrderID:      1234567,
+		SLClientAlgoID: "ALGO_SL_BTCUSDT_1",
+		SLPrice:        decimal.NewFromFloat(81500.0),
+		TPOrderID:      7654321,
+		TPClientAlgoID: "ALGO_TP_BTCUSDT_1",
+		TPPrice:        decimal.NewFromFloat(80000.0),
+		SignalAuditID:  9988,
+		OpenedAt:       now,
+		MaxMAE:         0.25,
+		MaxMFE:         0.80,
+		UpdatedAt:      now,
+	}
+
+	if err := repo.SaveLivePosition(ctx, livePos); err != nil {
+		t.Fatalf("failed to save live position: %v", err)
+	}
+
+	livePositions, err := repo.GetAllLivePositions(ctx)
+	if err != nil {
+		t.Fatalf("failed to get live positions: %v", err)
+	}
+	if len(livePositions) != 1 {
+		t.Fatalf("expected 1 live position, got %d", len(livePositions))
+	}
+	if livePositions[0].Symbol != "BTCUSDT" || livePositions[0].SLOrderID != 1234567 || !livePositions[0].SLPrice.Equal(decimal.NewFromFloat(81500.0)) {
+		t.Fatalf("unexpected live position data: %+v", livePositions[0])
+	}
+
+	// Update live position (e.g. trailing SL move)
+	livePos.SLPrice = decimal.NewFromFloat(80900.0)
+	livePos.SLOrderID = 9999999
+	if err := repo.SaveLivePosition(ctx, livePos); err != nil {
+		t.Fatalf("failed to update live position: %v", err)
+	}
+
+	updatedLive, err := repo.GetAllLivePositions(ctx)
+	if err != nil || len(updatedLive) != 1 {
+		t.Fatalf("expected 1 updated live position, got %d, err=%v", len(updatedLive), err)
+	}
+	if !updatedLive[0].SLPrice.Equal(decimal.NewFromFloat(80900.0)) || updatedLive[0].SLOrderID != 9999999 {
+		t.Fatalf("live position update failed: %+v", updatedLive[0])
+	}
+
+	// Delete live position
+	if err := repo.DeleteLivePosition(ctx, "BTCUSDT"); err != nil {
+		t.Fatalf("failed to delete live position: %v", err)
+	}
+	remainingLive, _ := repo.GetAllLivePositions(ctx)
+	if len(remainingLive) != 0 {
+		t.Fatalf("expected 0 live positions after delete, got %d", len(remainingLive))
+	}
 }

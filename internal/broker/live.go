@@ -20,6 +20,24 @@ type LiveBrokerConfig struct {
 	MaxHoldingDuration  time.Duration
 }
 
+type LiveOpenPosition struct {
+	Symbol         string
+	Side           model.Side
+	Qty            decimal.Decimal
+	EntryPrice     decimal.Decimal
+	SLOrderID      int64
+	SLClientAlgoID string
+	SLPrice        decimal.Decimal
+	TPOrderID      int64
+	TPClientAlgoID string
+	TPPrice        decimal.Decimal
+	SignalAuditID  int64
+	OpenTime       time.Time
+	MaxMAE         float64
+	MaxMFE         float64
+	UpdatedAt      time.Time
+}
+
 type BinanceLiveBroker struct {
 	Mu                     sync.Mutex
 	Cfg                    LiveBrokerConfig
@@ -50,6 +68,8 @@ type BinanceLiveBroker struct {
 	EmergencyMarketCloseFn func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error
 	QueryOrderFn           func(ctx context.Context, symbol string, clientOrderID string) (*model.LiveOrderRecord, error)
 	OnTradeClosedFn        func(rec TradeClosedRecord)
+	OnPositionSavedFn      func(pos LiveOpenPosition)
+	OnPositionDeletedFn    func(symbol string)
 }
 
 func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
@@ -66,6 +86,115 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		TPRepairInFlight:    make(map[string]bool),
 		ActiveMAE:           make(map[string]float64),
 		ActiveMFE:           make(map[string]float64),
+	}
+}
+
+// RestoreOpenPosition memulihkan posisi live dari database/exchange ke memory saat startup (TD-01 & TD-02)
+func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
+	if pos == nil || pos.Symbol == "" {
+		return
+	}
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+
+	b.ActivePositions[pos.Symbol] = pos.Qty
+	b.PositionSides[pos.Symbol] = pos.Side
+	b.PositionEntryPrices[pos.Symbol] = pos.EntryPrice
+	b.PositionOpenTimes[pos.Symbol] = pos.OpenTime
+	b.ActiveMAE[pos.Symbol] = pos.MaxMAE
+	b.ActiveMFE[pos.Symbol] = pos.MaxMFE
+
+	b.Protections[pos.Symbol] = &model.LivePositionProtection{
+		Symbol:          pos.Symbol,
+		Side:            pos.Side,
+		PlanGeneration:  1,
+		ProtectedQty:    pos.Qty,
+		SLOrderID:       pos.SLOrderID,
+		SLClientAlgoID:  pos.SLClientAlgoID,
+		SLStatus:        model.ProtectionAcked,
+		SLPrice:         pos.SLPrice,
+		TPOrderID:       pos.TPOrderID,
+		TPClientAlgoID:  pos.TPClientAlgoID,
+		TPStatus:        model.ProtectionAcked,
+		TPPrice:         pos.TPPrice,
+		LastAttemptTime: pos.UpdatedAt,
+		SignalAuditID:   pos.SignalAuditID,
+	}
+
+	if pos.SLClientAlgoID != "" {
+		b.OrdersByClient[pos.SLClientAlgoID] = &model.LiveOrderRecord{
+			ClientOrderID:   pos.SLClientAlgoID,
+			ExchangeOrderID: pos.SLOrderID,
+			Symbol:          pos.Symbol,
+			Side:            model.OppositeSide(pos.Side),
+			IsEntry:         false,
+			IsAlgo:          true,
+			Status:          model.StatusNew,
+			TargetQty:       pos.Qty,
+			SLPrice:         pos.SLPrice,
+			CreatedAt:       pos.OpenTime,
+		}
+		if pos.SLOrderID != 0 {
+			b.OrdersByExchangeID[pos.SLOrderID] = b.OrdersByClient[pos.SLClientAlgoID]
+		}
+	}
+
+	if pos.TPClientAlgoID != "" {
+		b.OrdersByClient[pos.TPClientAlgoID] = &model.LiveOrderRecord{
+			ClientOrderID:   pos.TPClientAlgoID,
+			ExchangeOrderID: pos.TPOrderID,
+			Symbol:          pos.Symbol,
+			Side:            model.OppositeSide(pos.Side),
+			IsEntry:         false,
+			IsAlgo:          true,
+			Status:          model.StatusNew,
+			TargetQty:       pos.Qty,
+			TPPrice:         pos.TPPrice,
+			CreatedAt:       pos.OpenTime,
+		}
+		if pos.TPOrderID != 0 {
+			b.OrdersByExchangeID[pos.TPOrderID] = b.OrdersByClient[pos.TPClientAlgoID]
+		}
+	}
+}
+
+func (b *BinanceLiveBroker) notifyPositionSavedLocked(symbol string) {
+	if b.OnPositionSavedFn == nil {
+		return
+	}
+	qty, ok := b.ActivePositions[symbol]
+	if !ok || qty.LessThanOrEqual(decimal.Zero) {
+		return
+	}
+	prot, hasProt := b.Protections[symbol]
+	if !hasProt {
+		return
+	}
+	savedPos := LiveOpenPosition{
+		Symbol:         symbol,
+		Side:           prot.Side,
+		Qty:            qty,
+		EntryPrice:     b.PositionEntryPrices[symbol],
+		SLOrderID:      prot.SLOrderID,
+		SLClientAlgoID: prot.SLClientAlgoID,
+		SLPrice:        prot.SLPrice,
+		TPOrderID:      prot.TPOrderID,
+		TPClientAlgoID: prot.TPClientAlgoID,
+		TPPrice:        prot.TPPrice,
+		SignalAuditID:  prot.SignalAuditID,
+		OpenTime:       b.PositionOpenTimes[symbol],
+		MaxMAE:         b.ActiveMAE[symbol],
+		MaxMFE:         b.ActiveMFE[symbol],
+		UpdatedAt:      time.Now().UTC(),
+	}
+	fn := b.OnPositionSavedFn
+	go fn(savedPos)
+}
+
+func (b *BinanceLiveBroker) notifyPositionDeleted(symbol string) {
+	if b.OnPositionDeletedFn != nil {
+		fn := b.OnPositionDeletedFn
+		go fn(symbol)
 	}
 }
 
@@ -379,8 +508,13 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 	}
 	b.Mu.Unlock()
 
-	if tradeRec != nil && b.OnTradeClosedFn != nil {
-		go b.OnTradeClosedFn(*tradeRec)
+	if tradeRec != nil {
+		if b.OnPositionDeletedFn != nil {
+			go b.OnPositionDeletedFn(tradeRec.Symbol)
+		}
+		if b.OnTradeClosedFn != nil {
+			go b.OnTradeClosedFn(*tradeRec)
+		}
 	}
 
 	if siblingCancelAlgoID != 0 && b.CancelAlgoOrderFn != nil {
@@ -563,6 +697,8 @@ func (b *BinanceLiveBroker) executeProtectionPlan(action model.ProtectionPlanAct
 		}
 		b.OrdersByExchangeID[newTPOrderID] = b.OrdersByClient[action.ClientTPAlgoID]
 	}
+
+	b.notifyPositionSavedLocked(action.Symbol)
 }
 
 func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
@@ -786,6 +922,7 @@ func (b *BinanceLiveBroker) RepairFailedProtections(now time.Time) {
 			CreatedAt:       now,
 		}
 		b.OrdersByExchangeID[newTPID] = b.OrdersByClient[tgt.clientTPAlgoID]
+		b.notifyPositionSavedLocked(tgt.symbol)
 		b.Mu.Unlock()
 
 		slog.Info("TP repair successfully restored take-profit order", "symbol", tgt.symbol, "tpOrderID", newTPID, "price", tgt.tpPrice)

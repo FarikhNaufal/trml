@@ -1063,6 +1063,77 @@ func TestDryRunBrokerPersistence_PeriodicCheckpoint(t *testing.T) {
 	}
 }
 
+func TestLiveBrokerPersistence_RestoreAndCallbacks(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 10 * time.Second,
+	}
+	broker := NewBinanceLiveBroker(cfg)
+
+	// 1. Test RestoreOpenPosition
+	now := time.Now().UTC()
+	posToRestore := &LiveOpenPosition{
+		Symbol:         "ETHUSDT",
+		Side:           model.SideShort,
+		Qty:            decimal.NewFromFloat(1.5),
+		EntryPrice:     decimal.NewFromFloat(3000.0),
+		SLOrderID:      111222,
+		SLClientAlgoID: "ALGO_SL_ETHUSDT_1",
+		SLPrice:        decimal.NewFromFloat(3050.0),
+		TPOrderID:      333444,
+		TPClientAlgoID: "ALGO_TP_ETHUSDT_1",
+		TPPrice:        decimal.NewFromFloat(2900.0),
+		SignalAuditID:  555,
+		OpenTime:       now,
+		MaxMAE:         0.15,
+		MaxMFE:         0.45,
+		UpdatedAt:      now,
+	}
+
+	broker.RestoreOpenPosition(posToRestore)
+
+	dtos := broker.GetActivePositions()
+	if len(dtos) != 1 {
+		t.Fatalf("expected 1 restored position in DTO, got %d", len(dtos))
+	}
+	if dtos[0].Symbol != "ETHUSDT" || dtos[0].Side != "SHORT" || dtos[0].EntryPrice != 3000.0 {
+		t.Fatalf("unexpected DTO: %+v", dtos[0])
+	}
+
+	// 2. Test OnPositionDeletedFn callback on trade close
+	deletedChan := make(chan string, 1)
+	broker.OnPositionDeletedFn = func(sym string) {
+		deletedChan <- sym
+	}
+
+	// Simulate SL execution report
+	broker.HandleUserDataOrderUpdate(
+		"ALGO_SL_ETHUSDT_1",
+		111222,
+		"ETHUSDT",
+		model.StatusFilled,
+		decimal.NewFromFloat(1.5),
+		decimal.NewFromFloat(3050.0),
+		decimal.NewFromFloat(-75.0),
+	)
+
+	select {
+	case deletedSym := <-deletedChan:
+		if deletedSym != "ETHUSDT" {
+			t.Fatalf("expected deleted symbol ETHUSDT, got %s", deletedSym)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for OnPositionDeletedFn callback")
+	}
+
+	// Verify position is removed from in-memory maps
+	if len(broker.GetActivePositions()) != 0 {
+		t.Fatalf("expected 0 positions after close, got %d", len(broker.GetActivePositions()))
+	}
+}
+
+
 
 
 

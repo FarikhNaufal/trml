@@ -303,3 +303,58 @@ func (c *Client) QueryOrder(ctx context.Context, symbol, clientOrderID string) (
 	}, nil
 }
 
+type PositionRiskResponse struct {
+	Symbol           string          `json:"symbol"`
+	PositionAmt      decimal.Decimal `json:"positionAmt"`
+	EntryPrice       decimal.Decimal `json:"entryPrice"`
+	MarkPrice        decimal.Decimal `json:"markPrice"`
+	UnrealizedProfit decimal.Decimal `json:"unRealizedProfit"`
+	LiquidationPrice decimal.Decimal `json:"liquidationPrice"`
+	Leverage         string          `json:"leverage"`
+	MarginType       string          `json:"marginType"`
+	IsolatedMargin   string          `json:"isolatedMargin"`
+	PositionSide     string          `json:"positionSide"`
+	UpdateTime       int64           `json:"updateTime"`
+}
+
+// GetPositionRisk mengambil posisi risiko akun dari GET /fapi/v2/positionRisk (TD-02)
+func (c *Client) GetPositionRisk(ctx context.Context, symbol string) ([]PositionRiskResponse, error) {
+	params := url.Values{}
+	if symbol != "" {
+		params.Set("symbol", symbol)
+	}
+
+	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v2/positionRisk", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("get position risk: %w", err)
+	}
+
+	var resp []PositionRiskResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return nil, fmt.Errorf("get position risk decode: %w", err)
+	}
+
+	return resp, nil
+}
+
+// GetOpenOrders mengambil semua pesanan terbuka (termasuk algo/conditional) dari GET /fapi/v1/openOrders (TD-02)
+func (c *Client) GetOpenOrders(ctx context.Context, symbol string) ([]QueryOrderResponse, error) {
+	params := url.Values{}
+	if symbol != "" {
+		params.Set("symbol", symbol)
+	}
+
+	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v1/openOrders", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("get open orders: %w", err)
+	}
+
+	var resp []QueryOrderResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return nil, fmt.Errorf("get open orders decode: %w", err)
+	}
+
+	return resp, nil
+}
+
+

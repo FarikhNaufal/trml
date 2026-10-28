@@ -98,6 +98,34 @@ func TestMarketDataEndpoints(t *testing.T) {
 			} else {
 				w.WriteHeader(http.StatusOK)
 			}
+		case "/fapi/v2/positionRisk":
+			_, _ = w.Write([]byte(`[
+				{
+					"symbol": "BTCUSDT",
+					"positionAmt": "-0.050",
+					"entryPrice": "81000.0",
+					"markPrice": "80850.0",
+					"unRealizedProfit": "7.500",
+					"liquidationPrice": "95000.0",
+					"leverage": "8",
+					"marginType": "isolated",
+					"positionSide": "BOTH"
+				}
+			]`))
+		case "/fapi/v1/openOrders":
+			_, _ = w.Write([]byte(`[
+				{
+					"clientOrderId": "ALGO_SL_BTCUSDT_1",
+					"orderId": 991122,
+					"symbol": "BTCUSDT",
+					"side": "BUY",
+					"status": "NEW",
+					"origQty": "0.050",
+					"price": "0",
+					"stopPrice": "81500.0",
+					"reduceOnly": true
+				}
+			]`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -164,5 +192,17 @@ func TestMarketDataEndpoints(t *testing.T) {
 	}
 	if ordRec.ExchangeOrderID != 888999 || ordRec.Status != model.StatusFilled || !ordRec.IsEntry {
 		t.Errorf("unexpected query order result: %+v", ordRec)
+	}
+
+	// 8. GetPositionRisk (TD-02)
+	posRisk, err := client.GetPositionRisk(ctx, "BTCUSDT")
+	if err != nil || len(posRisk) != 1 || posRisk[0].Symbol != "BTCUSDT" {
+		t.Fatalf("get position risk failed: %v, pos: %+v", err, posRisk)
+	}
+
+	// 9. GetOpenOrders (TD-02)
+	openOrds, err := client.GetOpenOrders(ctx, "BTCUSDT")
+	if err != nil || len(openOrds) != 1 || openOrds[0].OrderID != 991122 || openOrds[0].ClientOrderID != "ALGO_SL_BTCUSDT_1" {
+		t.Fatalf("get open orders failed: %v, orders: %+v", err, openOrds)
 	}
 }

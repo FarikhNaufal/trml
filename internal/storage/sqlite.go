@@ -91,7 +91,26 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
     max_mfe              REAL NOT NULL DEFAULT 0.0
 );
 
+CREATE TABLE IF NOT EXISTS live_open_positions (
+    symbol               TEXT PRIMARY KEY,
+    side                 TEXT NOT NULL,
+    qty                  TEXT NOT NULL,
+    entry_price          TEXT NOT NULL,
+    sl_order_id          INTEGER NOT NULL DEFAULT 0,
+    sl_client_algo_id    TEXT NOT NULL DEFAULT '',
+    sl_price             TEXT NOT NULL,
+    tp_order_id          INTEGER NOT NULL DEFAULT 0,
+    tp_client_algo_id    TEXT NOT NULL DEFAULT '',
+    tp_price             TEXT NOT NULL,
+    signal_audit_id      INTEGER NOT NULL DEFAULT 0,
+    opened_at_utc        TEXT NOT NULL,
+    max_mae              REAL NOT NULL DEFAULT 0.0,
+    max_mfe              REAL NOT NULL DEFAULT 0.0,
+    updated_at_utc       TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_dryrun_open_positions_symbol ON dryrun_open_positions (symbol);
+CREATE INDEX IF NOT EXISTS idx_live_open_positions_symbol ON live_open_positions (symbol);
 CREATE INDEX IF NOT EXISTS idx_signal_audit_log_symbol_time ON signal_audit_log (symbol, candle_open_time_utc);
 CREATE INDEX IF NOT EXISTS idx_signal_audit_log_created_at ON signal_audit_log (created_at_utc);
 CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);

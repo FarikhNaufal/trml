@@ -308,6 +308,28 @@ func main() {
 			slog.Warn("TRIGGERING EMERGENCY MARKET CLOSE", "symbol", symbol, "side", side, "qty", qty, "reason", reason)
 			return client.EmergencyMarketClose(ctx, symbol, side, qty)
 		}
+		engine.liveBroker.OnPositionSavedFn = func(pos broker.LiveOpenPosition) {
+			_ = repo.SaveLivePosition(context.Background(), storage.StoredLivePosition{
+				Symbol:         pos.Symbol,
+				Side:           string(pos.Side),
+				Qty:            pos.Qty,
+				EntryPrice:     pos.EntryPrice,
+				SLOrderID:      pos.SLOrderID,
+				SLClientAlgoID: pos.SLClientAlgoID,
+				SLPrice:        pos.SLPrice,
+				TPOrderID:      pos.TPOrderID,
+				TPClientAlgoID: pos.TPClientAlgoID,
+				TPPrice:        pos.TPPrice,
+				SignalAuditID:  pos.SignalAuditID,
+				OpenedAt:       pos.OpenTime,
+				MaxMAE:         pos.MaxMAE,
+				MaxMFE:         pos.MaxMFE,
+				UpdatedAt:      pos.UpdatedAt,
+			})
+		}
+		engine.liveBroker.OnPositionDeletedFn = func(symbol string) {
+			_ = repo.DeleteLivePosition(context.Background(), symbol)
+		}
 		engine.liveBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
@@ -339,6 +361,100 @@ func main() {
 			engine.dryRunBroker.SessionStartEquity = startEq
 			engine.dryRunBroker.CircuitBreakerTripped = breakerHit
 			engine.dryRunBroker.Mu.Unlock()
+		}
+	}
+
+	// 5b. Rekonsiliasi Posisi Live Saat Boot (TD-01 & TD-02)
+	if engine.liveBroker != nil {
+		slog.Info("reconciling live open positions with Binance exchange...")
+		storedLivePositions, err := repo.GetAllLivePositions(ctx)
+		if err != nil {
+			slog.Error("failed to load stored live positions from database", "err", err)
+		}
+
+		exchangePositions, err := client.GetPositionRisk(ctx, "")
+		if err != nil {
+			slog.Error("failed to fetch position risk from Binance at boot reconciliation", "err", err)
+			for _, sp := range storedLivePositions {
+				engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
+					Symbol:         sp.Symbol,
+					Side:           model.Side(sp.Side),
+					Qty:            sp.Qty,
+					EntryPrice:     sp.EntryPrice,
+					SLOrderID:      sp.SLOrderID,
+					SLClientAlgoID: sp.SLClientAlgoID,
+					SLPrice:        sp.SLPrice,
+					TPOrderID:      sp.TPOrderID,
+					TPClientAlgoID: sp.TPClientAlgoID,
+					TPPrice:        sp.TPPrice,
+					SignalAuditID:  sp.SignalAuditID,
+					OpenTime:       sp.OpenedAt,
+					MaxMAE:         sp.MaxMAE,
+					MaxMFE:         sp.MaxMFE,
+					UpdatedAt:      sp.UpdatedAt,
+				})
+			}
+		} else {
+			activeOnExchange := make(map[string]exchange.PositionRiskResponse)
+			for _, ep := range exchangePositions {
+				if ep.PositionAmt.Abs().GreaterThan(decimal.Zero) {
+					activeOnExchange[ep.Symbol] = ep
+				}
+			}
+
+			storedMap := make(map[string]storage.StoredLivePosition)
+			for _, sp := range storedLivePositions {
+				storedMap[sp.Symbol] = sp
+			}
+
+			// 1. Rekonsiliasi posisi tersimpan
+			for sym, sp := range storedMap {
+				if ep, exists := activeOnExchange[sym]; exists {
+					engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
+						Symbol:         sp.Symbol,
+						Side:           model.Side(sp.Side),
+						Qty:            ep.PositionAmt.Abs(),
+						EntryPrice:     ep.EntryPrice,
+						SLOrderID:      sp.SLOrderID,
+						SLClientAlgoID: sp.SLClientAlgoID,
+						SLPrice:        sp.SLPrice,
+						TPOrderID:      sp.TPOrderID,
+						TPClientAlgoID: sp.TPClientAlgoID,
+						TPPrice:        sp.TPPrice,
+						SignalAuditID:  sp.SignalAuditID,
+						OpenTime:       sp.OpenedAt,
+						MaxMAE:         sp.MaxMAE,
+						MaxMFE:         sp.MaxMFE,
+						UpdatedAt:      sp.UpdatedAt,
+					})
+					slog.Info("reconciled & restored active live position from database and exchange",
+						"symbol", sp.Symbol, "qty", ep.PositionAmt.Abs(), "entryPrice", ep.EntryPrice,
+						"slPrice", sp.SLPrice, "tpPrice", sp.TPPrice)
+				} else {
+					slog.Warn("live position closed on exchange during downtime; cleaning up stored state", "symbol", sym)
+					_ = repo.DeleteLivePosition(ctx, sym)
+				}
+			}
+
+			// 2. Deteksi posisi orphan di exchange yang belum tercatat di DB
+			for sym, ep := range activeOnExchange {
+				if _, exists := storedMap[sym]; !exists {
+					side := model.SideLong
+					if ep.PositionAmt.IsNegative() {
+						side = model.SideShort
+					}
+					slog.Warn("DETECTED UNMANAGED LIVE POSITION ON BINANCE (missing from DB)",
+						"symbol", sym, "side", side, "qty", ep.PositionAmt.Abs(), "entryPrice", ep.EntryPrice)
+					engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
+						Symbol:     sym,
+						Side:       side,
+						Qty:        ep.PositionAmt.Abs(),
+						EntryPrice: ep.EntryPrice,
+						OpenTime:   time.Now().UTC(),
+						UpdatedAt:  time.Now().UTC(),
+					})
+				}
+			}
 		}
 	}
 

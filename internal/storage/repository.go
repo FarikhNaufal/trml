@@ -29,6 +29,24 @@ type StoredDryRunPosition struct {
 	MaxMFE           float64
 }
 
+type StoredLivePosition struct {
+	Symbol         string
+	Side           string
+	Qty            decimal.Decimal
+	EntryPrice     decimal.Decimal
+	SLOrderID      int64
+	SLClientAlgoID string
+	SLPrice        decimal.Decimal
+	TPOrderID      int64
+	TPClientAlgoID string
+	TPPrice        decimal.Decimal
+	SignalAuditID  int64
+	OpenedAt       time.Time
+	MaxMAE         float64
+	MaxMFE         float64
+	UpdatedAt      time.Time
+}
+
 type Repository interface {
 	SaveDailyState(ctx context.Context, epochDay int64, sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool) error
 	GetDailyState(ctx context.Context, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
@@ -38,6 +56,9 @@ type Repository interface {
 	SaveDryRunPosition(ctx context.Context, pos StoredDryRunPosition) error
 	DeleteDryRunPosition(ctx context.Context, symbol string) error
 	GetAllDryRunPositions(ctx context.Context) ([]StoredDryRunPosition, error)
+	SaveLivePosition(ctx context.Context, pos StoredLivePosition) error
+	DeleteLivePosition(ctx context.Context, symbol string) error
+	GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error)
 	UpdateTradeAutopsy(ctx context.Context, clientOrderID, autopsy string) error
 	GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error)
 }
@@ -402,5 +423,134 @@ func (r *SQLiteRepository) GetTradeAutopsy(ctx context.Context, clientOrderID st
 	}
 	return autopsy, nil
 }
+
+// SaveLivePosition menyimpan atau memperbarui posisi live ke SQLite agar tahan restart (TD-01)
+func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLivePosition) error {
+	query := `
+	INSERT INTO live_open_positions (
+		symbol, side, qty, entry_price, sl_order_id, sl_client_algo_id,
+		sl_price, tp_order_id, tp_client_algo_id, tp_price, signal_audit_id,
+		opened_at_utc, max_mae, max_mfe, updated_at_utc
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(symbol) DO UPDATE SET
+		side = excluded.side,
+		qty = excluded.qty,
+		entry_price = excluded.entry_price,
+		sl_order_id = excluded.sl_order_id,
+		sl_client_algo_id = excluded.sl_client_algo_id,
+		sl_price = excluded.sl_price,
+		tp_order_id = excluded.tp_order_id,
+		tp_client_algo_id = excluded.tp_client_algo_id,
+		tp_price = excluded.tp_price,
+		signal_audit_id = excluded.signal_audit_id,
+		max_mae = excluded.max_mae,
+		max_mfe = excluded.max_mfe,
+		updated_at_utc = excluded.updated_at_utc;
+	`
+	openTime := pos.OpenedAt.UTC().Format(time.RFC3339Nano)
+	if pos.OpenedAt.IsZero() {
+		openTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	updTime := pos.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	if pos.UpdatedAt.IsZero() {
+		updTime = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	_, err := r.db.conn.ExecContext(
+		ctx,
+		query,
+		pos.Symbol,
+		pos.Side,
+		pos.Qty.String(),
+		pos.EntryPrice.String(),
+		pos.SLOrderID,
+		pos.SLClientAlgoID,
+		pos.SLPrice.String(),
+		pos.TPOrderID,
+		pos.TPClientAlgoID,
+		pos.TPPrice.String(),
+		pos.SignalAuditID,
+		openTime,
+		pos.MaxMAE,
+		pos.MaxMFE,
+		updTime,
+	)
+	if err != nil {
+		return fmt.Errorf("storage: failed to save live position %s: %w", pos.Symbol, err)
+	}
+	return nil
+}
+
+// DeleteLivePosition menghapus posisi live dari database setelah posisi ditutup
+func (r *SQLiteRepository) DeleteLivePosition(ctx context.Context, symbol string) error {
+	query := `DELETE FROM live_open_positions WHERE symbol = ?;`
+	_, err := r.db.conn.ExecContext(ctx, query, symbol)
+	if err != nil {
+		return fmt.Errorf("storage: failed to delete live position %s: %w", symbol, err)
+	}
+	return nil
+}
+
+// GetAllLivePositions mengambil seluruh posisi live terbuka yang tersimpan saat startup bot
+func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error) {
+	query := `
+	SELECT symbol, side, qty, entry_price, sl_order_id, sl_client_algo_id,
+	       sl_price, tp_order_id, tp_client_algo_id, tp_price, signal_audit_id,
+	       opened_at_utc, max_mae, max_mfe, updated_at_utc
+	FROM live_open_positions;
+	`
+	rows, err := r.db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("storage: failed to query live positions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []StoredLivePosition
+	for rows.Next() {
+		var p StoredLivePosition
+		var qtyStr, entryStr, slStr, tpStr string
+		var openTimeStr, updTimeStr string
+		err := rows.Scan(
+			&p.Symbol,
+			&p.Side,
+			&qtyStr,
+			&entryStr,
+			&p.SLOrderID,
+			&p.SLClientAlgoID,
+			&slStr,
+			&p.TPOrderID,
+			&p.TPClientAlgoID,
+			&tpStr,
+			&p.SignalAuditID,
+			&openTimeStr,
+			&p.MaxMAE,
+			&p.MaxMFE,
+			&updTimeStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("storage: failed to scan live position: %w", err)
+		}
+		p.Qty, _ = decimal.NewFromString(qtyStr)
+		p.EntryPrice, _ = decimal.NewFromString(entryStr)
+		p.SLPrice, _ = decimal.NewFromString(slStr)
+		p.TPPrice, _ = decimal.NewFromString(tpStr)
+		if t, err := time.Parse(time.RFC3339Nano, openTimeStr); err == nil {
+			p.OpenedAt = t
+		} else if t, err := time.Parse(time.RFC3339, openTimeStr); err == nil {
+			p.OpenedAt = t
+		}
+		if t, err := time.Parse(time.RFC3339Nano, updTimeStr); err == nil {
+			p.UpdatedAt = t
+		} else if t, err := time.Parse(time.RFC3339, updTimeStr); err == nil {
+			p.UpdatedAt = t
+		}
+		results = append(results, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: error iterating live positions: %w", err)
+	}
+	return results, nil
+}
+
 
 
