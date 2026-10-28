@@ -867,6 +867,7 @@ func TestDryRunBrokerPersistence_FIFOOrdering(t *testing.T) {
 		MaxSlots:            3,
 		AccountLeverage:     5.0,
 		EntryOrderType:      "MARKET",
+		Tier1BEEnabled:      true,
 		BreakEvenTriggerATR: 1.0,
 		TakerFeeRate:        0.0005,
 	}
@@ -1138,6 +1139,7 @@ func TestDryRunBroker_TieredDynamicBreakEvenAndProfitLock(t *testing.T) {
 		MaxSlots:                 3,
 		AccountLeverage:          5.0,
 		EntryOrderType:           "MARKET",
+		Tier1BEEnabled:           true,
 		Tier1BETriggerLongATR:    0.70,
 		Tier1BETriggerShortATR:   0.90,
 		Tier2ProfitLockATR:       1.40,

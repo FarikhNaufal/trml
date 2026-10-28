@@ -26,6 +26,7 @@ func TestDryRunBrokerFullCrashRecoveryIntegration(t *testing.T) {
 	cfg := broker.DryRunConfig{
 		MaxSlots:            3,
 		AccountLeverage:     8.0,
+		Tier1BEEnabled:      true,
 		BreakEvenTriggerATR: 1.15,
 		EntryOrderType:      "MARKET",
 		TakerFeeRate:        0.0005,

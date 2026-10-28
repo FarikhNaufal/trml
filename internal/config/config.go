@@ -73,6 +73,7 @@ type Config struct {
 	SLATRMultiplier          float64
 	TPATRMultiplier          float64
 	BreakEvenTriggerATR      float64
+	Tier1BEEnabled           bool
 	Tier1BETriggerLongATR    float64
 	Tier1BETriggerShortATR   float64
 	Tier2ProfitLockATR       float64
@@ -384,6 +385,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BREAK_EVEN_TRIGGER_ATR '%s' (must be float between 0.1 and 10.0)", beTriggerStr)
 	}
 
+	tier1BEEnabled := getEnv("TIER1_BE_ENABLED", "false") == "true"
 	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "0.70")
 	t1BETriggerLong, err := strconv.ParseFloat(t1BETriggerLongStr, 64)
 	if err != nil || t1BETriggerLong <= 0.05 || t1BETriggerLong > 10.0 {
@@ -536,6 +538,7 @@ func LoadConfig() (*Config, error) {
 		SLATRMultiplier:          slMult,
 		TPATRMultiplier:          tpMult,
 		BreakEvenTriggerATR:      beTrigger,
+		Tier1BEEnabled:           tier1BEEnabled,
 		Tier1BETriggerLongATR:    t1BETriggerLong,
 		Tier1BETriggerShortATR:   t1BETriggerShort,
 		Tier2ProfitLockATR:       t2ProfitLock,

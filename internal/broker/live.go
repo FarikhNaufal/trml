@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ type LiveBrokerConfig struct {
 	LimitOrderTimeout   time.Duration
 	MaxHoldingDuration       time.Duration
 	BreakEvenTriggerATR      float64
+	Tier1BEEnabled           bool
 	Tier1BETriggerLongATR    float64
 	Tier1BETriggerShortATR   float64
 	Tier2ProfitLockATR       float64
@@ -1078,7 +1080,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						newTargetTier = 2
 						newSL = calculatedSL
 					}
-				} else if currentTier < 1 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t1TriggerDist) {
+				} else if b.Cfg.Tier1BEEnabled && currentTier < 1 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t1TriggerDist) {
 					calculatedSL := entryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
 					if calculatedSL.GreaterThan(prot.SLPrice) {
 						newTargetTier = 1
@@ -1096,7 +1098,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						newTargetTier = 2
 						newSL = calculatedSL
 					}
-				} else if currentTier < 1 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t1TriggerDist) {
+				} else if b.Cfg.Tier1BEEnabled && currentTier < 1 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t1TriggerDist) {
 					calculatedSL := entryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
 					if calculatedSL.LessThan(prot.SLPrice) {
 						newTargetTier = 1
@@ -1248,6 +1250,12 @@ func (b *BinanceLiveBroker) GetActivePositions() []ActivePositionDTO {
 			IsBreakEven:      isBE,
 		})
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].OpenTimeUTC != result[j].OpenTimeUTC {
+			return result[i].OpenTimeUTC > result[j].OpenTimeUTC
+		}
+		return result[i].Symbol < result[j].Symbol
+	})
 	return result
 }
 

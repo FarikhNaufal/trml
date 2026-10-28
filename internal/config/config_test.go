@@ -48,6 +48,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Tier2ProfitLockOffsetATR != 0.90 {
 		t.Errorf("expected default Tier2ProfitLockOffsetATR 0.90, got %f", cfg.Tier2ProfitLockOffsetATR)
 	}
+	if cfg.Tier1BEEnabled {
+		t.Errorf("expected default Tier1BEEnabled false, got true")
+	}
 	if cfg.MaxHoldingDuration != 4*time.Hour {
 		t.Errorf("expected default MaxHoldingDuration 4h, got %v", cfg.MaxHoldingDuration)
 	}

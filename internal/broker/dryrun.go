@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,7 @@ type DryRunConfig struct {
 	MaxDailyDrawdownPct      float64
 	AccountLeverage          float64
 	BreakEvenTriggerATR      float64
+	Tier1BEEnabled           bool
 	Tier1BETriggerLongATR    float64
 	Tier1BETriggerShortATR   float64
 	Tier2ProfitLockATR       float64
@@ -529,7 +531,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 					slog.Info("dryrun: Tier 2 Profit Lock activated",
 						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
 				}
-			} else if pos.ProtectionTier < 1 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t1TriggerDist) {
+			} else if d.Cfg.Tier1BEEnabled && pos.ProtectionTier < 1 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t1TriggerDist) {
 				// Tier 1: Rem Dini / Early BE Shield (+0.70x ATR MFE -> Pindahkan SL ke Entry + Fee Buffer)
 				newSL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
 				if newSL.GreaterThan(pos.CurrentSLPrice) {
@@ -593,7 +595,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 					slog.Info("dryrun: Tier 2 Profit Lock activated",
 						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
 				}
-			} else if pos.ProtectionTier < 1 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t1TriggerDist) {
+			} else if d.Cfg.Tier1BEEnabled && pos.ProtectionTier < 1 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t1TriggerDist) {
 				// Tier 1: Rem Dini / Early BE Shield (+0.90x ATR MFE -> Pindahkan SL ke Entry - Fee Buffer)
 				newSL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
 				if newSL.LessThan(pos.CurrentSLPrice) {
@@ -969,6 +971,12 @@ func (d *DryRunBroker) GetActivePositions() []ActivePositionDTO {
 			IsBreakEven:      pos.IsBreakEvenMoved,
 		})
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].OpenTimeUTC != result[j].OpenTimeUTC {
+			return result[i].OpenTimeUTC > result[j].OpenTimeUTC
+		}
+		return result[i].Symbol < result[j].Symbol
+	})
 	return result
 }
 

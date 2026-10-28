@@ -239,8 +239,16 @@ function renderActivePositions(positions) {
 
   container.classList.remove('is-empty');
 
+  // Urutkan posisi secara stabil & deterministik: koin yang paling baru dibuka berada di urutan teratas/depan
+  const sortedPositions = [...positions].sort((a, b) => {
+    const timeA = new Date(a.open_time_utc || 0).getTime();
+    const timeB = new Date(b.open_time_utc || 0).getTime();
+    if (timeA !== timeB) return timeB - timeA;
+    return (a.symbol || '').localeCompare(b.symbol || '');
+  });
+
   let html = '';
-  for (const pos of positions) {
+  for (const pos of sortedPositions) {
     const sideClass = pos.side === 'LONG' ? 'pos-side-long' : 'pos-side-short';
     const pnlClass = pos.unrealized_pnl >= 0 ? 'val-green' : 'val-red';
     const roeClass = pos.unrealized_roe_pct >= 0 ? 'val-green' : 'val-red';
