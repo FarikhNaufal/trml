@@ -24,6 +24,9 @@ type LiveBrokerConfig struct {
 	Tier1BETriggerShortATR   float64
 	Tier2ProfitLockATR       float64
 	Tier2ProfitLockOffsetATR float64
+	PartialTPEnabled         bool
+	PartialTP1Ratio          float64
+	PartialTP1ATRMult        float64
 	MinBreakEvenOffsetPct    float64
 }
 
@@ -31,6 +34,7 @@ type LiveOpenPosition struct {
 	Symbol         string
 	Side           model.Side
 	Qty            decimal.Decimal
+	InitialQty     decimal.Decimal
 	EntryPrice     decimal.Decimal
 	SLOrderID      int64
 	SLClientAlgoID string
@@ -38,6 +42,8 @@ type LiveOpenPosition struct {
 	TPOrderID      int64
 	TPClientAlgoID string
 	TPPrice        decimal.Decimal
+	TP1Price       decimal.Decimal
+	IsTP1Hit       bool
 	ProtectionTier int
 	SignalAuditID  int64
 	OpenTime       time.Time
@@ -196,6 +202,9 @@ func (b *BinanceLiveBroker) notifyPositionSavedLocked(symbol string) {
 		TPOrderID:      prot.TPOrderID,
 		TPClientAlgoID: prot.TPClientAlgoID,
 		TPPrice:        prot.TPPrice,
+		InitialQty:     qty,
+		TP1Price:       decimal.Zero,
+		IsTP1Hit:       false,
 		ProtectionTier: b.ProtectionTiers[symbol],
 		SignalAuditID:  prot.SignalAuditID,
 		OpenTime:       b.PositionOpenTimes[symbol],

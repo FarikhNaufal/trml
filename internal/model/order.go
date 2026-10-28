@@ -54,6 +54,7 @@ type OrderIntent struct {
 	LimitPrice    decimal.Decimal
 	SLPrice       decimal.Decimal
 	TPPrice       decimal.Decimal
+	TP1Price      decimal.Decimal
 	ATRAtEntry    decimal.Decimal
 	CreatedAt     time.Time
 	SignalAuditID int64

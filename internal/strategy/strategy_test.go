@@ -1502,6 +1502,75 @@ func TestEvaluateSignal_BTCGatePersistenceBuffer(t *testing.T) {
 	}
 }
 
+func TestBuildSafeDecimalOrderIntent_StopDistanceFloorAndTP1(t *testing.T) {
+	now := time.Now().UTC()
+	snap := model.MarketSnapshot{
+		Symbol:  "LOWVOLUSDT",
+		BestBid: 100.0,
+		BestAsk: 100.0,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.001),
+			MinQty:      decimal.NewFromFloat(0.001),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+
+	// Skenario 1: ATR kecil (0.35%). Tanpa floor, SL 1.5x ATR = 0.525% (0.525).
+	// Dengan MinSLDistancePct = 0.015 (1.50%), jarak SL minimal harus 1.50 (SL = 98.50).
+	// Jarak TP2 minimal harus 1.50 * (2.25/1.5) = 2.25 (TP = 102.25).
+	// Jarak TP1 minimal harus 1.50 * (1.20/1.5) = 1.20 (TP1 = 101.20).
+	cfg := SizingConfig{
+		RiskPerTradePct:                decimal.NewFromFloat(0.01), // $10 pada equity $1000
+		MaxSlotMarginFraction:          decimal.NewFromFloat(0.50),
+		AccountLeverage:                5.0,
+		SLMultiplier:                   1.5,
+		TPMultiplier:                   2.25,
+		TP1Multiplier:                  1.20,
+		MinSLDistancePct:               decimal.NewFromFloat(0.015), // Floor 1.50%
+		MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+		TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+		SlippageRate:                   decimal.NewFromFloat(0.0003),
+		AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+	}
+
+	equity := decimal.NewFromFloat(1000.0)
+	available := decimal.NewFromFloat(1000.0)
+	atr14 := 0.35 // NATR = 0.35%
+
+	intent, ok := BuildSafeDecimalOrderIntent(snap, equity, available, model.SideLong, 100.0, atr14, cfg)
+	if !ok {
+		t.Fatalf("expected order intent to be built successfully")
+	}
+
+	// Verifikasi SLPrice: entry 100.0 - 1.50 = 98.50
+	expectedSL := decimal.NewFromFloat(98.50)
+	if !intent.SLPrice.Equal(expectedSL) {
+		t.Errorf("expected SLPrice %s with floor, got %s", expectedSL, intent.SLPrice)
+	}
+
+	// Verifikasi TPPrice: entry 100.0 + 2.25 = 102.25
+	expectedTP := decimal.NewFromFloat(102.25)
+	if !intent.TPPrice.Equal(expectedTP) {
+		t.Errorf("expected TPPrice %s with R:R preservation, got %s", expectedTP, intent.TPPrice)
+	}
+
+	// Verifikasi TP1Price: entry 100.0 + 1.20 = 101.20
+	expectedTP1 := decimal.NewFromFloat(101.20)
+	if !intent.TP1Price.Equal(expectedTP1) {
+		t.Errorf("expected TP1Price %s, got %s", expectedTP1, intent.TP1Price)
+	}
+
+	// Verifikasi Sizing: Dollar risk capital tetap terkontrol sekitar $10 USDT
+	// actualLossPerUnit = (100 - 98.50) + friction (0.001 * 100) = 1.50 + 0.10 = 1.60
+	// finalQty = 10.0 / 1.60 = 6.25 unit (bukan 19 unit seperti pada SL 0.525)
+	expectedMaxQty := decimal.NewFromFloat(6.5)
+	if intent.Qty.GreaterThan(expectedMaxQty) {
+		t.Errorf("expected Qty to be scaled down by floor, got %s", intent.Qty)
+	}
+}
+
 
 
 

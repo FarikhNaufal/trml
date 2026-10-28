@@ -6,11 +6,13 @@ import (
 )
 
 type SizingConfig struct {
-	RiskPerTradePct        decimal.Decimal
-	MaxSlotMarginFraction  decimal.Decimal
-	AccountLeverage        float64
-	SLMultiplier           float64
-	TPMultiplier           float64
+	RiskPerTradePct                decimal.Decimal
+	MaxSlotMarginFraction          decimal.Decimal
+	AccountLeverage                float64
+	SLMultiplier                   float64
+	TPMultiplier                   float64
+	TP1Multiplier                  float64
+	MinSLDistancePct               decimal.Decimal
 	MakerFeeRate                   decimal.Decimal
 	TakerFeeRate                   decimal.Decimal
 	SlippageRate                   decimal.Decimal
@@ -38,9 +40,38 @@ func BuildSafeDecimalOrderIntent(
 
 	atrDec := decimal.NewFromFloat(atr14)
 	slDist := atrDec.Mul(decimal.NewFromFloat(cfg.SLMultiplier))
-	tpDist := atrDec.Mul(decimal.NewFromFloat(cfg.TPMultiplier))
 
-	var slPrice, tpPrice decimal.Decimal
+	// Stop Distance Floor: Lindungi SL agar tidak diletakkan di dalam zona noise (< MinSLDistancePct)
+	if cfg.MinSLDistancePct.GreaterThan(decimal.Zero) {
+		minSLDist := entryPrice.Mul(cfg.MinSLDistancePct)
+		if slDist.LessThan(minSLDist) {
+			slDist = minSLDist
+		}
+	}
+
+	tpDist := atrDec.Mul(decimal.NewFromFloat(cfg.TPMultiplier))
+	// Jaga rasio Risk-to-Reward: pastikan tpDist tidak lebih kecil dari slDist * (TPMultiplier / SLMultiplier)
+	if cfg.SLMultiplier > 0 && cfg.TPMultiplier > 0 {
+		minTPDist := slDist.Mul(decimal.NewFromFloat(cfg.TPMultiplier / cfg.SLMultiplier))
+		if tpDist.LessThan(minTPDist) {
+			tpDist = minTPDist
+		}
+	}
+
+	tp1Mult := cfg.TP1Multiplier
+	if tp1Mult <= 0 {
+		tp1Mult = 1.20
+	}
+	tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
+	// Jika ada floor pada slDist, sesuaikan tp1Dist proporsional
+	if cfg.SLMultiplier > 0 {
+		minTP1Dist := slDist.Mul(decimal.NewFromFloat(tp1Mult / cfg.SLMultiplier))
+		if tp1Dist.LessThan(minTP1Dist) {
+			tp1Dist = minTP1Dist
+		}
+	}
+
+	var slPrice, tpPrice, tp1Price decimal.Decimal
 	if side == model.SideLong {
 		slPrice, err = model.QuantizePrice(entryPrice.Sub(slDist), snap.Filter.TickSize, false)
 		if err != nil {
@@ -50,12 +81,20 @@ func BuildSafeDecimalOrderIntent(
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
+		tp1Price, err = model.QuantizePrice(entryPrice.Add(tp1Dist), snap.Filter.TickSize, true)
+		if err != nil {
+			return model.OrderIntent{}, false
+		}
 	} else {
 		slPrice, err = model.QuantizePrice(entryPrice.Add(slDist), snap.Filter.TickSize, true)
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
 		tpPrice, err = model.QuantizePrice(entryPrice.Sub(tpDist), snap.Filter.TickSize, false)
+		if err != nil {
+			return model.OrderIntent{}, false
+		}
+		tp1Price, err = model.QuantizePrice(entryPrice.Sub(tp1Dist), snap.Filter.TickSize, false)
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
@@ -105,6 +144,7 @@ func BuildSafeDecimalOrderIntent(
 		LimitPrice:    entryPrice,
 		SLPrice:       slPrice,
 		TPPrice:       tpPrice,
+		TP1Price:      tp1Price,
 		ATRAtEntry:    atrDec,
 		CreatedAt:     snap.Now,
 	}, true

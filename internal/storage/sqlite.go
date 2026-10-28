@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
     opened_at_utc        TEXT NOT NULL,
     is_breakeven_moved   INTEGER NOT NULL DEFAULT 0,
     protection_tier      INTEGER NOT NULL DEFAULT 0,
+    initial_qty          TEXT NOT NULL DEFAULT '',
+    tp1_price            TEXT NOT NULL DEFAULT '',
+    is_tp1_hit           INTEGER NOT NULL DEFAULT 0,
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     max_mae              REAL NOT NULL DEFAULT 0.0,
     max_mfe              REAL NOT NULL DEFAULT 0.0
@@ -96,6 +99,7 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     symbol               TEXT PRIMARY KEY,
     side                 TEXT NOT NULL,
     qty                  TEXT NOT NULL,
+    initial_qty          TEXT NOT NULL DEFAULT '',
     entry_price          TEXT NOT NULL,
     sl_order_id          INTEGER NOT NULL DEFAULT 0,
     sl_client_algo_id    TEXT NOT NULL DEFAULT '',
@@ -103,6 +107,8 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     tp_order_id          INTEGER NOT NULL DEFAULT 0,
     tp_client_algo_id    TEXT NOT NULL DEFAULT '',
     tp_price             TEXT NOT NULL,
+    tp1_price            TEXT NOT NULL DEFAULT '',
+    is_tp1_hit           INTEGER NOT NULL DEFAULT 0,
     protection_tier      INTEGER NOT NULL DEFAULT 0,
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     opened_at_utc        TEXT NOT NULL,
@@ -202,6 +208,21 @@ func OpenDB(dbPath string) (*DB, error) {
 	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'protection_tier';`).Scan(&tierCount)
 	if tierCount == 0 {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN protection_tier INTEGER NOT NULL DEFAULT 0;`)
+	}
+
+	// Migrasi otomatis kolom partial TP (initial_qty, tp1_price, is_tp1_hit)
+	var tp1Count int
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'initial_qty';`).Scan(&tp1Count)
+	if tp1Count == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN initial_qty TEXT NOT NULL DEFAULT '';`)
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN tp1_price TEXT NOT NULL DEFAULT '';`)
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN is_tp1_hit INTEGER NOT NULL DEFAULT 0;`)
+	}
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'initial_qty';`).Scan(&tp1Count)
+	if tp1Count == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN initial_qty TEXT NOT NULL DEFAULT '';`)
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN tp1_price TEXT NOT NULL DEFAULT '';`)
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN is_tp1_hit INTEGER NOT NULL DEFAULT 0;`)
 	}
 
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)

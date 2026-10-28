@@ -22,10 +22,13 @@ type VirtualOpenPosition struct {
 	Symbol           string
 	Side             model.Side
 	Qty              decimal.Decimal
+	InitialQty       decimal.Decimal
 	EntryPrice       decimal.Decimal
 	EntryFee         decimal.Decimal
 	CurrentSLPrice   decimal.Decimal
 	TPPrice          decimal.Decimal
+	TP1Price         decimal.Decimal
+	IsTP1Hit         bool
 	ATRAtEntry       decimal.Decimal
 	LastMarkPrice    decimal.Decimal
 	MarkUpdatedAt    time.Time
@@ -46,6 +49,9 @@ type DryRunConfig struct {
 	Tier1BETriggerShortATR   float64
 	Tier2ProfitLockATR       float64
 	Tier2ProfitLockOffsetATR float64
+	PartialTPEnabled         bool
+	PartialTP1Ratio          float64
+	PartialTP1ATRMult        float64
 	MinBreakEvenOffsetPct    float64
 	LimitOrderTimeout        time.Duration
 	MaxHoldingDuration       time.Duration
@@ -110,6 +116,9 @@ type DryRunBroker struct {
 func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
+	if pos.InitialQty.IsZero() {
+		pos.InitialQty = pos.Qty
+	}
 	if _, exists := d.OpenPositions[pos.Symbol]; !exists {
 		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(pos.EntryFee)
 	}
@@ -235,10 +244,12 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			Symbol:           intent.Symbol,
 			Side:             intent.Side,
 			Qty:              intent.Qty,
+			InitialQty:       intent.Qty,
 			EntryPrice:       fillPrice,
 			EntryFee:         entryFee,
 			CurrentSLPrice:   intent.SLPrice,
 			TPPrice:          intent.TPPrice,
+			TP1Price:         intent.TP1Price,
 			ATRAtEntry:       intent.ATRAtEntry,
 			LastMarkPrice:    fillPrice,
 			MarkUpdatedAt:    now,
@@ -491,6 +502,15 @@ func (d *DryRunBroker) OnRealtimeTick(
 				return
 			}
 
+			// Partial Take Profit (Scale-Out Phase 2)
+			if d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
+				isTP1Hit := triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) ||
+					(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price))
+				if isTP1Hit {
+					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.TakerFeeRate, beOffsetRate)
+				}
+			}
+
 			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1LongTriggerATR))
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
@@ -546,6 +566,15 @@ func (d *DryRunBroker) OnRealtimeTick(
 				return
 			}
 
+			// Partial Take Profit (Scale-Out Phase 2)
+			if d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
+				isTP1Hit := triggerRefPrice.LessThanOrEqual(pos.TP1Price) ||
+					(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price))
+				if isTP1Hit {
+					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.TakerFeeRate, beOffsetRate)
+				}
+			}
+
 			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1ShortTriggerATR))
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
@@ -595,10 +624,12 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 			Symbol:           ord.Intent.Symbol,
 			Side:             ord.Intent.Side,
 			Qty:              ord.FilledQty,
+			InitialQty:       ord.Intent.Qty,
 			EntryPrice:       ord.Intent.LimitPrice,
 			EntryFee:         entryFee,
 			CurrentSLPrice:   ord.Intent.SLPrice,
 			TPPrice:          ord.Intent.TPPrice,
+			TP1Price:         ord.Intent.TP1Price,
 			ATRAtEntry:       ord.Intent.ATRAtEntry,
 			LastMarkPrice:    ord.Intent.LimitPrice,
 			MarkUpdatedAt:    now,
@@ -617,6 +648,89 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 	})
 }
 
+func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, beOffsetRate decimal.Decimal) {
+	ratio := d.Cfg.PartialTP1Ratio
+	if ratio <= 0.05 || ratio >= 0.95 {
+		ratio = 0.50
+	}
+	closeQty := pos.Qty.Mul(decimal.NewFromFloat(ratio))
+	if closeQty.LessThanOrEqual(decimal.Zero) || closeQty.GreaterThanOrEqual(pos.Qty) {
+		return
+	}
+
+	var grossPnL decimal.Decimal
+	if pos.Side == model.SideLong {
+		grossPnL = exitPrice.Sub(pos.EntryPrice).Mul(closeQty)
+	} else {
+		grossPnL = pos.EntryPrice.Sub(exitPrice).Mul(closeQty)
+	}
+	exitFee := exitPrice.Mul(closeQty).Mul(decimal.NewFromFloat(feeRate))
+
+	initQty := pos.InitialQty
+	if initQty.IsZero() {
+		initQty = pos.Qty
+	}
+	entryFeePortion := pos.EntryFee.Mul(closeQty).Div(initQty)
+	netPnL := grossPnL.Sub(entryFeePortion).Sub(exitFee)
+
+	// Saldo akun saat entry sudah didebet pos.EntryFee, maka penambahan saat exit adalah: grossPnL - exitFee
+	d.RealizedEquityUSDT = d.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
+	pos.Qty = pos.Qty.Sub(closeQty)
+	pos.IsTP1Hit = true
+
+	// Pindahkan SL ke Break-Even (Entry +/- beOffsetRate)
+	var newSL decimal.Decimal
+	if pos.Side == model.SideLong {
+		newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
+		if newSL.GreaterThan(pos.CurrentSLPrice) {
+			pos.CurrentSLPrice = newSL
+		}
+	} else {
+		newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
+		if newSL.LessThan(pos.CurrentSLPrice) {
+			pos.CurrentSLPrice = newSL
+		}
+	}
+	pos.IsBreakEvenMoved = true
+	pos.ProtectionTier = 1
+
+	d.enqueuePositionEvent(PositionEvent{
+		Type: PositionEventSave,
+		Pos:  *pos,
+	})
+
+	now := time.Now().UTC()
+	if d.OnTradeClosedFn != nil {
+		tradeRec := TradeClosedRecord{
+			ClientOrderID: fmt.Sprintf("%s_TP1", pos.ClientOrderID),
+			Symbol:        pos.Symbol,
+			Side:          string(pos.Side),
+			Qty:           closeQty,
+			EntryPrice:    pos.EntryPrice,
+			ExitPrice:     exitPrice,
+			SLPrice:       pos.CurrentSLPrice,
+			TPPrice:       pos.TPPrice,
+			NetPnL:        netPnL,
+			MAE:           pos.MaxMAE,
+			MFE:           pos.MaxMFE,
+			ExitReason:    "PARTIAL_TAKE_PROFIT",
+			OpenedAt:      pos.OpenTime,
+			ClosedAt:      now,
+			SignalAuditID: pos.SignalAuditID,
+		}
+		go d.OnTradeClosedFn(tradeRec)
+	}
+
+	slog.Info("dryrun: TP1 Partial Take Profit filled",
+		"symbol", pos.Symbol,
+		"clientOrderID", pos.ClientOrderID,
+		"closedQty", closeQty,
+		"remainingQty", pos.Qty,
+		"exitPrice", exitPrice,
+		"netPnL", netPnL,
+		"newSL", pos.CurrentSLPrice)
+}
+
 func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, reason string) {
 	var grossPnL decimal.Decimal
 	if pos.Side == model.SideLong {
@@ -625,8 +739,13 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 		grossPnL = pos.EntryPrice.Sub(exitPrice).Mul(pos.Qty)
 	}
 	exitFee := exitPrice.Mul(pos.Qty).Mul(decimal.NewFromFloat(feeRate))
+
+	entryFeePortion := pos.EntryFee
+	if !pos.InitialQty.IsZero() && pos.InitialQty.GreaterThan(pos.Qty) {
+		entryFeePortion = pos.EntryFee.Mul(pos.Qty).Div(pos.InitialQty)
+	}
 	// Round-Trip True Net PnL = Gross PnL - Entry Fee - Exit Fee
-	netPnL := grossPnL.Sub(pos.EntryFee).Sub(exitFee)
+	netPnL := grossPnL.Sub(entryFeePortion).Sub(exitFee)
 	// Saldo akun saat entry sudah didebet pos.EntryFee, maka penambahan saat exit adalah: grossPnL - exitFee
 	d.RealizedEquityUSDT = d.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
 

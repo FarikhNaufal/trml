@@ -79,6 +79,10 @@ type Config struct {
 	Tier2ProfitLockOffsetATR float64
 	MinBounceZScoreLong      float64
 	MinBounceZScoreShort     float64
+	MinSLDistancePct         decimal.Decimal
+	PartialTPEnabled         bool
+	PartialTP1Ratio          float64
+	PartialTP1ATRMult        float64
 	BTCGateEnabled           bool
 	BTCMax5mDumpPct          float64
 	BTCMax5mPumpPct          float64
@@ -267,13 +271,13 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid PULLBACK_TOLERANCE_ATR '%s' (must be float between 0.05 and 2.0)", pullbackTolStr)
 	}
 
-	minBounceZStr := getEnv("MIN_BOUNCE_ZSCORE", "1.20")
+	minBounceZStr := getEnv("MIN_BOUNCE_ZSCORE", "1.00")
 	minBounceZ, err := strconv.ParseFloat(minBounceZStr, 64)
 	if err != nil || minBounceZ <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
 	}
 
-	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "1.50")
+	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "1.00")
 	minBounceZLong, err := strconv.ParseFloat(minBounceZLongStr, 64)
 	if err != nil || minBounceZLong <= 0 {
 		minBounceZLong = minBounceZ
@@ -303,7 +307,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR '%s' (must be positive float)", minImpulseATRStr)
 	}
 
-	maxEntryDistStr := getEnv("MAX_ENTRY_DISTANCE_ATR", "1.00")
+	maxEntryDistStr := getEnv("MAX_ENTRY_DISTANCE_ATR", "1.20")
 	maxEntryDist, err := strconv.ParseFloat(maxEntryDistStr, 64)
 	if err != nil || maxEntryDist <= 0 || maxEntryDist > 5.0 {
 		return nil, fmt.Errorf("config: invalid MAX_ENTRY_DISTANCE_ATR '%s' (must be float between 0.1 and 5.0)", maxEntryDistStr)
@@ -326,7 +330,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_SPREAD_PCT '%s' (must be float between 0.001 and 1.0)", maxSpreadStr)
 	}
 
-	minNATRStr := getEnv("MIN_NATR_PCT", "0.35")
+	minNATRStr := getEnv("MIN_NATR_PCT", "0.70")
 	minNATR, err := strconv.ParseFloat(minNATRStr, 64)
 	if err != nil || minNATR <= 0 || minNATR > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_NATR_PCT '%s' (must be float between 0.01 and 10.0)", minNATRStr)
@@ -402,6 +406,26 @@ func LoadConfig() (*Config, error) {
 	t2Offset, err := strconv.ParseFloat(t2OffsetStr, 64)
 	if err != nil || t2Offset <= 0.05 || t2Offset > 10.0 {
 		t2Offset = 0.70
+	}
+
+	minSLDistPctStr := getEnv("MIN_SL_DISTANCE_PCT", "0.0150")
+	minSLDistPct, err := decimal.NewFromString(minSLDistPctStr)
+	if err != nil || minSLDistPct.LessThan(decimal.Zero) || minSLDistPct.GreaterThan(decimal.NewFromFloat(0.20)) {
+		return nil, fmt.Errorf("config: invalid MIN_SL_DISTANCE_PCT '%s' (must be between 0.00 and 0.20)", minSLDistPctStr)
+	}
+
+	partialTPEnabled := getEnv("PARTIAL_TP_ENABLED", "true") == "true"
+
+	partialTP1RatioStr := getEnv("PARTIAL_TP1_RATIO", "0.50")
+	partialTP1Ratio, err := strconv.ParseFloat(partialTP1RatioStr, 64)
+	if err != nil || partialTP1Ratio <= 0.05 || partialTP1Ratio >= 0.95 {
+		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_RATIO '%s' (must be float between 0.05 and 0.95)", partialTP1RatioStr)
+	}
+
+	partialTP1ATRMultStr := getEnv("PARTIAL_TP1_ATR_MULT", "1.20")
+	partialTP1ATRMult, err := strconv.ParseFloat(partialTP1ATRMultStr, 64)
+	if err != nil || partialTP1ATRMult <= 0.1 || partialTP1ATRMult > 10.0 {
+		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_ATR_MULT '%s' (must be float between 0.1 and 10.0)", partialTP1ATRMultStr)
 	}
 
 	btcGateEnabledStr := getEnv("BTC_GATE_ENABLED", "true")
@@ -510,6 +534,10 @@ func LoadConfig() (*Config, error) {
 		Tier1BETriggerShortATR:   t1BETriggerShort,
 		Tier2ProfitLockATR:       t2ProfitLock,
 		Tier2ProfitLockOffsetATR: t2Offset,
+		MinSLDistancePct:         minSLDistPct,
+		PartialTPEnabled:         partialTPEnabled,
+		PartialTP1Ratio:          partialTP1Ratio,
+		PartialTP1ATRMult:        partialTP1ATRMult,
 		BTCGateEnabled:           btcGateEnabled,
 		BTCMax5mDumpPct:          btcMaxDump,
 		BTCMax5mPumpPct:          btcMaxPump,

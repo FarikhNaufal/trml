@@ -1291,6 +1291,112 @@ func TestDryRunBroker_TieredDynamicBreakEvenAndProfitLock(t *testing.T) {
 	}
 }
 
+func TestDryRunBroker_PartialTakeProfit_ScaleOut(t *testing.T) {
+	now := time.Now().UTC()
+	broker := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+		MaxSlots:              3,
+		AccountLeverage:       5.0,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		PartialTP1ATRMult:     1.20,
+		MinBreakEvenOffsetPct: 0.0010,
+		EntryOrderType:        "MARKET",
+		TakerFeeRate:          0.0005,
+		MakerFeeRate:          0.0002,
+		SlippageRate:          0.0001,
+	})
+	defer broker.Close()
+
+	closedTrades := make(chan TradeClosedRecord, 5)
+	broker.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTrades <- rec
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST-SCALE-OUT-001",
+		Symbol:        "ADAUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(100.0),
+		LimitPrice:    decimal.NewFromFloat(1.00),
+		SLPrice:       decimal.NewFromFloat(0.985),  // SL 1.5%
+		TP1Price:      decimal.NewFromFloat(1.012),  // TP1 +1.2%
+		TPPrice:       decimal.NewFromFloat(1.0225), // TP2 +2.25%
+		ATRAtEntry:    decimal.NewFromFloat(0.010),
+		CreatedAt:     now,
+	}
+
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("expected entry to succeed, got ok=%v, err=%v", ok, err)
+	}
+
+	// 1. Harga naik menyentuh TP1 (1.0125 >= 1.012)
+	broker.OnRealtimeTick("ADAUSDT", 1.0124, 1.0126, 1.0125, 1.0125, 50.0, false, now.Add(1*time.Minute))
+
+	// Verifikasi trade partial take profit
+	select {
+	case tp1Rec := <-closedTrades:
+		if tp1Rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+			t.Errorf("expected exit reason PARTIAL_TAKE_PROFIT, got %s", tp1Rec.ExitReason)
+		}
+		if !tp1Rec.Qty.Equal(decimal.NewFromFloat(50.0)) {
+			t.Errorf("expected closed qty 50.0, got %s", tp1Rec.Qty)
+		}
+		if tp1Rec.NetPnL.LessThanOrEqual(decimal.Zero) {
+			t.Errorf("expected positive netPnL on TP1, got %s", tp1Rec.NetPnL)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for TP1 partial trade closed record")
+	}
+
+	// Verifikasi state posisi in-memory: kuantitas tersisa separuh dan SL sudah di Break-Even
+	broker.Mu.Lock()
+	pos, exists := broker.OpenPositions["ADAUSDT"]
+	if !exists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected position to still exist with remaining runner")
+	}
+	if !pos.Qty.Equal(decimal.NewFromFloat(50.0)) {
+		t.Errorf("expected remaining qty 50.0, got %s", pos.Qty)
+	}
+	if !pos.IsTP1Hit {
+		t.Errorf("expected pos.IsTP1Hit to be true")
+	}
+	// SL harus sudah dipindahkan ke Break-Even: 1.00 * (1 + 0.0011 fee buffer) = 1.0011
+	expectedBESL := decimal.NewFromFloat(1.0011)
+	if !pos.CurrentSLPrice.Equal(expectedBESL) {
+		t.Errorf("expected BE SL %s, got %s", expectedBESL, pos.CurrentSLPrice)
+	}
+	broker.Mu.Unlock()
+
+	// 2. Harga retrace tajam turun ke 1.0005 (menyentuh SL Break-Even 1.0010)
+	broker.OnRealtimeTick("ADAUSDT", 1.0004, 1.0006, 1.0005, 1.0005, 50.0, false, now.Add(2*time.Minute))
+
+	// Verifikasi sisa posisi ditutup dengan BREAK_EVEN
+	select {
+	case beRec := <-closedTrades:
+		if beRec.ExitReason != "BREAK_EVEN" {
+			t.Errorf("expected exit reason BREAK_EVEN for runner retrace, got %s", beRec.ExitReason)
+		}
+		if !beRec.Qty.Equal(decimal.NewFromFloat(50.0)) {
+			t.Errorf("expected closed runner qty 50.0, got %s", beRec.Qty)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for runner trade closed record")
+	}
+
+	// Posisi sekarang harus sudah sepenuhnya tertutup
+	broker.Mu.Lock()
+	if len(broker.OpenPositions) != 0 {
+		t.Errorf("expected 0 open positions, got %d", len(broker.OpenPositions))
+	}
+	// Total realized equity harus lebih besar dari initial equity ($1000) karena TP1 cuan riil!
+	if broker.RealizedEquityUSDT.LessThanOrEqual(decimal.NewFromFloat(1000.0)) {
+		t.Errorf("expected total realized equity > 1000.0, got %s", broker.RealizedEquityUSDT)
+	}
+	broker.Mu.Unlock()
+}
+
 
 
 
