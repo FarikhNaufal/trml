@@ -396,16 +396,16 @@ func LoadConfig() (*Config, error) {
 		t1BETriggerShort = 0.90
 	}
 
-	t2ProfitLockStr := getEnv("TIER2_PROFIT_LOCK_ATR", "1.40")
+	t2ProfitLockStr := getEnv("TIER2_PROFIT_LOCK_ATR", "1.80")
 	t2ProfitLock, err := strconv.ParseFloat(t2ProfitLockStr, 64)
 	if err != nil || t2ProfitLock <= 0.1 || t2ProfitLock > 10.0 {
-		t2ProfitLock = 1.40
+		t2ProfitLock = 1.80
 	}
 
-	t2OffsetStr := getEnv("TIER2_PROFIT_LOCK_OFFSET_ATR", "0.70")
+	t2OffsetStr := getEnv("TIER2_PROFIT_LOCK_OFFSET_ATR", "0.90")
 	t2Offset, err := strconv.ParseFloat(t2OffsetStr, 64)
 	if err != nil || t2Offset <= 0.05 || t2Offset > 10.0 {
-		t2Offset = 0.70
+		t2Offset = 0.90
 	}
 
 	minSLDistPctStr := getEnv("MIN_SL_DISTANCE_PCT", "0.0150")
@@ -486,6 +486,12 @@ func LoadConfig() (*Config, error) {
 		aiRateLimit = 10
 	}
 
+	maxHoldingDurationStr := getEnv("MAX_HOLDING_DURATION", "4h")
+	maxHoldingDuration, err := time.ParseDuration(maxHoldingDurationStr)
+	if err != nil || maxHoldingDuration < 15*time.Minute {
+		maxHoldingDuration = 4 * time.Hour
+	}
+
 	return &Config{
 		Env:                  env,
 		APIKey:               apiKey,
@@ -555,7 +561,7 @@ func LoadConfig() (*Config, error) {
 		MaxOIInterval:      8 * time.Minute,
 		MaxOIStaleness:     330 * time.Second,
 		LimitOrderTimeout:  45 * time.Second,
-		MaxHoldingDuration: 4 * time.Hour,
+		MaxHoldingDuration: maxHoldingDuration,
 		RecvWindowMS:       recvWin,
 
 		DashboardPIN:     dashPIN,

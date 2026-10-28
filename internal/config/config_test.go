@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -40,6 +41,15 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.MaxCounterImpulseATR != 1.50 {
 		t.Errorf("expected default MaxCounterImpulseATR 1.50, got %f", cfg.MaxCounterImpulseATR)
+	}
+	if cfg.Tier2ProfitLockATR != 1.80 {
+		t.Errorf("expected default Tier2ProfitLockATR 1.80, got %f", cfg.Tier2ProfitLockATR)
+	}
+	if cfg.Tier2ProfitLockOffsetATR != 0.90 {
+		t.Errorf("expected default Tier2ProfitLockOffsetATR 0.90, got %f", cfg.Tier2ProfitLockOffsetATR)
+	}
+	if cfg.MaxHoldingDuration != 4*time.Hour {
+		t.Errorf("expected default MaxHoldingDuration 4h, got %v", cfg.MaxHoldingDuration)
 	}
 }
 
@@ -185,5 +195,18 @@ func TestMaxDailyDrawdownDryRunAndLiveClamping(t *testing.T) {
 	}
 	if cfgLive.MaxDailyDrawdown != -0.05 {
 		t.Errorf("expected live mode to clamp to -0.05, got %f", cfgLive.MaxDailyDrawdown)
+	}
+}
+
+func TestMaxHoldingDurationConfig(t *testing.T) {
+	_ = os.Setenv("MAX_HOLDING_DURATION", "6h")
+	defer func() { _ = os.Unsetenv("MAX_HOLDING_DURATION") }()
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+	if cfg.MaxHoldingDuration != 6*time.Hour {
+		t.Errorf("expected 6h, got %v", cfg.MaxHoldingDuration)
 	}
 }

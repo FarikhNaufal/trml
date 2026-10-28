@@ -1050,12 +1050,12 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 
 		t2TriggerATR := b.Cfg.Tier2ProfitLockATR
 		if t2TriggerATR <= 0 {
-			t2TriggerATR = 1.40
+			t2TriggerATR = 1.80
 		}
 
 		t2OffsetATR := b.Cfg.Tier2ProfitLockOffsetATR
 		if t2OffsetATR <= 0 {
-			t2OffsetATR = 0.70
+			t2OffsetATR = 0.90
 		}
 
 		beOffsetRate := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))

@@ -455,12 +455,12 @@ func (d *DryRunBroker) OnRealtimeTick(
 
 		t2TriggerATR := d.Cfg.Tier2ProfitLockATR
 		if t2TriggerATR <= 0 {
-			t2TriggerATR = 1.40
+			t2TriggerATR = 1.80
 		}
 
 		t2OffsetATR := d.Cfg.Tier2ProfitLockOffsetATR
 		if t2OffsetATR <= 0 {
-			t2OffsetATR = 0.70
+			t2OffsetATR = 0.90
 		}
 
 		beOffsetRate := decimal.NewFromFloat(math.Max(d.Cfg.MinBreakEvenOffsetPct, 2.0*d.Cfg.TakerFeeRate+d.Cfg.SlippageRate))
@@ -515,7 +515,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-			// Tier 2: Half-Way Profit Lock (+1.40x ATR MFE -> Kunci SL ke Entry + 0.70x ATR)
+			// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry + 0.90x ATR)
 			if pos.ProtectionTier < 2 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t2TriggerDist) {
 				newSL := pos.EntryPrice.Add(t2OffsetDist)
 				if newSL.GreaterThan(pos.CurrentSLPrice) {
@@ -579,7 +579,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-			// Tier 2: Half-Way Profit Lock (+1.40x ATR MFE -> Kunci SL ke Entry - 0.70x ATR)
+			// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry - 0.90x ATR)
 			if pos.ProtectionTier < 2 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t2TriggerDist) {
 				newSL := pos.EntryPrice.Sub(t2OffsetDist)
 				if newSL.LessThan(pos.CurrentSLPrice) {
