@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
     mark_updated_at_utc  TEXT NOT NULL,
     opened_at_utc        TEXT NOT NULL,
     is_breakeven_moved   INTEGER NOT NULL DEFAULT 0,
+    protection_tier      INTEGER NOT NULL DEFAULT 0,
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     max_mae              REAL NOT NULL DEFAULT 0.0,
     max_mfe              REAL NOT NULL DEFAULT 0.0
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     tp_order_id          INTEGER NOT NULL DEFAULT 0,
     tp_client_algo_id    TEXT NOT NULL DEFAULT '',
     tp_price             TEXT NOT NULL,
+    protection_tier      INTEGER NOT NULL DEFAULT 0,
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     opened_at_utc        TEXT NOT NULL,
     max_mae              REAL NOT NULL DEFAULT 0.0,
@@ -190,6 +192,18 @@ func OpenDB(dbPath string) (*DB, error) {
 	if colCount == 0 {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE trade_ledger ADD COLUMN ai_autopsy TEXT NOT NULL DEFAULT '';`)
 	}
+
+	// Migrasi otomatis kolom protection_tier di dryrun_open_positions & live_open_positions
+	var tierCount int
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'protection_tier';`).Scan(&tierCount)
+	if tierCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN protection_tier INTEGER NOT NULL DEFAULT 0;`)
+	}
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'protection_tier';`).Scan(&tierCount)
+	if tierCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN protection_tier INTEGER NOT NULL DEFAULT 0;`)
+	}
+
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);`)
 

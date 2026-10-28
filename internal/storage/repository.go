@@ -24,6 +24,7 @@ type StoredDryRunPosition struct {
 	MarkUpdatedAt    time.Time
 	OpenedAt         time.Time
 	IsBreakEvenMoved bool
+	ProtectionTier   int
 	SignalAuditID    int64
 	MaxMAE           float64
 	MaxMFE           float64
@@ -40,6 +41,7 @@ type StoredLivePosition struct {
 	TPOrderID      int64
 	TPClientAlgoID string
 	TPPrice        decimal.Decimal
+	ProtectionTier int
 	SignalAuditID  int64
 	OpenedAt       time.Time
 	MaxMAE         float64
@@ -262,14 +264,15 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 	INSERT INTO dryrun_open_positions (
 		client_order_id, symbol, side, qty, entry_price, entry_fee,
 		current_sl_price, tp_price, atr_at_entry, last_mark_price,
-		mark_updated_at_utc, opened_at_utc, is_breakeven_moved,
+		mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
 		signal_audit_id, max_mae, max_mfe
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
 		current_sl_price = excluded.current_sl_price,
 		last_mark_price = excluded.last_mark_price,
 		mark_updated_at_utc = excluded.mark_updated_at_utc,
 		is_breakeven_moved = excluded.is_breakeven_moved,
+		protection_tier = excluded.protection_tier,
 		max_mae = excluded.max_mae,
 		max_mfe = excluded.max_mfe;
 	`
@@ -303,6 +306,7 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		markTime,
 		openTime,
 		beInt,
+		pos.ProtectionTier,
 		pos.SignalAuditID,
 		pos.MaxMAE,
 		pos.MaxMFE,
@@ -328,7 +332,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	query := `
 	SELECT symbol, client_order_id, side, qty, entry_price, entry_fee,
 	       current_sl_price, tp_price, atr_at_entry, last_mark_price,
-	       mark_updated_at_utc, opened_at_utc, is_breakeven_moved,
+	       mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
 	       signal_audit_id, max_mae, max_mfe
 	FROM dryrun_open_positions;
 	`
@@ -359,6 +363,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 			&markTimeStr,
 			&openTimeStr,
 			&beInt,
+			&p.ProtectionTier,
 			&p.SignalAuditID,
 			&p.MaxMAE,
 			&p.MaxMFE,
@@ -429,9 +434,9 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 	query := `
 	INSERT INTO live_open_positions (
 		symbol, side, qty, entry_price, sl_order_id, sl_client_algo_id,
-		sl_price, tp_order_id, tp_client_algo_id, tp_price, signal_audit_id,
+		sl_price, tp_order_id, tp_client_algo_id, tp_price, protection_tier, signal_audit_id,
 		opened_at_utc, max_mae, max_mfe, updated_at_utc
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(symbol) DO UPDATE SET
 		side = excluded.side,
 		qty = excluded.qty,
@@ -442,6 +447,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		tp_order_id = excluded.tp_order_id,
 		tp_client_algo_id = excluded.tp_client_algo_id,
 		tp_price = excluded.tp_price,
+		protection_tier = excluded.protection_tier,
 		signal_audit_id = excluded.signal_audit_id,
 		max_mae = excluded.max_mae,
 		max_mfe = excluded.max_mfe,
@@ -469,6 +475,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		pos.TPOrderID,
 		pos.TPClientAlgoID,
 		pos.TPPrice.String(),
+		pos.ProtectionTier,
 		pos.SignalAuditID,
 		openTime,
 		pos.MaxMAE,
@@ -495,7 +502,7 @@ func (r *SQLiteRepository) DeleteLivePosition(ctx context.Context, symbol string
 func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error) {
 	query := `
 	SELECT symbol, side, qty, entry_price, sl_order_id, sl_client_algo_id,
-	       sl_price, tp_order_id, tp_client_algo_id, tp_price, signal_audit_id,
+	       sl_price, tp_order_id, tp_client_algo_id, tp_price, protection_tier, signal_audit_id,
 	       opened_at_utc, max_mae, max_mfe, updated_at_utc
 	FROM live_open_positions;
 	`
@@ -521,6 +528,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 			&p.TPOrderID,
 			&p.TPClientAlgoID,
 			&tpStr,
+			&p.ProtectionTier,
 			&p.SignalAuditID,
 			&openTimeStr,
 			&p.MaxMAE,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +18,13 @@ type LiveBrokerConfig struct {
 	MaxDailyDrawdownPct float64
 	MaxAccountStaleness time.Duration
 	LimitOrderTimeout   time.Duration
-	MaxHoldingDuration  time.Duration
+	MaxHoldingDuration       time.Duration
+	BreakEvenTriggerATR      float64
+	Tier1BETriggerLongATR    float64
+	Tier1BETriggerShortATR   float64
+	Tier2ProfitLockATR       float64
+	Tier2ProfitLockOffsetATR float64
+	MinBreakEvenOffsetPct    float64
 }
 
 type LiveOpenPosition struct {
@@ -31,6 +38,7 @@ type LiveOpenPosition struct {
 	TPOrderID      int64
 	TPClientAlgoID string
 	TPPrice        decimal.Decimal
+	ProtectionTier int
 	SignalAuditID  int64
 	OpenTime       time.Time
 	MaxMAE         float64
@@ -60,6 +68,8 @@ type BinanceLiveBroker struct {
 	TPRepairInFlight       map[string]bool            // symbol -> true if TP repair order in flight
 	ActiveMAE              map[string]float64         // symbol -> max adverse excursion pct
 	ActiveMFE              map[string]float64         // symbol -> max favorable excursion pct
+	ProtectionTiers        map[string]int             // symbol -> current protection tier (0, 1, 2)
+	ATRAtEntry             map[string]decimal.Decimal // symbol -> atr at entry
 
 	PlaceEntryFn           func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
 	PlaceAlgoOrderFn       func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (algoID int64, err error)
@@ -86,6 +96,8 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		TPRepairInFlight:    make(map[string]bool),
 		ActiveMAE:           make(map[string]float64),
 		ActiveMFE:           make(map[string]float64),
+		ProtectionTiers:     make(map[string]int),
+		ATRAtEntry:          make(map[string]decimal.Decimal),
 	}
 }
 
@@ -103,6 +115,9 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 	b.PositionOpenTimes[pos.Symbol] = pos.OpenTime
 	b.ActiveMAE[pos.Symbol] = pos.MaxMAE
 	b.ActiveMFE[pos.Symbol] = pos.MaxMFE
+	if pos.ProtectionTier > 0 {
+		b.ProtectionTiers[pos.Symbol] = pos.ProtectionTier
+	}
 
 	b.Protections[pos.Symbol] = &model.LivePositionProtection{
 		Symbol:          pos.Symbol,
@@ -181,6 +196,7 @@ func (b *BinanceLiveBroker) notifyPositionSavedLocked(symbol string) {
 		TPOrderID:      prot.TPOrderID,
 		TPClientAlgoID: prot.TPClientAlgoID,
 		TPPrice:        prot.TPPrice,
+		ProtectionTier: b.ProtectionTiers[symbol],
 		SignalAuditID:  prot.SignalAuditID,
 		OpenTime:       b.PositionOpenTimes[symbol],
 		MaxMAE:         b.ActiveMAE[symbol],
@@ -245,6 +261,7 @@ func (b *BinanceLiveBroker) ReserveEntryIntent(intent model.OrderIntent) (bool, 
 		SignalAuditID:       intent.SignalAuditID,
 		CreatedAt:           time.Now().UTC(),
 	}
+	b.ATRAtEntry[intent.Symbol] = intent.ATRAtEntry
 	return true, nil
 }
 
@@ -258,6 +275,7 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 	if b.PlaceEntryFn == nil {
 		b.Mu.Lock()
 		delete(b.OrdersByClient, intent.ClientOrderID)
+		delete(b.ATRAtEntry, intent.Symbol)
 		b.Mu.Unlock()
 		return false, fmt.Errorf("PlaceEntryFn adapter is not configured")
 	}
@@ -269,6 +287,7 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 	if err != nil {
 		b.Mu.Lock()
 		delete(b.OrdersByClient, intent.ClientOrderID)
+		delete(b.ATRAtEntry, intent.Symbol)
 		b.Mu.Unlock()
 		return false, fmt.Errorf("entry placement rejected/failed: %w", err)
 	}
@@ -447,26 +466,39 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 		delete(b.PositionOpenTimes, symbol)
 		if prot, ok := b.Protections[symbol]; ok {
 			var exitReason string
+			currentTier := b.ProtectionTiers[symbol]
 			if (exchangeOrderID == prot.SLOrderID || clientOrderID == prot.SLClientAlgoID) && prot.TPOrderID != 0 {
 				siblingCancelAlgoID = prot.TPOrderID
 				siblingCancelSymbol = symbol
 				exitReason = "STOP_LOSS"
+				if currentTier == 2 {
+					exitReason = "PROFIT_LOCK"
+				} else if currentTier == 1 {
+					exitReason = "BREAK_EVEN"
+				}
 			} else if (exchangeOrderID == prot.TPOrderID || clientOrderID == prot.TPClientAlgoID) && prot.SLOrderID != 0 {
 				siblingCancelAlgoID = prot.SLOrderID
 				siblingCancelSymbol = symbol
 				exitReason = "TAKE_PROFIT"
 			} else if exchangeOrderID == prot.SLOrderID || clientOrderID == prot.SLClientAlgoID {
 				exitReason = "STOP_LOSS"
+				if currentTier == 2 {
+					exitReason = "PROFIT_LOCK"
+				} else if currentTier == 1 {
+					exitReason = "BREAK_EVEN"
+				}
 			} else {
 				exitReason = "TAKE_PROFIT"
 			}
 
 			entryPrice := b.PositionEntryPrices[symbol]
 			delete(b.PositionEntryPrices, symbol)
+			delete(b.ProtectionTiers, symbol)
+			delete(b.ATRAtEntry, symbol)
 
 			exitPrice := avgPrice
 			if exitPrice.LessThanOrEqual(decimal.Zero) {
-				if exitReason == "STOP_LOSS" {
+				if exitReason == "STOP_LOSS" || exitReason == "BREAK_EVEN" || exitReason == "PROFIT_LOCK" {
 					exitPrice = prot.SLPrice
 				} else {
 					exitPrice = prot.TPPrice
@@ -984,6 +1016,120 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 			advPct := ((markPrice - entryF) / entryF) * 100.0
 			if advPct > b.ActiveMAE[symbol] {
 				b.ActiveMAE[symbol] = advPct
+			}
+		}
+	}
+
+	// Proteksi Dinamis Tier 1 & Tier 2 Break-Even / Profit Lock untuk Live Trading
+	atr := b.ATRAtEntry[symbol]
+	if atr.GreaterThan(decimal.Zero) {
+		t1LongTriggerATR := b.Cfg.Tier1BETriggerLongATR
+		if t1LongTriggerATR <= 0 {
+			t1LongTriggerATR = b.Cfg.BreakEvenTriggerATR
+		}
+		if t1LongTriggerATR <= 0 {
+			t1LongTriggerATR = 0.70
+		}
+
+		t1ShortTriggerATR := b.Cfg.Tier1BETriggerShortATR
+		if t1ShortTriggerATR <= 0 {
+			t1ShortTriggerATR = b.Cfg.BreakEvenTriggerATR
+		}
+		if t1ShortTriggerATR <= 0 {
+			t1ShortTriggerATR = 0.90
+		}
+
+		t2TriggerATR := b.Cfg.Tier2ProfitLockATR
+		if t2TriggerATR <= 0 {
+			t2TriggerATR = 1.40
+		}
+
+		t2OffsetATR := b.Cfg.Tier2ProfitLockOffsetATR
+		if t2OffsetATR <= 0 {
+			t2OffsetATR = 0.70
+		}
+
+		beOffsetRate := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))
+		markPriceDec := decimal.NewFromFloat(markPrice)
+		prot, hasProt := b.Protections[symbol]
+		currentTier := b.ProtectionTiers[symbol]
+
+		if hasProt && prot.SLStatus == model.ProtectionAcked && b.PlaceAlgoOrderFn != nil {
+			var newTargetTier int
+			var newSL decimal.Decimal
+
+			if side == model.SideLong {
+				t1TriggerDist := atr.Mul(decimal.NewFromFloat(t1LongTriggerATR))
+				t2TriggerDist := atr.Mul(decimal.NewFromFloat(t2TriggerATR))
+				t2OffsetDist := atr.Mul(decimal.NewFromFloat(t2OffsetATR))
+
+				if currentTier < 2 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t2TriggerDist) {
+					calculatedSL := entryPrice.Add(t2OffsetDist)
+					if calculatedSL.GreaterThan(prot.SLPrice) {
+						newTargetTier = 2
+						newSL = calculatedSL
+					}
+				} else if currentTier < 1 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t1TriggerDist) {
+					calculatedSL := entryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
+					if calculatedSL.GreaterThan(prot.SLPrice) {
+						newTargetTier = 1
+						newSL = calculatedSL
+					}
+				}
+			} else {
+				t1TriggerDist := atr.Mul(decimal.NewFromFloat(t1ShortTriggerATR))
+				t2TriggerDist := atr.Mul(decimal.NewFromFloat(t2TriggerATR))
+				t2OffsetDist := atr.Mul(decimal.NewFromFloat(t2OffsetATR))
+
+				if currentTier < 2 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t2TriggerDist) {
+					calculatedSL := entryPrice.Sub(t2OffsetDist)
+					if calculatedSL.LessThan(prot.SLPrice) {
+						newTargetTier = 2
+						newSL = calculatedSL
+					}
+				} else if currentTier < 1 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t1TriggerDist) {
+					calculatedSL := entryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
+					if calculatedSL.LessThan(prot.SLPrice) {
+						newTargetTier = 1
+						newSL = calculatedSL
+					}
+				}
+			}
+
+			if newTargetTier > 0 && !newSL.IsZero() {
+				b.ProtectionTiers[symbol] = newTargetTier
+				oldSLID := prot.SLOrderID
+				prot.SLPrice = newSL
+				prot.PlanGeneration++
+				gen := prot.PlanGeneration
+				exitSide := model.OppositeSide(side)
+				clientSLID := fmt.Sprintf("live_sl_%s_%d", symbol, time.Now().UnixNano())
+				prot.SLClientAlgoID = clientSLID
+
+				go func(sym string, eSide model.Side, targetQty, targetSL decimal.Decimal, cAlgoID string, oldID int64, generation uint64, tier int) {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					newID, err := b.PlaceAlgoOrderFn(ctx, sym, eSide, "STOP_MARKET", targetQty, targetSL, cAlgoID)
+					cancel()
+					if err == nil && newID != 0 {
+						b.Mu.Lock()
+						if p, ok := b.Protections[sym]; ok && p.PlanGeneration == generation {
+							p.SLOrderID = newID
+							b.notifyPositionSavedLocked(sym)
+						}
+						b.Mu.Unlock()
+
+						if oldID != 0 && b.CancelAlgoOrderFn != nil {
+							cCtx, cCancel := context.WithTimeout(context.Background(), 5*time.Second)
+							_ = b.CancelAlgoOrderFn(cCtx, sym, oldID)
+							cCancel()
+						}
+						slog.Info("live: dynamic protection tier activated",
+							"symbol", sym, "tier", tier, "newSL", targetSL, "algoID", newID)
+					} else {
+						slog.Error("live: failed to place dynamic protection SL",
+							"symbol", sym, "tier", tier, "targetSL", targetSL, "err", err)
+					}
+				}(symbol, exitSide, qty, newSL, clientSLID, oldSLID, gen, newTargetTier)
 			}
 		}
 	}

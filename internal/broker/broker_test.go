@@ -1133,6 +1133,164 @@ func TestLiveBrokerPersistence_RestoreAndCallbacks(t *testing.T) {
 	}
 }
 
+func TestDryRunBroker_TieredDynamicBreakEvenAndProfitLock(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:                 3,
+		AccountLeverage:          5.0,
+		EntryOrderType:           "MARKET",
+		Tier1BETriggerLongATR:    0.70,
+		Tier1BETriggerShortATR:   0.90,
+		Tier2ProfitLockATR:       1.40,
+		Tier2ProfitLockOffsetATR: 0.70,
+		MinBreakEvenOffsetPct:    0.0010,
+		MakerFeeRate:             0.0002,
+		TakerFeeRate:             0.0005,
+		SlippageRate:             0.0,
+	}
+
+	now := time.Now().UTC()
+
+	// 1. UJI TIER 1 BREAK-EVEN (LONG)
+	b1 := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
+	defer b1.Close()
+
+	closedChan1 := make(chan string, 1)
+	b1.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedChan1 <- rec.ExitReason
+	}
+
+	intentLong := model.OrderIntent{
+		ClientOrderID: "ORDER_T1_LONG",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(97.0),
+		TPPrice:       decimal.NewFromFloat(106.0),
+		ATRAtEntry:    decimal.NewFromFloat(2.0),
+	}
+	_, _ = b1.SubmitLimitEntry(intentLong)
+
+	// Price naik ke 101.40 (+1.40 = +0.70x ATR) -> Memicu Tier 1 Break-Even
+	b1.OnRealtimeTick("SOLUSDT", 101.40, 101.41, 101.40, 101.40, 1.0, true, now.Add(time.Second))
+
+	b1.Mu.Lock()
+	pos1 := b1.OpenPositions["SOLUSDT"]
+	if pos1.ProtectionTier != 1 || !pos1.IsBreakEvenMoved {
+		t.Fatalf("expected ProtectionTier=1 and IsBreakEvenMoved=true, got tier=%d moved=%v", pos1.ProtectionTier, pos1.IsBreakEvenMoved)
+	}
+	// SL harus berada di atas entry: 100 * (1 + 0.0010) = 100.10
+	if pos1.CurrentSLPrice.LessThan(decimal.NewFromFloat(100.0)) {
+		t.Fatalf("expected CurrentSLPrice > 100.0, got %s", pos1.CurrentSLPrice)
+	}
+	b1.Mu.Unlock()
+
+	// Price berbalik turun menyentuh SL 100.10
+	b1.OnRealtimeTick("SOLUSDT", 100.05, 100.06, 100.05, 100.05, 1.0, true, now.Add(2*time.Second))
+	select {
+	case exitReason1 := <-closedChan1:
+		if exitReason1 != "BREAK_EVEN" {
+			t.Fatalf("expected exitReason BREAK_EVEN, got %s", exitReason1)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for trade closed callback")
+	}
+
+	// 2. UJI TIER 2 PROFIT LOCK (LONG)
+	b2 := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
+	defer b2.Close()
+
+	closedChan2 := make(chan string, 1)
+	b2.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedChan2 <- rec.ExitReason
+	}
+
+	intentLong2 := model.OrderIntent{
+		ClientOrderID: "ORDER_T2_LONG",
+		Symbol:        "AVAXUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(97.0),
+		TPPrice:       decimal.NewFromFloat(106.0),
+		ATRAtEntry:    decimal.NewFromFloat(2.0),
+	}
+	_, _ = b2.SubmitLimitEntry(intentLong2)
+
+	// Price naik ke 102.85 (>= 100 + 1.40*2.0 = 102.80) -> Memicu Tier 2 Profit Lock
+	b2.OnRealtimeTick("AVAXUSDT", 102.85, 102.86, 102.85, 102.85, 1.0, true, now.Add(time.Second))
+
+	b2.Mu.Lock()
+	pos2 := b2.OpenPositions["AVAXUSDT"]
+	if pos2.ProtectionTier != 2 {
+		t.Fatalf("expected ProtectionTier=2, got %d", pos2.ProtectionTier)
+	}
+	// SL harus terkunci di Entry + 0.70x ATR = 100.0 + 1.40 = 101.40
+	expectedSL := decimal.NewFromFloat(101.40)
+	if !pos2.CurrentSLPrice.Equal(expectedSL) {
+		t.Fatalf("expected CurrentSLPrice=%s, got %s", expectedSL, pos2.CurrentSLPrice)
+	}
+	b2.Mu.Unlock()
+
+	// Price berbalik turun menyentuh Profit Lock 101.40
+	b2.OnRealtimeTick("AVAXUSDT", 101.35, 101.36, 101.35, 101.35, 1.0, true, now.Add(2*time.Second))
+	select {
+	case exitReason2 := <-closedChan2:
+		if exitReason2 != "PROFIT_LOCK" {
+			t.Fatalf("expected exitReason PROFIT_LOCK, got %s", exitReason2)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for trade closed callback")
+	}
+
+	// 3. UJI TIER 2 PROFIT LOCK (SHORT)
+	b3 := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
+	defer b3.Close()
+
+	closedChan3 := make(chan string, 1)
+	b3.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedChan3 <- rec.ExitReason
+	}
+
+	intentShort := model.OrderIntent{
+		ClientOrderID: "ORDER_T2_SHORT",
+		Symbol:        "LINKUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(103.0),
+		TPPrice:       decimal.NewFromFloat(94.0),
+		ATRAtEntry:    decimal.NewFromFloat(2.0),
+	}
+	_, _ = b3.SubmitLimitEntry(intentShort)
+
+	// Price turun ke 97.10 (<= 100 - 1.40*2.0 = 97.20) -> Memicu Tier 2 Profit Lock
+	b3.OnRealtimeTick("LINKUSDT", 97.10, 97.11, 97.10, 97.10, 1.0, true, now.Add(time.Second))
+
+	b3.Mu.Lock()
+	pos3 := b3.OpenPositions["LINKUSDT"]
+	if pos3.ProtectionTier != 2 {
+		t.Fatalf("expected ProtectionTier=2, got %d", pos3.ProtectionTier)
+	}
+	// SL harus terkunci di Entry - 0.70x ATR = 100.0 - 1.40 = 98.60
+	expectedSLShort := decimal.NewFromFloat(98.60)
+	if !pos3.CurrentSLPrice.Equal(expectedSLShort) {
+		t.Fatalf("expected CurrentSLPrice=%s, got %s", expectedSLShort, pos3.CurrentSLPrice)
+	}
+	b3.Mu.Unlock()
+
+	// Price memantul naik menyentuh Profit Lock 98.60
+	b3.OnRealtimeTick("LINKUSDT", 98.65, 98.66, 98.65, 98.65, 1.0, true, now.Add(2*time.Second))
+	select {
+	case exitReason3 := <-closedChan3:
+		if exitReason3 != "PROFIT_LOCK" {
+			t.Fatalf("expected exitReason PROFIT_LOCK, got %s", exitReason3)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for trade closed callback")
+	}
+}
+
 
 
 

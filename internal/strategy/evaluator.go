@@ -33,21 +33,24 @@ type EvaluatorConfig struct {
 	MaxAdverseFundingRate float64
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
-	PullbackToleranceATR float64
-	MinBounceZScore      float64
-	LookbackImpulseBars  int
-	RetestLookbackBars   int
-	MinImpulseATR        float64
-	MaxEntryDistanceATR  float64
-	EntryOrderType       string
+	PullbackToleranceATR   float64
+	MinBounceZScore        float64
+	MinBounceZScoreLong    float64
+	MinBounceZScoreShort   float64
+	LookbackImpulseBars    int
+	RetestLookbackBars     int
+	MinImpulseATR          float64
+	MaxEntryDistanceATR    float64
+	EntryOrderType         string
 
 	// Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
-	BTCGateEnabled       bool
-	BTCMax5mDumpPct      float64
-	BTCMax5mPumpPct      float64
-	AllowedSide          string
-	MaxFrenzyRVOL        float64
-	MaxCounterImpulseATR float64
+	BTCGateEnabled         bool
+	BTCMax5mDumpPct        float64
+	BTCMax5mPumpPct        float64
+	BTCGatePersistenceBars int
+	AllowedSide            string
+	MaxFrenzyRVOL          float64
+	MaxCounterImpulseATR   float64
 
 	Sizing SizingConfig
 }
@@ -147,6 +150,14 @@ func EvaluateSignal(
 	if minBounceZ <= 0 {
 		minBounceZ = 1.20
 	}
+	minBounceZLong := cfg.MinBounceZScoreLong
+	if minBounceZLong <= 0 {
+		minBounceZLong = minBounceZ
+	}
+	minBounceZShort := cfg.MinBounceZScoreShort
+	if minBounceZShort <= 0 {
+		minBounceZShort = minBounceZ
+	}
 	lookback := cfg.LookbackImpulseBars
 	if lookback <= 0 {
 		lookback = 18
@@ -208,8 +219,8 @@ func EvaluateSignal(
 		return model.OrderIntent{}, false, "INVALID_ZSCORE_BASELINE", ""
 	}
 
-	longBounce := (latest.Close > latest.Open) && (latest.Close >= vwap) && (barDeltaZScore >= minBounceZ)
-	shortBounce := (latest.Close < latest.Open) && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZ)
+	longBounce := (latest.Close > latest.Open) && (latest.Close >= vwap) && (barDeltaZScore >= minBounceZLong)
+	shortBounce := (latest.Close < latest.Open) && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
 
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
 	oiDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
@@ -273,7 +284,7 @@ func EvaluateSignal(
 		if !(latest.Close >= vwap) {
 			longFails = append(longFails, "CLOSE_BELOW_VWAP")
 		}
-		if !(barDeltaZScore >= minBounceZ) {
+		if !(barDeltaZScore >= minBounceZLong) {
 			longFails = append(longFails, "WEAK_DELTA_ZSCORE")
 		}
 		if !(oiDeltaPct >= minOIDeltaLong) {
@@ -299,7 +310,7 @@ func EvaluateSignal(
 		if !(latest.Close <= vwap) {
 			shortFails = append(shortFails, "CLOSE_ABOVE_VWAP")
 		}
-		if !(barDeltaZScore <= -minBounceZ) {
+		if !(barDeltaZScore <= -minBounceZShort) {
 			shortFails = append(shortFails, "WEAK_DELTA_ZSCORE")
 		}
 		if !(oiDeltaPct >= minOIDeltaShort) {
@@ -402,6 +413,21 @@ func EvaluateSignal(
 				btcVWAP := btcSnap.CurrentSessionVWAP
 				if latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP) {
 					return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_OR_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+				}
+
+				// Multi-Candle Persistence Check: Hindari jebakan 1-candle bounce (fake breakout/whipsaw)
+				persistenceBars := cfg.BTCGatePersistenceBars
+				if persistenceBars <= 0 {
+					persistenceBars = 3
+				}
+				if len(btcSnap.ClosedCandles) >= persistenceBars {
+					for p := 0; p < persistenceBars; p++ {
+						idx := len(btcSnap.ClosedCandles) - 1 - p
+						c := btcSnap.ClosedCandles[idx]
+						if c.Close < btcEMA {
+							return model.OrderIntent{}, false, "BTC_TREND_LONG_VETO_PERSISTENCE", fmt.Sprintf("BTC_BAR_%d_AGO_CLOSE_%.1f_BELOW_EMA_%.1f_REQUIRED_%d_BARS", p, c.Close, btcEMA, persistenceBars)
+						}
+					}
 				}
 			}
 		}

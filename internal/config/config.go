@@ -70,15 +70,22 @@ type Config struct {
 	MinOIDeltaPct        float64
 	MinOIDeltaLongPct    float64
 	MinOIDeltaShortPct   float64
-	SLATRMultiplier      float64
-	TPATRMultiplier      float64
-	BreakEvenTriggerATR  float64
-	BTCGateEnabled       bool
-	BTCMax5mDumpPct      float64
-	BTCMax5mPumpPct      float64
-	AllowedSide          string
-	MaxFrenzyRVOL        float64
-	MaxCounterImpulseATR float64
+	SLATRMultiplier          float64
+	TPATRMultiplier          float64
+	BreakEvenTriggerATR      float64
+	Tier1BETriggerLongATR    float64
+	Tier1BETriggerShortATR   float64
+	Tier2ProfitLockATR       float64
+	Tier2ProfitLockOffsetATR float64
+	MinBounceZScoreLong      float64
+	MinBounceZScoreShort     float64
+	BTCGateEnabled           bool
+	BTCMax5mDumpPct          float64
+	BTCMax5mPumpPct          float64
+	BTCGatePersistenceBars   int
+	AllowedSide              string
+	MaxFrenzyRVOL            float64
+	MaxCounterImpulseATR     float64
 
 	// Batas Waktu & Staleness
 	ScannerInterval   time.Duration
@@ -266,6 +273,18 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
 	}
 
+	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "1.50")
+	minBounceZLong, err := strconv.ParseFloat(minBounceZLongStr, 64)
+	if err != nil || minBounceZLong <= 0 {
+		minBounceZLong = minBounceZ
+	}
+
+	minBounceZShortStr := getEnv("MIN_BOUNCE_ZSCORE_SHORT", minBounceZStr)
+	minBounceZShort, err := strconv.ParseFloat(minBounceZShortStr, 64)
+	if err != nil || minBounceZShort <= 0 {
+		minBounceZShort = minBounceZ
+	}
+
 	lookbackBarsStr := getEnv("LOOKBACK_IMPULSE_BARS", "18")
 	lookbackBars, err := strconv.Atoi(lookbackBarsStr)
 	if err != nil || lookbackBars < 2 || lookbackBars > 100 {
@@ -361,6 +380,30 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BREAK_EVEN_TRIGGER_ATR '%s' (must be float between 0.1 and 10.0)", beTriggerStr)
 	}
 
+	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "0.70")
+	t1BETriggerLong, err := strconv.ParseFloat(t1BETriggerLongStr, 64)
+	if err != nil || t1BETriggerLong <= 0.05 || t1BETriggerLong > 10.0 {
+		t1BETriggerLong = 0.70
+	}
+
+	t1BETriggerShortStr := getEnv("TIER1_BE_TRIGGER_SHORT_ATR", "0.90")
+	t1BETriggerShort, err := strconv.ParseFloat(t1BETriggerShortStr, 64)
+	if err != nil || t1BETriggerShort <= 0.05 || t1BETriggerShort > 10.0 {
+		t1BETriggerShort = 0.90
+	}
+
+	t2ProfitLockStr := getEnv("TIER2_PROFIT_LOCK_ATR", "1.40")
+	t2ProfitLock, err := strconv.ParseFloat(t2ProfitLockStr, 64)
+	if err != nil || t2ProfitLock <= 0.1 || t2ProfitLock > 10.0 {
+		t2ProfitLock = 1.40
+	}
+
+	t2OffsetStr := getEnv("TIER2_PROFIT_LOCK_OFFSET_ATR", "0.70")
+	t2Offset, err := strconv.ParseFloat(t2OffsetStr, 64)
+	if err != nil || t2Offset <= 0.05 || t2Offset > 10.0 {
+		t2Offset = 0.70
+	}
+
 	btcGateEnabledStr := getEnv("BTC_GATE_ENABLED", "true")
 	btcGateEnabled, err := strconv.ParseBool(btcGateEnabledStr)
 	if err != nil {
@@ -377,6 +420,12 @@ func LoadConfig() (*Config, error) {
 	btcMaxPump, err := strconv.ParseFloat(btcMaxPumpStr, 64)
 	if err != nil || btcMaxPump <= 0.05 || btcMaxPump > 10.0 {
 		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_PUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxPumpStr)
+	}
+
+	btcPersistenceBarsStr := getEnv("BTC_GATE_PERSISTENCE_BARS", "3")
+	btcPersistenceBars, err := strconv.Atoi(btcPersistenceBarsStr)
+	if err != nil || btcPersistenceBars < 1 || btcPersistenceBars > 20 {
+		btcPersistenceBars = 3
 	}
 
 	allowedSide := strings.ToUpper(strings.TrimSpace(getEnv("ALLOWED_SIDE", "AUTO")))
@@ -443,24 +492,31 @@ func LoadConfig() (*Config, error) {
 		MinNATRPct:           minNATR,
 		MaxNATRPct:           maxNATR,
 		MaxWatchedCoins:      maxWatched,
-		PullbackToleranceATR: pullbackTol,
-		MinBounceZScore:      minBounceZ,
-		LookbackImpulseBars:  lookbackBars,
-		RetestLookbackBars:   retestLookbackBars,
-		MinImpulseATR:        minImpulseATR,
-		MaxEntryDistanceATR:  maxEntryDist,
-		MinOIDeltaPct:        minOIDelta,
-		MinOIDeltaLongPct:    minOIDeltaLong,
-		MinOIDeltaShortPct:   minOIDeltaShort,
-		SLATRMultiplier:      slMult,
-		TPATRMultiplier:      tpMult,
-		BreakEvenTriggerATR:  beTrigger,
-		BTCGateEnabled:       btcGateEnabled,
-		BTCMax5mDumpPct:      btcMaxDump,
-		BTCMax5mPumpPct:      btcMaxPump,
-		AllowedSide:          allowedSide,
-		MaxFrenzyRVOL:        maxFrenzyRVOL,
-		MaxCounterImpulseATR: maxCounterImpulseATR,
+		PullbackToleranceATR:     pullbackTol,
+		MinBounceZScore:          minBounceZ,
+		MinBounceZScoreLong:      minBounceZLong,
+		MinBounceZScoreShort:     minBounceZShort,
+		LookbackImpulseBars:      lookbackBars,
+		RetestLookbackBars:       retestLookbackBars,
+		MinImpulseATR:            minImpulseATR,
+		MaxEntryDistanceATR:      maxEntryDist,
+		MinOIDeltaPct:            minOIDelta,
+		MinOIDeltaLongPct:        minOIDeltaLong,
+		MinOIDeltaShortPct:       minOIDeltaShort,
+		SLATRMultiplier:          slMult,
+		TPATRMultiplier:          tpMult,
+		BreakEvenTriggerATR:      beTrigger,
+		Tier1BETriggerLongATR:    t1BETriggerLong,
+		Tier1BETriggerShortATR:   t1BETriggerShort,
+		Tier2ProfitLockATR:       t2ProfitLock,
+		Tier2ProfitLockOffsetATR: t2Offset,
+		BTCGateEnabled:           btcGateEnabled,
+		BTCMax5mDumpPct:          btcMaxDump,
+		BTCMax5mPumpPct:          btcMaxPump,
+		BTCGatePersistenceBars:   btcPersistenceBars,
+		AllowedSide:              allowedSide,
+		MaxFrenzyRVOL:            maxFrenzyRVOL,
+		MaxCounterImpulseATR:     maxCounterImpulseATR,
 
 		ScannerInterval:    15 * time.Minute,
 		MaxBookStaleness:   5 * time.Second,

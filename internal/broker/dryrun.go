@@ -31,24 +31,29 @@ type VirtualOpenPosition struct {
 	MarkUpdatedAt    time.Time
 	OpenTime         time.Time
 	IsBreakEvenMoved bool
+	ProtectionTier   int
 	SignalAuditID    int64
 	MaxMAE           float64
 	MaxMFE           float64
 }
 
 type DryRunConfig struct {
-	MaxSlots              int
-	MaxDailyDrawdownPct   float64
-	AccountLeverage       float64
-	BreakEvenTriggerATR   float64
-	MinBreakEvenOffsetPct float64
-	LimitOrderTimeout     time.Duration
-	MaxHoldingDuration    time.Duration
-	MaxMarkStaleness      time.Duration
-	MakerFeeRate          float64
-	TakerFeeRate          float64
-	SlippageRate          float64
-	EntryOrderType        string
+	MaxSlots                 int
+	MaxDailyDrawdownPct      float64
+	AccountLeverage          float64
+	BreakEvenTriggerATR      float64
+	Tier1BETriggerLongATR    float64
+	Tier1BETriggerShortATR   float64
+	Tier2ProfitLockATR       float64
+	Tier2ProfitLockOffsetATR float64
+	MinBreakEvenOffsetPct    float64
+	LimitOrderTimeout        time.Duration
+	MaxHoldingDuration       time.Duration
+	MaxMarkStaleness         time.Duration
+	MakerFeeRate             float64
+	TakerFeeRate             float64
+	SlippageRate             float64
+	EntryOrderType           string
 }
 
 type TradeClosedRecord struct {
@@ -412,7 +417,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 
 	// 2. Evaluasi Posisi Terbuka (Break-Even, SL, TP, dan Time Stop)
 	if pos, exists := d.OpenPositions[symbol]; exists {
-		if !pos.MarkUpdatedAt.IsZero() && now.Sub(pos.MarkUpdatedAt) > d.Cfg.MaxMarkStaleness {
+		if d.Cfg.MaxMarkStaleness > 0 && !pos.MarkUpdatedAt.IsZero() && now.Sub(pos.MarkUpdatedAt) > d.Cfg.MaxMarkStaleness {
 			return // Tolak mengevaluasi exit menggunakan mark price stale (Solusi P1-8)
 		}
 
@@ -421,10 +426,35 @@ func (d *DryRunBroker) OnRealtimeTick(
 			return
 		}
 
-		beTriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(d.Cfg.BreakEvenTriggerATR))
+		t1LongTriggerATR := d.Cfg.Tier1BETriggerLongATR
+		if t1LongTriggerATR <= 0 {
+			t1LongTriggerATR = d.Cfg.BreakEvenTriggerATR
+		}
+		if t1LongTriggerATR <= 0 {
+			t1LongTriggerATR = 0.70
+		}
+
+		t1ShortTriggerATR := d.Cfg.Tier1BETriggerShortATR
+		if t1ShortTriggerATR <= 0 {
+			t1ShortTriggerATR = d.Cfg.BreakEvenTriggerATR
+		}
+		if t1ShortTriggerATR <= 0 {
+			t1ShortTriggerATR = 0.90
+		}
+
+		t2TriggerATR := d.Cfg.Tier2ProfitLockATR
+		if t2TriggerATR <= 0 {
+			t2TriggerATR = 1.40
+		}
+
+		t2OffsetATR := d.Cfg.Tier2ProfitLockOffsetATR
+		if t2OffsetATR <= 0 {
+			t2OffsetATR = 0.70
+		}
+
 		beOffsetRate := decimal.NewFromFloat(math.Max(d.Cfg.MinBreakEvenOffsetPct, 2.0*d.Cfg.TakerFeeRate+d.Cfg.SlippageRate))
 
-		if now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
+		if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
 			d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING")
 			delete(d.PendingOrders, symbol)
 			return
@@ -440,24 +470,6 @@ func (d *DryRunBroker) OnRealtimeTick(
 		}
 
 		if pos.Side == model.SideLong {
-			if !pos.IsBreakEvenMoved && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(beTriggerDist) {
-				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
-				pos.IsBreakEvenMoved = true
-				d.enqueuePositionEvent(PositionEvent{
-					Type: PositionEventSave,
-					Pos:  *pos,
-				})
-			}
-			if triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice) {
-				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
-				exitReason := "STOP_LOSS"
-				if pos.IsBreakEvenMoved {
-					exitReason = "BREAK_EVEN"
-				}
-				d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason)
-				delete(d.PendingOrders, symbol)
-				return
-			}
 			isTPHit := triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
 			if isTPHit {
@@ -465,31 +477,107 @@ func (d *DryRunBroker) OnRealtimeTick(
 				delete(d.PendingOrders, symbol)
 				return
 			}
-		} else {
-			if !pos.IsBreakEvenMoved && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(beTriggerDist) {
-				pos.CurrentSLPrice = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
-				pos.IsBreakEvenMoved = true
-				d.enqueuePositionEvent(PositionEvent{
-					Type: PositionEventSave,
-					Pos:  *pos,
-				})
-			}
-			if triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice) {
-				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
+
+			if triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice) {
+				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
 				exitReason := "STOP_LOSS"
-				if pos.IsBreakEvenMoved {
+				if pos.ProtectionTier == 2 {
+					exitReason = "PROFIT_LOCK"
+				} else if pos.IsBreakEvenMoved {
 					exitReason = "BREAK_EVEN"
 				}
 				d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason)
 				delete(d.PendingOrders, symbol)
 				return
 			}
+
+			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1LongTriggerATR))
+			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
+			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
+
+			// Tier 2: Half-Way Profit Lock (+1.40x ATR MFE -> Kunci SL ke Entry + 0.70x ATR)
+			if pos.ProtectionTier < 2 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t2TriggerDist) {
+				newSL := pos.EntryPrice.Add(t2OffsetDist)
+				if newSL.GreaterThan(pos.CurrentSLPrice) {
+					pos.CurrentSLPrice = newSL
+					pos.IsBreakEvenMoved = true
+					pos.ProtectionTier = 2
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+					slog.Info("dryrun: Tier 2 Profit Lock activated",
+						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
+				}
+			} else if pos.ProtectionTier < 1 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t1TriggerDist) {
+				// Tier 1: Rem Dini / Early BE Shield (+0.70x ATR MFE -> Pindahkan SL ke Entry + Fee Buffer)
+				newSL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
+				if newSL.GreaterThan(pos.CurrentSLPrice) {
+					pos.CurrentSLPrice = newSL
+					pos.IsBreakEvenMoved = true
+					pos.ProtectionTier = 1
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+					slog.Info("dryrun: Tier 1 Break-Even activated",
+						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
+				}
+			}
+		} else {
 			isTPHit := triggerRefPrice.LessThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
 			if isTPHit {
 				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
 				delete(d.PendingOrders, symbol)
 				return
+			}
+
+			if triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice) {
+				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
+				exitReason := "STOP_LOSS"
+				if pos.ProtectionTier == 2 {
+					exitReason = "PROFIT_LOCK"
+				} else if pos.IsBreakEvenMoved {
+					exitReason = "BREAK_EVEN"
+				}
+				d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason)
+				delete(d.PendingOrders, symbol)
+				return
+			}
+
+			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1ShortTriggerATR))
+			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
+			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
+
+			// Tier 2: Half-Way Profit Lock (+1.40x ATR MFE -> Kunci SL ke Entry - 0.70x ATR)
+			if pos.ProtectionTier < 2 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t2TriggerDist) {
+				newSL := pos.EntryPrice.Sub(t2OffsetDist)
+				if newSL.LessThan(pos.CurrentSLPrice) {
+					pos.CurrentSLPrice = newSL
+					pos.IsBreakEvenMoved = true
+					pos.ProtectionTier = 2
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+					slog.Info("dryrun: Tier 2 Profit Lock activated",
+						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
+				}
+			} else if pos.ProtectionTier < 1 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t1TriggerDist) {
+				// Tier 1: Rem Dini / Early BE Shield (+0.90x ATR MFE -> Pindahkan SL ke Entry - Fee Buffer)
+				newSL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
+				if newSL.LessThan(pos.CurrentSLPrice) {
+					pos.CurrentSLPrice = newSL
+					pos.IsBreakEvenMoved = true
+					pos.ProtectionTier = 1
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+					slog.Info("dryrun: Tier 1 Break-Even activated",
+						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
+				}
 			}
 		}
 	}

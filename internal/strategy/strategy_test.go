@@ -707,7 +707,9 @@ func TestEvaluateSignalBTCMacroGateFlashDumpVetoLong(t *testing.T) {
 	}
 
 	// 3. Jika BTC normal / tenang (Open 84000, Close 84010 = +0.01%, tidak bearish), Long harus DISETUJUI (idiosinkronik altcoin)
-	btcCandles[54].Close = 84010.0
+	for i := 50; i <= 54; i++ {
+		btcCandles[i].Close = 84010.0
+	}
 	btcSnapNormal := model.MarketSnapshot{
 		Symbol:             "BTCUSDT",
 		ClosedCandles:      btcCandles,
@@ -1253,6 +1255,250 @@ func TestEvaluateSignal_BTCGate_BearishLongVeto_OrCondition(t *testing.T) {
 	_, okC, reasonC, _ := EvaluateSignal(snapLong, &btcSnapA, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
 	if !okC || reasonC != "SIGNAL_APPROVED" {
 		t.Fatalf("expected SIGNAL_APPROVED when ALLOWED_SIDE=BOTH (bypassing Tier 2 soft veto), got ok=%v, reason=%s", okC, reasonC)
+	}
+}
+
+func TestEvaluateSignal_AsymmetricHurdle(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := EvaluatorConfig{
+		MaxSlots:              3,
+		MaxBookStaleness:      5 * time.Second,
+		MaxMarkStaleness:      15 * time.Second,
+		MaxDataStaleness:      330 * time.Second,
+		MinOIInterval:         4 * time.Minute,
+		MaxOIInterval:         7 * time.Minute,
+		MaxOIStaleness:        300 * time.Second,
+		MaxSpreadPct:          0.05,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		EMAPeriod:             50,
+		ATRPeriod:             14,
+		DeltaZScoreWindow:     50,
+		MinBounceZScore:       1.20,
+		MinBounceZScoreLong:   1.50, // LONG hurdle tinggi
+		MinBounceZScoreShort:  1.20, // SHORT hurdle standar
+		MinOIDeltaLongPct:     0.12, // LONG OI hurdle tinggi
+		MinOIDeltaShortPct:    -0.02,
+		MaxAdverseFundingRate: 0.0005,
+		PullbackToleranceATR:  0.35,
+		LookbackImpulseBars:   12,
+		MinImpulseATR:         1.0,
+		AllowedSide:           "BOTH",
+		Sizing: SizingConfig{
+			RiskPerTradePct:       decimal.NewFromFloat(0.01),
+			MaxSlotMarginFraction: decimal.NewFromFloat(0.30),
+			AccountLeverage:       5.0,
+			SLMultiplier:          1.5,
+			TPMultiplier:          2.25,
+		},
+	}
+
+	candles := make([]model.Candle, 60)
+	deltas := make([]float64, 60)
+	for i := 0; i < 60; i++ {
+		p := 100.0 + float64(i)*0.1
+		candles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime:  now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:       p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
+			VolumeBase: 1000.0,
+		}
+		deltas[i] = 100.0
+	}
+	candles[50].High = 110.0 // Prior bullish impulse
+	candles[58].Low = 104.5  // Retest VWAP
+	candles[59] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       105.0, High: 106.0, Low: 104.9, Close: 105.8,
+		VolumeBase: 2000.0,
+	}
+
+	snap := model.MarketSnapshot{
+		Symbol:              "ALTUSDT",
+		BestBid:             105.70,
+		BestAsk:             105.72,
+		BookUpdatedAt:       now,
+		MarkPriceUpdatedAt:  now,
+		FundingUpdatedAt:    now,
+		CurrentSessionVWAP:  105.0,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: deltas,
+		PrevOpenInterest:    1000.0,
+		CurrOpenInterest:    1000.8, // +0.08% OI (cukup untuk Short -0.02%, tapi < 0.12% Long)
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:     now,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+
+	// 1. Z-score 1.35 (antara 1.20 dan 1.50) -> LONG ditolak karena hurdle 1.50 belum tercapai
+	deltas[59] = 100.0 // baseline deviasi rendah
+	// Hitung delta agar zscore ~1.35
+	// Tapi cara termudah adalah set zscore langsung lewat deltas
+	// ClosedBarDeltasUSDT: deltas[0..49]=0, deltas[50..58]=0, delta[59]
+	for i := 0; i < 59; i++ {
+		deltas[i] = 0.0
+	}
+	// Standar deviasi = 0 jika semua 0, jadi beri sedikit variasi
+	for i := 0; i < 59; i++ {
+		if i%2 == 0 {
+			deltas[i] = 10.0
+		} else {
+			deltas[i] = -10.0
+		}
+	}
+	// Stdev ~10.0. delta[59] = 13.5 -> Z-Score ~1.35
+	deltas[59] = 13.5
+	snap.ClosedBarDeltasUSDT = deltas
+
+	_, okLong, reasonLong, subLong := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if okLong {
+		t.Fatalf("expected LONG to fail asymmetric hurdle (Z=1.35 < 1.50 and OI=+0.08%% < +0.12%%), got approved")
+	}
+	if reasonLong != "CONDITIONS_NOT_MET" || (!strings.Contains(subLong, "WEAK_DELTA_ZSCORE") && !strings.Contains(subLong, "LOW_OI_DELTA")) {
+		t.Errorf("expected failure due to weak delta or low OI, got reason=%s subReason=%s", reasonLong, subLong)
+	}
+
+	// 2. Ketika Z-Score dinaikkan ke > 1.50 (delta 20.0) dan OI dinaikkan ke +0.15% (1001.5)
+	deltas[59] = 20.0
+	snap.ClosedBarDeltasUSDT = deltas
+	snap.CurrOpenInterest = 1001.5 // +0.15%
+
+	intentApproved, okApproved, reasonApproved, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if !okApproved || reasonApproved != "SIGNAL_APPROVED" {
+		t.Fatalf("expected LONG approved after meeting higher hurdle (Z=2.0, OI=+0.15%%), got ok=%v, reason=%s", okApproved, reasonApproved)
+	}
+	if intentApproved.Side != model.SideLong {
+		t.Errorf("expected SideLong, got %s", intentApproved.Side)
+	}
+}
+
+func TestEvaluateSignal_BTCGatePersistenceBuffer(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := EvaluatorConfig{
+		MaxSlots:               3,
+		MaxBookStaleness:       5 * time.Second,
+		MaxMarkStaleness:       15 * time.Second,
+		MaxDataStaleness:       330 * time.Second,
+		MinOIInterval:          4 * time.Minute,
+		MaxOIInterval:          7 * time.Minute,
+		MaxOIStaleness:         300 * time.Second,
+		MaxSpreadPct:           0.05,
+		MinNATRPct:             0.20,
+		MaxNATRPct:             5.00,
+		EMAPeriod:              50,
+		ATRPeriod:              14,
+		DeltaZScoreWindow:      50,
+		MinBarDeltaZScore:      1.20,
+		MinOIDeltaPct:          -0.10,
+		MaxAdverseFundingRate:  0.0005,
+		PullbackToleranceATR:   0.35,
+		MinBounceZScore:        1.20,
+		LookbackImpulseBars:    12,
+		MinImpulseATR:          1.0,
+		BTCGateEnabled:         true,
+		BTCMax5mDumpPct:        0.60,
+		BTCMax5mPumpPct:        0.60,
+		BTCGatePersistenceBars: 3,
+		AllowedSide:            "AUTO",
+		Sizing: SizingConfig{
+			RiskPerTradePct:       decimal.NewFromFloat(0.01),
+			MaxSlotMarginFraction: decimal.NewFromFloat(0.30),
+			AccountLeverage:       5.0,
+			SLMultiplier:          1.5,
+			TPMultiplier:          2.25,
+		},
+	}
+
+	candles := make([]model.Candle, 60)
+	deltas := make([]float64, 60)
+	for i := 0; i < 60; i++ {
+		p := 100.0 + float64(i)*0.1
+		candles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime:  now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:       p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
+			VolumeBase: 1000.0,
+		}
+		deltas[i] = 100.0 + float64(i%7)*15.0
+	}
+	candles[50].High = 110.0
+	candles[58].Low = 104.5
+	candles[59] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       105.0, High: 106.0, Low: 104.9, Close: 105.8,
+		VolumeBase: 2000.0,
+	}
+	deltas[59] = 2000.0
+
+	altSnap := model.MarketSnapshot{
+		Symbol:              "ALTUSDT",
+		BestBid:             105.70,
+		BestAsk:             105.72,
+		BookUpdatedAt:       now,
+		MarkPriceUpdatedAt:  now,
+		FundingUpdatedAt:    now,
+		CurrentSessionVWAP:  105.0,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: deltas,
+		PrevOpenInterest:    1000.0,
+		CurrOpenInterest:    1050.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:     now,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+
+	// Buat 55 candle BTC di mana candle 0..53 berada di bawah EMA (84000)
+	// dan hanya candle 54 yang memantul ke atas EMA (84050) -> Whipsaw Trap!
+	btcCandles := make([]model.Candle, 55)
+	for i := 0; i < 54; i++ {
+		btcCandles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:       84000.0, High: 84020.0, Low: 83980.0, Close: 84000.0,
+			VolumeBase: 100.0,
+		}
+	}
+	btcCandles[54] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       84000.0, High: 84100.0, Low: 84000.0, Close: 84050.0, // Pantulan 1 bar
+		VolumeBase: 200.0,
+	}
+
+	btcSnap := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		ClosedCandles:      btcCandles,
+		CurrentSessionVWAP: 84000.0,
+		Now:                now,
+	}
+
+	// Evaluasi Long: Harus di-VETO oleh BTC_TREND_LONG_VETO_PERSISTENCE
+	_, okWhipsaw, reasonWhipsaw, _ := EvaluateSignal(altSnap, &btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if okWhipsaw || reasonWhipsaw != "BTC_TREND_LONG_VETO_PERSISTENCE" {
+		t.Fatalf("expected BTC_TREND_LONG_VETO_PERSISTENCE for 1-candle whipsaw trap, got ok=%v, reason=%s", okWhipsaw, reasonWhipsaw)
+	}
+
+	// Setelah BTC konsisten di atas EMA selama minimal 3 candle berturut-turut (candle 52, 53, 54 >= EMA)
+	btcCandles[52].Close = 84050.0
+	btcCandles[53].Close = 84050.0
+	btcCandles[54].Close = 84050.0
+
+	_, okStable, reasonStable, _ := EvaluateSignal(altSnap, &btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if !okStable || reasonStable != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SIGNAL_APPROVED after 3 persistent candles above EMA, got ok=%v, reason=%s", okStable, reasonStable)
 	}
 }
 
