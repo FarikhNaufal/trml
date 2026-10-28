@@ -407,7 +407,7 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 		stats.TotalTrades++
 		stats.TotalNetPnLUSDT += pnl
 
-		if reason == "TAKE_PROFIT" || reason == "PROFIT_LOCK" || reason == "PARTIAL_TAKE_PROFIT" || pnl > 0.005 {
+		if reason == "TAKE_PROFIT" || reason == "PROFIT_LOCK" || reason == "PARTIAL_TAKE_PROFIT" || reason == "TRAILING_STOP" || pnl > 0.005 {
 			stats.WinsCount++
 			totalWinVal += pnl
 		} else if reason == "BREAK_EVEN" || (reason != "STOP_LOSS" && math.Abs(pnl) <= 0.05) {

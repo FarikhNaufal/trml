@@ -251,8 +251,14 @@ function renderActivePositions(positions) {
   for (const pos of sortedPositions) {
     const sideClass = pos.side === 'LONG' ? 'pos-side-long' : 'pos-side-short';
     const pnlClass = pos.unrealized_pnl >= 0 ? 'val-green' : 'val-red';
-    const roeClass = pos.unrealized_roe_pct >= 0 ? 'val-green' : 'val-red';
-    const beBadge = pos.is_break_even ? '<span class="badge badge-be" style="margin-left: 6px;">BE MOVED</span>' : '';
+    let beBadge = '';
+    if (pos.protection_tier === 3) {
+      beBadge = '<span class="badge badge-tp" style="margin-left: 6px; background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4);">TRAILING</span>';
+    } else if (pos.protection_tier === 2) {
+      beBadge = '<span class="badge badge-tp" style="margin-left: 6px;">PROFIT LOCK</span>';
+    } else if (pos.is_break_even) {
+      beBadge = '<span class="badge badge-be" style="margin-left: 6px;">BE MOVED</span>';
+    }
 
     html += `
       <div class="position-card">
@@ -458,6 +464,8 @@ function renderTrades(trades) {
       reasonBadge = '<span class="badge badge-tp">TAKE PROFIT</span>';
     } else if (t.exit_reason === 'PROFIT_LOCK') {
       reasonBadge = '<span class="badge badge-tp">PROFIT LOCK</span>';
+    } else if (t.exit_reason === 'TRAILING_STOP') {
+      reasonBadge = '<span class="badge badge-tp" style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4);">TRAILING STOP</span>';
     } else if (t.exit_reason === 'PARTIAL_TAKE_PROFIT') {
       reasonBadge = '<span class="badge badge-tp">PARTIAL TP</span>';
     } else if (t.exit_reason === 'BREAK_EVEN') {

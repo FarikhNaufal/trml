@@ -51,6 +51,15 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Tier1BEEnabled {
 		t.Errorf("expected default Tier1BEEnabled false, got true")
 	}
+	if !cfg.TrailingEnabled {
+		t.Errorf("expected default TrailingEnabled true, got false")
+	}
+	if cfg.TrailingActivateATR != 2.00 {
+		t.Errorf("expected default TrailingActivateATR 2.00, got %f", cfg.TrailingActivateATR)
+	}
+	if cfg.TrailingDistanceATR != 0.80 {
+		t.Errorf("expected default TrailingDistanceATR 0.80, got %f", cfg.TrailingDistanceATR)
+	}
 	if cfg.MaxHoldingDuration != 4*time.Hour {
 		t.Errorf("expected default MaxHoldingDuration 4h, got %v", cfg.MaxHoldingDuration)
 	}

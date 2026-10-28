@@ -39,6 +39,7 @@ type VirtualOpenPosition struct {
 	SignalAuditID    int64
 	MaxMAE           float64
 	MaxMFE           float64
+	PeakPrice        decimal.Decimal
 }
 
 type DryRunConfig struct {
@@ -54,6 +55,9 @@ type DryRunConfig struct {
 	PartialTPEnabled         bool
 	PartialTP1Ratio          float64
 	PartialTP1ATRMult        float64
+	TrailingEnabled          bool
+	TrailingActivateATR      float64
+	TrailingDistanceATR      float64
 	MinBreakEvenOffsetPct    float64
 	LimitOrderTimeout        time.Duration
 	MaxHoldingDuration       time.Duration
@@ -120,6 +124,9 @@ func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 	defer d.Mu.Unlock()
 	if pos.InitialQty.IsZero() {
 		pos.InitialQty = pos.Qty
+	}
+	if pos.PeakPrice.IsZero() {
+		pos.PeakPrice = pos.EntryPrice
 	}
 	if _, exists := d.OpenPositions[pos.Symbol]; !exists {
 		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(pos.EntryFee)
@@ -258,6 +265,7 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			OpenTime:         now,
 			IsBreakEvenMoved: false,
 			SignalAuditID:    intent.SignalAuditID,
+			PeakPrice:        fillPrice,
 		}
 		d.OpenPositions[intent.Symbol] = pos
 
@@ -439,6 +447,25 @@ func (d *DryRunBroker) OnRealtimeTick(
 			return
 		}
 
+		if pos.Side == model.SideLong {
+			if pos.PeakPrice.IsZero() || triggerRefPrice.GreaterThan(pos.PeakPrice) {
+				pos.PeakPrice = triggerRefPrice
+			}
+		} else {
+			if pos.PeakPrice.IsZero() || triggerRefPrice.LessThan(pos.PeakPrice) {
+				pos.PeakPrice = triggerRefPrice
+			}
+		}
+
+		trailActivateATR := d.Cfg.TrailingActivateATR
+		if trailActivateATR <= 0 {
+			trailActivateATR = 2.00
+		}
+		trailDistATR := d.Cfg.TrailingDistanceATR
+		if trailDistATR <= 0 {
+			trailDistATR = 0.80
+		}
+
 		t1LongTriggerATR := d.Cfg.Tier1BETriggerLongATR
 		if t1LongTriggerATR <= 0 {
 			t1LongTriggerATR = d.Cfg.BreakEvenTriggerATR
@@ -485,7 +512,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 		if pos.Side == model.SideLong {
 			isTPHit := triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
-			if isTPHit {
+			if isTPHit && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
 				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
 				delete(d.PendingOrders, symbol)
 				return
@@ -494,7 +521,9 @@ func (d *DryRunBroker) OnRealtimeTick(
 			if triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice) {
 				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
 				exitReason := "STOP_LOSS"
-				if pos.ProtectionTier == 2 {
+				if pos.ProtectionTier == 3 {
+					exitReason = "TRAILING_STOP"
+				} else if pos.ProtectionTier == 2 {
 					exitReason = "PROFIT_LOCK"
 				} else if pos.IsBreakEvenMoved {
 					exitReason = "BREAK_EVEN"
@@ -513,12 +542,28 @@ func (d *DryRunBroker) OnRealtimeTick(
 				}
 			}
 
+			trailActivateDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailActivateATR))
+			trailDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailDistATR))
 			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1LongTriggerATR))
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-			// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry + 0.90x ATR)
-			if pos.ProtectionTier < 2 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t2TriggerDist) {
+			// Tier 3: Trailing Stop untuk Runner (aktif setelah TP1 tercapai dan Peak >= Entry + trailActivateDist)
+			if d.Cfg.TrailingEnabled && pos.IsTP1Hit && pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(trailActivateDist) {
+				newSL := pos.PeakPrice.Sub(trailDist)
+				if newSL.GreaterThan(pos.CurrentSLPrice) {
+					pos.CurrentSLPrice = newSL
+					pos.IsBreakEvenMoved = true
+					pos.ProtectionTier = 3
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+					slog.Info("dryrun: Trailing Stop updated for runner",
+						"symbol", symbol, "peakPrice", pos.PeakPrice, "newSL", newSL, "triggerPrice", triggerRefPrice)
+				}
+			} else if pos.ProtectionTier < 2 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t2TriggerDist) {
+				// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry + 0.90x ATR)
 				newSL := pos.EntryPrice.Add(t2OffsetDist)
 				if newSL.GreaterThan(pos.CurrentSLPrice) {
 					pos.CurrentSLPrice = newSL
@@ -549,7 +594,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 		} else {
 			isTPHit := triggerRefPrice.LessThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
-			if isTPHit {
+			if isTPHit && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
 				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
 				delete(d.PendingOrders, symbol)
 				return
@@ -558,7 +603,9 @@ func (d *DryRunBroker) OnRealtimeTick(
 			if triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice) {
 				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
 				exitReason := "STOP_LOSS"
-				if pos.ProtectionTier == 2 {
+				if pos.ProtectionTier == 3 {
+					exitReason = "TRAILING_STOP"
+				} else if pos.ProtectionTier == 2 {
 					exitReason = "PROFIT_LOCK"
 				} else if pos.IsBreakEvenMoved {
 					exitReason = "BREAK_EVEN"
@@ -577,12 +624,28 @@ func (d *DryRunBroker) OnRealtimeTick(
 				}
 			}
 
+			trailActivateDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailActivateATR))
+			trailDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailDistATR))
 			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1ShortTriggerATR))
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-			// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry - 0.90x ATR)
-			if pos.ProtectionTier < 2 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t2TriggerDist) {
+			// Tier 3: Trailing Stop untuk Runner (aktif setelah TP1 tercapai dan Peak <= Entry - trailActivateDist)
+			if d.Cfg.TrailingEnabled && pos.IsTP1Hit && pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(trailActivateDist) {
+				newSL := pos.PeakPrice.Add(trailDist)
+				if newSL.LessThan(pos.CurrentSLPrice) {
+					pos.CurrentSLPrice = newSL
+					pos.IsBreakEvenMoved = true
+					pos.ProtectionTier = 3
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+					slog.Info("dryrun: Trailing Stop updated for runner",
+						"symbol", symbol, "peakPrice", pos.PeakPrice, "newSL", newSL, "triggerPrice", triggerRefPrice)
+				}
+			} else if pos.ProtectionTier < 2 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t2TriggerDist) {
+				// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry - 0.90x ATR)
 				newSL := pos.EntryPrice.Sub(t2OffsetDist)
 				if newSL.LessThan(pos.CurrentSLPrice) {
 					pos.CurrentSLPrice = newSL
@@ -638,6 +701,7 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 			OpenTime:         now,
 			IsBreakEvenMoved: false,
 			SignalAuditID:    ord.Intent.SignalAuditID,
+			PeakPrice:        ord.Intent.LimitPrice,
 		}
 		d.OpenPositions[ord.Intent.Symbol] = pos
 	} else {
@@ -969,6 +1033,7 @@ func (d *DryRunBroker) GetActivePositions() []ActivePositionDTO {
 			OpenTimeUTC:      pos.OpenTime.Format(time.RFC3339),
 			DurationSec:      int64(now.Sub(pos.OpenTime).Seconds()),
 			IsBreakEven:      pos.IsBreakEvenMoved,
+			ProtectionTier:   pos.ProtectionTier,
 		})
 	}
 	sort.SliceStable(result, func(i, j int) bool {

@@ -29,6 +29,9 @@ type LiveBrokerConfig struct {
 	PartialTPEnabled         bool
 	PartialTP1Ratio          float64
 	PartialTP1ATRMult        float64
+	TrailingEnabled          bool
+	TrailingActivateATR      float64
+	TrailingDistanceATR      float64
 	MinBreakEvenOffsetPct    float64
 }
 
@@ -76,8 +79,9 @@ type BinanceLiveBroker struct {
 	TPRepairInFlight       map[string]bool            // symbol -> true if TP repair order in flight
 	ActiveMAE              map[string]float64         // symbol -> max adverse excursion pct
 	ActiveMFE              map[string]float64         // symbol -> max favorable excursion pct
-	ProtectionTiers        map[string]int             // symbol -> current protection tier (0, 1, 2)
+	ProtectionTiers        map[string]int             // symbol -> current protection tier (0, 1, 2, 3)
 	ATRAtEntry             map[string]decimal.Decimal // symbol -> atr at entry
+	PeakPrices             map[string]decimal.Decimal // symbol -> highest (long) or lowest (short) mark price
 
 	PlaceEntryFn           func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
 	PlaceAlgoOrderFn       func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (algoID int64, err error)
@@ -106,6 +110,7 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		ActiveMFE:           make(map[string]float64),
 		ProtectionTiers:     make(map[string]int),
 		ATRAtEntry:          make(map[string]decimal.Decimal),
+		PeakPrices:          make(map[string]decimal.Decimal),
 	}
 }
 
@@ -125,6 +130,9 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 	b.ActiveMFE[pos.Symbol] = pos.MaxMFE
 	if pos.ProtectionTier > 0 {
 		b.ProtectionTiers[pos.Symbol] = pos.ProtectionTier
+	}
+	if pos.EntryPrice.GreaterThan(decimal.Zero) {
+		b.PeakPrices[pos.Symbol] = pos.EntryPrice
 	}
 
 	b.Protections[pos.Symbol] = &model.LivePositionProtection{
@@ -482,7 +490,9 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 				siblingCancelAlgoID = prot.TPOrderID
 				siblingCancelSymbol = symbol
 				exitReason = "STOP_LOSS"
-				if currentTier == 2 {
+				if currentTier == 3 {
+					exitReason = "TRAILING_STOP"
+				} else if currentTier == 2 {
 					exitReason = "PROFIT_LOCK"
 				} else if currentTier == 1 {
 					exitReason = "BREAK_EVEN"
@@ -493,7 +503,9 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 				exitReason = "TAKE_PROFIT"
 			} else if exchangeOrderID == prot.SLOrderID || clientOrderID == prot.SLClientAlgoID {
 				exitReason = "STOP_LOSS"
-				if currentTier == 2 {
+				if currentTier == 3 {
+					exitReason = "TRAILING_STOP"
+				} else if currentTier == 2 {
 					exitReason = "PROFIT_LOCK"
 				} else if currentTier == 1 {
 					exitReason = "BREAK_EVEN"
@@ -506,10 +518,11 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 			delete(b.PositionEntryPrices, symbol)
 			delete(b.ProtectionTiers, symbol)
 			delete(b.ATRAtEntry, symbol)
+			delete(b.PeakPrices, symbol)
 
 			exitPrice := avgPrice
 			if exitPrice.LessThanOrEqual(decimal.Zero) {
-				if exitReason == "STOP_LOSS" || exitReason == "BREAK_EVEN" || exitReason == "PROFIT_LOCK" {
+				if exitReason == "STOP_LOSS" || exitReason == "BREAK_EVEN" || exitReason == "PROFIT_LOCK" || exitReason == "TRAILING_STOP" {
 					exitPrice = prot.SLPrice
 				} else {
 					exitPrice = prot.TPPrice
@@ -1065,6 +1078,33 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 		prot, hasProt := b.Protections[symbol]
 		currentTier := b.ProtectionTiers[symbol]
 
+		peakPrice, hasPeak := b.PeakPrices[symbol]
+		if !hasPeak || peakPrice.IsZero() {
+			peakPrice = entryPrice
+		}
+		if side == model.SideLong {
+			if markPriceDec.GreaterThan(peakPrice) {
+				peakPrice = markPriceDec
+				b.PeakPrices[symbol] = peakPrice
+			}
+		} else {
+			if markPriceDec.LessThan(peakPrice) {
+				peakPrice = markPriceDec
+				b.PeakPrices[symbol] = peakPrice
+			}
+		}
+
+		trailActivateATR := b.Cfg.TrailingActivateATR
+		if trailActivateATR <= 0 {
+			trailActivateATR = 2.00
+		}
+		trailDistATR := b.Cfg.TrailingDistanceATR
+		if trailDistATR <= 0 {
+			trailDistATR = 0.80
+		}
+		trailActivateDist := atr.Mul(decimal.NewFromFloat(trailActivateATR))
+		trailDist := atr.Mul(decimal.NewFromFloat(trailDistATR))
+
 		if hasProt && prot.SLStatus == model.ProtectionAcked && b.PlaceAlgoOrderFn != nil {
 			var newTargetTier int
 			var newSL decimal.Decimal
@@ -1074,7 +1114,13 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				t2TriggerDist := atr.Mul(decimal.NewFromFloat(t2TriggerATR))
 				t2OffsetDist := atr.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-				if currentTier < 2 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t2TriggerDist) {
+				if b.Cfg.TrailingEnabled && peakPrice.Sub(entryPrice).GreaterThanOrEqual(trailActivateDist) {
+					calculatedSL := peakPrice.Sub(trailDist)
+					if calculatedSL.GreaterThan(prot.SLPrice) {
+						newTargetTier = 3
+						newSL = calculatedSL
+					}
+				} else if currentTier < 2 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t2TriggerDist) {
 					calculatedSL := entryPrice.Add(t2OffsetDist)
 					if calculatedSL.GreaterThan(prot.SLPrice) {
 						newTargetTier = 2
@@ -1092,7 +1138,13 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				t2TriggerDist := atr.Mul(decimal.NewFromFloat(t2TriggerATR))
 				t2OffsetDist := atr.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-				if currentTier < 2 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t2TriggerDist) {
+				if b.Cfg.TrailingEnabled && entryPrice.Sub(peakPrice).GreaterThanOrEqual(trailActivateDist) {
+					calculatedSL := peakPrice.Add(trailDist)
+					if calculatedSL.LessThan(prot.SLPrice) {
+						newTargetTier = 3
+						newSL = calculatedSL
+					}
+				} else if currentTier < 2 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t2TriggerDist) {
 					calculatedSL := entryPrice.Sub(t2OffsetDist)
 					if calculatedSL.LessThan(prot.SLPrice) {
 						newTargetTier = 2
@@ -1248,6 +1300,7 @@ func (b *BinanceLiveBroker) GetActivePositions() []ActivePositionDTO {
 			OpenTimeUTC:      openTime.Format(time.RFC3339),
 			DurationSec:      int64(now.Sub(openTime).Seconds()),
 			IsBreakEven:      isBE,
+			ProtectionTier:   b.ProtectionTiers[sym],
 		})
 	}
 	sort.SliceStable(result, func(i, j int) bool {

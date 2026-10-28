@@ -84,6 +84,9 @@ type Config struct {
 	PartialTPEnabled         bool
 	PartialTP1Ratio          float64
 	PartialTP1ATRMult        float64
+	TrailingEnabled          bool
+	TrailingActivateATR      float64
+	TrailingDistanceATR      float64
 	BTCGateEnabled           bool
 	BTCMax5mDumpPct          float64
 	BTCMax5mPumpPct          float64
@@ -430,6 +433,20 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_ATR_MULT '%s' (must be float between 0.1 and 10.0)", partialTP1ATRMultStr)
 	}
 
+	trailingEnabled := getEnv("TRAILING_ENABLED", "true") == "true"
+
+	trailingActivateATRStr := getEnv("TRAILING_ACTIVATE_ATR", "2.00")
+	trailingActivateATR, err := strconv.ParseFloat(trailingActivateATRStr, 64)
+	if err != nil || trailingActivateATR <= 0.1 || trailingActivateATR > 10.0 {
+		trailingActivateATR = 2.00
+	}
+
+	trailingDistATRStr := getEnv("TRAILING_DISTANCE_ATR", "0.80")
+	trailingDistATR, err := strconv.ParseFloat(trailingDistATRStr, 64)
+	if err != nil || trailingDistATR <= 0.05 || trailingDistATR > 10.0 {
+		trailingDistATR = 0.80
+	}
+
 	btcGateEnabledStr := getEnv("BTC_GATE_ENABLED", "true")
 	btcGateEnabled, err := strconv.ParseBool(btcGateEnabledStr)
 	if err != nil {
@@ -547,6 +564,9 @@ func LoadConfig() (*Config, error) {
 		PartialTPEnabled:         partialTPEnabled,
 		PartialTP1Ratio:          partialTP1Ratio,
 		PartialTP1ATRMult:        partialTP1ATRMult,
+		TrailingEnabled:          trailingEnabled,
+		TrailingActivateATR:      trailingActivateATR,
+		TrailingDistanceATR:      trailingDistATR,
 		BTCGateEnabled:           btcGateEnabled,
 		BTCMax5mDumpPct:          btcMaxDump,
 		BTCMax5mPumpPct:          btcMaxPump,

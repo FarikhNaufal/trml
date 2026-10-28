@@ -221,6 +221,9 @@ func main() {
 			PartialTPEnabled:         cfg.PartialTPEnabled,
 			PartialTP1Ratio:          cfg.PartialTP1Ratio,
 			PartialTP1ATRMult:        cfg.PartialTP1ATRMult,
+			TrailingEnabled:          cfg.TrailingEnabled,
+			TrailingActivateATR:      cfg.TrailingActivateATR,
+			TrailingDistanceATR:      cfg.TrailingDistanceATR,
 			MinBreakEvenOffsetPct:    0.0010,
 			LimitOrderTimeout:        cfg.LimitOrderTimeout,
 			MaxHoldingDuration:       cfg.MaxHoldingDuration,
@@ -323,6 +326,9 @@ func main() {
 			PartialTPEnabled:         cfg.PartialTPEnabled,
 			PartialTP1Ratio:          cfg.PartialTP1Ratio,
 			PartialTP1ATRMult:        cfg.PartialTP1ATRMult,
+			TrailingEnabled:          cfg.TrailingEnabled,
+			TrailingActivateATR:      cfg.TrailingActivateATR,
+			TrailingDistanceATR:      cfg.TrailingDistanceATR,
 			MinBreakEvenOffsetPct:    0.0010,
 		}
 		engine.liveBroker = broker.NewBinanceLiveBroker(liveCfg)

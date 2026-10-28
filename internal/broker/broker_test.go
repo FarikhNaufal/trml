@@ -1399,6 +1399,257 @@ func TestDryRunBroker_PartialTakeProfit_ScaleOut(t *testing.T) {
 	broker.Mu.Unlock()
 }
 
+func TestDryRunBrokerRunnerTrailingStop(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:                 3,
+		MaxDailyDrawdownPct:      -0.03,
+		AccountLeverage:          5.0,
+		PartialTPEnabled:         true,
+		PartialTP1Ratio:          0.50,
+		PartialTP1ATRMult:        1.20,
+		TrailingEnabled:          true,
+		TrailingActivateATR:      2.00,
+		TrailingDistanceATR:      0.80,
+		Tier2ProfitLockATR:       1.80,
+		Tier2ProfitLockOffsetATR: 0.90,
+		Tier1BEEnabled:           false,
+		MinBreakEvenOffsetPct:    0.0010,
+		EntryOrderType:           "MARKET",
+		MakerFeeRate:             0.0002,
+		TakerFeeRate:             0.0005,
+		SlippageRate:             0.0001,
+	}
+	broker := NewDryRunBroker(decimal.NewFromFloat(10000.0), cfg)
+	defer broker.Close()
+
+	closedTrades := make(chan TradeClosedRecord, 10)
+	broker.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTrades <- rec
+	}
+
+	now := time.Now().UTC()
+
+	// 1. Long Entry di 100.0, ATR = 10.0
+	// TP1 = 100 + 1.20*10 = 112.0
+	// Fixed TP = 100 + 2.25*10 = 122.5
+	// Trailing Activate at Peak >= 100 + 2.0*10 = 120.0
+	// Trailing Distance = 0.80*10 = 8.0
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_TRAIL_LONG",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(10.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(90.0),
+		TPPrice:       decimal.NewFromFloat(122.5),
+		TP1Price:      decimal.NewFromFloat(112.0),
+		ATRAtEntry:    decimal.NewFromFloat(10.0),
+		CreatedAt:     now,
+	}
+
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("failed to submit market entry: %v", err)
+	}
+
+	// 2. Harga naik menyentuh TP1 (112.0)
+	broker.OnRealtimeTick("SOLUSDT", 112.0, 112.1, 112.0, 112.0, 5.0, false, now.Add(1*time.Minute))
+
+	select {
+	case tp1Rec := <-closedTrades:
+		if tp1Rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+			t.Errorf("expected exit reason PARTIAL_TAKE_PROFIT, got %s", tp1Rec.ExitReason)
+		}
+		if !tp1Rec.Qty.Equal(decimal.NewFromFloat(5.0)) {
+			t.Errorf("expected closed qty 5.0, got %s", tp1Rec.Qty)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for TP1 record")
+	}
+
+	// 3. Harga melesat melampaui fixed TP2 (122.5) menuju 130.0!
+	// Dengan TrailingEnabled=true, runner TIDAK tertutup di 122.5, melainkan terus berjalan!
+	broker.OnRealtimeTick("SOLUSDT", 130.0, 130.1, 130.0, 130.0, 5.0, false, now.Add(2*time.Minute))
+
+	broker.Mu.Lock()
+	pos, exists := broker.OpenPositions["SOLUSDT"]
+	if !exists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected runner to stay open beyond fixed TP2")
+	}
+	// SL harus sudah trailing: Peak = 130.0 -> SL = 130.0 - 8.0 = 122.0
+	expectedSL := decimal.NewFromFloat(122.0)
+	if !pos.CurrentSLPrice.Equal(expectedSL) {
+		t.Errorf("expected trailing SL %s, got %s", expectedSL, pos.CurrentSLPrice)
+	}
+	if pos.ProtectionTier != 3 {
+		t.Errorf("expected ProtectionTier 3 (TRAILING), got %d", pos.ProtectionTier)
+	}
+	broker.Mu.Unlock()
+
+	// 4. Harga melesat lagi ke 140.0 (+4.0 ATR extension)
+	broker.OnRealtimeTick("SOLUSDT", 140.0, 140.1, 140.0, 140.0, 5.0, false, now.Add(3*time.Minute))
+
+	broker.Mu.Lock()
+	pos = broker.OpenPositions["SOLUSDT"]
+	// New SL = 140.0 - 8.0 = 132.0
+	expectedSL2 := decimal.NewFromFloat(132.0)
+	if !pos.CurrentSLPrice.Equal(expectedSL2) {
+		t.Errorf("expected trailing SL %s, got %s", expectedSL2, pos.CurrentSLPrice)
+	}
+	broker.Mu.Unlock()
+
+	// 5. Harga retrace dari peak 140.0 turun ke 131.9 (menembus SL 132.0)
+	broker.OnRealtimeTick("SOLUSDT", 131.8, 132.0, 131.9, 131.9, 5.0, false, now.Add(4*time.Minute))
+
+	select {
+	case trailRec := <-closedTrades:
+		if trailRec.ExitReason != "TRAILING_STOP" {
+			t.Errorf("expected exit reason TRAILING_STOP, got %s", trailRec.ExitReason)
+		}
+		if !trailRec.Qty.Equal(decimal.NewFromFloat(5.0)) {
+			t.Errorf("expected closed runner qty 5.0, got %s", trailRec.Qty)
+		}
+		// Exit price harus di sekitar 132.0 (minus slippage)
+		if trailRec.ExitPrice.LessThan(decimal.NewFromFloat(131.0)) {
+			t.Errorf("expected exit price near 132.0, got %s", trailRec.ExitPrice)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for TRAILING_STOP record")
+	}
+
+	broker.Mu.Lock()
+	if len(broker.OpenPositions) != 0 {
+		t.Errorf("expected 0 open positions, got %d", len(broker.OpenPositions))
+	}
+	broker.Mu.Unlock()
+}
+
+func TestDryRunBrokerRunnerTrailingStop_Short(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:                 3,
+		MaxDailyDrawdownPct:      -0.03,
+		AccountLeverage:          5.0,
+		PartialTPEnabled:         true,
+		PartialTP1Ratio:          0.50,
+		PartialTP1ATRMult:        1.20,
+		TrailingEnabled:          true,
+		TrailingActivateATR:      2.00,
+		TrailingDistanceATR:      0.80,
+		Tier2ProfitLockATR:       1.80,
+		Tier2ProfitLockOffsetATR: 0.90,
+		Tier1BEEnabled:           false,
+		MinBreakEvenOffsetPct:    0.0010,
+		EntryOrderType:           "MARKET",
+		MakerFeeRate:             0.0002,
+		TakerFeeRate:             0.0005,
+		SlippageRate:             0.0001,
+	}
+	broker := NewDryRunBroker(decimal.NewFromFloat(10000.0), cfg)
+	defer broker.Close()
+
+	closedTrades := make(chan TradeClosedRecord, 10)
+	broker.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTrades <- rec
+	}
+
+	now := time.Now().UTC()
+
+	// Short Entry di 100.0, ATR = 10.0
+	// TP1 = 100 - 1.20*10 = 88.0
+	// Fixed TP = 100 - 2.25*10 = 77.5
+	// Trailing Activate at Peak <= 100 - 2.0*10 = 80.0
+	// Trailing Distance = 0.80*10 = 8.0
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_TRAIL_SHORT",
+		Symbol:        "BNBUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(10.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(110.0),
+		TPPrice:       decimal.NewFromFloat(77.5),
+		TP1Price:      decimal.NewFromFloat(88.0),
+		ATRAtEntry:    decimal.NewFromFloat(10.0),
+		CreatedAt:     now,
+	}
+
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("failed to submit short market entry: %v", err)
+	}
+
+	// 1. Harga turun menyentuh TP1 (88.0)
+	broker.OnRealtimeTick("BNBUSDT", 87.9, 88.0, 88.0, 88.0, 5.0, false, now.Add(1*time.Minute))
+
+	select {
+	case tp1Rec := <-closedTrades:
+		if tp1Rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+			t.Errorf("expected exit reason PARTIAL_TAKE_PROFIT, got %s", tp1Rec.ExitReason)
+		}
+		if !tp1Rec.Qty.Equal(decimal.NewFromFloat(5.0)) {
+			t.Errorf("expected closed qty 5.0, got %s", tp1Rec.Qty)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for TP1 record")
+	}
+
+	// 2. Harga dump melampaui fixed TP2 (77.5) menuju 70.0!
+	broker.OnRealtimeTick("BNBUSDT", 69.9, 70.1, 70.0, 70.0, 5.0, false, now.Add(2*time.Minute))
+
+	broker.Mu.Lock()
+	pos, exists := broker.OpenPositions["BNBUSDT"]
+	if !exists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected short runner to stay open beyond fixed TP2")
+	}
+	// SL harus sudah trailing: Peak = 70.0 -> SL = 70.0 + 8.0 = 78.0
+	expectedSL := decimal.NewFromFloat(78.0)
+	if !pos.CurrentSLPrice.Equal(expectedSL) {
+		t.Errorf("expected trailing SL %s, got %s", expectedSL, pos.CurrentSLPrice)
+	}
+	if pos.ProtectionTier != 3 {
+		t.Errorf("expected ProtectionTier 3 (TRAILING), got %d", pos.ProtectionTier)
+	}
+	broker.Mu.Unlock()
+
+	// 3. Harga dump lagi ke 60.0 (-4.0 ATR extension) -> New SL = 60.0 + 8.0 = 68.0
+	broker.OnRealtimeTick("BNBUSDT", 59.9, 60.1, 60.0, 60.0, 5.0, false, now.Add(3*time.Minute))
+
+	broker.Mu.Lock()
+	pos = broker.OpenPositions["BNBUSDT"]
+	expectedSL2 := decimal.NewFromFloat(68.0)
+	if !pos.CurrentSLPrice.Equal(expectedSL2) {
+		t.Errorf("expected trailing SL %s, got %s", expectedSL2, pos.CurrentSLPrice)
+	}
+	broker.Mu.Unlock()
+
+	// 4. Harga pullback bounce dari 60.0 naik ke 68.1 (menembus SL 68.0)
+	broker.OnRealtimeTick("BNBUSDT", 68.0, 68.2, 68.1, 68.1, 5.0, false, now.Add(4*time.Minute))
+
+	select {
+	case trailRec := <-closedTrades:
+		if trailRec.ExitReason != "TRAILING_STOP" {
+			t.Errorf("expected exit reason TRAILING_STOP, got %s", trailRec.ExitReason)
+		}
+		if !trailRec.Qty.Equal(decimal.NewFromFloat(5.0)) {
+			t.Errorf("expected closed runner qty 5.0, got %s", trailRec.Qty)
+		}
+		if trailRec.ExitPrice.GreaterThan(decimal.NewFromFloat(69.0)) {
+			t.Errorf("expected exit price near 68.0, got %s", trailRec.ExitPrice)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for TRAILING_STOP record")
+	}
+
+	broker.Mu.Lock()
+	if len(broker.OpenPositions) != 0 {
+		t.Errorf("expected 0 open positions, got %d", len(broker.OpenPositions))
+	}
+	broker.Mu.Unlock()
+}
+
+
+
 
 
 

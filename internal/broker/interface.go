@@ -20,6 +20,7 @@ type ActivePositionDTO struct {
 	OpenTimeUTC      string  `json:"open_time_utc"`
 	DurationSec      int64   `json:"duration_sec"`
 	IsBreakEven      bool    `json:"is_break_even"`
+	ProtectionTier   int     `json:"protection_tier"`
 }
 
 type ExecutionBroker interface {
