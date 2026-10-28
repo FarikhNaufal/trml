@@ -219,8 +219,12 @@ func EvaluateSignal(
 		return model.OrderIntent{}, false, "INVALID_ZSCORE_BASELINE", ""
 	}
 
-	longBounce := (latest.Close > latest.Open) && (latest.Close >= vwap) && (barDeltaZScore >= minBounceZLong)
-	shortBounce := (latest.Close < latest.Open) && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
+	latestRange := latest.High - latest.Low
+	isBullishShape := (latest.Close > latest.Open) || (latestRange > 0 && (latest.Close-latest.Low) >= latestRange*0.50)
+	isBearishShape := (latest.Close < latest.Open) || (latestRange > 0 && (latest.High-latest.Close) >= latestRange*0.50)
+
+	longBounce := isBullishShape && (latest.Close >= vwap) && (barDeltaZScore >= minBounceZLong)
+	shortBounce := isBearishShape && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
 
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
 	oiDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
@@ -283,7 +287,7 @@ func EvaluateSignal(
 		if !longTestedVWAP {
 			longFails = append(longFails, "VWAP_NOT_TESTED")
 		}
-		if !(latest.Close > latest.Open) {
+		if !isBullishShape {
 			longFails = append(longFails, "CANDLE_NOT_BULLISH")
 		}
 		if !(latest.Close >= vwap) {
@@ -309,7 +313,7 @@ func EvaluateSignal(
 		if !shortTestedVWAP {
 			shortFails = append(shortFails, "VWAP_NOT_TESTED")
 		}
-		if !(latest.Close < latest.Open) {
+		if !isBearishShape {
 			shortFails = append(shortFails, "CANDLE_NOT_BEARISH")
 		}
 		if !(latest.Close <= vwap) {
