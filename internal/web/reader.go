@@ -134,8 +134,8 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 	if statusFilter != "" && statusFilter != "ALL" {
 		sf := strings.ToUpper(strings.TrimSpace(statusFilter))
 		switch sf {
-		case "TAKE_PROFIT", "TP":
-			whereClauses = append(whereClauses, "exit_reason IN ('TAKE_PROFIT', 'TP')")
+		case "TAKE_PROFIT", "TP", "WIN":
+			whereClauses = append(whereClauses, "exit_reason IN ('TAKE_PROFIT', 'TP', 'PROFIT_LOCK', 'PARTIAL_TAKE_PROFIT')")
 		case "BREAK_EVEN", "BE":
 			whereClauses = append(whereClauses, "exit_reason IN ('BREAK_EVEN', 'BE')")
 		case "STOP_LOSS", "SL":
@@ -407,11 +407,11 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 		stats.TotalTrades++
 		stats.TotalNetPnLUSDT += pnl
 
-		if reason == "BREAK_EVEN" || (reason != "TAKE_PROFIT" && reason != "STOP_LOSS" && math.Abs(pnl) <= 0.50) {
-			stats.BreakEvenCount++
-		} else if reason == "TAKE_PROFIT" || pnl > 0.01 {
+		if reason == "TAKE_PROFIT" || reason == "PROFIT_LOCK" || reason == "PARTIAL_TAKE_PROFIT" || pnl > 0.005 {
 			stats.WinsCount++
 			totalWinVal += pnl
+		} else if reason == "BREAK_EVEN" || (reason != "STOP_LOSS" && math.Abs(pnl) <= 0.05) {
+			stats.BreakEvenCount++
 		} else {
 			stats.LossesCount++
 			totalLossVal += math.Abs(pnl)

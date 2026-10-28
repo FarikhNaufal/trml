@@ -448,6 +448,10 @@ function renderTrades(trades) {
     let reasonBadge = '<span class="badge badge-time">' + escapeHtml(t.exit_reason) + '</span>';
     if (t.exit_reason === 'TAKE_PROFIT') {
       reasonBadge = '<span class="badge badge-tp">TAKE PROFIT</span>';
+    } else if (t.exit_reason === 'PROFIT_LOCK') {
+      reasonBadge = '<span class="badge badge-tp">PROFIT LOCK</span>';
+    } else if (t.exit_reason === 'PARTIAL_TAKE_PROFIT') {
+      reasonBadge = '<span class="badge badge-tp">PARTIAL TP</span>';
     } else if (t.exit_reason === 'BREAK_EVEN') {
       reasonBadge = '<span class="badge badge-be">BREAK EVEN</span>';
     } else if (t.exit_reason === 'STOP_LOSS') {
