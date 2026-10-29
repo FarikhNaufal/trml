@@ -147,7 +147,8 @@ func EvaluateSignal(
 		warmupMins = 30
 	}
 	utcNow := snap.Now.UTC()
-	if utcNow.Hour() == 0 && utcNow.Minute() < warmupMins {
+	minsSinceMidnight := utcNow.Hour()*60 + utcNow.Minute()
+	if minsSinceMidnight < warmupMins {
 		return model.OrderIntent{}, false, "VWAP_SESSION_WARMUP", fmt.Sprintf("UTC_%02d:%02d_IN_WARMUP_%dm", utcNow.Hour(), utcNow.Minute(), warmupMins)
 	}
 
@@ -259,10 +260,17 @@ func EvaluateSignal(
 		minOIDeltaShort = cfg.MinOIDeltaPct
 	}
 
-	// Soft OI Bypass: Jika orderflow bounce solid (Z-Score >= 0.80) atau volatilitas dinamis (NATR >= 0.70%),
-	// jangan biarkan keterlambatan update API Open Interest Binance mematikan setup pantulan valid!
-	oiValidLong := (oiDeltaPct >= minOIDeltaLong) || (barDeltaZScore >= 0.80) || (natrPct >= 0.70)
-	oiValidShort := (oiDeltaPct >= minOIDeltaShort) || (barDeltaZScore <= -0.80) || (natrPct >= 0.70)
+	// Soft OI Bypass dengan Capitulation Floor:
+	// Jika orderflow bounce solid (Z-Score) atau volatilitas dinamis (NATR >= 0.70%), bypass keterlambatan
+	// update API Open Interest Binance. NAMUN, soft bypass hanya berlaku jika penurunan OI tidak melebihi
+	// batas kapitulasi (penurunan OI tajam mengindikasikan likuidasi massal/exhaustion, bukan agresor baru).
+	const minCapitulationOIDeltaShort = -0.10 // Max OI drop -0.10% untuk Short
+	const minCapitulationOIDeltaLong = -0.05  // Max OI drop -0.05% untuk Long
+
+	oiValidLong := (oiDeltaPct >= minOIDeltaLong) ||
+		((barDeltaZScore >= 0.80 || natrPct >= 0.70) && oiDeltaPct >= minCapitulationOIDeltaLong)
+	oiValidShort := (oiDeltaPct >= minOIDeltaShort) ||
+		((barDeltaZScore <= -0.80 || natrPct >= 0.70) && oiDeltaPct >= minCapitulationOIDeltaShort)
 
 	// Filter Tren Struktural & Anti-Chop EMA200: Jarak Close ke EMA200 minimal MinEMA200DistanceATR
 	// untuk menghindari eksekusi sinyal palsu saat harga sedang bolak-balik menempel di kawat EMA200 yang mendatar.

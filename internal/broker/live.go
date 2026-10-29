@@ -50,6 +50,7 @@ type LiveOpenPosition struct {
 	TPPrice        decimal.Decimal
 	TP1Price       decimal.Decimal
 	IsTP1Hit       bool
+	ATRAtEntry     decimal.Decimal
 	ProtectionTier int
 	SignalAuditID  int64
 	OpenTime       time.Time
@@ -167,6 +168,9 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 		b.TP1Prices[pos.Symbol] = pos.TP1Price
 	}
 	b.IsTP1Hits[pos.Symbol] = pos.IsTP1Hit
+	if pos.ATRAtEntry.GreaterThan(decimal.Zero) {
+		b.ATRAtEntry[pos.Symbol] = pos.ATRAtEntry
+	}
 
 	b.Protections[pos.Symbol] = &model.LivePositionProtection{
 		Symbol:          pos.Symbol,
@@ -261,6 +265,7 @@ func (b *BinanceLiveBroker) notifyPositionSavedLocked(symbol string) {
 		TPPrice:        prot.TPPrice,
 		TP1Price:       b.TP1Prices[symbol],
 		IsTP1Hit:       b.IsTP1Hits[symbol],
+		ATRAtEntry:     b.ATRAtEntry[symbol],
 		ProtectionTier: b.ProtectionTiers[symbol],
 		SignalAuditID:  prot.SignalAuditID,
 		OpenTime:       b.PositionOpenTimes[symbol],
@@ -450,6 +455,14 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 	status model.OrderLifecycleStatus,
 	cumFilledQty, avgPrice, realizedProfit decimal.Decimal,
 ) {
+	// Guard Kritis MISS #1: Order Partial TP1 ("ALGO_TP1_...")
+	// Order penutupan TP1 50% reduceOnly tidak boleh masuk ke Skenario 2 (penutupan posisi penuh),
+	// karena akan menghapus sisa 50% lot runner dan proteksinya dari memori.
+	// Akuntansi parsial dan pergeseran SL ke BE dikelola secara deterministik oleh executePartialTP1Live.
+	if strings.HasPrefix(clientOrderID, "ALGO_TP1_") {
+		return
+	}
+
 	var plan model.ProtectionPlanAction
 	var needPlanExecution bool
 	var siblingCancelAlgoID int64
@@ -1238,14 +1251,12 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 							}
 						}
 
-						b.ProtectionTiers[sym] = 1
 						prot, ok := b.Protections[sym]
 						var oldSLID int64
 						var gen uint64 = 1
 						clientSLID := fmt.Sprintf("live_sl_be_%s_%d", sym, time.Now().UnixNano())
 						if ok {
 							oldSLID = prot.SLOrderID
-							prot.SLPrice = beSL
 							prot.ProtectedQty = remQty
 							prot.PlanGeneration++
 							gen = prot.PlanGeneration
@@ -1306,6 +1317,24 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 								b.Mu.Lock()
 								if p, ok := b.Protections[sym]; ok && p.PlanGeneration == gen {
 									p.SLOrderID = newSLID
+									p.SLPrice = beSL
+									b.ProtectionTiers[sym] = 1
+									b.OrdersByClient[clientSLID] = &model.LiveOrderRecord{
+										ClientOrderID:   clientSLID,
+										ExchangeOrderID: newSLID,
+										Symbol:          sym,
+										Side:            eSide,
+										TargetQty:       remQty,
+										SLPrice:         beSL,
+										Status:          model.StatusNew,
+										IsEntry:         false,
+										IsAlgo:          true,
+										CreatedAt:       time.Now().UTC(),
+									}
+									b.OrdersByExchangeID[newSLID] = b.OrdersByClient[clientSLID]
+									if oldSLID != 0 && oldSLID != newSLID {
+										delete(b.OrdersByExchangeID, oldSLID)
+									}
 									b.notifyPositionSavedLocked(sym)
 								}
 								b.Mu.Unlock()
@@ -1500,9 +1529,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 					}
 				}
 
-				b.ProtectionTiers[symbol] = newTargetTier
 				oldSLID := prot.SLOrderID
-				prot.SLPrice = newSL
 				prot.PlanGeneration++
 				gen := prot.PlanGeneration
 				exitSide := model.OppositeSide(side)
@@ -1532,6 +1559,24 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						b.Mu.Lock()
 						if p, ok := b.Protections[sym]; ok && p.PlanGeneration == generation {
 							p.SLOrderID = newID
+							p.SLPrice = targetSL
+							b.ProtectionTiers[sym] = tier
+							b.OrdersByClient[cAlgoID] = &model.LiveOrderRecord{
+								ClientOrderID:   cAlgoID,
+								ExchangeOrderID: newID,
+								Symbol:          sym,
+								Side:            eSide,
+								TargetQty:       targetQty,
+								SLPrice:         targetSL,
+								Status:          model.StatusNew,
+								IsEntry:         false,
+								IsAlgo:          true,
+								CreatedAt:       time.Now().UTC(),
+							}
+							b.OrdersByExchangeID[newID] = b.OrdersByClient[cAlgoID]
+							if oldID != 0 && oldID != newID {
+								delete(b.OrdersByExchangeID, oldID)
+							}
 							b.notifyPositionSavedLocked(sym)
 						}
 						b.Mu.Unlock()
@@ -1547,7 +1592,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						slog.Error("live: failed to place dynamic protection SL",
 							"symbol", sym, "tier", tier, "targetSL", targetSL, "err", err)
 					}
-				}(symbol, exitSide, qty, newSL, clientSLID, oldSLID, gen, newTargetTier)
+				}(symbol, exitSide, targetQty, newSL, clientSLID, oldSLID, gen, newTargetTier)
 			}
 		}
 	}

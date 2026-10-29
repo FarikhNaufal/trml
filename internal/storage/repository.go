@@ -49,6 +49,7 @@ type StoredLivePosition struct {
 	TPPrice        decimal.Decimal
 	TP1Price       decimal.Decimal
 	IsTP1Hit       bool
+	ATRAtEntry     decimal.Decimal
 	ProtectionTier int
 	SignalAuditID  int64
 	OpenedAt       time.Time
@@ -480,8 +481,8 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 	INSERT INTO live_open_positions (
 		symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
 		sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
-		protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(symbol) DO UPDATE SET
 		side = excluded.side,
 		qty = excluded.qty,
@@ -496,6 +497,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		tp_price = excluded.tp_price,
 		tp1_price = excluded.tp1_price,
 		is_tp1_hit = excluded.is_tp1_hit,
+		atr_at_entry = excluded.atr_at_entry,
 		protection_tier = excluded.protection_tier,
 		signal_audit_id = excluded.signal_audit_id,
 		max_mae = excluded.max_mae,
@@ -541,6 +543,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		pos.TPPrice.String(),
 		pos.TP1Price.String(),
 		tpHitInt,
+		pos.ATRAtEntry.String(),
 		pos.ProtectionTier,
 		pos.SignalAuditID,
 		openTime,
@@ -569,7 +572,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 	query := `
 	SELECT symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
 	       sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
-	       protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
+	       atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
 	FROM live_open_positions;
 	`
 	rows, err := r.db.conn.QueryContext(ctx, query)
@@ -581,7 +584,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 	var results []StoredLivePosition
 	for rows.Next() {
 		var p StoredLivePosition
-		var qtyStr, initQtyStr, entryStr, slStr, initSLStr, tpStr, tp1Str string
+		var qtyStr, initQtyStr, entryStr, slStr, initSLStr, tpStr, tp1Str, atrStr string
 		var openTimeStr, updTimeStr string
 		var tpHitInt int
 		err := rows.Scan(
@@ -599,6 +602,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 			&tpStr,
 			&tp1Str,
 			&tpHitInt,
+			&atrStr,
 			&p.ProtectionTier,
 			&p.SignalAuditID,
 			&openTimeStr,
@@ -623,6 +627,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 		p.TPPrice, _ = decimal.NewFromString(tpStr)
 		p.TP1Price, _ = decimal.NewFromString(tp1Str)
 		p.IsTP1Hit = (tpHitInt == 1)
+		p.ATRAtEntry, _ = decimal.NewFromString(atrStr)
 		if t, err := time.Parse(time.RFC3339Nano, openTimeStr); err == nil {
 			p.OpenedAt = t
 		} else if t, err := time.Parse(time.RFC3339, openTimeStr); err == nil {

@@ -44,6 +44,9 @@ type BotEngine struct {
 	filtersMu       sync.RWMutex
 	exchangeFilters map[string]model.ExchangeFilter
 
+	cooldownMu    sync.RWMutex
+	cooldownExits map[string]time.Time
+
 	evaluatorCfg strategy.EvaluatorConfig
 	scannerCfg   scanner.ScannerConfig
 
@@ -127,6 +130,7 @@ func main() {
 		client:          client,
 		activeStates:    make(map[string]*model.SymbolState),
 		exchangeFilters: make(map[string]model.ExchangeFilter),
+		cooldownExits:   make(map[string]time.Time),
 		verifiedSymbols: make(map[string]bool),
 		evaluatorCfg: strategy.EvaluatorConfig{
 			MaxSlots:              cfg.MaxSlots,
@@ -248,6 +252,10 @@ func main() {
 			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
 			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+				engine.cooldownMu.Lock()
+				engine.cooldownExits[rec.Symbol] = rec.ClosedAt
+				engine.cooldownMu.Unlock()
+
 				engine.statesMu.RLock()
 				st := engine.activeStates[rec.Symbol]
 				engine.statesMu.RUnlock()
@@ -387,6 +395,7 @@ func main() {
 				TPPrice:        pos.TPPrice,
 				TP1Price:       pos.TP1Price,
 				IsTP1Hit:       pos.IsTP1Hit,
+				ATRAtEntry:     pos.ATRAtEntry,
 				ProtectionTier: pos.ProtectionTier,
 				SignalAuditID:  pos.SignalAuditID,
 				OpenedAt:       pos.OpenTime,
@@ -402,6 +411,10 @@ func main() {
 			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
 			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+				engine.cooldownMu.Lock()
+				engine.cooldownExits[rec.Symbol] = rec.ClosedAt
+				engine.cooldownMu.Unlock()
+
 				engine.statesMu.RLock()
 				st := engine.activeStates[rec.Symbol]
 				engine.statesMu.RUnlock()
@@ -456,13 +469,18 @@ func main() {
 					Symbol:         sp.Symbol,
 					Side:           model.Side(sp.Side),
 					Qty:            sp.Qty,
+					InitialQty:     sp.InitialQty,
 					EntryPrice:     sp.EntryPrice,
 					SLOrderID:      sp.SLOrderID,
 					SLClientAlgoID: sp.SLClientAlgoID,
 					SLPrice:        sp.SLPrice,
+					InitialSLPrice: sp.InitialSLPrice,
 					TPOrderID:      sp.TPOrderID,
 					TPClientAlgoID: sp.TPClientAlgoID,
 					TPPrice:        sp.TPPrice,
+					TP1Price:       sp.TP1Price,
+					IsTP1Hit:       sp.IsTP1Hit,
+					ATRAtEntry:     sp.ATRAtEntry,
 					ProtectionTier: sp.ProtectionTier,
 					SignalAuditID:  sp.SignalAuditID,
 					OpenTime:       sp.OpenedAt,
@@ -491,13 +509,18 @@ func main() {
 						Symbol:         sp.Symbol,
 						Side:           model.Side(sp.Side),
 						Qty:            ep.PositionAmt.Abs(),
+						InitialQty:     sp.InitialQty,
 						EntryPrice:     ep.EntryPrice,
 						SLOrderID:      sp.SLOrderID,
 						SLClientAlgoID: sp.SLClientAlgoID,
 						SLPrice:        sp.SLPrice,
+						InitialSLPrice: sp.InitialSLPrice,
 						TPOrderID:      sp.TPOrderID,
 						TPClientAlgoID: sp.TPClientAlgoID,
 						TPPrice:        sp.TPPrice,
+						TP1Price:       sp.TP1Price,
+						IsTP1Hit:       sp.IsTP1Hit,
+						ATRAtEntry:     sp.ATRAtEntry,
 						ProtectionTier: sp.ProtectionTier,
 						SignalAuditID:  sp.SignalAuditID,
 						OpenTime:       sp.OpenedAt,
@@ -815,6 +838,11 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	for k, v := range localStates {
 		if _, exists := e.activeStates[k]; !exists {
 			e.activeStates[k] = v
+			e.cooldownMu.RLock()
+			if exitTime, ok := e.cooldownExits[k]; ok {
+				v.SetLastExitTime(exitTime)
+			}
+			e.cooldownMu.RUnlock()
 		}
 	}
 	// Pertahankan simbol yang sedang memiliki posisi terbuka atau order aktif agar stream feed tidak putus

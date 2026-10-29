@@ -2012,6 +2012,168 @@ func TestLiveBrokerInitialSLPricePreservation(t *testing.T) {
 	}
 }
 
+func TestLiveBrokerHandleUserDataOrderUpdate_ALGO_TP1(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	// Set active position
+	b.ActivePositions["BTCUSDT"] = decimal.NewFromFloat(2.0)
+	b.PositionSides["BTCUSDT"] = model.SideLong
+	b.PositionEntryPrices["BTCUSDT"] = decimal.NewFromFloat(50000.0)
+	b.Protections["BTCUSDT"] = &model.LivePositionProtection{
+		Symbol:       "BTCUSDT",
+		Side:         model.SideLong,
+		ProtectedQty: decimal.NewFromFloat(2.0),
+		SLPrice:      decimal.NewFromFloat(49000.0),
+		TPPrice:      decimal.NewFromFloat(52000.0),
+	}
+
+	// Simulasi event WebSocket fill untuk partial TP1 ("ALGO_TP1_...")
+	b.HandleUserDataOrderUpdate("ALGO_TP1_BTCUSDT_179319999", 887766, "BTCUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(51000.0), decimal.NewFromFloat(10.0))
+
+	// MISS #1 FIX: Posisi aktif dan proteksi TIDAK BOLEH dihapus!
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+	qty, exists := b.ActivePositions["BTCUSDT"]
+	if !exists {
+		t.Fatalf("expected BTCUSDT active position to be preserved, but it was deleted!")
+	}
+	if !qty.Equal(decimal.NewFromFloat(2.0)) {
+		t.Errorf("expected active position qty 2.0, got %s", qty)
+	}
+	if _, hasProt := b.Protections["BTCUSDT"]; !hasProt {
+		t.Fatalf("expected protections to be preserved for runner")
+	}
+}
+
+func TestLiveBrokerDynamicSL_RetryOnFailure(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+		TrailingEnabled:     true,
+		TrailingActivateATR: 1.0,
+		TrailingDistanceATR: 0.5,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	var shouldFail atomic.Bool
+	var callCount atomic.Int32
+
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		callCount.Add(1)
+		if shouldFail.Load() {
+			return 0, fmt.Errorf("transient network error")
+		}
+		return 999123, nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_RETRY_FAIL",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(115.0),
+		ATRAtEntry:    decimal.NewFromFloat(5.0),
+		CreatedAt:     now,
+	}
+	b.ReserveEntryIntent(intent)
+	b.HandleUserDataOrderUpdate("TEST_RETRY_FAIL", 123456, "SOLUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(100.0), decimal.Zero)
+	time.Sleep(50 * time.Millisecond)
+
+	// Sekarang aktifkan kegagalan API khusus saat update dynamic SL pertama
+	shouldFail.Store(true)
+
+	// Tick 1: trigger trailing, tapi API Binance gagal
+	b.OnRealtimeTick("SOLUSDT", 108.0, 108.5, 108.0, 108.0, 1.0, true, now)
+	time.Sleep(50 * time.Millisecond)
+
+	b.Mu.Lock()
+	prot := b.Protections["SOLUSDT"]
+	// MISS #2.2 FIX: Karena API gagal, SLPrice tidak boleh bermutasi optimistik ke trailing price!
+	if !prot.SLPrice.Equal(decimal.NewFromFloat(95.0)) {
+		t.Errorf("expected SLPrice to remain 95.0 after failure, got %s", prot.SLPrice)
+	}
+	if b.ProtectionTiers["SOLUSDT"] != 0 {
+		t.Errorf("expected ProtectionTier to remain 0 after failure, got %d", b.ProtectionTiers["SOLUSDT"])
+	}
+	b.Mu.Unlock()
+
+	// Sekarang perbaiki API Binance (sukses)
+	shouldFail.Store(false)
+
+	// Tick 2 (setelah jeda throttle): harus bisa me-retry karena SLPrice lama belum terupdate
+	later := now.Add(4 * time.Second)
+	b.OnRealtimeTick("SOLUSDT", 109.0, 109.5, 109.0, 109.0, 1.0, true, later)
+	time.Sleep(50 * time.Millisecond)
+
+	b.Mu.Lock()
+	if b.ProtectionTiers["SOLUSDT"] != 3 {
+		t.Errorf("expected ProtectionTier to become 3 after retry success, got %d", b.ProtectionTiers["SOLUSDT"])
+	}
+	if !b.Protections["SOLUSDT"].SLPrice.GreaterThan(decimal.NewFromFloat(100.0)) {
+		t.Errorf("expected SLPrice to be updated > 100.0 after successful retry, got %s", b.Protections["SOLUSDT"].SLPrice)
+	}
+	b.Mu.Unlock()
+}
+
+func TestLiveBrokerRestorePositionWithATR(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+
+	pos := &LiveOpenPosition{
+		Symbol:         "AVAXUSDT",
+		Side:           model.SideShort,
+		Qty:            decimal.NewFromFloat(5.0),
+		InitialQty:     decimal.NewFromFloat(10.0),
+		EntryPrice:     decimal.NewFromFloat(30.0),
+		SLOrderID:      112233,
+		SLPrice:        decimal.NewFromFloat(31.0),
+		InitialSLPrice: decimal.NewFromFloat(32.0),
+		TP1Price:       decimal.NewFromFloat(28.5),
+		IsTP1Hit:       true,
+		ATRAtEntry:     decimal.NewFromFloat(1.5),
+		ProtectionTier: 1,
+		OpenTime:       now,
+	}
+	b.RestoreOpenPosition(pos)
+
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+
+	// MISS #3 FIX: Pastikan semua field pulih ke memory
+	if !b.ATRAtEntry["AVAXUSDT"].Equal(decimal.NewFromFloat(1.5)) {
+		t.Errorf("expected ATRAtEntry 1.5, got %s", b.ATRAtEntry["AVAXUSDT"])
+	}
+	if !b.InitialQtys["AVAXUSDT"].Equal(decimal.NewFromFloat(10.0)) {
+		t.Errorf("expected InitialQtys 10.0, got %s", b.InitialQtys["AVAXUSDT"])
+	}
+	if !b.InitialSLPrices["AVAXUSDT"].Equal(decimal.NewFromFloat(32.0)) {
+		t.Errorf("expected InitialSLPrices 32.0, got %s", b.InitialSLPrices["AVAXUSDT"])
+	}
+	if !b.TP1Prices["AVAXUSDT"].Equal(decimal.NewFromFloat(28.5)) {
+		t.Errorf("expected TP1Prices 28.5, got %s", b.TP1Prices["AVAXUSDT"])
+	}
+	if !b.IsTP1Hits["AVAXUSDT"] {
+		t.Errorf("expected IsTP1Hit true")
+	}
+}
+
 
 
 

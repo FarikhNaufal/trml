@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     tp_price             TEXT NOT NULL,
     tp1_price            TEXT NOT NULL DEFAULT '',
     is_tp1_hit           INTEGER NOT NULL DEFAULT 0,
+    atr_at_entry         TEXT NOT NULL DEFAULT '',
     protection_tier      INTEGER NOT NULL DEFAULT 0,
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     opened_at_utc        TEXT NOT NULL,
@@ -237,6 +238,13 @@ func OpenDB(dbPath string) (*DB, error) {
 	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'initial_sl_price';`).Scan(&initSLLiveCount)
 	if initSLLiveCount == 0 {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN initial_sl_price TEXT NOT NULL DEFAULT '';`)
+	}
+
+	// Migrasi otomatis kolom atr_at_entry di live_open_positions
+	var atrLiveCount int
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'atr_at_entry';`).Scan(&atrLiveCount)
+	if atrLiveCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN atr_at_entry TEXT NOT NULL DEFAULT '';`)
 	}
 
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)

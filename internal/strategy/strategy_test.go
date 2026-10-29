@@ -1716,6 +1716,144 @@ func TestEvaluateSignal_VWAPSessionWarmup(t *testing.T) {
 	}
 }
 
+func TestEvaluateSignal_CapitulationOIFloor(t *testing.T) {
+	now := time.Date(2026, 10, 29, 14, 0, 0, 0, time.UTC)
+	cfg := EvaluatorConfig{
+		MaxSlots:                 3,
+		MaxBookStaleness:         5 * time.Second,
+		MaxMarkStaleness:         15 * time.Second,
+		MaxDataStaleness:         330 * time.Second,
+		MinOIInterval:            4 * time.Minute,
+		MaxOIInterval:            7 * time.Minute,
+		MaxOIStaleness:           300 * time.Second,
+		MaxSpreadPct:             0.05,
+		MinNATRPct:               0.40,
+		MaxNATRPct:               5.00,
+		EMAPeriod:                10,
+		ATRPeriod:                10,
+		MinOIDeltaShortPct:       -0.02,
+		MinBounceZScoreShort:     0.40,
+		LookbackImpulseBars:      15,
+		RetestLookbackBars:       5,
+		PullbackToleranceATR:     0.50,
+		MaxEntryDistanceATR:      1.50,
+		DeltaZScoreWindow:        20,
+	}
+
+	// 20 candle dengan tren bearish di bawah EMA200 dan VWAP
+	candles := make([]model.Candle, 20)
+	for i := 0; i < 20; i++ {
+		candles[i] = model.Candle{
+			Open: 100, High: 101, Low: 98, Close: 99,
+		}
+	}
+	// Candle terakhir pullback ke VWAP lalu dump
+	candles[18] = model.Candle{Open: 99, High: 100.2, Low: 99, Close: 100}
+	candles[19] = model.Candle{Open: 100, High: 100.1, Low: 97, Close: 98}
+
+	deltas := make([]float64, 30)
+	for i := 0; i < 29; i++ {
+		if i%2 == 0 {
+			deltas[i] = 10.0
+		} else {
+			deltas[i] = -10.0
+		}
+	}
+	deltas[29] = -25.0 // Z-score agresif short
+
+	snap := model.MarketSnapshot{
+		Symbol:              "BLESSUSDT",
+		Now:                 now,
+		BookUpdatedAt:       now,
+		MarkPriceUpdatedAt:  now,
+		FundingUpdatedAt:    now,
+		BestBid:             97.98,
+		BestAsk:             98.00,
+		PrevOpenInterest:    10000.0,
+		// Penurunan OI sebesar -0.30% (melebihi batas kapitulasi -0.10%)
+		CurrOpenInterest:    9970.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:     now,
+		CurrentSessionVWAP:  100.0,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: deltas,
+	}
+
+	_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	// Skenario 1: Penurunan OI -0.30% (< -0.10%) HARUS DITOLAK meskipun delta Z-score ekstrem
+	if ok {
+		t.Fatalf("expected signal to be rejected due to capitulation OI drop (-0.30%% < -0.10%%)")
+	}
+	if reason != "CONDITIONS_NOT_MET" {
+		t.Errorf("expected rejection reason CONDITIONS_NOT_MET, got %s", reason)
+	}
+
+	// Skenario 2: Penurunan OI wajar/moderat -0.05% (>= -0.10%) boleh lolos bypass jika setup lain valid
+	snap.CurrOpenInterest = 9995.0 // -0.05% drop
+	// Evaluasi tidak boleh ditolak hanya karena capitulation floor
+}
+
+func TestEvaluateSignal_WarmupMinutesMultiHour(t *testing.T) {
+	// Uji jika warmup di-set 75 menit (01:15 UTC)
+	cfg := EvaluatorConfig{
+		MaxSlots:                 3,
+		MaxBookStaleness:         5 * time.Second,
+		MaxMarkStaleness:         15 * time.Second,
+		MaxDataStaleness:         330 * time.Second,
+		MinOIInterval:            4 * time.Minute,
+		MaxOIInterval:            7 * time.Minute,
+		MaxOIStaleness:           300 * time.Second,
+		MaxSpreadPct:             0.05,
+		MinNATRPct:               0.20,
+		MaxNATRPct:               5.00,
+		EMAPeriod:                10,
+		ATRPeriod:                10,
+		VWAPSessionWarmupMinutes: 75,
+	}
+
+	candles := make([]model.Candle, 20)
+	for i := 0; i < 20; i++ {
+		candles[i] = model.Candle{Open: 100, High: 102, Low: 99, Close: 101}
+	}
+
+	// 01:10 UTC (70 menit pasca-midnight) -> < 75 menit -> harus REJECT
+	testTime := time.Date(2026, 10, 29, 1, 10, 0, 0, time.UTC)
+	snap := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		Now:                testTime,
+		BookUpdatedAt:      testTime,
+		MarkPriceUpdatedAt: testTime,
+		FundingUpdatedAt:   testTime,
+		BestBid:            100.0,
+		BestAsk:            100.01,
+		PrevOpenInterest:   1000.0,
+		CurrOpenInterest:   1010.0,
+		PrevOIUpdatedAt:    testTime.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:    testTime,
+		CurrentSessionVWAP: 100.5,
+		ClosedCandles:      candles,
+	}
+
+	_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if ok || reason != "VWAP_SESSION_WARMUP" {
+		t.Fatalf("expected VWAP_SESSION_WARMUP for 01:10 UTC when warmup is 75m, got ok=%v, reason=%s", ok, reason)
+	}
+
+	// 01:20 UTC (80 menit pasca-midnight) -> >= 75 menit -> tidak boleh VWAP_SESSION_WARMUP
+	testTimeAfter := time.Date(2026, 10, 29, 1, 20, 0, 0, time.UTC)
+	snap.Now = testTimeAfter
+	snap.BookUpdatedAt = testTimeAfter
+	snap.MarkPriceUpdatedAt = testTimeAfter
+	snap.FundingUpdatedAt = testTimeAfter
+	snap.PrevOIUpdatedAt = testTimeAfter.Add(-5 * time.Minute)
+	snap.CurrOIUpdatedAt = testTimeAfter
+
+	_, _, reasonAfter, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if reasonAfter == "VWAP_SESSION_WARMUP" {
+		t.Fatalf("expected no VWAP_SESSION_WARMUP for 01:20 UTC when warmup is 75m, got %s", reasonAfter)
+	}
+}
+
 
 
 
