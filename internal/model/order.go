@@ -71,7 +71,10 @@ type LiveOrderRecord struct {
 	TargetQty           decimal.Decimal
 	CumulativeFilledQty decimal.Decimal
 	SLPrice             decimal.Decimal
+	InitialSLPrice      decimal.Decimal
 	TPPrice             decimal.Decimal
+	TP1Price            decimal.Decimal
+	ATRAtEntry          decimal.Decimal
 	CreatedAt           time.Time
 	SignalAuditID       int64
 }
@@ -81,14 +84,18 @@ type LivePositionProtection struct {
 	Side            Side
 	PlanGeneration  uint64
 	ProtectedQty    decimal.Decimal
+	InitialQty      decimal.Decimal
 	SLOrderID       int64
 	SLClientAlgoID  string
 	SLStatus        ProtectionOrderStatus
 	SLPrice         decimal.Decimal
+	InitialSLPrice  decimal.Decimal
 	TPOrderID       int64
 	TPClientAlgoID  string
 	TPStatus        ProtectionOrderStatus
 	TPPrice         decimal.Decimal
+	TP1Price        decimal.Decimal
+	IsTP1Hit        bool
 	LastAttemptTime time.Time
 	LastError       string
 	TPRetryCount    int

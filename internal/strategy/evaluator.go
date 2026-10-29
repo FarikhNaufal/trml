@@ -53,6 +53,9 @@ type EvaluatorConfig struct {
 	MaxFrenzyRVOL          float64
 	MaxCounterImpulseATR   float64
 
+	CooldownAfterExitMinutes int
+	VWAPSessionWarmupMinutes int
+
 	Sizing SizingConfig
 }
 
@@ -67,7 +70,7 @@ func EvaluateSignal(
 	effectiveEquity, availBal decimal.Decimal,
 	cfg EvaluatorConfig,
 ) (model.OrderIntent, bool, string, string) {
-	// Gatekeeper 1: Circuit Breaker & Slot Cap
+	// Gatekeeper 1: Circuit Breaker, Slot Cap, Active Symbol, Cooldown
 	if isDailyBreached {
 		return model.OrderIntent{}, false, "CIRCUIT_BREAKER_ACTIVE", ""
 	}
@@ -76,6 +79,13 @@ func EvaluateSignal(
 	}
 	if hasActiveSymbol {
 		return model.OrderIntent{}, false, "SYMBOL_ALREADY_ACTIVE", ""
+	}
+	if !snap.LastExitTime.IsZero() && cfg.CooldownAfterExitMinutes > 0 {
+		cooldownDuration := time.Duration(cfg.CooldownAfterExitMinutes) * time.Minute
+		if snap.Now.Sub(snap.LastExitTime) < cooldownDuration {
+			remainingSec := int(cooldownDuration.Seconds() - snap.Now.Sub(snap.LastExitTime).Seconds())
+			return model.OrderIntent{}, false, "SYMBOL_IN_COOLDOWN", fmt.Sprintf("COOLDOWN_ACTIVE_%ds_REMAINING", remainingSec)
+		}
 	}
 
 	// Gatekeeper 2: Validasi Kesegaran BBO, Mark Price, Funding
@@ -129,6 +139,16 @@ func EvaluateSignal(
 	vwap := snap.CurrentSessionVWAP
 	if vwap <= 0 {
 		return model.OrderIntent{}, false, "INVALID_VWAP", ""
+	}
+
+	// Warmup Guard Pasca-Reset Session VWAP (00:00 - 00:30 UTC): hindari sinyal false pada awal sesi
+	warmupMins := cfg.VWAPSessionWarmupMinutes
+	if warmupMins <= 0 {
+		warmupMins = 30
+	}
+	utcNow := snap.Now.UTC()
+	if utcNow.Hour() == 0 && utcNow.Minute() < warmupMins {
+		return model.OrderIntent{}, false, "VWAP_SESSION_WARMUP", fmt.Sprintf("UTC_%02d:%02d_IN_WARMUP_%dm", utcNow.Hour(), utcNow.Minute(), warmupMins)
 	}
 
 	// Filter Anti-Chasing: Batasi jarak maksimal penutupan candle dari garis VWAP
@@ -453,7 +473,11 @@ func EvaluateSignal(
 		}
 	}
 
-	intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, rawEntryPrice, atr14, cfg.Sizing)
+	sizingCfg := cfg.Sizing
+	if sizingCfg.EntryOrderType == "" {
+		sizingCfg.EntryOrderType = cfg.EntryOrderType
+	}
+	intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, rawEntryPrice, atr14, sizingCfg)
 	if !ok {
 		return model.OrderIntent{}, false, "SIZING_FAILED", ""
 	}

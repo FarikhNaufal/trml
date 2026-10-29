@@ -1,6 +1,8 @@
 package strategy
 
 import (
+	"strings"
+
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
 )
@@ -17,6 +19,7 @@ type SizingConfig struct {
 	TakerFeeRate                   decimal.Decimal
 	SlippageRate                   decimal.Decimal
 	AvailableBalanceBufferFraction decimal.Decimal
+	EntryOrderType                 string
 }
 
 // BuildSafeDecimalOrderIntent menghitung ukuran lot presisi dengan proteksi friksi fee, slippage,
@@ -96,8 +99,15 @@ func BuildSafeDecimalOrderIntent(
 		}
 	}
 
-	// 1. Kerugian Efektif per Unit (termasuk friksi Maker Fee + Taker Fee + Slippage)
-	totalFrictionRate := cfg.MakerFeeRate.Add(cfg.TakerFeeRate).Add(cfg.SlippageRate)
+	// 1. Kerugian Efektif per Unit (termasuk friksi Maker Fee / Taker Fee + Slippage)
+	var totalFrictionRate decimal.Decimal
+	if strings.EqualFold(cfg.EntryOrderType, "MARKET") {
+		// Entry Taker + Slippage, Exit Taker + Slippage
+		totalFrictionRate = cfg.TakerFeeRate.Mul(decimal.NewFromInt(2)).Add(cfg.SlippageRate.Mul(decimal.NewFromInt(2)))
+	} else {
+		// Entry Maker, Exit Taker + Slippage
+		totalFrictionRate = cfg.MakerFeeRate.Add(cfg.TakerFeeRate).Add(cfg.SlippageRate)
+	}
 	frictionPerUnit := entryPrice.Mul(totalFrictionRate)
 	actualSLDist := entryPrice.Sub(slPrice).Abs()
 	effectiveLossPerUnit := actualSLDist.Add(frictionPerUnit)

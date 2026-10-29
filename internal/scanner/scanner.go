@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"trml/internal/indicator"
@@ -44,6 +45,7 @@ func RunBulkMarketScanner(
 	var passed []Candidate
 	var candidates []Candidate
 
+	var symbolsToScan []string
 	for sym := range perpetualFilters {
 		if !strings.HasSuffix(sym, "USDT") {
 			continue
@@ -63,40 +65,80 @@ func RunBulkMarketScanner(
 		if spreadPct > maxScanSpread {
 			continue
 		}
+		symbolsToScan = append(symbolsToScan, sym)
+	}
+	sort.Strings(symbolsToScan)
 
-		rawKlines := fetchKlinesFn(sym, cfg.BootstrapCount+1)
-		validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime)
-		if err != nil || len(validKlines) < cfg.EMAPeriod+1 {
-			continue
-		}
+	klineLimit := cfg.BootstrapCount + 1
+	if klineLimit > 300 {
+		klineLimit = 300
+	}
+	if klineLimit < cfg.EMAPeriod+20 {
+		klineLimit = cfg.EMAPeriod + 20
+	}
 
-		atr14 := indicator.CalculateATR(validKlines, cfg.ATRPeriod)
-		lastClose := validKlines[len(validKlines)-1].Close
-		if lastClose <= 0 {
-			continue
-		}
-		natrPct := (atr14 / lastClose) * 100.0
-		if natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
-			continue
-		}
+	type scanResult struct {
+		cand     Candidate
+		isPassed bool
+	}
 
-		// Filter Kedekatan VWAP: Tolak koin yang sudah terbang/jatuh terlalu jauh dari Session VWAP
-		// (misal > 2.50x ATR) agar slot radar 20 koin tidak disia-siakan untuk koin yang mustahil pullback.
-		if cfg.MaxScannerVWAPDistATR > 0 && atr14 > 0 {
-			sessionVWAP := indicator.CalculateSessionVWAP(validKlines)
-			if sessionVWAP > 0 {
-				distFromVWAP := math.Abs(lastClose - sessionVWAP)
-				if (distFromVWAP / atr14) > cfg.MaxScannerVWAPDistATR {
-					continue
+	resultsChan := make(chan scanResult, len(symbolsToScan))
+	workerCount := 5
+	if len(symbolsToScan) < workerCount {
+		workerCount = len(symbolsToScan)
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	sem := make(chan struct{}, workerCount)
+	var wg sync.WaitGroup
+
+	for _, sym := range symbolsToScan {
+		wg.Add(1)
+		go func(symbol string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			rawKlines := fetchKlinesFn(symbol, klineLimit)
+			validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime)
+			if err != nil || len(validKlines) < cfg.EMAPeriod+1 {
+				return
+			}
+
+			atr14 := indicator.CalculateATR(validKlines, cfg.ATRPeriod)
+			lastClose := validKlines[len(validKlines)-1].Close
+			if lastClose <= 0 {
+				return
+			}
+			natrPct := (atr14 / lastClose) * 100.0
+			if natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
+				return
+			}
+
+			if cfg.MaxScannerVWAPDistATR > 0 && atr14 > 0 {
+				sessionVWAP := indicator.CalculateSessionVWAP(validKlines)
+				if sessionVWAP > 0 {
+					distFromVWAP := math.Abs(lastClose - sessionVWAP)
+					if (distFromVWAP / atr14) > cfg.MaxScannerVWAPDistATR {
+						return
+					}
 				}
 			}
-		}
 
-		rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
-		cand := Candidate{Symbol: sym, RVOL: rvol, Candles: validKlines}
-		candidates = append(candidates, cand)
-		if rvol >= cfg.MinRVOL {
-			passed = append(passed, cand)
+			rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
+			cand := Candidate{Symbol: symbol, RVOL: rvol, Candles: validKlines}
+			resultsChan <- scanResult{cand: cand, isPassed: rvol >= cfg.MinRVOL}
+		}(sym)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	for res := range resultsChan {
+		candidates = append(candidates, res.cand)
+		if res.isPassed {
+			passed = append(passed, res.cand)
 		}
 	}
 

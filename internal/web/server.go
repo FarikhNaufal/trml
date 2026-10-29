@@ -159,15 +159,16 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
-		"equity":             equityF,
-		"balance":            balanceF,
-		"daily_drawdown_pct": ddPct,
-		"active_slots":       activeSlots,
-		"max_slots":          s.cfg.MaxSlots,
-		"env":                s.cfg.Env,
-		"circuit_breaker":    circuitBreaker,
-		"positions":          positions,
-		"stats":              stats,
+		"equity":                 equityF,
+		"balance":                balanceF,
+		"daily_drawdown_pct":     ddPct,
+		"max_daily_drawdown_pct": s.cfg.MaxDailyDrawdown,
+		"active_slots":           activeSlots,
+		"max_slots":              s.cfg.MaxSlots,
+		"env":                    s.cfg.Env,
+		"circuit_breaker":        circuitBreaker,
+		"positions":              positions,
+		"stats":                  stats,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -365,8 +366,8 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 	}
 
 	maxDailyDrawdown := s.cfg.MaxDailyDrawdown
-	if maxDailyDrawdown <= 0 {
-		maxDailyDrawdown = 3.0
+	if maxDailyDrawdown == 0 {
+		maxDailyDrawdown = -0.03
 	}
 
 	// Ambil riwayat trade terakhir (kosongkan AIAutopsy agar hemat token prompt)

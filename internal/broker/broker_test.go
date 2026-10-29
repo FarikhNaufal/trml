@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1646,6 +1647,369 @@ func TestDryRunBrokerRunnerTrailingStop_Short(t *testing.T) {
 		t.Errorf("expected 0 open positions, got %d", len(broker.OpenPositions))
 	}
 	broker.Mu.Unlock()
+}
+
+func TestLiveBrokerPartialTP1AndBE(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:              3,
+		MaxDailyDrawdownPct:   -0.05,
+		MaxAccountStaleness:   60 * time.Second,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		Tier1BEEnabled:        true,
+		MinBreakEvenOffsetPct: 0.0010,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+
+	b.HandleAccountUpdate(
+		decimal.NewFromFloat(10000.0),
+		decimal.Zero,
+		decimal.NewFromFloat(10000.0),
+		nil,
+		now,
+	)
+
+	filter := model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.01),
+		StepSize: decimal.NewFromFloat(0.1),
+	}
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return filter, true
+	}
+
+	var marketCloseQty decimal.Decimal
+	var marketCloseSide model.Side
+	var marketCloseCount int32
+	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, error) {
+		atomic.AddInt32(&marketCloseCount, 1)
+		marketCloseSide = side
+		marketCloseQty = qty
+		return 777001, nil
+	}
+
+	var slMu sync.Mutex
+	var slTriggerPrice decimal.Decimal
+	var slOrderQty decimal.Decimal
+	var slAlgoCount int32
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if orderType == "STOP_MARKET" {
+			slMu.Lock()
+			atomic.AddInt32(&slAlgoCount, 1)
+			slTriggerPrice = triggerPrice
+			slOrderQty = qty
+			slMu.Unlock()
+			return 888001, nil
+		}
+		return 0, nil
+	}
+
+	closedTrades := make(chan TradeClosedRecord, 5)
+	b.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTrades <- rec
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_LIVE_TP1_LONG",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(2.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(110.0),
+		TP1Price:      decimal.NewFromFloat(103.0),
+		ATRAtEntry:    decimal.NewFromFloat(2.0),
+		CreatedAt:     now,
+	}
+
+	ok, err := b.ReserveEntryIntent(intent)
+	if !ok || err != nil {
+		t.Fatalf("failed to reserve intent: %v", err)
+	}
+
+	// Simulasi fill entry
+	b.HandleUserDataOrderUpdate("TEST_LIVE_TP1_LONG", 111001, "BTCUSDT", model.StatusFilled, decimal.NewFromFloat(2.0), decimal.NewFromFloat(100.0), decimal.Zero)
+
+	// Wait for initial entry SL placement to complete and be acked
+	for i := 0; i < 50; i++ {
+		if atomic.LoadInt32(&slAlgoCount) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&slAlgoCount) != 1 {
+		t.Fatalf("expected initial SL placement count 1, got %d", atomic.LoadInt32(&slAlgoCount))
+	}
+
+	// Price ticks below TP1 -> TP1 should NOT trigger
+	b.OnRealtimeTick("BTCUSDT", 101.0, 101.1, 101.0, 101.0, 1.0, true, now)
+	if atomic.LoadInt32(&marketCloseCount) != 0 {
+		t.Fatalf("expected no market close at price 101")
+	}
+
+	// Price ticks at or above TP1 (103.0) -> TP1 should trigger!
+	b.OnRealtimeTick("BTCUSDT", 103.0, 103.1, 103.0, 103.0, 1.0, true, now)
+
+	// Wait for async market close goroutine
+	for i := 0; i < 50; i++ {
+		if atomic.LoadInt32(&marketCloseCount) > 0 && atomic.LoadInt32(&slAlgoCount) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if atomic.LoadInt32(&marketCloseCount) != 1 {
+		t.Fatalf("expected 1 market close call, got %d", atomic.LoadInt32(&marketCloseCount))
+	}
+	if !marketCloseQty.Equal(decimal.NewFromFloat(1.0)) {
+		t.Errorf("expected 1.0 close qty (50%% of 2.0), got %s", marketCloseQty)
+	}
+	if marketCloseSide != model.SideShort {
+		t.Errorf("expected close side SHORT for long position, got %s", marketCloseSide)
+	}
+
+	select {
+	case rec := <-closedTrades:
+		if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+			t.Errorf("expected exit reason PARTIAL_TAKE_PROFIT, got %s", rec.ExitReason)
+		}
+		if !rec.Qty.Equal(decimal.NewFromFloat(1.0)) {
+			t.Errorf("expected 1.0 qty, got %s", rec.Qty)
+		}
+		if !rec.SLPrice.Equal(decimal.NewFromFloat(95.0)) {
+			t.Errorf("expected initial SL price 95.0, got %s", rec.SLPrice)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for partial TP1 trade record")
+	}
+
+	// Wait for the asynchronous BE SL order placement to complete
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&slAlgoCount) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&slAlgoCount) < 2 {
+		t.Fatalf("timeout waiting for BE SL algo order placement, count=%d", atomic.LoadInt32(&slAlgoCount))
+	}
+
+	// Verify that remaining qty is 1.0, tier is 1 (BE), and BE SL was placed
+	b.Mu.Lock()
+	if !b.ActivePositions["BTCUSDT"].Equal(decimal.NewFromFloat(1.0)) {
+		t.Errorf("expected remaining active position 1.0, got %s", b.ActivePositions["BTCUSDT"])
+	}
+	if b.ProtectionTiers["BTCUSDT"] != 1 {
+		t.Errorf("expected protection tier 1, got %d", b.ProtectionTiers["BTCUSDT"])
+	}
+	b.Mu.Unlock()
+
+	slMu.Lock()
+	finalSLQty := slOrderQty
+	finalSLPrice := slTriggerPrice
+	slMu.Unlock()
+
+	if !finalSLQty.Equal(decimal.NewFromFloat(1.0)) {
+		t.Errorf("expected BE SL order for remaining 1.0 qty, got %s", finalSLQty)
+	}
+	if finalSLPrice.LessThan(decimal.NewFromFloat(100.0)) {
+		t.Errorf("expected BE SL >= entry price (100.0), got %s", finalSLPrice)
+	}
+}
+
+func TestLiveBrokerTickSizeQuantization(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+		TrailingEnabled:     true,
+		TrailingActivateATR: 1.0,
+		TrailingDistanceATR: 0.5,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	// Tick size 0.005 -> any price must be multiple of 0.005!
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.005),
+			StepSize: decimal.NewFromFloat(1.0),
+		}, true
+	}
+
+	var slMu sync.Mutex
+	var lastSLPrice decimal.Decimal
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		slMu.Lock()
+		lastSLPrice = triggerPrice
+		slMu.Unlock()
+		return 999123, nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_TICK_QUANT",
+		Symbol:        "DOGEUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(100.0),
+		LimitPrice:    decimal.NewFromFloat(0.123456),
+		SLPrice:       decimal.NewFromFloat(0.111111),
+		TPPrice:       decimal.NewFromFloat(0.150000),
+		ATRAtEntry:    decimal.NewFromFloat(0.012345),
+		CreatedAt:     now,
+	}
+
+	b.ReserveEntryIntent(intent)
+	b.HandleUserDataOrderUpdate("TEST_TICK_QUANT", 112233, "DOGEUSDT", model.StatusFilled, decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.123456), decimal.Zero)
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Initial SL should be quantized to 0.005 step
+	slMu.Lock()
+	initialSL := lastSLPrice
+	slMu.Unlock()
+
+	rem := initialSL.Mod(decimal.NewFromFloat(0.005))
+	if !rem.IsZero() {
+		t.Errorf("initial SL %s is not multiple of tickSize 0.005 (rem: %s)", initialSL, rem)
+	}
+
+	// Trigger trailing stop with an arbitrary mark price
+	b.OnRealtimeTick("DOGEUSDT", 0.150000, 0.150005, 0.150000, 0.150000, 10.0, true, now)
+	time.Sleep(50 * time.Millisecond)
+
+	b.Mu.Lock()
+	prot := b.Protections["DOGEUSDT"]
+	trailSL := prot.SLPrice
+	b.Mu.Unlock()
+
+	remTrail := trailSL.Mod(decimal.NewFromFloat(0.005))
+	if !remTrail.IsZero() {
+		t.Errorf("trailing SL %s is not multiple of tickSize 0.005 (rem: %s)", trailSL, remTrail)
+	}
+}
+
+func TestLiveBrokerTrailingThrottling(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+		TrailingEnabled:     true,
+		TrailingActivateATR: 1.0,
+		TrailingDistanceATR: 0.5,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.1),
+			StepSize: decimal.NewFromFloat(1.0),
+		}, true
+	}
+
+	var algoCallCount int32
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		atomic.AddInt32(&algoCallCount, 1)
+		return int64(1000 + atomic.LoadInt32(&algoCallCount)), nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_THROTTLE",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(10.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(120.0),
+		ATRAtEntry:    decimal.NewFromFloat(5.0),
+		CreatedAt:     now,
+	}
+	b.ReserveEntryIntent(intent)
+	b.HandleUserDataOrderUpdate("TEST_THROTTLE", 445566, "SOLUSDT", model.StatusFilled, decimal.NewFromFloat(10.0), decimal.NewFromFloat(100.0), decimal.Zero)
+	time.Sleep(50 * time.Millisecond)
+
+	initialCalls := atomic.LoadInt32(&algoCallCount) // Initial SL call
+
+	// Send rapid ticks that activate trailing stop
+	b.OnRealtimeTick("SOLUSDT", 110.0, 110.1, 110.0, 110.0, 1.0, true, now)
+	time.Sleep(50 * time.Millisecond)
+	afterFirstTrail := atomic.LoadInt32(&algoCallCount)
+	if afterFirstTrail <= initialCalls {
+		t.Fatalf("expected trailing SL to be placed, calls: %d", afterFirstTrail)
+	}
+
+	// Send another tick immediately (within 3 seconds) with tiny movement
+	b.OnRealtimeTick("SOLUSDT", 110.2, 110.3, 110.2, 110.2, 1.0, true, now.Add(100*time.Millisecond))
+	time.Sleep(50 * time.Millisecond)
+
+	// Call count should NOT have increased because of 3-second throttle!
+	if atomic.LoadInt32(&algoCallCount) != afterFirstTrail {
+		t.Errorf("expected throttled update within 3s, but got new call! count=%d", atomic.LoadInt32(&algoCallCount))
+	}
+}
+
+func TestLiveBrokerInitialSLPricePreservation(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+		TrailingEnabled:     true,
+		TrailingActivateATR: 1.0,
+		TrailingDistanceATR: 0.5,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	var slAlgoID int64 = 555001
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		return slAlgoID, nil
+	}
+
+	closedTrades := make(chan TradeClosedRecord, 5)
+	b.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTrades <- rec
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_INITIAL_SL_PRESERVE",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(2000.0),
+		SLPrice:       decimal.NewFromFloat(1950.0),
+		TPPrice:       decimal.NewFromFloat(2200.0),
+		ATRAtEntry:    decimal.NewFromFloat(40.0),
+		CreatedAt:     now,
+	}
+	b.ReserveEntryIntent(intent)
+	b.HandleUserDataOrderUpdate("TEST_INITIAL_SL_PRESERVE", 778899, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(2000.0), decimal.Zero)
+	time.Sleep(50 * time.Millisecond)
+
+	// Move trailing SL up to ~2060
+	b.OnRealtimeTick("ETHUSDT", 2080.0, 2080.5, 2080.0, 2080.0, 1.0, true, now)
+	time.Sleep(50 * time.Millisecond)
+
+	// Now Stop Loss fills at the trailing price
+	b.HandleUserDataOrderUpdate("live_sl_ETHUSDT", slAlgoID, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(2060.0), decimal.NewFromFloat(60.0))
+
+	select {
+	case rec := <-closedTrades:
+		// SLPrice MUST be the initial SL (1950.0), not the trailing price (2060.0)!
+		if !rec.SLPrice.Equal(decimal.NewFromFloat(1950.0)) {
+			t.Errorf("expected preserved initial SL 1950.0, got %s", rec.SLPrice)
+		}
+		if rec.ExitReason != "TRAILING_STOP" {
+			t.Errorf("expected exit reason TRAILING_STOP, got %s", rec.ExitReason)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timeout waiting for closed trade record")
+	}
 }
 
 

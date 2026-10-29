@@ -189,7 +189,9 @@ function renderSummary(data) {
     elDD.className = 'kpi-value ' + (ddPct < -2.0 ? 'val-red' : (ddPct < 0 ? 'val-yellow' : 'val-green'));
   }
   if (elDDSub) {
-    elDDSub.textContent = data.circuit_breaker ? 'CIRCUIT BREAKER TRIPPED' : 'Breaker: Max 3.00%';
+    const maxDD = Math.abs(data.max_daily_drawdown_pct || 0.03);
+    const maxDDPct = (maxDD < 1 ? maxDD * 100 : maxDD).toFixed(2);
+    elDDSub.textContent = data.circuit_breaker ? 'CIRCUIT BREAKER TRIPPED' : `Breaker: Max ${maxDDPct}%`;
     if (data.circuit_breaker) elDDSub.classList.add('val-red');
   }
 

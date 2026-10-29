@@ -43,6 +43,7 @@ type StoredLivePosition struct {
 	SLOrderID      int64
 	SLClientAlgoID string
 	SLPrice        decimal.Decimal
+	InitialSLPrice decimal.Decimal
 	TPOrderID      int64
 	TPClientAlgoID string
 	TPPrice        decimal.Decimal
@@ -478,9 +479,9 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 	query := `
 	INSERT INTO live_open_positions (
 		symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
-		sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
+		sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
 		protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(symbol) DO UPDATE SET
 		side = excluded.side,
 		qty = excluded.qty,
@@ -489,6 +490,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		sl_order_id = excluded.sl_order_id,
 		sl_client_algo_id = excluded.sl_client_algo_id,
 		sl_price = excluded.sl_price,
+		initial_sl_price = excluded.initial_sl_price,
 		tp_order_id = excluded.tp_order_id,
 		tp_client_algo_id = excluded.tp_client_algo_id,
 		tp_price = excluded.tp_price,
@@ -513,6 +515,10 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 	if pos.InitialQty.IsZero() {
 		initQtyStr = pos.Qty.String()
 	}
+	initSLStr := pos.InitialSLPrice.String()
+	if pos.InitialSLPrice.IsZero() {
+		initSLStr = pos.SLPrice.String()
+	}
 	tpHitInt := 0
 	if pos.IsTP1Hit {
 		tpHitInt = 1
@@ -529,6 +535,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		pos.SLOrderID,
 		pos.SLClientAlgoID,
 		pos.SLPrice.String(),
+		initSLStr,
 		pos.TPOrderID,
 		pos.TPClientAlgoID,
 		pos.TPPrice.String(),
@@ -561,7 +568,7 @@ func (r *SQLiteRepository) DeleteLivePosition(ctx context.Context, symbol string
 func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error) {
 	query := `
 	SELECT symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
-	       sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
+	       sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
 	       protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
 	FROM live_open_positions;
 	`
@@ -574,7 +581,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 	var results []StoredLivePosition
 	for rows.Next() {
 		var p StoredLivePosition
-		var qtyStr, initQtyStr, entryStr, slStr, tpStr, tp1Str string
+		var qtyStr, initQtyStr, entryStr, slStr, initSLStr, tpStr, tp1Str string
 		var openTimeStr, updTimeStr string
 		var tpHitInt int
 		err := rows.Scan(
@@ -586,6 +593,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 			&p.SLOrderID,
 			&p.SLClientAlgoID,
 			&slStr,
+			&initSLStr,
 			&p.TPOrderID,
 			&p.TPClientAlgoID,
 			&tpStr,
@@ -608,6 +616,10 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 		}
 		p.EntryPrice, _ = decimal.NewFromString(entryStr)
 		p.SLPrice, _ = decimal.NewFromString(slStr)
+		p.InitialSLPrice, _ = decimal.NewFromString(initSLStr)
+		if p.InitialSLPrice.IsZero() {
+			p.InitialSLPrice = p.SLPrice
+		}
 		p.TPPrice, _ = decimal.NewFromString(tpStr)
 		p.TP1Price, _ = decimal.NewFromString(tp1Str)
 		p.IsTP1Hit = (tpHitInt == 1)

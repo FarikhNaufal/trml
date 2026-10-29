@@ -196,6 +196,35 @@ func (c *Client) EmergencyMarketClose(ctx context.Context, symbol string, side m
 	return nil
 }
 
+// PlaceMarketClose mengirimkan order MARKET penutupan parsial/penuh dengan reduceOnly=true (POST /fapi/v1/order)
+func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, error) {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	if side == model.SideLong {
+		params.Set("side", "BUY")
+	} else {
+		params.Set("side", "SELL")
+	}
+	params.Set("type", "MARKET")
+	params.Set("reduceOnly", "true")
+	params.Set("quantity", qty.String())
+	if clientOrderID != "" {
+		params.Set("newClientOrderId", clientOrderID)
+	}
+
+	respBytes, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
+	if err != nil {
+		return 0, fmt.Errorf("place market close: %w (body: %s)", err, string(respBytes))
+	}
+
+	var resp OrderResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return 0, fmt.Errorf("place market close: failed to decode response: %w", err)
+	}
+
+	return resp.OrderID, nil
+}
+
 // InitAndVerifySymbol memverifikasi One-Way mode, isolasi margin, dan leverage 5x (Solusi P0-5 & P0-7)
 func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverage int) (bool, error) {
 	// 1. Verifikasi One-Way Mode (GET /fapi/v1/positionSide/dual)

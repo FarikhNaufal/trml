@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     sl_order_id          INTEGER NOT NULL DEFAULT 0,
     sl_client_algo_id    TEXT NOT NULL DEFAULT '',
     sl_price             TEXT NOT NULL,
+    initial_sl_price     TEXT NOT NULL DEFAULT '',
     tp_order_id          INTEGER NOT NULL DEFAULT 0,
     tp_client_algo_id    TEXT NOT NULL DEFAULT '',
     tp_price             TEXT NOT NULL,
@@ -226,11 +227,16 @@ func OpenDB(dbPath string) (*DB, error) {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN is_tp1_hit INTEGER NOT NULL DEFAULT 0;`)
 	}
 
-	// Migrasi otomatis kolom initial_sl_price di dryrun_open_positions
+	// Migrasi otomatis kolom initial_sl_price di dryrun_open_positions dan live_open_positions
 	var initSLCount int
 	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'initial_sl_price';`).Scan(&initSLCount)
 	if initSLCount == 0 {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN initial_sl_price TEXT NOT NULL DEFAULT '';`)
+	}
+	var initSLLiveCount int
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'initial_sl_price';`).Scan(&initSLLiveCount)
+	if initSLLiveCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN initial_sl_price TEXT NOT NULL DEFAULT '';`)
 	}
 
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)

@@ -96,6 +96,8 @@ type Config struct {
 	AllowedSide              string
 	MaxFrenzyRVOL            float64
 	MaxCounterImpulseATR     float64
+	CooldownAfterExitMinutes int
+	VWAPSessionWarmupMinutes int
 
 	// Batas Waktu & Staleness
 	ScannerInterval   time.Duration
@@ -525,6 +527,18 @@ func LoadConfig() (*Config, error) {
 		maxHoldingDuration = 4 * time.Hour
 	}
 
+	cooldownMinsStr := getEnv("COOLDOWN_AFTER_EXIT_MINUTES", "20")
+	cooldownMins, err := strconv.Atoi(cooldownMinsStr)
+	if err != nil || cooldownMins < 0 {
+		cooldownMins = 20
+	}
+
+	vwapWarmupMinsStr := getEnv("VWAP_SESSION_WARMUP_MINUTES", "30")
+	vwapWarmupMins, err := strconv.Atoi(vwapWarmupMinsStr)
+	if err != nil || vwapWarmupMins < 0 {
+		vwapWarmupMins = 30
+	}
+
 	return &Config{
 		Env:                  env,
 		APIKey:               apiKey,
@@ -590,6 +604,8 @@ func LoadConfig() (*Config, error) {
 		AllowedSide:              allowedSide,
 		MaxFrenzyRVOL:            maxFrenzyRVOL,
 		MaxCounterImpulseATR:     maxCounterImpulseATR,
+		CooldownAfterExitMinutes: cooldownMins,
+		VWAPSessionWarmupMinutes: vwapWarmupMins,
 
 		ScannerInterval:    15 * time.Minute,
 		MaxBookStaleness:   5 * time.Second,

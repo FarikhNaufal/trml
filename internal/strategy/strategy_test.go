@@ -1572,6 +1572,150 @@ func TestBuildSafeDecimalOrderIntent_StopDistanceFloorAndTP1(t *testing.T) {
 	}
 }
 
+func TestBuildSafeDecimalOrderIntent_MarketVsLimitFriction(t *testing.T) {
+	snap := model.MarketSnapshot{
+		Symbol: "BTCUSDT",
+		BestBid: 100.0,
+		BestAsk: 100.0,
+		Filter: model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.01),
+			StepSize: decimal.NewFromFloat(0.001),
+			MinQty:   decimal.NewFromFloat(0.001),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+	}
+	equity := decimal.NewFromFloat(1000.0)
+	available := decimal.NewFromFloat(1000.0)
+	atr14 := 2.0
+
+	cfgLimit := SizingConfig{
+		RiskPerTradePct:                decimal.NewFromFloat(0.01), // $10 risk
+		MaxSlotMarginFraction:          decimal.NewFromFloat(0.50),
+		AccountLeverage:                5.0,
+		SLMultiplier:                   1.5, // 3.0 distance
+		TPMultiplier:                   2.25,
+		TP1Multiplier:                  1.20,
+		MakerFeeRate:                   decimal.NewFromFloat(0.0002), // 0.02%
+		TakerFeeRate:                   decimal.NewFromFloat(0.0005), // 0.05%
+		SlippageRate:                   decimal.NewFromFloat(0.0002), // 0.02%
+		AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+		EntryOrderType:                 "LIMIT",
+	}
+
+	cfgMarket := cfgLimit
+	cfgMarket.EntryOrderType = "MARKET"
+
+	intentLimit, okLimit := BuildSafeDecimalOrderIntent(snap, equity, available, model.SideLong, 100.0, atr14, cfgLimit)
+	if !okLimit {
+		t.Fatalf("expected limit intent to succeed")
+	}
+
+	intentMarket, okMarket := BuildSafeDecimalOrderIntent(snap, equity, available, model.SideLong, 100.0, atr14, cfgMarket)
+	if !okMarket {
+		t.Fatalf("expected market intent to succeed")
+	}
+
+	// For limit: friction = 0.0002 + 0.0005 + 0.0002 = 0.0009 -> frictionPerUnit = 0.09.
+	// For market: friction = 2 * (0.0005 + 0.0002) = 0.0014 -> frictionPerUnit = 0.14.
+	// Effective loss per unit is higher for MARKET (3.14 vs 3.09), so MARKET qty must be <= LIMIT qty.
+	if intentMarket.Qty.GreaterThan(intentLimit.Qty) {
+		t.Errorf("market qty %s should be <= limit qty %s due to higher taker+slippage friction", intentMarket.Qty, intentLimit.Qty)
+	}
+}
+
+func TestEvaluateSignal_SymbolCooldown(t *testing.T) {
+	now := time.Date(2026, 10, 29, 14, 0, 0, 0, time.UTC)
+	cfg := EvaluatorConfig{
+		MaxSlots:                 3,
+		CooldownAfterExitMinutes: 20,
+	}
+
+	snap := model.MarketSnapshot{
+		Symbol:       "BTCUSDT",
+		Now:          now,
+		LastExitTime: now.Add(-10 * time.Minute), // Only 10 mins ago (< 20 mins cooldown)
+	}
+
+	_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if ok {
+		t.Fatalf("expected signal to be rejected due to active cooldown")
+	}
+	if reason != "SYMBOL_IN_COOLDOWN" {
+		t.Errorf("expected reason SYMBOL_IN_COOLDOWN, got %s", reason)
+	}
+
+	// Skenario 2: LastExitTime 25 mins ago (> 20 mins cooldown) -> should NOT reject with SYMBOL_IN_COOLDOWN
+	snap.LastExitTime = now.Add(-25 * time.Minute)
+	_, _, reason2, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if reason2 == "SYMBOL_IN_COOLDOWN" {
+		t.Errorf("expected cooldown to expire after 25m, but got %s", reason2)
+	}
+}
+
+func TestEvaluateSignal_VWAPSessionWarmup(t *testing.T) {
+	// Jam 00:15 UTC (dalam rentang 00:00 - 00:30 UTC warmup)
+	warmupTime := time.Date(2026, 10, 29, 0, 15, 0, 0, time.UTC)
+	cfg := EvaluatorConfig{
+		MaxSlots:                 3,
+		MaxBookStaleness:         5 * time.Second,
+		MaxMarkStaleness:         15 * time.Second,
+		MaxDataStaleness:         330 * time.Second,
+		MinOIInterval:            4 * time.Minute,
+		MaxOIInterval:            7 * time.Minute,
+		MaxOIStaleness:           300 * time.Second,
+		MaxSpreadPct:             0.05,
+		MinNATRPct:               0.20,
+		MaxNATRPct:               5.00,
+		EMAPeriod:                10,
+		ATRPeriod:                10,
+		VWAPSessionWarmupMinutes: 30,
+	}
+
+	candles := make([]model.Candle, 20)
+	for i := 0; i < 20; i++ {
+		candles[i] = model.Candle{
+			Open: 100, High: 102, Low: 99, Close: 101,
+		}
+	}
+
+	snap := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		Now:                warmupTime,
+		BookUpdatedAt:      warmupTime,
+		MarkPriceUpdatedAt: warmupTime,
+		FundingUpdatedAt:   warmupTime,
+		BestBid:            100.0,
+		BestAsk:            100.01,
+		PrevOpenInterest:   1000.0,
+		CurrOpenInterest:   1010.0,
+		PrevOIUpdatedAt:    warmupTime.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:    warmupTime,
+		CurrentSessionVWAP: 100.5,
+		ClosedCandles:      candles,
+	}
+
+	_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if ok {
+		t.Fatalf("expected signal to be rejected during 00:00-00:30 UTC VWAP warmup")
+	}
+	if reason != "VWAP_SESSION_WARMUP" {
+		t.Errorf("expected reason VWAP_SESSION_WARMUP, got %s", reason)
+	}
+
+	// Di luar warmup (misal 01:15 UTC) -> tidak boleh di-reject dengan VWAP_SESSION_WARMUP
+	snap.Now = time.Date(2026, 10, 29, 1, 15, 0, 0, time.UTC)
+	snap.BookUpdatedAt = snap.Now
+	snap.MarkPriceUpdatedAt = snap.Now
+	snap.FundingUpdatedAt = snap.Now
+	snap.PrevOIUpdatedAt = snap.Now.Add(-5 * time.Minute)
+	snap.CurrOIUpdatedAt = snap.Now
+
+	_, _, reasonNormal, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if reasonNormal == "VWAP_SESSION_WARMUP" {
+		t.Errorf("expected no VWAP warmup rejection at 01:15 UTC, got %s", reasonNormal)
+	}
+}
+
 
 
 

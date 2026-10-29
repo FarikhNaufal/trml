@@ -41,6 +41,9 @@ type BotEngine struct {
 	activeStates map[string]*model.SymbolState
 	watchedCoins []string
 
+	filtersMu       sync.RWMutex
+	exchangeFilters map[string]model.ExchangeFilter
+
 	evaluatorCfg strategy.EvaluatorConfig
 	scannerCfg   scanner.ScannerConfig
 
@@ -119,10 +122,11 @@ func main() {
 		client.RecvWindow = cfg.RecvWindowMS
 	}
 	engine := &BotEngine{
-		cfg:          cfg,
-		repo:         repo,
-		client:       client,
+		cfg:             cfg,
+		repo:            repo,
+		client:          client,
 		activeStates:    make(map[string]*model.SymbolState),
+		exchangeFilters: make(map[string]model.ExchangeFilter),
 		verifiedSymbols: make(map[string]bool),
 		evaluatorCfg: strategy.EvaluatorConfig{
 			MaxSlots:              cfg.MaxSlots,
@@ -158,8 +162,10 @@ func main() {
 			BTCMax5mPumpPct:        cfg.BTCMax5mPumpPct,
 			BTCGatePersistenceBars: cfg.BTCGatePersistenceBars,
 			AllowedSide:            cfg.AllowedSide,
-			MaxFrenzyRVOL:          cfg.MaxFrenzyRVOL,
-			MaxCounterImpulseATR:   cfg.MaxCounterImpulseATR,
+			MaxFrenzyRVOL:            cfg.MaxFrenzyRVOL,
+			MaxCounterImpulseATR:     cfg.MaxCounterImpulseATR,
+			CooldownAfterExitMinutes: cfg.CooldownAfterExitMinutes,
+			VWAPSessionWarmupMinutes: cfg.VWAPSessionWarmupMinutes,
 			Sizing: strategy.SizingConfig{
 				RiskPerTradePct:               cfg.RiskPerTradePct,
 				MaxSlotMarginFraction:         cfg.MaxSlotMarginFrac,
@@ -172,6 +178,7 @@ func main() {
 				MakerFeeRate:                  cfg.MakerFeeRate,
 				TakerFeeRate:                  cfg.TakerFeeRate,
 				SlippageRate:                  cfg.SlippageRate,
+				EntryOrderType:                cfg.EntryOrderType,
 			},
 		},
 		scannerCfg: scanner.ScannerConfig{
@@ -240,6 +247,14 @@ func main() {
 		engine.dryRunBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
+			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+				engine.statesMu.RLock()
+				st := engine.activeStates[rec.Symbol]
+				engine.statesMu.RUnlock()
+				if st != nil {
+					st.SetLastExitTime(rec.ClosedAt)
+				}
+			}
 			pureRealEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
 			epochDay := time.Now().UTC().Unix() / 86400
 			engine.dryRunBroker.Mu.Lock()
@@ -259,6 +274,7 @@ func main() {
 				EntryPrice:       pos.EntryPrice,
 				EntryFee:         pos.EntryFee,
 				CurrentSLPrice:   pos.CurrentSLPrice,
+				InitialSLPrice:   pos.InitialSLPrice,
 				TPPrice:          pos.TPPrice,
 				TP1Price:         pos.TP1Price,
 				IsTP1Hit:         pos.IsTP1Hit,
@@ -341,9 +357,16 @@ func main() {
 			engine.liveBroker.PlaceEntryFn = client.PlaceLimitEntry
 		}
 		engine.liveBroker.PlaceAlgoOrderFn = client.PlaceAlgoOrder
+		engine.liveBroker.MarketCloseFn = client.PlaceMarketClose
 		engine.liveBroker.CancelOrderFn = client.CancelOrder
 		engine.liveBroker.CancelAlgoOrderFn = client.CancelAlgoOrder
 		engine.liveBroker.QueryOrderFn = client.QueryOrder
+		engine.liveBroker.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+			engine.filtersMu.RLock()
+			defer engine.filtersMu.RUnlock()
+			f, ok := engine.exchangeFilters[symbol]
+			return f, ok
+		}
 		engine.liveBroker.EmergencyMarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error {
 			slog.Warn("TRIGGERING EMERGENCY MARKET CLOSE", "symbol", symbol, "side", side, "qty", qty, "reason", reason)
 			return client.EmergencyMarketClose(ctx, symbol, side, qty)
@@ -358,6 +381,7 @@ func main() {
 				SLOrderID:      pos.SLOrderID,
 				SLClientAlgoID: pos.SLClientAlgoID,
 				SLPrice:        pos.SLPrice,
+				InitialSLPrice: pos.InitialSLPrice,
 				TPOrderID:      pos.TPOrderID,
 				TPClientAlgoID: pos.TPClientAlgoID,
 				TPPrice:        pos.TPPrice,
@@ -377,6 +401,14 @@ func main() {
 		engine.liveBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
+			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+				engine.statesMu.RLock()
+				st := engine.activeStates[rec.Symbol]
+				engine.statesMu.RUnlock()
+				if st != nil {
+					st.SetLastExitTime(rec.ClosedAt)
+				}
+			}
 		}
 		engine.broker = engine.liveBroker
 	}
@@ -731,6 +763,9 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		slog.Error("failed to fetch exchange info", "err", err)
 		return
 	}
+	e.filtersMu.Lock()
+	e.exchangeFilters = filters
+	e.filtersMu.Unlock()
 
 	volMap, err := e.client.Fetch24hTickers(ctx)
 	if err != nil {
@@ -774,6 +809,9 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	)
 
 	e.statesMu.Lock()
+	oldWatched := make([]string, len(e.watchedCoins))
+	copy(oldWatched, e.watchedCoins)
+
 	for k, v := range localStates {
 		if _, exists := e.activeStates[k]; !exists {
 			e.activeStates[k] = v
@@ -826,9 +864,10 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	}
 	e.statesMu.Unlock()
 
-	// Inisialisasi state BTCUSDT sebagai benchmark makro jika belum ada
+	// Inisialisasi dan periodik re-sinkronisasi state BTCUSDT sebagai benchmark makro (P2-3)
 	e.statesMu.Lock()
-	if _, exists := e.activeStates[BenchmarkSymbol]; !exists {
+	btcSt, exists := e.activeStates[BenchmarkSymbol]
+	if !exists {
 		filter, ok := filters[BenchmarkSymbol]
 		if !ok {
 			filter = model.ExchangeFilter{
@@ -838,17 +877,26 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 				MinNotional: decimal.NewFromFloat(5.0),
 			}
 		}
-		st := model.NewSymbolState(BenchmarkSymbol, filter, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
-		st.IsLeverageIsolatedVerified = true
-		klines, kErr := e.client.FetchKlines(ctx, BenchmarkSymbol, "5m", e.scannerCfg.BootstrapCount)
-		if kErr == nil {
-			for _, k := range klines {
-				st.ApplyClosedCandleLocked(k, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
-			}
-		}
-		e.activeStates[BenchmarkSymbol] = st
+		btcSt = model.NewSymbolState(BenchmarkSymbol, filter, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
+		btcSt.IsLeverageIsolatedVerified = true
+		e.activeStates[BenchmarkSymbol] = btcSt
 	}
 	e.statesMu.Unlock()
+
+	btcFetchCount := 100
+	if !exists {
+		btcFetchCount = e.scannerCfg.BootstrapCount
+	}
+	klines, kErr := e.client.FetchKlines(ctx, BenchmarkSymbol, "5m", btcFetchCount)
+	if kErr == nil && len(klines) > 0 {
+		btcSt.Mu.Lock()
+		for _, k := range klines {
+			btcSt.ApplyClosedCandleLocked(k, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
+		}
+		btcSt.Mu.Unlock()
+	} else if kErr != nil {
+		slog.Warn("periodic BTC klines sync failed", "err", kErr)
+	}
 
 	slog.Info("market scan completed", "selectedCount", len(finalWatched), "symbols", finalWatched)
 
@@ -894,8 +942,33 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	// Segera muat Open Interest awal untuk simbol terpilih agar tidak MISSING_OI_DATA
 	e.pollOpenInterest(ctx)
 
-	// Perbarui streaming WebSocket untuk simbol terpilih
-	e.restartMarketStream(ctx, finalWatched)
+	// Diff check simbol watched (P2-2: Anti-WebSocket Churn)
+	symbolsChanged := false
+	if len(oldWatched) != len(finalWatched) {
+		symbolsChanged = true
+	} else {
+		oldSet := make(map[string]bool, len(oldWatched))
+		for _, s := range oldWatched {
+			oldSet[s] = true
+		}
+		for _, s := range finalWatched {
+			if !oldSet[s] {
+				symbolsChanged = true
+				break
+			}
+		}
+	}
+
+	e.streamMu.Lock()
+	hasActiveStream := (e.streamCancel != nil)
+	e.streamMu.Unlock()
+
+	if symbolsChanged || !hasActiveStream {
+		slog.Info("watched symbols changed, updating market streams", "previous", oldWatched, "current", finalWatched)
+		e.restartMarketStream(ctx, finalWatched)
+	} else {
+		slog.Info("watched symbols unchanged, retaining active market streams", "count", len(finalWatched))
+	}
 }
 
 func (e *BotEngine) pollOpenInterest(ctx context.Context) {
