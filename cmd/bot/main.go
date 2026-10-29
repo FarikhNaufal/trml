@@ -869,7 +869,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 			}
 		}
 		for _, ord := range e.liveBroker.OrdersByClient {
-			if (ord.Status == model.StatusNew || ord.Status == model.StatusPendingNew) && !slices.Contains(finalWatched, ord.Symbol) {
+			if ord.IsEntry && (ord.Status == model.StatusNew || ord.Status == model.StatusPendingNew) && !slices.Contains(finalWatched, ord.Symbol) {
 				finalWatched = append(finalWatched, ord.Symbol)
 			}
 		}

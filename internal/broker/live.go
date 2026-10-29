@@ -670,6 +670,14 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 			delete(b.LastAlgoUpdateTimes, symbol)
 			delete(b.LastSentSLPrices, symbol)
 		}
+		for cID, ord := range b.OrdersByClient {
+			if ord.Symbol == symbol {
+				if ord.ExchangeOrderID != 0 {
+					delete(b.OrdersByExchangeID, ord.ExchangeOrderID)
+				}
+				delete(b.OrdersByClient, cID)
+			}
+		}
 		delete(b.OrdersByClient, rec.ClientOrderID)
 		delete(b.OrdersByExchangeID, exchangeOrderID)
 	}
@@ -1253,14 +1261,15 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 
 						prot, ok := b.Protections[sym]
 						var oldSLID int64
+						var oldClientSLID string
 						var gen uint64 = 1
 						clientSLID := fmt.Sprintf("live_sl_be_%s_%d", sym, time.Now().UnixNano())
 						if ok {
 							oldSLID = prot.SLOrderID
+							oldClientSLID = prot.SLClientAlgoID
 							prot.ProtectedQty = remQty
 							prot.PlanGeneration++
 							gen = prot.PlanGeneration
-							prot.SLClientAlgoID = clientSLID
 						}
 
 						// Hitung estimasi PnL untuk record leg TP1
@@ -1318,6 +1327,8 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 								if p, ok := b.Protections[sym]; ok && p.PlanGeneration == gen {
 									p.SLOrderID = newSLID
 									p.SLPrice = beSL
+									p.SLClientAlgoID = clientSLID
+									b.LastSentSLPrices[sym] = beSL
 									b.ProtectionTiers[sym] = 1
 									b.OrdersByClient[clientSLID] = &model.LiveOrderRecord{
 										ClientOrderID:   clientSLID,
@@ -1334,6 +1345,9 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 									b.OrdersByExchangeID[newSLID] = b.OrdersByClient[clientSLID]
 									if oldSLID != 0 && oldSLID != newSLID {
 										delete(b.OrdersByExchangeID, oldSLID)
+									}
+									if oldClientSLID != "" && oldClientSLID != clientSLID {
+										delete(b.OrdersByClient, oldClientSLID)
 									}
 									b.notifyPositionSavedLocked(sym)
 								}
@@ -1530,22 +1544,21 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				}
 
 				oldSLID := prot.SLOrderID
+				oldClientSLID := prot.SLClientAlgoID
 				prot.PlanGeneration++
 				gen := prot.PlanGeneration
 				exitSide := model.OppositeSide(side)
 				clientSLID := fmt.Sprintf("live_sl_%s_%d", symbol, nowUTC.UnixNano())
-				prot.SLClientAlgoID = clientSLID
 
 				b.AlgoUpdateInFlight[symbol] = true
 				b.LastAlgoUpdateTimes[symbol] = nowUTC
-				b.LastSentSLPrices[symbol] = newSL
 
 				targetQty := prot.ProtectedQty
 				if targetQty.IsZero() {
 					targetQty = qty
 				}
 
-				go func(sym string, eSide model.Side, targetQty, targetSL decimal.Decimal, cAlgoID string, oldID int64, generation uint64, tier int) {
+				go func(sym string, eSide model.Side, targetQty, targetSL decimal.Decimal, cAlgoID string, oldID int64, oldClientSLID string, generation uint64, tier int) {
 					defer func() {
 						b.Mu.Lock()
 						b.AlgoUpdateInFlight[sym] = false
@@ -1560,6 +1573,8 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						if p, ok := b.Protections[sym]; ok && p.PlanGeneration == generation {
 							p.SLOrderID = newID
 							p.SLPrice = targetSL
+							p.SLClientAlgoID = cAlgoID
+							b.LastSentSLPrices[sym] = targetSL
 							b.ProtectionTiers[sym] = tier
 							b.OrdersByClient[cAlgoID] = &model.LiveOrderRecord{
 								ClientOrderID:   cAlgoID,
@@ -1577,6 +1592,9 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 							if oldID != 0 && oldID != newID {
 								delete(b.OrdersByExchangeID, oldID)
 							}
+							if oldClientSLID != "" && oldClientSLID != cAlgoID {
+								delete(b.OrdersByClient, oldClientSLID)
+							}
 							b.notifyPositionSavedLocked(sym)
 						}
 						b.Mu.Unlock()
@@ -1592,7 +1610,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						slog.Error("live: failed to place dynamic protection SL",
 							"symbol", sym, "tier", tier, "targetSL", targetSL, "err", err)
 					}
-				}(symbol, exitSide, targetQty, newSL, clientSLID, oldSLID, gen, newTargetTier)
+				}(symbol, exitSide, targetQty, newSL, clientSLID, oldSLID, oldClientSLID, gen, newTargetTier)
 			}
 		}
 	}
