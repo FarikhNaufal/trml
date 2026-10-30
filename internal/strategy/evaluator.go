@@ -54,9 +54,20 @@ type EvaluatorConfig struct {
 	MaxCounterImpulseATR   float64
 
 	CooldownAfterExitMinutes int
+	CooldownLossMinutes      int
+	CooldownProfitMinutes    int
 	VWAPSessionWarmupMinutes int
 
 	Sizing SizingConfig
+}
+
+func isWinningExit(reason string) bool {
+	switch strings.ToUpper(strings.TrimSpace(reason)) {
+	case "TAKE_PROFIT", "TRAILING_STOP", "PROFIT_LOCK":
+		return true
+	default:
+		return false
+	}
 }
 
 // EvaluateSignal mengevaluasi seluruh gatekeeper risiko dan 5 konfirmasi VWAP Pullback/Retest
@@ -80,11 +91,26 @@ func EvaluateSignal(
 	if hasActiveSymbol {
 		return model.OrderIntent{}, false, "SYMBOL_ALREADY_ACTIVE", ""
 	}
-	if !snap.LastExitTime.IsZero() && cfg.CooldownAfterExitMinutes > 0 {
-		cooldownDuration := time.Duration(cfg.CooldownAfterExitMinutes) * time.Minute
-		if snap.Now.Sub(snap.LastExitTime) < cooldownDuration {
-			remainingSec := int(cooldownDuration.Seconds() - snap.Now.Sub(snap.LastExitTime).Seconds())
-			return model.OrderIntent{}, false, "SYMBOL_IN_COOLDOWN", fmt.Sprintf("COOLDOWN_ACTIVE_%ds_REMAINING", remainingSec)
+	if !snap.LastExitTime.IsZero() {
+		cooldownMins := cfg.CooldownAfterExitMinutes
+		if isWinningExit(snap.LastExitReason) {
+			if cfg.CooldownProfitMinutes > 0 {
+				cooldownMins = cfg.CooldownProfitMinutes
+			} else {
+				cooldownMins = 10
+			}
+		} else {
+			if cfg.CooldownLossMinutes > 0 {
+				cooldownMins = cfg.CooldownLossMinutes
+			}
+		}
+
+		if cooldownMins > 0 {
+			cooldownDuration := time.Duration(cooldownMins) * time.Minute
+			if snap.Now.Sub(snap.LastExitTime) < cooldownDuration {
+				remainingSec := int(cooldownDuration.Seconds() - snap.Now.Sub(snap.LastExitTime).Seconds())
+				return model.OrderIntent{}, false, "SYMBOL_IN_COOLDOWN", fmt.Sprintf("COOLDOWN_ACTIVE_%ds_REMAINING", remainingSec)
+			}
 		}
 	}
 

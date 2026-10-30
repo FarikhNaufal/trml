@@ -37,6 +37,7 @@ type SymbolState struct {
 	ClosedCandles               []Candle
 	ClosedBarDeltasUSDT         []float64
 	LastExitTime                time.Time
+	LastExitReason              string
 }
 
 type OISample struct {
@@ -259,6 +260,7 @@ type MarketSnapshot struct {
 	ClosedCandles       []Candle
 	ClosedBarDeltasUSDT []float64
 	LastExitTime        time.Time
+	LastExitReason      string
 }
 
 type BookQuote struct {
@@ -297,11 +299,17 @@ func (s *SymbolState) Snapshot(now time.Time) MarketSnapshot {
 		ClosedCandles:       candlesCopy,
 		ClosedBarDeltasUSDT: deltasCopy,
 		LastExitTime:        s.LastExitTime,
+		LastExitReason:      s.LastExitReason,
 	}
 }
 
-func (s *SymbolState) SetLastExitTime(t time.Time) {
+func (s *SymbolState) SetLastExit(t time.Time, reason string) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 	s.LastExitTime = t
+	s.LastExitReason = reason
+}
+
+func (s *SymbolState) SetLastExitTime(t time.Time) {
+	s.SetLastExit(t, "")
 }

@@ -1628,27 +1628,47 @@ func TestEvaluateSignal_SymbolCooldown(t *testing.T) {
 	cfg := EvaluatorConfig{
 		MaxSlots:                 3,
 		CooldownAfterExitMinutes: 20,
+		CooldownLossMinutes:      20,
+		CooldownProfitMinutes:    10,
 	}
 
-	snap := model.MarketSnapshot{
-		Symbol:       "BTCUSDT",
-		Now:          now,
-		LastExitTime: now.Add(-10 * time.Minute), // Only 10 mins ago (< 20 mins cooldown)
+	// 1. Loss Exit (STOP_LOSS): 15 mins ago -> still in cooldown (< 20m)
+	snapLoss := model.MarketSnapshot{
+		Symbol:         "BTCUSDT",
+		Now:            now,
+		LastExitTime:   now.Add(-15 * time.Minute),
+		LastExitReason: "STOP_LOSS",
 	}
 
-	_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
-	if ok {
-		t.Fatalf("expected signal to be rejected due to active cooldown")
-	}
-	if reason != "SYMBOL_IN_COOLDOWN" {
-		t.Errorf("expected reason SYMBOL_IN_COOLDOWN, got %s", reason)
+	_, okLoss, reasonLoss, _ := EvaluateSignal(snapLoss, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if okLoss || reasonLoss != "SYMBOL_IN_COOLDOWN" {
+		t.Fatalf("expected STOP_LOSS exit at 15m to be in cooldown, got ok=%v, reason=%s", okLoss, reasonLoss)
 	}
 
-	// Skenario 2: LastExitTime 25 mins ago (> 20 mins cooldown) -> should NOT reject with SYMBOL_IN_COOLDOWN
-	snap.LastExitTime = now.Add(-25 * time.Minute)
-	_, _, reason2, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
-	if reason2 == "SYMBOL_IN_COOLDOWN" {
-		t.Errorf("expected cooldown to expire after 25m, but got %s", reason2)
+	// 2. Win Exit (TAKE_PROFIT): 15 mins ago -> should EXPIRE (> 10m cooldown)
+	snapWin := model.MarketSnapshot{
+		Symbol:         "BTCUSDT",
+		Now:            now,
+		LastExitTime:   now.Add(-15 * time.Minute),
+		LastExitReason: "TAKE_PROFIT",
+	}
+
+	_, _, reasonWin, _ := EvaluateSignal(snapWin, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if reasonWin == "SYMBOL_IN_COOLDOWN" {
+		t.Fatalf("expected TAKE_PROFIT exit at 15m to NOT be in cooldown (profit cooldown=10m), got %s", reasonWin)
+	}
+
+	// 3. Win Exit (TAKE_PROFIT): 5 mins ago -> should be in cooldown (< 10m)
+	snapWinRecent := model.MarketSnapshot{
+		Symbol:         "BTCUSDT",
+		Now:            now,
+		LastExitTime:   now.Add(-5 * time.Minute),
+		LastExitReason: "TAKE_PROFIT",
+	}
+
+	_, okWinRecent, reasonWinRecent, _ := EvaluateSignal(snapWinRecent, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if okWinRecent || reasonWinRecent != "SYMBOL_IN_COOLDOWN" {
+		t.Fatalf("expected TAKE_PROFIT exit at 5m to be in cooldown, got ok=%v, reason=%s", okWinRecent, reasonWinRecent)
 	}
 }
 

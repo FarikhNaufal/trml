@@ -302,7 +302,9 @@ func TestSQLiteRepository(t *testing.T) {
 	}
 	if solExit, ok := recentExits["SOLUSDT"]; !ok {
 		t.Fatalf("expected SOLUSDT in recent exits, got: %+v", recentExits)
-	} else if solExit.Before(nowUTC.Add(-6*time.Minute)) || solExit.After(nowUTC.Add(-4*time.Minute)) {
-		t.Fatalf("unexpected SOLUSDT exit timestamp: %s", solExit)
+	} else if solExit.ClosedAt.Before(nowUTC.Add(-6*time.Minute)) || solExit.ClosedAt.After(nowUTC.Add(-4*time.Minute)) {
+		t.Fatalf("unexpected SOLUSDT exit timestamp: %s", solExit.ClosedAt)
+	} else if solExit.ExitReason != "STOP_LOSS" {
+		t.Fatalf("expected SOLUSDT exit reason STOP_LOSS, got: %s", solExit.ExitReason)
 	}
 }

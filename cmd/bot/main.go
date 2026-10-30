@@ -45,7 +45,7 @@ type BotEngine struct {
 	exchangeFilters map[string]model.ExchangeFilter
 
 	cooldownMu    sync.RWMutex
-	cooldownExits map[string]time.Time
+	cooldownExits map[string]storage.RecentExitRecord
 
 	evaluatorCfg strategy.EvaluatorConfig
 	scannerCfg   scanner.ScannerConfig
@@ -130,7 +130,7 @@ func main() {
 		client:          client,
 		activeStates:    make(map[string]*model.SymbolState),
 		exchangeFilters: make(map[string]model.ExchangeFilter),
-		cooldownExits:   make(map[string]time.Time),
+		cooldownExits:   make(map[string]storage.RecentExitRecord),
 		verifiedSymbols: make(map[string]bool),
 		evaluatorCfg: strategy.EvaluatorConfig{
 			MaxSlots:              cfg.MaxSlots,
@@ -169,6 +169,8 @@ func main() {
 			MaxFrenzyRVOL:            cfg.MaxFrenzyRVOL,
 			MaxCounterImpulseATR:     cfg.MaxCounterImpulseATR,
 			CooldownAfterExitMinutes: cfg.CooldownAfterExitMinutes,
+			CooldownLossMinutes:      cfg.CooldownLossMinutes,
+			CooldownProfitMinutes:    cfg.CooldownProfitMinutes,
 			VWAPSessionWarmupMinutes: cfg.VWAPSessionWarmupMinutes,
 			Sizing: strategy.SizingConfig{
 				RiskPerTradePct:               cfg.RiskPerTradePct,
@@ -203,15 +205,18 @@ func main() {
 	}
 
 	// [COOLDOWN-PERSISTENCE] Hydrate cooldown state dari trade_ledger untuk mencegah amnesia saat restart
-	cooldownMins := cfg.CooldownAfterExitMinutes
-	if cooldownMins <= 0 {
-		cooldownMins = 30
+	cooldownLossMins := cfg.CooldownLossMinutes
+	if cooldownLossMins <= 0 {
+		cooldownLossMins = cfg.CooldownAfterExitMinutes
 	}
-	cooldownCutoff := time.Now().UTC().Add(-time.Duration(cooldownMins) * time.Minute)
+	if cooldownLossMins <= 0 {
+		cooldownLossMins = 20
+	}
+	cooldownCutoff := time.Now().UTC().Add(-time.Duration(cooldownLossMins) * time.Minute)
 	if recentExits, err := repo.GetRecentExits(ctx, cooldownCutoff); err == nil && len(recentExits) > 0 {
 		engine.cooldownMu.Lock()
-		for sym, exitTime := range recentExits {
-			engine.cooldownExits[sym] = exitTime
+		for sym, exitRec := range recentExits {
+			engine.cooldownExits[sym] = exitRec
 		}
 		engine.cooldownMu.Unlock()
 		slog.Info("hydrated active cooldowns from trade ledger", "count", len(recentExits), "since", cooldownCutoff)
@@ -275,14 +280,18 @@ func main() {
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
 			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
 				engine.cooldownMu.Lock()
-				engine.cooldownExits[rec.Symbol] = rec.ClosedAt
+				engine.cooldownExits[rec.Symbol] = storage.RecentExitRecord{
+					Symbol:     rec.Symbol,
+					ClosedAt:   rec.ClosedAt,
+					ExitReason: rec.ExitReason,
+				}
 				engine.cooldownMu.Unlock()
 
 				engine.statesMu.RLock()
 				st := engine.activeStates[rec.Symbol]
 				engine.statesMu.RUnlock()
 				if st != nil {
-					st.SetLastExitTime(rec.ClosedAt)
+					st.SetLastExit(rec.ClosedAt, rec.ExitReason)
 				}
 			}
 			pureRealEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
@@ -437,14 +446,18 @@ func main() {
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
 			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
 				engine.cooldownMu.Lock()
-				engine.cooldownExits[rec.Symbol] = rec.ClosedAt
+				engine.cooldownExits[rec.Symbol] = storage.RecentExitRecord{
+					Symbol:     rec.Symbol,
+					ClosedAt:   rec.ClosedAt,
+					ExitReason: rec.ExitReason,
+				}
 				engine.cooldownMu.Unlock()
 
 				engine.statesMu.RLock()
 				st := engine.activeStates[rec.Symbol]
 				engine.statesMu.RUnlock()
 				if st != nil {
-					st.SetLastExitTime(rec.ClosedAt)
+					st.SetLastExit(rec.ClosedAt, rec.ExitReason)
 				}
 			}
 		}
@@ -887,14 +900,14 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		if existing, exists := e.activeStates[k]; !exists {
 			e.activeStates[k] = v
 			e.cooldownMu.RLock()
-			if exitTime, ok := e.cooldownExits[k]; ok {
-				v.SetLastExitTime(exitTime)
+			if exitRec, ok := e.cooldownExits[k]; ok {
+				v.SetLastExit(exitRec.ClosedAt, exitRec.ExitReason)
 			}
 			e.cooldownMu.RUnlock()
 		} else {
 			e.cooldownMu.RLock()
-			if exitTime, ok := e.cooldownExits[k]; ok {
-				existing.SetLastExitTime(exitTime)
+			if exitRec, ok := e.cooldownExits[k]; ok {
+				existing.SetLastExit(exitRec.ClosedAt, exitRec.ExitReason)
 			}
 			e.cooldownMu.RUnlock()
 		}

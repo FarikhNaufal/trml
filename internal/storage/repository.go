@@ -60,6 +60,12 @@ type StoredLivePosition struct {
 	PeakPrice      decimal.Decimal
 }
 
+type RecentExitRecord struct {
+	Symbol     string
+	ClosedAt   time.Time
+	ExitReason string
+}
+
 type Repository interface {
 	SaveDailyState(ctx context.Context, epochDay int64, sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool) error
 	GetDailyState(ctx context.Context, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
@@ -75,7 +81,7 @@ type Repository interface {
 	GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error)
 	UpdateTradeAutopsy(ctx context.Context, clientOrderID, autopsy string) error
 	GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error)
-	GetRecentExits(ctx context.Context, since time.Time) (map[string]time.Time, error)
+	GetRecentExits(ctx context.Context, since time.Time) (map[string]RecentExitRecord, error)
 }
 
 type SQLiteRepository struct {
@@ -526,14 +532,18 @@ func (r *SQLiteRepository) GetTradeAutopsy(ctx context.Context, clientOrderID st
 	return autopsy, nil
 }
 
-// GetRecentExits mengambil timestamp penutupan posisi terakhir untuk tiap simbol sejak waktu 'since'.
+// GetRecentExits mengambil record penutupan posisi terakhir untuk tiap simbol sejak waktu 'since'.
 // Mengabaikan PARTIAL_TAKE_PROFIT agar hanya penutupan posisi penuh (SL, full TP, time stop, dsb) yang memicu cooldown.
-func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) (map[string]time.Time, error) {
+func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) (map[string]RecentExitRecord, error) {
 	query := `
-	SELECT symbol, MAX(closed_at_utc)
-	FROM trade_ledger
-	WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND closed_at_utc >= ?
-	GROUP BY symbol;
+	SELECT t.symbol, t.exit_reason, t.closed_at_utc
+	FROM trade_ledger t
+	INNER JOIN (
+		SELECT symbol, MAX(closed_at_utc) AS max_closed
+		FROM trade_ledger
+		WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND closed_at_utc >= ?
+		GROUP BY symbol
+	) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed;
 	`
 	rows, err := r.db.conn.QueryContext(ctx, query, since.UTC().Format(time.RFC3339Nano))
 	if err != nil {
@@ -541,10 +551,10 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 	}
 	defer rows.Close()
 
-	exits := make(map[string]time.Time)
+	exits := make(map[string]RecentExitRecord)
 	for rows.Next() {
-		var sym, closedAtStr string
-		if err := rows.Scan(&sym, &closedAtStr); err != nil {
+		var sym, reason, closedAtStr string
+		if err := rows.Scan(&sym, &reason, &closedAtStr); err != nil {
 			return nil, fmt.Errorf("storage: failed to scan recent exit row: %w", err)
 		}
 		t, err := time.Parse(time.RFC3339Nano, closedAtStr)
@@ -552,7 +562,11 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 			t, err = time.Parse(time.RFC3339, closedAtStr)
 		}
 		if err == nil {
-			exits[sym] = t.UTC()
+			exits[sym] = RecentExitRecord{
+				Symbol:     sym,
+				ClosedAt:   t.UTC(),
+				ExitReason: reason,
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {

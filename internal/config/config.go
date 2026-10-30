@@ -97,6 +97,8 @@ type Config struct {
 	MaxFrenzyRVOL            float64
 	MaxCounterImpulseATR     float64
 	CooldownAfterExitMinutes int
+	CooldownLossMinutes      int
+	CooldownProfitMinutes    int
 	VWAPSessionWarmupMinutes int
 
 	// Batas Waktu & Staleness
@@ -540,6 +542,18 @@ func LoadConfig() (*Config, error) {
 		cooldownMins = 20
 	}
 
+	cooldownLossStr := getEnv("COOLDOWN_AFTER_LOSS_MINUTES", strconv.Itoa(cooldownMins))
+	cooldownLossMins, err := strconv.Atoi(cooldownLossStr)
+	if err != nil || cooldownLossMins < 0 {
+		cooldownLossMins = cooldownMins
+	}
+
+	cooldownProfitStr := getEnv("COOLDOWN_AFTER_WIN_MINUTES", "10")
+	cooldownProfitMins, err := strconv.Atoi(cooldownProfitStr)
+	if err != nil || cooldownProfitMins < 0 {
+		cooldownProfitMins = 10
+	}
+
 	vwapWarmupMinsStr := getEnv("VWAP_SESSION_WARMUP_MINUTES", "30")
 	vwapWarmupMins, err := strconv.Atoi(vwapWarmupMinsStr)
 	if err != nil || vwapWarmupMins < 0 {
@@ -612,6 +626,8 @@ func LoadConfig() (*Config, error) {
 		MaxFrenzyRVOL:            maxFrenzyRVOL,
 		MaxCounterImpulseATR:     maxCounterImpulseATR,
 		CooldownAfterExitMinutes: cooldownMins,
+		CooldownLossMinutes:      cooldownLossMins,
+		CooldownProfitMinutes:    cooldownProfitMins,
 		VWAPSessionWarmupMinutes: vwapWarmupMins,
 
 		ScannerInterval:    15 * time.Minute,
