@@ -1218,7 +1218,8 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 					}
 				}
 			}
-			if closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(qty) {
+			splitPossible := closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(qty)
+			if splitPossible {
 				// [H-04] Validasi MinNotional dan MinQty agar order split tidak di-reject bursa
 				minNotional := decimal.NewFromFloat(5.0)
 				if b.GetExchangeFilterFn != nil {
@@ -1227,20 +1228,99 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 							minNotional = f.MinNotional
 						}
 						if f.MinQty.GreaterThan(decimal.Zero) && (closeQty.LessThan(f.MinQty) || qty.Sub(closeQty).LessThan(f.MinQty)) {
-							slog.Warn("live: skipping partial TP1 due to minQty on split legs",
-								"symbol", symbol, "closeQty", closeQty, "minQty", f.MinQty)
-							return
+							splitPossible = false
 						}
 					}
 				}
 				remQtyCheck := qty.Sub(closeQty)
 				if closeQty.Mul(tp1Price).LessThan(minNotional) || remQtyCheck.Mul(tp1Price).LessThan(minNotional) {
-					slog.Warn("live: skipping partial TP1 because split legs do not meet Binance MinNotional",
-						"symbol", symbol, "closeQty", closeQty, "remQty", remQtyCheck, "minNotional", minNotional)
-					return
+					splitPossible = false
+				}
+			}
+
+			if !splitPossible {
+				b.IsTP1Hits[symbol] = true
+				slog.Info("live: position notional too small for partial TP1 split (< 5 USDT); moving SL to BE and letting 100% position run as runner",
+					"symbol", symbol, "qty", qty, "tp1Price", tp1Price)
+
+				// Pindahkan SL ke Break-Even (Tier 1) untuk 100% posisi
+				beOffset := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))
+				var beSL decimal.Decimal
+				if side == model.SideLong {
+					beSL = entryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffset))
+				} else {
+					beSL = entryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffset))
+				}
+				if b.GetExchangeFilterFn != nil {
+					if f, ok := b.GetExchangeFilterFn(symbol); ok && f.TickSize.GreaterThan(decimal.Zero) {
+						if qSL, err := model.QuantizePrice(beSL, f.TickSize, side == model.SideShort); err == nil {
+							beSL = qSL
+						}
+					}
 				}
 
-				b.TP1InFlight[symbol] = true
+				prot, ok := b.Protections[symbol]
+				var oldSLID int64
+				var oldClientSLID string
+				var gen uint64 = 1
+				clientSLID := fmt.Sprintf("live_sl_be_%s_%d", symbol, time.Now().UnixNano())
+				if ok {
+					oldSLID = prot.SLOrderID
+					oldClientSLID = prot.SLClientAlgoID
+					prot.PlanGeneration++
+					gen = prot.PlanGeneration
+				}
+
+				b.notifyPositionSavedLocked(symbol)
+
+				if b.PlaceAlgoOrderFn != nil {
+					exitSide := model.OppositeSide(side)
+					go func(sym string, eSide model.Side, remQty, targetSL decimal.Decimal, cSLID string, oSLID int64, oClientSLID string, generation uint64) {
+						ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
+						newSLID, slErr := b.PlaceAlgoOrderFn(ctxSL, sym, eSide, "STOP_MARKET", remQty, targetSL, cSLID)
+						cancelSL()
+						if slErr == nil && newSLID != 0 {
+							b.Mu.Lock()
+							if p, ok := b.Protections[sym]; ok && p.PlanGeneration == generation {
+								p.SLOrderID = newSLID
+								p.SLPrice = targetSL
+								p.SLClientAlgoID = cSLID
+								b.LastSentSLPrices[sym] = targetSL
+								b.ProtectionTiers[sym] = 1
+								b.OrdersByClient[cSLID] = &model.LiveOrderRecord{
+									ClientOrderID:   cSLID,
+									ExchangeOrderID: newSLID,
+									Symbol:          sym,
+									Side:            eSide,
+									TargetQty:       remQty,
+									SLPrice:         targetSL,
+									Status:          model.StatusNew,
+									IsEntry:         false,
+									IsAlgo:          true,
+									CreatedAt:       time.Now().UTC(),
+								}
+								b.OrdersByExchangeID[newSLID] = b.OrdersByClient[cSLID]
+								if oSLID != 0 && oSLID != newSLID {
+									delete(b.OrdersByExchangeID, oSLID)
+								}
+								if oClientSLID != "" && oClientSLID != cSLID {
+									delete(b.OrdersByClient, oClientSLID)
+								}
+								b.notifyPositionSavedLocked(sym)
+							}
+							b.Mu.Unlock()
+							if oSLID != 0 && b.CancelAlgoOrderFn != nil {
+								ctxC, cancelC := context.WithTimeout(context.Background(), 5*time.Second)
+								_ = b.CancelAlgoOrderFn(ctxC, sym, oSLID)
+								cancelC()
+							}
+						}
+					}(symbol, exitSide, qty, beSL, clientSLID, oldSLID, oldClientSLID, gen)
+				}
+				return
+			}
+
+			b.TP1InFlight[symbol] = true
 				exitSide := model.OppositeSide(side)
 				tp1ClientOrderID := fmt.Sprintf("ALGO_TP1_%s_%d", symbol, time.Now().UnixNano())
 
@@ -1393,7 +1473,6 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 					}
 				}(symbol, exitSide, closeQty, tp1ClientOrderID, entryPrice, tp1Price, side, qty)
 				return
-			}
 		}
 	}
 

@@ -1400,6 +1400,89 @@ func TestDryRunBroker_PartialTakeProfit_ScaleOut(t *testing.T) {
 	broker.Mu.Unlock()
 }
 
+func TestDryRunBroker_PartialTP1_MinNotionalFallback(t *testing.T) {
+	now := time.Now().UTC()
+	broker := NewDryRunBroker(decimal.NewFromFloat(100.0), DryRunConfig{
+		MaxSlots:              3,
+		AccountLeverage:       5.0,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		PartialTP1ATRMult:     1.20,
+		MinBreakEvenOffsetPct: 0.0010,
+		EntryOrderType:        "MARKET",
+		TakerFeeRate:          0.0005,
+		MakerFeeRate:          0.0002,
+		SlippageRate:          0.0001,
+	})
+	defer broker.Close()
+
+	closedTrades := make(chan TradeClosedRecord, 5)
+	broker.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTrades <- rec
+	}
+
+	// Posisi kecil: Qty = 4.0 @ $1.00 = 4.0 USDT notional (< 5 USDT MinNotional)
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST-SMALL-NOTIONAL-001",
+		Symbol:        "ADAUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(4.0),
+		LimitPrice:    decimal.NewFromFloat(1.00),
+		SLPrice:       decimal.NewFromFloat(0.985),
+		TP1Price:      decimal.NewFromFloat(1.012),
+		TPPrice:       decimal.NewFromFloat(1.0225),
+		ATRAtEntry:    decimal.NewFromFloat(0.010),
+		CreatedAt:     now,
+	}
+
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("expected entry to succeed, got ok=%v, err=%v", ok, err)
+	}
+
+	// Harga naik menyentuh TP1 (1.0125 >= 1.012)
+	broker.OnRealtimeTick("ADAUSDT", 1.0124, 1.0126, 1.0125, 1.0125, 50.0, false, now.Add(1*time.Minute))
+
+	// Tidak boleh ada penutupan parsial di closedTrades karena nilai < 5 USDT
+	select {
+	case rec := <-closedTrades:
+		t.Fatalf("unexpected trade closed record: %+v", rec)
+	default:
+	}
+
+	// Verifikasi: pos.IsTP1Hit harus TRUE, SL digeser ke BE, dan Qty tetap 100% (4.0)
+	broker.Mu.Lock()
+	pos, exists := broker.OpenPositions["ADAUSDT"]
+	if !exists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected position to exist")
+	}
+	if !pos.IsTP1Hit {
+		t.Errorf("expected pos.IsTP1Hit to be true")
+	}
+	if !pos.IsBreakEvenMoved {
+		t.Errorf("expected pos.IsBreakEvenMoved to be true")
+	}
+	if pos.ProtectionTier != 1 {
+		t.Errorf("expected pos.ProtectionTier to be 1, got %d", pos.ProtectionTier)
+	}
+	if !pos.Qty.Equal(decimal.NewFromFloat(4.0)) {
+		t.Errorf("expected 100%% qty preserved (4.0), got %s", pos.Qty)
+	}
+	if pos.CurrentSLPrice.LessThanOrEqual(decimal.NewFromFloat(1.00)) {
+		t.Errorf("expected CurrentSLPrice to be moved above entry price (1.00), got %s", pos.CurrentSLPrice)
+	}
+	broker.Mu.Unlock()
+
+	// Tick kedua: tidak boleh looping atau merusak state
+	broker.OnRealtimeTick("ADAUSDT", 1.0130, 1.0132, 1.0131, 1.0131, 50.0, false, now.Add(2*time.Minute))
+	select {
+	case rec := <-closedTrades:
+		t.Fatalf("unexpected trade closed on second tick: %+v", rec)
+	default:
+	}
+}
+
 func TestDryRunBrokerRunnerTrailingStop(t *testing.T) {
 	cfg := DryRunConfig{
 		MaxSlots:                 3,

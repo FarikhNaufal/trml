@@ -723,16 +723,42 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		ratio = 0.50
 	}
 	closeQty := pos.Qty.Mul(decimal.NewFromFloat(ratio))
-	if closeQty.LessThanOrEqual(decimal.Zero) || closeQty.GreaterThanOrEqual(pos.Qty) {
-		return
-	}
-
-	// [H-04] Validasi MinNotional (5.0 USDT) agar paritas dengan batas minimum eksekusi Binance
 	minNotional := decimal.NewFromFloat(5.0)
 	remQty := pos.Qty.Sub(closeQty)
-	if closeQty.Mul(exitPrice).LessThan(minNotional) || remQty.Mul(exitPrice).LessThan(minNotional) {
-		slog.Warn("dryrun: skipping partial TP1 due to minNotional (< 5 USDT) on split legs",
-			"symbol", pos.Symbol, "closeQty", closeQty, "remQty", remQty, "exitPrice", exitPrice)
+
+	// [H-04] Validasi MinNotional (5.0 USDT) agar paritas dengan batas minimum eksekusi Binance
+	splitPossible := closeQty.GreaterThan(decimal.Zero) &&
+		closeQty.LessThan(pos.Qty) &&
+		closeQty.Mul(exitPrice).GreaterThanOrEqual(minNotional) &&
+		remQty.Mul(exitPrice).GreaterThanOrEqual(minNotional)
+
+	if !splitPossible {
+		// Ukuran posisi terlalu kecil untuk dipecah (atau MinNotional < 5 USDT).
+		// Anggap TP1 milestone tercapai: tandai IsTP1Hit, geser SL ke BE, biarkan 100% posisi berjalan sebagai runner.
+		pos.IsTP1Hit = true
+
+		var newSL decimal.Decimal
+		if pos.Side == model.SideLong {
+			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
+			if newSL.GreaterThan(pos.CurrentSLPrice) {
+				pos.CurrentSLPrice = newSL
+			}
+		} else {
+			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
+			if newSL.LessThan(pos.CurrentSLPrice) {
+				pos.CurrentSLPrice = newSL
+			}
+		}
+		pos.IsBreakEvenMoved = true
+		pos.ProtectionTier = 1
+
+		slog.Info("dryrun: position notional too small for partial TP1 split (< 5 USDT); moving SL to BE and letting 100% position run as runner",
+			"symbol", pos.Symbol, "qty", pos.Qty, "exitPrice", exitPrice, "newSL", pos.CurrentSLPrice)
+
+		d.enqueuePositionEvent(PositionEvent{
+			Type: PositionEventSave,
+			Pos:  *pos,
+		})
 		return
 	}
 

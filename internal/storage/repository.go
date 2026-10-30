@@ -690,24 +690,6 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 		if p.PeakPrice.IsZero() {
 			p.PeakPrice = p.EntryPrice
 		}
-		if err != nil {
-			return nil, fmt.Errorf("storage: failed to scan live position: %w", err)
-		}
-		p.Qty, _ = decimal.NewFromString(qtyStr)
-		p.InitialQty, _ = decimal.NewFromString(initQtyStr)
-		if p.InitialQty.IsZero() {
-			p.InitialQty = p.Qty
-		}
-		p.EntryPrice, _ = decimal.NewFromString(entryStr)
-		p.SLPrice, _ = decimal.NewFromString(slStr)
-		p.InitialSLPrice, _ = decimal.NewFromString(initSLStr)
-		if p.InitialSLPrice.IsZero() {
-			p.InitialSLPrice = p.SLPrice
-		}
-		p.TPPrice, _ = decimal.NewFromString(tpStr)
-		p.TP1Price, _ = decimal.NewFromString(tp1Str)
-		p.IsTP1Hit = (tpHitInt == 1)
-		p.ATRAtEntry, _ = decimal.NewFromString(atrStr)
 		if t, err := time.Parse(time.RFC3339Nano, openTimeStr); err == nil {
 			p.OpenedAt = t
 		} else if t, err := time.Parse(time.RFC3339, openTimeStr); err == nil {

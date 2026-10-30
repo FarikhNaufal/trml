@@ -275,15 +275,15 @@ func EvaluateSignal(
 	}
 
 	// Soft OI Bypass dengan Capitulation Floor:
-	// Bypass keterlambatan update API Open Interest HANYA JIKA terdapat konfirmasi orderflow kuat (Z-Score >= 1.50).
+	// Bypass keterlambatan update API Open Interest HANYA JIKA terdapat konfirmasi orderflow kuat (Z-Score >= 1.20).
 	// Tautologi (natrPct >= 0.70) DIHAPUS karena seluruh koin lolos scanner sudah memiliki NATR >= 0.65%.
 	const minCapitulationOIDeltaShort = -0.10 // Max OI drop -0.10% untuk Short
 	const minCapitulationOIDeltaLong = -0.05  // Max OI drop -0.05% untuk Long
 
 	oiValidLong := (oiDeltaPct >= minOIDeltaLong) ||
-		(barDeltaZScore >= 1.50 && oiDeltaPct >= minCapitulationOIDeltaLong)
+		(barDeltaZScore >= 1.20 && oiDeltaPct >= minCapitulationOIDeltaLong)
 	oiValidShort := (oiDeltaPct >= minOIDeltaShort) ||
-		(barDeltaZScore <= -1.50 && oiDeltaPct >= minCapitulationOIDeltaShort)
+		(barDeltaZScore <= -1.20 && oiDeltaPct >= minCapitulationOIDeltaShort)
 
 	// Filter Tren Struktural & Anti-Chop EMA200: Jarak Close ke EMA200 minimal MinEMA200DistanceATR
 	// untuk menghindari eksekusi sinyal palsu saat harga sedang bolak-balik menempel di kawat EMA200 yang mendatar.
