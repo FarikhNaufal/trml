@@ -32,6 +32,7 @@ type StoredDryRunPosition struct {
 	SignalAuditID    int64
 	MaxMAE           float64
 	MaxMFE           float64
+	PeakPrice        decimal.Decimal
 }
 
 type StoredLivePosition struct {
@@ -56,11 +57,13 @@ type StoredLivePosition struct {
 	MaxMAE         float64
 	MaxMFE         float64
 	UpdatedAt      time.Time
+	PeakPrice      decimal.Decimal
 }
 
 type Repository interface {
 	SaveDailyState(ctx context.Context, epochDay int64, sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool) error
 	GetDailyState(ctx context.Context, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
+	GetLatestDailyState(ctx context.Context) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error)
 	LogTrade(ctx context.Context, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64) error
 	LogSignalAudit(ctx context.Context, candleOpenTime time.Time, symbol, side string, closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64, decision, rejectReason, rejectSubReason string) (int64, error)
 	PruneOldSignalAuditLogs(ctx context.Context, olderThanDays int) (int64, error)
@@ -148,6 +151,41 @@ func (r *SQLiteRepository) GetDailyState(
 	}
 
 	return startDec, realDec, breakerInt == 1, true, nil
+}
+
+// GetLatestDailyState mengambil record account_daily_state terbaru untuk memulihkan ekuitas saat rollover (C-05)
+func (r *SQLiteRepository) GetLatestDailyState(
+	ctx context.Context,
+) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error) {
+	query := `
+	SELECT epoch_day_utc, session_start_equity, realized_equity, circuit_breaker_hit
+	FROM account_daily_state
+	ORDER BY epoch_day_utc DESC
+	LIMIT 1;
+	`
+	row := r.db.conn.QueryRowContext(ctx, query)
+
+	var startStr, realStr string
+	var breakerInt int
+	var epDay int64
+
+	if err := row.Scan(&epDay, &startStr, &realStr, &breakerInt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return decimal.Zero, decimal.Zero, false, 0, false, nil
+		}
+		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: failed to query latest daily state: %w", err)
+	}
+
+	startDec, err := decimal.NewFromString(startStr)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: corrupt start equity: %w", err)
+	}
+	realDec, err := decimal.NewFromString(realStr)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: corrupt realized equity: %w", err)
+	}
+
+	return startDec, realDec, breakerInt == 1, epDay, true, nil
 }
 
 func (r *SQLiteRepository) LogTrade(
@@ -274,8 +312,8 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		client_order_id, symbol, side, qty, initial_qty, entry_price, entry_fee,
 		current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 		mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
-		signal_audit_id, max_mae, max_mfe
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		signal_audit_id, max_mae, max_mfe, peak_price
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
 		qty = excluded.qty,
 		initial_qty = excluded.initial_qty,
@@ -288,7 +326,8 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		is_breakeven_moved = excluded.is_breakeven_moved,
 		protection_tier = excluded.protection_tier,
 		max_mae = excluded.max_mae,
-		max_mfe = excluded.max_mfe;
+		max_mfe = excluded.max_mfe,
+		peak_price = excluded.peak_price;
 	`
 	beInt := 0
 	if pos.IsBreakEvenMoved {
@@ -318,6 +357,11 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		initSLStr = pos.CurrentSLPrice.String()
 	}
 
+	peakStr := pos.PeakPrice.String()
+	if pos.PeakPrice.IsZero() {
+		peakStr = pos.EntryPrice.String()
+	}
+
 	_, err := r.db.conn.ExecContext(
 		ctx,
 		query,
@@ -342,6 +386,7 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		pos.SignalAuditID,
 		pos.MaxMAE,
 		pos.MaxMFE,
+		peakStr,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: failed to save dry-run position %s (%s): %w", pos.Symbol, pos.ClientOrderID, err)
@@ -365,7 +410,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	SELECT symbol, client_order_id, side, qty, initial_qty, entry_price, entry_fee,
 	       current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 	       mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
-	       signal_audit_id, max_mae, max_mfe
+	       signal_audit_id, max_mae, max_mfe, peak_price
 	FROM dryrun_open_positions;
 	`
 	rows, err := r.db.conn.QueryContext(ctx, query)
@@ -377,7 +422,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	var results []StoredDryRunPosition
 	for rows.Next() {
 		var p StoredDryRunPosition
-		var qtyStr, initQtyStr, entryStr, feeStr, slStr, initSLStr, tpStr, tp1Str, atrStr, markStr string
+		var qtyStr, initQtyStr, entryStr, feeStr, slStr, initSLStr, tpStr, tp1Str, atrStr, markStr, peakStr string
 		var markTimeStr, openTimeStr string
 		var beInt, tpHitInt int
 
@@ -403,6 +448,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 			&p.SignalAuditID,
 			&p.MaxMAE,
 			&p.MaxMFE,
+			&peakStr,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("storage: failed to scan dry-run position: %w", err)
@@ -426,6 +472,10 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 		p.ATRAtEntry, _ = decimal.NewFromString(atrStr)
 		p.LastMarkPrice, _ = decimal.NewFromString(markStr)
 		p.IsBreakEvenMoved = (beInt == 1)
+		p.PeakPrice, _ = decimal.NewFromString(peakStr)
+		if p.PeakPrice.IsZero() {
+			p.PeakPrice = p.EntryPrice
+		}
 
 		if t, err := time.Parse(time.RFC3339Nano, markTimeStr); err == nil {
 			p.MarkUpdatedAt = t
@@ -481,8 +531,8 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 	INSERT INTO live_open_positions (
 		symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
 		sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
-		atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc, peak_price
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(symbol) DO UPDATE SET
 		side = excluded.side,
 		qty = excluded.qty,
@@ -502,7 +552,8 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		signal_audit_id = excluded.signal_audit_id,
 		max_mae = excluded.max_mae,
 		max_mfe = excluded.max_mfe,
-		updated_at_utc = excluded.updated_at_utc;
+		updated_at_utc = excluded.updated_at_utc,
+		peak_price = excluded.peak_price;
 	`
 	openTime := pos.OpenedAt.UTC().Format(time.RFC3339Nano)
 	if pos.OpenedAt.IsZero() {
@@ -524,6 +575,11 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 	tpHitInt := 0
 	if pos.IsTP1Hit {
 		tpHitInt = 1
+	}
+
+	peakStr := pos.PeakPrice.String()
+	if pos.PeakPrice.IsZero() {
+		peakStr = pos.EntryPrice.String()
 	}
 
 	_, err := r.db.conn.ExecContext(
@@ -550,6 +606,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		pos.MaxMAE,
 		pos.MaxMFE,
 		updTime,
+		peakStr,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: failed to save live position %s: %w", pos.Symbol, err)
@@ -572,7 +629,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 	query := `
 	SELECT symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
 	       sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
-	       atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc
+	       atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc, peak_price
 	FROM live_open_positions;
 	`
 	rows, err := r.db.conn.QueryContext(ctx, query)
@@ -585,7 +642,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 	for rows.Next() {
 		var p StoredLivePosition
 		var qtyStr, initQtyStr, entryStr, slStr, initSLStr, tpStr, tp1Str, atrStr string
-		var openTimeStr, updTimeStr string
+		var openTimeStr, updTimeStr, peakStr string
 		var tpHitInt int
 		err := rows.Scan(
 			&p.Symbol,
@@ -609,7 +666,30 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 			&p.MaxMAE,
 			&p.MaxMFE,
 			&updTimeStr,
+			&peakStr,
 		)
+		if err != nil {
+			return nil, fmt.Errorf("storage: failed to scan live position: %w", err)
+		}
+		p.Qty, _ = decimal.NewFromString(qtyStr)
+		p.InitialQty, _ = decimal.NewFromString(initQtyStr)
+		if p.InitialQty.IsZero() {
+			p.InitialQty = p.Qty
+		}
+		p.EntryPrice, _ = decimal.NewFromString(entryStr)
+		p.SLPrice, _ = decimal.NewFromString(slStr)
+		p.InitialSLPrice, _ = decimal.NewFromString(initSLStr)
+		if p.InitialSLPrice.IsZero() {
+			p.InitialSLPrice = p.SLPrice
+		}
+		p.TPPrice, _ = decimal.NewFromString(tpStr)
+		p.TP1Price, _ = decimal.NewFromString(tp1Str)
+		p.IsTP1Hit = (tpHitInt == 1)
+		p.ATRAtEntry, _ = decimal.NewFromString(atrStr)
+		p.PeakPrice, _ = decimal.NewFromString(peakStr)
+		if p.PeakPrice.IsZero() {
+			p.PeakPrice = p.EntryPrice
+		}
 		if err != nil {
 			return nil, fmt.Errorf("storage: failed to scan live position: %w", err)
 		}

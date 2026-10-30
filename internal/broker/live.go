@@ -56,6 +56,7 @@ type LiveOpenPosition struct {
 	OpenTime       time.Time
 	MaxMAE         float64
 	MaxMFE         float64
+	PeakPrice      decimal.Decimal
 	UpdatedAt      time.Time
 }
 
@@ -151,7 +152,9 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 	if pos.ProtectionTier > 0 {
 		b.ProtectionTiers[pos.Symbol] = pos.ProtectionTier
 	}
-	if pos.EntryPrice.GreaterThan(decimal.Zero) {
+	if pos.PeakPrice.GreaterThan(decimal.Zero) {
+		b.PeakPrices[pos.Symbol] = pos.PeakPrice
+	} else if pos.EntryPrice.GreaterThan(decimal.Zero) {
 		b.PeakPrices[pos.Symbol] = pos.EntryPrice
 	}
 	if pos.InitialQty.GreaterThan(decimal.Zero) {
@@ -271,6 +274,7 @@ func (b *BinanceLiveBroker) notifyPositionSavedLocked(symbol string) {
 		OpenTime:       b.PositionOpenTimes[symbol],
 		MaxMAE:         b.ActiveMAE[symbol],
 		MaxMFE:         b.ActiveMFE[symbol],
+		PeakPrice:      b.PeakPrices[symbol],
 		UpdatedAt:      time.Now().UTC(),
 	}
 	fn := b.OnPositionSavedFn
@@ -1215,6 +1219,27 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				}
 			}
 			if closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(qty) {
+				// [H-04] Validasi MinNotional dan MinQty agar order split tidak di-reject bursa
+				minNotional := decimal.NewFromFloat(5.0)
+				if b.GetExchangeFilterFn != nil {
+					if f, ok := b.GetExchangeFilterFn(symbol); ok {
+						if f.MinNotional.GreaterThan(decimal.Zero) {
+							minNotional = f.MinNotional
+						}
+						if f.MinQty.GreaterThan(decimal.Zero) && (closeQty.LessThan(f.MinQty) || qty.Sub(closeQty).LessThan(f.MinQty)) {
+							slog.Warn("live: skipping partial TP1 due to minQty on split legs",
+								"symbol", symbol, "closeQty", closeQty, "minQty", f.MinQty)
+							return
+						}
+					}
+				}
+				remQtyCheck := qty.Sub(closeQty)
+				if closeQty.Mul(tp1Price).LessThan(minNotional) || remQtyCheck.Mul(tp1Price).LessThan(minNotional) {
+					slog.Warn("live: skipping partial TP1 because split legs do not meet Binance MinNotional",
+						"symbol", symbol, "closeQty", closeQty, "remQty", remQtyCheck, "minNotional", minNotional)
+					return
+				}
+
 				b.TP1InFlight[symbol] = true
 				exitSide := model.OppositeSide(side)
 				tp1ClientOrderID := fmt.Sprintf("ALGO_TP1_%s_%d", symbol, time.Now().UnixNano())

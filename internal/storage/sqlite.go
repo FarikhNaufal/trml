@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
     is_tp1_hit           INTEGER NOT NULL DEFAULT 0,
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     max_mae              REAL NOT NULL DEFAULT 0.0,
-    max_mfe              REAL NOT NULL DEFAULT 0.0
+    max_mfe              REAL NOT NULL DEFAULT 0.0,
+    peak_price           TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS live_open_positions (
@@ -117,7 +118,8 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     opened_at_utc        TEXT NOT NULL,
     max_mae              REAL NOT NULL DEFAULT 0.0,
     max_mfe              REAL NOT NULL DEFAULT 0.0,
-    updated_at_utc       TEXT NOT NULL
+    updated_at_utc       TEXT NOT NULL,
+    peak_price           TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_dryrun_open_positions_symbol ON dryrun_open_positions (symbol);
@@ -245,6 +247,18 @@ func OpenDB(dbPath string) (*DB, error) {
 	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'atr_at_entry';`).Scan(&atrLiveCount)
 	if atrLiveCount == 0 {
 		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN atr_at_entry TEXT NOT NULL DEFAULT '';`)
+	}
+
+	// Migrasi otomatis kolom peak_price di dryrun_open_positions dan live_open_positions (C-04)
+	var peakDryCount int
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'peak_price';`).Scan(&peakDryCount)
+	if peakDryCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN peak_price TEXT NOT NULL DEFAULT '';`)
+	}
+	var peakLiveCount int
+	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'peak_price';`).Scan(&peakLiveCount)
+	if peakLiveCount == 0 {
+		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN peak_price TEXT NOT NULL DEFAULT '';`)
 	}
 
 	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)

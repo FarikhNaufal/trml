@@ -99,6 +99,26 @@ func BuildSafeDecimalOrderIntent(
 		}
 	}
 
+	// Validasi Urutan Harga: TP1 harus berada di antara Entry dan TP2, dan SL harus berada di sisi berlawanan
+	if side == model.SideLong {
+		if tp1Price.GreaterThanOrEqual(tpPrice) || slPrice.GreaterThanOrEqual(entryPrice) {
+			return model.OrderIntent{}, false
+		}
+	} else {
+		if tp1Price.LessThanOrEqual(tpPrice) || slPrice.LessThanOrEqual(entryPrice) {
+			return model.OrderIntent{}, false
+		}
+	}
+
+	actualSLDist := entryPrice.Sub(slPrice).Abs()
+	if cfg.AccountLeverage > 0 {
+		// Proteksi Batas Likuidasi: Jarak SL tidak boleh melampaui 80% dari jarak likuidasi teoritis (1 / Leverage)
+		maxSafeSLPct := decimal.NewFromFloat(0.80 / cfg.AccountLeverage)
+		if actualSLDist.Div(entryPrice).GreaterThan(maxSafeSLPct) {
+			return model.OrderIntent{}, false
+		}
+	}
+
 	// 1. Kerugian Efektif per Unit (termasuk friksi Maker Fee / Taker Fee + Slippage)
 	var totalFrictionRate decimal.Decimal
 	if strings.EqualFold(cfg.EntryOrderType, "MARKET") {
@@ -109,7 +129,6 @@ func BuildSafeDecimalOrderIntent(
 		totalFrictionRate = cfg.MakerFeeRate.Add(cfg.TakerFeeRate).Add(cfg.SlippageRate)
 	}
 	frictionPerUnit := entryPrice.Mul(totalFrictionRate)
-	actualSLDist := entryPrice.Sub(slPrice).Abs()
 	effectiveLossPerUnit := actualSLDist.Add(frictionPerUnit)
 	if effectiveLossPerUnit.LessThanOrEqual(decimal.Zero) {
 		return model.OrderIntent{}, false

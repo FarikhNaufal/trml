@@ -396,7 +396,10 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 				ELSE client_order_id 
 			END AS setup_id,
 			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
-			MAX(exit_reason) AS last_exit_reason
+			COALESCE(
+				MAX(CASE WHEN exit_reason != 'PARTIAL_TAKE_PROFIT' THEN exit_reason ELSE NULL END),
+				'PARTIAL_TAKE_PROFIT'
+			) AS last_exit_reason
 		FROM trade_ledger
 		GROUP BY setup_id;
 	`

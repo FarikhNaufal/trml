@@ -215,6 +215,13 @@ func main() {
 		if found && startEq.GreaterThan(decimal.Zero) {
 			slog.Info("recovered daily state from database", "startEquity", startEq, "realizedEquity", realEq, "breakerTripped", tripped)
 			initialEquity = realEq
+		} else {
+			// [C-05] Jika hari baru belum memiliki record, warisi realized equity dari sesi terakhir agar akumulasi profit tidak reset
+			_, lastRealEq, _, _, latestFound, _ := repo.GetLatestDailyState(ctx)
+			if latestFound && lastRealEq.GreaterThan(decimal.Zero) {
+				slog.Info("recovered daily state from previous session", "realizedEquity", lastRealEq)
+				initialEquity = lastRealEq
+			}
 		}
 
 		makerFeeFloat, _ := cfg.MakerFeeRate.Float64()
@@ -295,6 +302,7 @@ func main() {
 				SignalAuditID:    pos.SignalAuditID,
 				MaxMAE:           pos.MaxMAE,
 				MaxMFE:           pos.MaxMFE,
+				PeakPrice:        pos.PeakPrice,
 			})
 		}
 
@@ -327,6 +335,7 @@ func main() {
 					SignalAuditID:    sp.SignalAuditID,
 					MaxMAE:           sp.MaxMAE,
 					MaxMFE:           sp.MaxMFE,
+					PeakPrice:        sp.PeakPrice,
 				})
 				slog.Info("restored dry-run active position from database",
 					"symbol", sp.Symbol, "clientOrderID", sp.ClientOrderID, "side", sp.Side,
@@ -402,6 +411,7 @@ func main() {
 				MaxMAE:         pos.MaxMAE,
 				MaxMFE:         pos.MaxMFE,
 				UpdatedAt:      pos.UpdatedAt,
+				PeakPrice:      pos.PeakPrice,
 			})
 		}
 		engine.liveBroker.OnPositionDeletedFn = func(symbol string) {
@@ -451,6 +461,27 @@ func main() {
 			engine.dryRunBroker.CircuitBreakerTripped = breakerHit
 			engine.dryRunBroker.Mu.Unlock()
 		}
+	} else if err == nil && !found {
+		// [C-05] Hari baru tanpa record: warisi realized equity hari sebelumnya sebagai sessionStartEquity hari ini
+		_, lastRealEq, _, _, latestFound, errLatest := repo.GetLatestDailyState(ctx)
+		if errLatest == nil && latestFound && lastRealEq.GreaterThan(decimal.Zero) {
+			slog.Info("starting new daily session inheriting previous day's equity",
+				"epochDay", todayEpochDay, "sessionStartEquity", lastRealEq)
+			_ = repo.SaveDailyState(ctx, todayEpochDay, lastRealEq, lastRealEq, false)
+			if engine.liveBroker != nil {
+				engine.liveBroker.Mu.Lock()
+				engine.liveBroker.SessionStartEpochDay = todayEpochDay
+				engine.liveBroker.SessionStartEquityUSDT = lastRealEq
+				engine.liveBroker.CircuitBreakerTripped = false
+				engine.liveBroker.Mu.Unlock()
+			} else if engine.dryRunBroker != nil {
+				engine.dryRunBroker.Mu.Lock()
+				engine.dryRunBroker.SessionDayEpochUTC = todayEpochDay
+				engine.dryRunBroker.SessionStartEquity = lastRealEq
+				engine.dryRunBroker.CircuitBreakerTripped = false
+				engine.dryRunBroker.Mu.Unlock()
+			}
+		}
 	}
 
 	// 5b. Rekonsiliasi Posisi Live Saat Boot (TD-01 & TD-02)
@@ -486,6 +517,7 @@ func main() {
 					OpenTime:       sp.OpenedAt,
 					MaxMAE:         sp.MaxMAE,
 					MaxMFE:         sp.MaxMFE,
+					PeakPrice:      sp.PeakPrice,
 					UpdatedAt:      sp.UpdatedAt,
 				})
 			}
@@ -526,6 +558,7 @@ func main() {
 						OpenTime:       sp.OpenedAt,
 						MaxMAE:         sp.MaxMAE,
 						MaxMFE:         sp.MaxMFE,
+						PeakPrice:      sp.PeakPrice,
 						UpdatedAt:      sp.UpdatedAt,
 					})
 					slog.Info("reconciled & restored active live position from database and exchange",
@@ -917,11 +950,15 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	}
 	klines, kErr := e.client.FetchKlines(ctx, BenchmarkSymbol, "5m", btcFetchCount)
 	if kErr == nil && len(klines) > 0 {
-		btcSt.Mu.Lock()
-		for _, k := range klines {
-			btcSt.ApplyClosedCandleLocked(k, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
+		// [C-03] Filter candle yang belum tutup agar tidak merusak state makro BTC
+		filteredKlines, vErr := model.ValidateAndFilterCandles(klines, time.Now().UTC())
+		if vErr == nil && len(filteredKlines) > 0 {
+			btcSt.Mu.Lock()
+			for _, k := range filteredKlines {
+				btcSt.ApplyClosedCandleLocked(k, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
+			}
+			btcSt.Mu.Unlock()
 		}
-		btcSt.Mu.Unlock()
 	} else if kErr != nil {
 		slog.Warn("periodic BTC klines sync failed", "err", kErr)
 	}

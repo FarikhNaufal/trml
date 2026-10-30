@@ -158,6 +158,7 @@ func TestSQLiteRepository(t *testing.T) {
 		TPPrice:          decimal.NewFromFloat(4.3930),
 		ATRAtEntry:       decimal.NewFromFloat(0.02967),
 		LastMarkPrice:    decimal.NewFromFloat(4.4800),
+		PeakPrice:        decimal.NewFromFloat(4.4200),
 		MarkUpdatedAt:    now,
 		OpenedAt:         now,
 		IsBreakEvenMoved: false,
@@ -179,6 +180,9 @@ func TestSQLiteRepository(t *testing.T) {
 	}
 	if positions[0].Symbol != "NEARUSDT" || positions[0].ClientOrderID != "SIM-NEARUSDT-12345" || positions[0].SignalAuditID != 4369 {
 		t.Fatalf("unexpected position data: %+v", positions[0])
+	}
+	if !positions[0].PeakPrice.Equal(decimal.NewFromFloat(4.4200)) {
+		t.Fatalf("expected dryrun PeakPrice 4.4200, got %s", positions[0].PeakPrice)
 	}
 
 	// Update break-even
@@ -219,6 +223,7 @@ func TestSQLiteRepository(t *testing.T) {
 		MaxMAE:         0.25,
 		MaxMFE:         0.80,
 		UpdatedAt:      now,
+		PeakPrice:      decimal.NewFromFloat(80500.0),
 	}
 
 	if err := repo.SaveLivePosition(ctx, livePos); err != nil {
@@ -235,6 +240,19 @@ func TestSQLiteRepository(t *testing.T) {
 	if livePositions[0].Symbol != "BTCUSDT" || livePositions[0].SLOrderID != 1234567 || !livePositions[0].SLPrice.Equal(decimal.NewFromFloat(81500.0)) {
 		t.Fatalf("unexpected live position data: %+v", livePositions[0])
 	}
+	if !livePositions[0].PeakPrice.Equal(decimal.NewFromFloat(80500.0)) {
+		t.Fatalf("expected live PeakPrice 80500.0, got %s", livePositions[0].PeakPrice)
+	}
+
+	// 7. Test GetLatestDailyState (C-05)
+	latestStart, latestReal, latestBreaker, latestEpoch, latestFound, err := repo.GetLatestDailyState(ctx)
+	if err != nil || !latestFound {
+		t.Fatalf("failed to get latest daily state: found=%v, err=%v", latestFound, err)
+	}
+	if latestEpoch != epochDay || !latestReal.Equal(updatedRealEq) || !latestBreaker {
+		t.Fatalf("unexpected latest daily state: epoch=%d, realEq=%s, breaker=%v", latestEpoch, latestReal, latestBreaker)
+	}
+	_ = latestStart
 
 	// Update live position (e.g. trailing SL move)
 	livePos.SLPrice = decimal.NewFromFloat(80900.0)

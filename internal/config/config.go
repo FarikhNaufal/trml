@@ -140,7 +140,17 @@ func loadDotEnv(filepath string) {
 		}
 		key := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
-		val = strings.Trim(val, `"'` + "`")
+		// [H-06] Bersihkan komentar inline (#) jika nilai tidak diapit kutip ganda/tunggal
+		if strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2 {
+			val = val[1 : len(val)-1]
+		} else if strings.HasPrefix(val, `'`) && strings.HasSuffix(val, `'`) && len(val) >= 2 {
+			val = val[1 : len(val)-1]
+		} else {
+			if idx := strings.Index(val, "#"); idx != -1 {
+				val = strings.TrimSpace(val[:idx])
+			}
+			val = strings.Trim(val, `"'`+"`")
+		}
 
 		if os.Getenv(key) == "" {
 			_ = os.Setenv(key, val)
@@ -404,7 +414,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BREAK_EVEN_TRIGGER_ATR '%s' (must be float between 0.1 and 10.0)", beTriggerStr)
 	}
 
-	tier1BEEnabled := getEnv("TIER1_BE_ENABLED", "false") == "true"
+	tier1BEEnabled := parseBoolEnv(getEnv("TIER1_BE_ENABLED", "false"))
 	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "0.70")
 	t1BETriggerLong, err := strconv.ParseFloat(t1BETriggerLongStr, 64)
 	if err != nil || t1BETriggerLong <= 0.05 || t1BETriggerLong > 10.0 {
@@ -435,7 +445,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_SL_DISTANCE_PCT '%s' (must be between 0.00 and 0.20)", minSLDistPctStr)
 	}
 
-	partialTPEnabled := getEnv("PARTIAL_TP_ENABLED", "true") == "true"
+	partialTPEnabled := parseBoolEnv(getEnv("PARTIAL_TP_ENABLED", "true"))
 
 	partialTP1RatioStr := getEnv("PARTIAL_TP1_RATIO", "0.50")
 	partialTP1Ratio, err := strconv.ParseFloat(partialTP1RatioStr, 64)
@@ -449,7 +459,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_ATR_MULT '%s' (must be float between 0.1 and 10.0)", partialTP1ATRMultStr)
 	}
 
-	trailingEnabled := getEnv("TRAILING_ENABLED", "true") == "true"
+	trailingEnabled := parseBoolEnv(getEnv("TRAILING_ENABLED", "true"))
 
 	trailingActivateATRStr := getEnv("TRAILING_ACTIVATE_ATR", "2.00")
 	trailingActivateATR, err := strconv.ParseFloat(trailingActivateATRStr, 64)
@@ -464,10 +474,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	btcGateEnabledStr := getEnv("BTC_GATE_ENABLED", "true")
-	btcGateEnabled, err := strconv.ParseBool(btcGateEnabledStr)
-	if err != nil {
-		return nil, fmt.Errorf("config: invalid BTC_GATE_ENABLED '%s' (must be true or false)", btcGateEnabledStr)
-	}
+	btcGateEnabled := parseBoolEnv(btcGateEnabledStr)
 
 	btcMaxDumpStr := getEnv("BTC_MAX_5M_DUMP_PCT", "0.60")
 	btcMaxDump, err := strconv.ParseFloat(btcMaxDumpStr, 64)
@@ -629,7 +636,18 @@ func LoadConfig() (*Config, error) {
 
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
-		return val
+		val = strings.TrimSpace(val)
+		if idx := strings.Index(val, "#"); idx != -1 {
+			val = strings.TrimSpace(val[:idx])
+		}
+		if val != "" {
+			return val
+		}
 	}
 	return defaultVal
+}
+
+func parseBoolEnv(val string) bool {
+	clean := strings.ToLower(strings.TrimSpace(val))
+	return clean == "true" || clean == "1" || clean == "yes" || clean == "y"
 }

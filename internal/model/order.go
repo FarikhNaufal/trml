@@ -136,7 +136,14 @@ func GenerateDeterministicClientOrderID(symbol string, side Side, candleCloseTim
 		if side == SideShort {
 			s = "S"
 		}
-		id = fmt.Sprintf("B_%s_%s_%d_%03d", symbol, s, candleCloseTime.UTC().Unix(), n)
+		sym := symbol
+		// Batasi panjang simbol agar total ClientOrderID maksimal 36 karakter (syarat Binance).
+		// Format: B_<sym>_<s:1>_<unix:10>_<nonce:3> -> Total selain sym adalah 19 karakter.
+		// Maka batas aman panjang sym adalah 36 - 19 = 17 karakter.
+		if len(sym) > 17 {
+			sym = sym[:17]
+		}
+		id = fmt.Sprintf("B_%s_%s_%d_%03d", sym, s, candleCloseTime.UTC().Unix(), n)
 	}
 	return id
 }

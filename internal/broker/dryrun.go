@@ -727,6 +727,15 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		return
 	}
 
+	// [H-04] Validasi MinNotional (5.0 USDT) agar paritas dengan batas minimum eksekusi Binance
+	minNotional := decimal.NewFromFloat(5.0)
+	remQty := pos.Qty.Sub(closeQty)
+	if closeQty.Mul(exitPrice).LessThan(minNotional) || remQty.Mul(exitPrice).LessThan(minNotional) {
+		slog.Warn("dryrun: skipping partial TP1 due to minNotional (< 5 USDT) on split legs",
+			"symbol", pos.Symbol, "closeQty", closeQty, "remQty", remQty, "exitPrice", exitPrice)
+		return
+	}
+
 	var grossPnL decimal.Decimal
 	if pos.Side == model.SideLong {
 		grossPnL = exitPrice.Sub(pos.EntryPrice).Mul(closeQty)

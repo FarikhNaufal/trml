@@ -199,6 +199,8 @@ func EvaluateSignal(
 
 	var hasPriorBullishImpulse bool
 	var hasPriorBearishImpulse bool
+	var latestImpulseIdxLong int = -1
+	var latestImpulseIdxShort int = -1
 	bullishImpulseThreshold := vwap + (minImpulseATR * atr14)
 	bearishImpulseThreshold := vwap - (minImpulseATR * atr14)
 
@@ -206,15 +208,19 @@ func EvaluateSignal(
 		c := snap.ClosedCandles[i]
 		if c.High >= bullishImpulseThreshold {
 			hasPriorBullishImpulse = true
+			latestImpulseIdxLong = i
 		}
 		if c.Low <= bearishImpulseThreshold {
 			hasPriorBearishImpulse = true
+			latestImpulseIdxShort = i
 		}
 	}
 
-	// KONFIRMASI 3: Zona Pullback Retest (Sentuhan Garis VWAP dengan Toleransi ATR)
-	// Memeriksa apakah dalam 4 bar terakhir (20 menit), harga sempat menguji zona toleransi VWAP
+	// KONFIRMASI 3: Zona Pullback Retest (Sentuhan Garis VWAP Dua Arah dengan Urutan Kronologis)
+	// Memeriksa apakah dalam N bar terakhir (default 4 bar), harga sempat menguji zona toleransi VWAP
+	// DAN retest terjadi secara kronologis bersamaan atau setelah ekspansi impulse.
 	tolDist := pullbackTol * atr14
+	maxAdverseRetestDist := 0.75 * atr14 // Batas bawah: jangan biarkan pullback anjlok jebol > 0.75 ATR menembus VWAP
 	var longTestedVWAP bool
 	var shortTestedVWAP bool
 
@@ -227,10 +233,10 @@ func EvaluateSignal(
 	}
 	for i := len(snap.ClosedCandles) - retestLookback; i < len(snap.ClosedCandles); i++ {
 		c := snap.ClosedCandles[i]
-		if c.Low <= vwap+tolDist {
+		if c.Low <= vwap+tolDist && c.Low >= vwap-maxAdverseRetestDist && (latestImpulseIdxLong >= 0 && i >= latestImpulseIdxLong) {
 			longTestedVWAP = true
 		}
-		if c.High >= vwap-tolDist {
+		if c.High >= vwap-tolDist && c.High <= vwap+maxAdverseRetestDist && (latestImpulseIdxShort >= 0 && i >= latestImpulseIdxShort) {
 			shortTestedVWAP = true
 		}
 	}
@@ -249,7 +255,15 @@ func EvaluateSignal(
 	shortBounce := isBearishShape && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
 
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
-	oiDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
+	rawOIDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
+	oiDeltaPct := rawOIDeltaPct
+	if !snap.PrevOIUpdatedAt.IsZero() && !snap.CurrOIUpdatedAt.IsZero() {
+		elapsedSec := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt).Seconds()
+		if elapsedSec >= 60.0 && elapsedSec <= 600.0 {
+			// Normalisasi laju perubahan Open Interest ke basis standar 300 detik (5 menit)
+			oiDeltaPct = rawOIDeltaPct * (300.0 / elapsedSec)
+		}
+	}
 
 	minOIDeltaLong := cfg.MinOIDeltaLongPct
 	if minOIDeltaLong == 0 {
@@ -261,16 +275,15 @@ func EvaluateSignal(
 	}
 
 	// Soft OI Bypass dengan Capitulation Floor:
-	// Jika orderflow bounce solid (Z-Score) atau volatilitas dinamis (NATR >= 0.70%), bypass keterlambatan
-	// update API Open Interest Binance. NAMUN, soft bypass hanya berlaku jika penurunan OI tidak melebihi
-	// batas kapitulasi (penurunan OI tajam mengindikasikan likuidasi massal/exhaustion, bukan agresor baru).
+	// Bypass keterlambatan update API Open Interest HANYA JIKA terdapat konfirmasi orderflow kuat (Z-Score >= 1.50).
+	// Tautologi (natrPct >= 0.70) DIHAPUS karena seluruh koin lolos scanner sudah memiliki NATR >= 0.65%.
 	const minCapitulationOIDeltaShort = -0.10 // Max OI drop -0.10% untuk Short
 	const minCapitulationOIDeltaLong = -0.05  // Max OI drop -0.05% untuk Long
 
 	oiValidLong := (oiDeltaPct >= minOIDeltaLong) ||
-		((barDeltaZScore >= 0.80 || natrPct >= 0.70) && oiDeltaPct >= minCapitulationOIDeltaLong)
+		(barDeltaZScore >= 1.50 && oiDeltaPct >= minCapitulationOIDeltaLong)
 	oiValidShort := (oiDeltaPct >= minOIDeltaShort) ||
-		((barDeltaZScore <= -0.80 || natrPct >= 0.70) && oiDeltaPct >= minCapitulationOIDeltaShort)
+		(barDeltaZScore <= -1.50 && oiDeltaPct >= minCapitulationOIDeltaShort)
 
 	// Filter Tren Struktural & Anti-Chop EMA200: Jarak Close ke EMA200 minimal MinEMA200DistanceATR
 	// untuk menghindari eksekusi sinyal palsu saat harga sedang bolak-balik menempel di kawat EMA200 yang mendatar.
@@ -396,12 +409,22 @@ func EvaluateSignal(
 		maxCounterImpulseATR = 1.50
 	}
 
+	checkLookback := 3
+	if len(snap.ClosedCandles) < checkLookback {
+		checkLookback = len(snap.ClosedCandles)
+	}
 	rvol := indicator.CalculateRVOL(snap.ClosedCandles, 20)
-	if rvol >= maxFrenzyRVOL {
-		checkLookback := 3
-		if len(snap.ClosedCandles) < checkLookback {
-			checkLookback = len(snap.ClosedCandles)
+	hasHighRVOL := rvol >= maxFrenzyRVOL
+	if !hasHighRVOL {
+		for i := len(snap.ClosedCandles) - checkLookback; i < len(snap.ClosedCandles); i++ {
+			if indicator.CalculateRVOL(snap.ClosedCandles[:i+1], 20) >= maxFrenzyRVOL {
+				hasHighRVOL = true
+				rvol = indicator.CalculateRVOL(snap.ClosedCandles[:i+1], 20)
+				break
+			}
 		}
+	}
+	if hasHighRVOL {
 		for i := len(snap.ClosedCandles) - checkLookback; i < len(snap.ClosedCandles); i++ {
 			c := snap.ClosedCandles[i]
 			barRange := c.High - c.Low

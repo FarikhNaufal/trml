@@ -126,6 +126,12 @@ func TestOppositeSideAndClientOrderID(t *testing.T) {
 	if len(id1) > 36 {
 		t.Errorf("client order ID exceeds Binance 36 chars limit: %s (len %d)", id1, len(id1))
 	}
+
+	longSym := "1000000BABYDOGEUSDT"
+	idLong := GenerateDeterministicClientOrderID(longSym, SideShort, now)
+	if len(idLong) > 36 {
+		t.Errorf("long symbol client order ID exceeds Binance 36 chars limit: %s (len %d)", idLong, len(idLong))
+	}
 }
 
 func TestRecordOpenInterest(t *testing.T) {

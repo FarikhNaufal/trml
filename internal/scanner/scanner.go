@@ -70,11 +70,11 @@ func RunBulkMarketScanner(
 	sort.Strings(symbolsToScan)
 
 	klineLimit := cfg.BootstrapCount + 1
-	if klineLimit > 300 {
-		klineLimit = 300
+	if klineLimit > 600 {
+		klineLimit = 600
 	}
-	if klineLimit < cfg.EMAPeriod+20 {
-		klineLimit = cfg.EMAPeriod + 20
+	if klineLimit < cfg.EMAPeriod+50 {
+		klineLimit = cfg.EMAPeriod + 50
 	}
 
 	type scanResult struct {

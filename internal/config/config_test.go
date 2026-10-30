@@ -231,3 +231,23 @@ func TestMaxHoldingDurationConfig(t *testing.T) {
 		t.Errorf("expected 6h, got %v", cfg.MaxHoldingDuration)
 	}
 }
+
+func TestInlineCommentSanitizationAndBoolParsing(t *testing.T) {
+	_ = os.Setenv("TIER1_BE_ENABLED", "True # inline comment")
+	_ = os.Setenv("MIN_VOLUME_24H_USDT", "40000000 # 40M volume")
+	defer func() {
+		_ = os.Unsetenv("TIER1_BE_ENABLED")
+		_ = os.Unsetenv("MIN_VOLUME_24H_USDT")
+	}()
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config with inline comments: %v", err)
+	}
+	if !cfg.Tier1BEEnabled {
+		t.Errorf("expected Tier1BEEnabled to be true despite comment and uppercase, got false")
+	}
+	if cfg.MinVolume24hUSDT != 40000000.0 {
+		t.Errorf("expected MinVolume24hUSDT to be 40000000, got %f", cfg.MinVolume24hUSDT)
+	}
+}
