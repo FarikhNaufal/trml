@@ -1854,6 +1854,101 @@ func TestEvaluateSignal_WarmupMinutesMultiHour(t *testing.T) {
 	}
 }
 
+func TestEvaluateSignal_BTCGatePersistenceBuffer_Short(t *testing.T) {
+	now := time.Now().UTC()
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	cfgShort.AllowedSide = "AUTO"
+	cfgShort.BTCGateEnabled = true
+	cfgShort.BTCGatePersistenceBars = 3
+
+	// Buat 55 candle BTC di mana candle 0..53 berada di atas EMA (84000)
+	// dan hanya candle 54 yang turun sesaat ke bawah EMA (83950) -> Bear Trap Whipsaw!
+	btcCandles := make([]model.Candle, 55)
+	for i := 0; i < 54; i++ {
+		btcCandles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:       84050.0, High: 84100.0, Low: 84000.0, Close: 84050.0,
+			VolumeBase: 100.0,
+		}
+	}
+	btcCandles[54] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       84050.0, High: 84050.0, Low: 83900.0, Close: 83950.0, // Retrace 1 bar
+		VolumeBase: 200.0,
+	}
+
+	btcSnap := model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		ClosedCandles:      btcCandles,
+		CurrentSessionVWAP: 84000.0,
+		Now:                now,
+	}
+
+	// Evaluasi Short: Harus di-VETO oleh BTC_TREND_SHORT_VETO_PERSISTENCE karena bar 1 & 2 yang lalu masih di atas EMA
+	_, okWhipsaw, reasonWhipsaw, _ := EvaluateSignal(snapShort, &btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if okWhipsaw || reasonWhipsaw != "BTC_TREND_SHORT_VETO_PERSISTENCE" {
+		t.Fatalf("expected BTC_TREND_SHORT_VETO_PERSISTENCE for 1-candle bear trap, got ok=%v, reason=%s", okWhipsaw, reasonWhipsaw)
+	}
+
+	// Setelah BTC konsisten di bawah EMA selama minimal 3 candle berturut-turut (candle 52, 53, 54 <= EMA)
+	btcCandles[52].Close = 83950.0
+	btcCandles[53].Close = 83950.0
+	btcCandles[54].Close = 83950.0
+
+	_, okStable, reasonStable, _ := EvaluateSignal(snapShort, &btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if !okStable || reasonStable != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SIGNAL_APPROVED after 3 persistent bars below EMA, got ok=%v, reason=%s", okStable, reasonStable)
+	}
+}
+
+func TestEvaluateSignal_ImpulseInvalidation_OppositeMove(t *testing.T) {
+	now := time.Now().UTC()
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+
+	// Kasus 1: Bullish impulse terjadi di bar 55 (High 107.5 > VWAP 105).
+	// Jika di bar 57 muncul candle yang Close-nya jebol jauh di bawah bearish threshold (Close 95.0 << VWAP 105),
+	// maka bullish impulse sebelumnya harus gugur.
+	snapLong.ClosedCandles[57].Close = 95.0
+	snapLong.ClosedCandles[57].Low = 94.0
+
+	_, okLong, reasonLong, subReasonLong := EvaluateSignal(snapLong, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if okLong || reasonLong != "CONDITIONS_NOT_MET" || !strings.Contains(subReasonLong, "NO_PRIOR_IMPULSE") {
+		t.Fatalf("expected Long rejected with NO_PRIOR_IMPULSE due to bearish invalidation close, got ok=%v, reason=%s, subReason=%s", okLong, reasonLong, subReasonLong)
+	}
+
+	// Kasus 2: Symmetrically untuk Short
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	// Short impulse terjadi di bar 55 (Low 97.0 < VWAP 100).
+	// Di bar 57 muncul candle yang Close-nya melonjak jauh di atas bullish threshold (Close 110.0 >> VWAP 100) (kasus OPUSDT)
+	snapShort.ClosedCandles[57].Close = 110.0
+	snapShort.ClosedCandles[57].High = 111.0
+
+	_, okShort, reasonShort, subReasonShort := EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if okShort || reasonShort != "CONDITIONS_NOT_MET" || !strings.Contains(subReasonShort, "NO_PRIOR_IMPULSE") {
+		t.Fatalf("expected Short rejected with NO_PRIOR_IMPULSE due to bullish invalidation close, got ok=%v, reason=%s, subReason=%s", okShort, reasonShort, subReasonShort)
+	}
+}
+
+func TestEvaluateSignal_RetestDirectionVerification(t *testing.T) {
+	now := time.Now().UTC()
+
+	// Short setup di mana harga tiba-tiba datang terjun bebas dari ATAS VWAP (Breakdown, bukan Pullback dari bawah)
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	vwap := snapShort.CurrentSessionVWAP
+	// Buat candle retest (bar 58 & 59) membuka di ATAS VWAP dan bar sebelumnya juga tutup di ATAS VWAP
+	snapShort.ClosedCandles[58].Close = vwap + 1.0
+	snapShort.ClosedCandles[59].Open = vwap + 0.8
+	// Walaupun High sempat berada di toleransi VWAP, arah datangnya dari atas!
+	snapShort.ClosedCandles[59].High = vwap + 0.2
+
+	_, ok, reason, subReason := EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if ok || reason != "CONDITIONS_NOT_MET" || subReason != "VWAP_NOT_TESTED" {
+		t.Fatalf("expected rejection with VWAP_NOT_TESTED when short approach is from above VWAP, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+}
+
+
 
 
 

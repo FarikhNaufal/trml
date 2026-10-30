@@ -202,6 +202,21 @@ func main() {
 		},
 	}
 
+	// [COOLDOWN-PERSISTENCE] Hydrate cooldown state dari trade_ledger untuk mencegah amnesia saat restart
+	cooldownMins := cfg.CooldownAfterExitMinutes
+	if cooldownMins <= 0 {
+		cooldownMins = 30
+	}
+	cooldownCutoff := time.Now().UTC().Add(-time.Duration(cooldownMins) * time.Minute)
+	if recentExits, err := repo.GetRecentExits(ctx, cooldownCutoff); err == nil && len(recentExits) > 0 {
+		engine.cooldownMu.Lock()
+		for sym, exitTime := range recentExits {
+			engine.cooldownExits[sym] = exitTime
+		}
+		engine.cooldownMu.Unlock()
+		slog.Info("hydrated active cooldowns from trade ledger", "count", len(recentExits), "since", cooldownCutoff)
+	}
+
 	if cfg.DryRun {
 		slog.Info("initializing Heuristic Dry-Run Volume-Through-Limit Simulator")
 		initialEquity := cfg.InitialEquity
@@ -869,11 +884,17 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	copy(oldWatched, e.watchedCoins)
 
 	for k, v := range localStates {
-		if _, exists := e.activeStates[k]; !exists {
+		if existing, exists := e.activeStates[k]; !exists {
 			e.activeStates[k] = v
 			e.cooldownMu.RLock()
 			if exitTime, ok := e.cooldownExits[k]; ok {
 				v.SetLastExitTime(exitTime)
+			}
+			e.cooldownMu.RUnlock()
+		} else {
+			e.cooldownMu.RLock()
+			if exitTime, ok := e.cooldownExits[k]; ok {
+				existing.SetLastExitTime(exitTime)
 			}
 			e.cooldownMu.RUnlock()
 		}

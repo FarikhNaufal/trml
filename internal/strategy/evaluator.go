@@ -216,6 +216,29 @@ func EvaluateSignal(
 		}
 	}
 
+	// [OP-01] Validasi Invalidation Impulse: Impulse gugur jika terjadi pembalikan rezim (Close bar lawan menembus threshold).
+	// Untuk LONG: Bullish impulse gugur jika setelahnya ada bar yang ditutup di bawah bearish threshold (Close < bearishThreshold).
+	validBullishImpulse := hasPriorBullishImpulse
+	if validBullishImpulse && latestImpulseIdxLong >= 0 {
+		for i := latestImpulseIdxLong + 1; i < endIdx; i++ {
+			if snap.ClosedCandles[i].Close < bearishImpulseThreshold {
+				validBullishImpulse = false
+				break
+			}
+		}
+	}
+
+	// Untuk SHORT: Bearish impulse gugur jika setelahnya ada bar yang ditutup di atas bullish threshold (Close > bullishThreshold).
+	validBearishImpulse := hasPriorBearishImpulse
+	if validBearishImpulse && latestImpulseIdxShort >= 0 {
+		for i := latestImpulseIdxShort + 1; i < endIdx; i++ {
+			if snap.ClosedCandles[i].Close > bullishImpulseThreshold {
+				validBearishImpulse = false
+				break
+			}
+		}
+	}
+
 	// KONFIRMASI 3: Zona Pullback Retest (Sentuhan Garis VWAP Dua Arah dengan Urutan Kronologis)
 	// Memeriksa apakah dalam N bar terakhir (default 4 bar), harga sempat menguji zona toleransi VWAP
 	// DAN retest terjadi secara kronologis bersamaan atau setelah ekspansi impulse.
@@ -233,10 +256,13 @@ func EvaluateSignal(
 	}
 	for i := len(snap.ClosedCandles) - retestLookback; i < len(snap.ClosedCandles); i++ {
 		c := snap.ClosedCandles[i]
-		if c.Low <= vwap+tolDist && c.Low >= vwap-maxAdverseRetestDist && (latestImpulseIdxLong >= 0 && i >= latestImpulseIdxLong) {
+		cameFromAbove := (c.Open >= vwap) || (i > 0 && snap.ClosedCandles[i-1].Close >= vwap)
+		cameFromBelow := (c.Open <= vwap) || (i > 0 && snap.ClosedCandles[i-1].Close <= vwap)
+
+		if cameFromAbove && c.Low <= vwap+tolDist && c.Low >= vwap-maxAdverseRetestDist && (latestImpulseIdxLong >= 0 && i >= latestImpulseIdxLong) {
 			longTestedVWAP = true
 		}
-		if c.High >= vwap-tolDist && c.High <= vwap+maxAdverseRetestDist && (latestImpulseIdxShort >= 0 && i >= latestImpulseIdxShort) {
+		if cameFromBelow && c.High >= vwap-tolDist && c.High <= vwap+maxAdverseRetestDist && (latestImpulseIdxShort >= 0 && i >= latestImpulseIdxShort) {
 			shortTestedVWAP = true
 		}
 	}
@@ -292,14 +318,14 @@ func EvaluateSignal(
 	emaTrendShort := (latest.Close < ema200) && (minEMADist <= 0 || (ema200-latest.Close) >= minEMADist)
 
 	longValid := emaTrendLong &&
-		hasPriorBullishImpulse &&
+		validBullishImpulse &&
 		longTestedVWAP &&
 		longBounce &&
 		oiValidLong &&
 		(snap.FundingRate <= cfg.MaxAdverseFundingRate)
 
 	shortValid := emaTrendShort &&
-		hasPriorBearishImpulse &&
+		validBearishImpulse &&
 		shortTestedVWAP &&
 		shortBounce &&
 		oiValidShort &&
@@ -331,7 +357,7 @@ func EvaluateSignal(
 		} else if !emaTrendLong {
 			longFails = append(longFails, "EMA200_CHOP_ZONE")
 		}
-		if !hasPriorBullishImpulse {
+		if !validBullishImpulse {
 			longFails = append(longFails, "NO_PRIOR_IMPULSE")
 		}
 		if !longTestedVWAP {
@@ -359,7 +385,7 @@ func EvaluateSignal(
 		} else if !emaTrendShort {
 			shortFails = append(shortFails, "EMA200_CHOP_ZONE")
 		}
-		if !hasPriorBearishImpulse {
+		if !validBearishImpulse {
 			shortFails = append(shortFails, "NO_PRIOR_IMPULSE")
 		}
 		if !shortTestedVWAP {
@@ -474,6 +500,23 @@ func EvaluateSignal(
 				btcVWAP := btcSnap.CurrentSessionVWAP
 				if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
 					return model.OrderIntent{}, false, "BTC_TREND_BULLISH_SHORT_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_ABOVE_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
+				}
+
+				// Multi-Candle Persistence Check: Hindari jebakan 1-candle dip (fake breakdown/whipsaw)
+				// Jika tren BTC sedang bullish kuat lalu muncul 1 bar koreksi sesaat ke bawah EMA,
+				// tahan pembukaan posisi SHORT altcoin hingga minimal persistenceBars terkonfirmasi di bawah EMA.
+				persistenceBars := cfg.BTCGatePersistenceBars
+				if persistenceBars <= 0 {
+					persistenceBars = 3
+				}
+				if len(btcSnap.ClosedCandles) >= persistenceBars {
+					for p := 0; p < persistenceBars; p++ {
+						idx := len(btcSnap.ClosedCandles) - 1 - p
+						c := btcSnap.ClosedCandles[idx]
+						if c.Close > btcEMA {
+							return model.OrderIntent{}, false, "BTC_TREND_SHORT_VETO_PERSISTENCE", fmt.Sprintf("BTC_BAR_%d_AGO_CLOSE_%.1f_ABOVE_EMA_%.1f_REQUIRED_%d_BARS", p, c.Close, btcEMA, persistenceBars)
+						}
+					}
 				}
 			}
 

@@ -75,6 +75,7 @@ type Repository interface {
 	GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error)
 	UpdateTradeAutopsy(ctx context.Context, clientOrderID, autopsy string) error
 	GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error)
+	GetRecentExits(ctx context.Context, since time.Time) (map[string]time.Time, error)
 }
 
 type SQLiteRepository struct {
@@ -523,6 +524,41 @@ func (r *SQLiteRepository) GetTradeAutopsy(ctx context.Context, clientOrderID st
 		return "", fmt.Errorf("storage: failed to get trade autopsy: %w", err)
 	}
 	return autopsy, nil
+}
+
+// GetRecentExits mengambil timestamp penutupan posisi terakhir untuk tiap simbol sejak waktu 'since'.
+// Mengabaikan PARTIAL_TAKE_PROFIT agar hanya penutupan posisi penuh (SL, full TP, time stop, dsb) yang memicu cooldown.
+func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) (map[string]time.Time, error) {
+	query := `
+	SELECT symbol, MAX(closed_at_utc)
+	FROM trade_ledger
+	WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND closed_at_utc >= ?
+	GROUP BY symbol;
+	`
+	rows, err := r.db.conn.QueryContext(ctx, query, since.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, fmt.Errorf("storage: failed to query recent exits: %w", err)
+	}
+	defer rows.Close()
+
+	exits := make(map[string]time.Time)
+	for rows.Next() {
+		var sym, closedAtStr string
+		if err := rows.Scan(&sym, &closedAtStr); err != nil {
+			return nil, fmt.Errorf("storage: failed to scan recent exit row: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339Nano, closedAtStr)
+		if err != nil {
+			t, err = time.Parse(time.RFC3339, closedAtStr)
+		}
+		if err == nil {
+			exits[sym] = t.UTC()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: error iterating recent exits: %w", err)
+	}
+	return exits, nil
 }
 
 // SaveLivePosition menyimpan atau memperbarui posisi live ke SQLite agar tahan restart (TD-01)

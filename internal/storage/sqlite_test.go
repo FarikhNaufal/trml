@@ -277,4 +277,32 @@ func TestSQLiteRepository(t *testing.T) {
 	if len(remainingLive) != 0 {
 		t.Fatalf("expected 0 live positions after delete, got %d", len(remainingLive))
 	}
+
+	// 8. Test GetRecentExits (anti-amnesia cooldown persistence across reboot)
+	nowUTC := time.Now().UTC()
+	// Trade 1: SOLUSDT full exit (STOP_LOSS) 5 mins ago -> should be returned
+	_ = repo.LogTrade(ctx, "cid-sol-1", "SOLUSDT", "LONG", decimal.NewFromFloat(1), decimal.NewFromFloat(100), decimal.NewFromFloat(98), decimal.NewFromFloat(98), decimal.NewFromFloat(105), decimal.NewFromFloat(-2), "STOP_LOSS", nowUTC.Add(-10*time.Minute), nowUTC.Add(-5*time.Minute), 0.02, 0.0, 1)
+
+	// Trade 2: ADAUSDT partial take profit 3 mins ago -> should NOT trigger full exit cooldown
+	_ = repo.LogTrade(ctx, "cid-ada-tp1", "ADAUSDT", "LONG", decimal.NewFromFloat(1), decimal.NewFromFloat(1), decimal.NewFromFloat(1.05), decimal.NewFromFloat(0.95), decimal.NewFromFloat(1.10), decimal.NewFromFloat(0.05), "PARTIAL_TAKE_PROFIT", nowUTC.Add(-15*time.Minute), nowUTC.Add(-3*time.Minute), 0.0, 0.05, 2)
+
+	// Trade 3: XRPUSDT exit 45 mins ago -> should be excluded by 30 min cutoff
+	_ = repo.LogTrade(ctx, "cid-xrp-old", "XRPUSDT", "SHORT", decimal.NewFromFloat(1), decimal.NewFromFloat(0.5), decimal.NewFromFloat(0.52), decimal.NewFromFloat(0.52), decimal.NewFromFloat(0.46), decimal.NewFromFloat(-0.02), "STOP_LOSS", nowUTC.Add(-50*time.Minute), nowUTC.Add(-45*time.Minute), 0.04, 0.0, 3)
+
+	cutoff := nowUTC.Add(-30 * time.Minute)
+	recentExits, err := repo.GetRecentExits(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("failed to query recent exits: %v", err)
+	}
+	if _, ok := recentExits["ADAUSDT"]; ok {
+		t.Fatalf("expected ADAUSDT (PARTIAL_TAKE_PROFIT) to NOT be in recent exits, got: %+v", recentExits)
+	}
+	if _, ok := recentExits["XRPUSDT"]; ok {
+		t.Fatalf("expected XRPUSDT (older than cutoff) to NOT be in recent exits, got: %+v", recentExits)
+	}
+	if solExit, ok := recentExits["SOLUSDT"]; !ok {
+		t.Fatalf("expected SOLUSDT in recent exits, got: %+v", recentExits)
+	} else if solExit.Before(nowUTC.Add(-6*time.Minute)) || solExit.After(nowUTC.Add(-4*time.Minute)) {
+		t.Fatalf("unexpected SOLUSDT exit timestamp: %s", solExit)
+	}
 }
