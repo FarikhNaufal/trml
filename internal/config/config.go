@@ -93,9 +93,11 @@ type Config struct {
 	BTCMax5mDumpPct          float64
 	BTCMax5mPumpPct          float64
 	BTCGatePersistenceBars   int
+	BTCCounterMomentumPct    float64
 	AllowedSide              string
 	MaxFrenzyRVOL            float64
 	MaxCounterImpulseATR     float64
+	MinSignalRVOL            float64
 	CooldownAfterExitMinutes int
 	CooldownLossMinutes      int
 	CooldownProfitMinutes    int
@@ -513,6 +515,18 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_COUNTER_IMPULSE_ATR '%s' (must be positive float)", maxCounterImpulseATRStr)
 	}
 
+	btcCounterMomStr := getEnv("BTC_COUNTER_MOMENTUM_PCT", "0.25")
+	btcCounterMom, err := strconv.ParseFloat(btcCounterMomStr, 64)
+	if err != nil || btcCounterMom < 0.0 || btcCounterMom > 5.0 {
+		return nil, fmt.Errorf("config: invalid BTC_COUNTER_MOMENTUM_PCT '%s' (must be float between 0.0 and 5.0)", btcCounterMomStr)
+	}
+
+	minSignalRVOLStr := getEnv("MIN_SIGNAL_RVOL", "0.75")
+	minSignalRVOL, err := strconv.ParseFloat(minSignalRVOLStr, 64)
+	if err != nil || minSignalRVOL < 0.0 || minSignalRVOL > 5.0 {
+		return nil, fmt.Errorf("config: invalid MIN_SIGNAL_RVOL '%s' (must be float between 0.0 and 5.0)", minSignalRVOLStr)
+	}
+
 	httpPort := getEnv("HTTP_PORT", "2020")
 	dashPIN := strings.TrimSpace(getEnv("DASHBOARD_PIN", ""))
 	geminiKey := strings.TrimSpace(getEnv("GEMINI_API_KEY", ""))
@@ -622,9 +636,11 @@ func LoadConfig() (*Config, error) {
 		BTCMax5mDumpPct:          btcMaxDump,
 		BTCMax5mPumpPct:          btcMaxPump,
 		BTCGatePersistenceBars:   btcPersistenceBars,
+		BTCCounterMomentumPct:    btcCounterMom,
 		AllowedSide:              allowedSide,
 		MaxFrenzyRVOL:            maxFrenzyRVOL,
 		MaxCounterImpulseATR:     maxCounterImpulseATR,
+		MinSignalRVOL:            minSignalRVOL,
 		CooldownAfterExitMinutes: cooldownMins,
 		CooldownLossMinutes:      cooldownLossMins,
 		CooldownProfitMinutes:    cooldownProfitMins,

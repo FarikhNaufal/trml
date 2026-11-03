@@ -1968,6 +1968,111 @@ func TestEvaluateSignal_RetestDirectionVerification(t *testing.T) {
 	}
 }
 
+func TestEvaluateSignal_BTCCounterMomentumGuard(t *testing.T) {
+	now := time.Now().UTC()
+
+	// 1. Setup SHORT altcoin yang valid
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	cfgShort.BTCGateEnabled = true
+	cfgShort.BTCCounterMomentumPct = 0.25
+
+	// Mock BTC snapshot di mana BTC baru saja memantul +0.30% pada candle 5m terakhir
+	btcCandles := make([]model.Candle, 60)
+	for i := 0; i < 59; i++ {
+		btcCandles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime:  now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:       50000.0,
+			High:       50100.0,
+			Low:        49900.0,
+			Close:      49950.0,
+			VolumeBase: 100.0,
+		}
+	}
+	// Candle terakhir BTC: Open 50000, Close 50150 (+0.30%)
+	btcCandles[59] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       50000.0,
+		High:       50160.0,
+		Low:        49980.0,
+		Close:      50150.0,
+		VolumeBase: 200.0,
+	}
+	btcSnap := &model.MarketSnapshot{
+		Symbol:        "BTCUSDT",
+		ClosedCandles: btcCandles,
+	}
+
+	_, ok, reason, _ := EvaluateSignal(snapShort, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if ok || reason != "BTC_COUNTER_MOMENTUM_PUMP" {
+		t.Fatalf("expected rejection with BTC_COUNTER_MOMENTUM_PUMP, got ok=%v, reason=%s", ok, reason)
+	}
+
+	// 2. Setup LONG altcoin yang valid
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+	cfgLong.BTCGateEnabled = true
+	cfgLong.BTCCounterMomentumPct = 0.25
+
+	// Mock BTC snapshot di mana BTC baru saja dump -0.30% pada candle 5m terakhir
+	// Candle terakhir BTC: Open 50000, Close 49850 (-0.30%)
+	btcCandles[59] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       50000.0,
+		High:       50010.0,
+		Low:        49840.0,
+		Close:      49850.0,
+		VolumeBase: 200.0,
+	}
+
+	_, okLong, reasonLong, _ := EvaluateSignal(snapLong, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if okLong || reasonLong != "BTC_COUNTER_MOMENTUM_DUMP" {
+		t.Fatalf("expected rejection with BTC_COUNTER_MOMENTUM_DUMP, got ok=%v, reason=%s", okLong, reasonLong)
+	}
+
+	// 3. Normal drift (+0.10% on BTC) should NOT be rejected by counter momentum guard
+	btcCandles[59] = model.Candle{
+		OpenTime:   now.Add(-5 * time.Minute),
+		CloseTime:  now,
+		Open:       50000.0,
+		High:       50060.0,
+		Low:        49980.0,
+		Close:      50050.0,
+		VolumeBase: 100.0,
+	}
+	cfgShort.AllowedSide = "BOTH"
+	_, okShortPassed, reasonShortPassed, _ := EvaluateSignal(snapShort, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if !okShortPassed && reasonShortPassed == "BTC_COUNTER_MOMENTUM_PUMP" {
+		t.Fatalf("expected normal drift +0.10%% to NOT trigger BTC_COUNTER_MOMENTUM_PUMP, got reason=%s", reasonShortPassed)
+	}
+}
+
+func TestEvaluateSignal_MinSignalRVOL(t *testing.T) {
+	now := time.Now().UTC()
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	cfgShort.MinSignalRVOL = 0.75
+
+	// Buat 20 candle sebelumnya memiliki volume rata-rata 1000
+	for i := len(snapShort.ClosedCandles) - 21; i < len(snapShort.ClosedCandles)-1; i++ {
+		snapShort.ClosedCandles[i].VolumeBase = 1000.0
+	}
+
+	// Kasus 1: Volume candle terakhir sangat rendah (550.0 -> RVOL = 0.55 < 0.75) seperti kasus ESPORTSUSDT
+	snapShort.ClosedCandles[len(snapShort.ClosedCandles)-1].VolumeBase = 550.0
+	_, ok, reason, subReason := EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if ok || reason != "LOW_SIGNAL_RVOL" {
+		t.Fatalf("expected rejection with LOW_SIGNAL_RVOL for rvol=0.55, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+
+	// Kasus 2: Volume candle terakhir sehat (850.0 -> RVOL = 0.85 >= 0.75)
+	snapShort.ClosedCandles[len(snapShort.ClosedCandles)-1].VolumeBase = 850.0
+	_, okPass, reasonPass, _ := EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if !okPass && reasonPass == "LOW_SIGNAL_RVOL" {
+		t.Fatalf("expected rvol=0.85 to pass LOW_SIGNAL_RVOL, got reason=%s", reasonPass)
+	}
+}
+
 
 
 

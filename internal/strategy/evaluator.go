@@ -49,9 +49,11 @@ type EvaluatorConfig struct {
 	BTCMax5mDumpPct        float64
 	BTCMax5mPumpPct        float64
 	BTCGatePersistenceBars int
+	BTCCounterMomentumPct  float64
 	AllowedSide            string
 	MaxFrenzyRVOL          float64
 	MaxCounterImpulseATR   float64
+	MinSignalRVOL          float64
 
 	CooldownAfterExitMinutes int
 	CooldownLossMinutes      int
@@ -465,7 +467,14 @@ func EvaluateSignal(
 	if len(snap.ClosedCandles) < checkLookback {
 		checkLookback = len(snap.ClosedCandles)
 	}
-	rvol := indicator.CalculateRVOL(snap.ClosedCandles, 20)
+	latestRVOL := indicator.CalculateRVOL(snap.ClosedCandles, 20)
+
+	// KONFIRMASI 5D: Filter Volume Minimum Sinyal (Menghindari Dead-Volume / Low-Liquidity Trap)
+	if cfg.MinSignalRVOL > 0 && latestRVOL < cfg.MinSignalRVOL {
+		return model.OrderIntent{}, false, "LOW_SIGNAL_RVOL", fmt.Sprintf("RVOL_%.2f_BELOW_MIN_%.2f", latestRVOL, cfg.MinSignalRVOL)
+	}
+
+	rvol := latestRVOL
 	hasHighRVOL := rvol >= maxFrenzyRVOL
 	if !hasHighRVOL {
 		for i := len(snap.ClosedCandles) - checkLookback; i < len(snap.ClosedCandles); i++ {
@@ -489,7 +498,7 @@ func EvaluateSignal(
 		}
 	}
 
-	// KONFIRMASI 6: Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
+	// KONFIRMASI 6: Gerbang Makro Bitcoin (Two-Tiered Soft Veto & Micro Counter-Momentum Guard)
 	if cfg.BTCGateEnabled && btcSnap != nil && len(btcSnap.ClosedCandles) > 0 && snap.Symbol != "BTCUSDT" {
 		latestBTC := btcSnap.ClosedCandles[len(btcSnap.ClosedCandles)-1]
 		var btc5mChangePct float64
@@ -512,6 +521,16 @@ func EvaluateSignal(
 		}
 		if targetSide == model.SideShort && btc5mChangePct > maxPump {
 			return model.OrderIntent{}, false, "BTC_FLASH_PUMP", fmt.Sprintf("BTC_5M_PUMP_%.2f%%_MAX_%.2f%%", btc5mChangePct, maxPump)
+		}
+
+		// TIER 1.5: Micro Counter-Momentum Guard (Mencegah Entry Saat Bar 5m BTC Sedang Memantul Kencang)
+		if cfg.BTCCounterMomentumPct > 0 {
+			if targetSide == model.SideShort && btc5mChangePct >= cfg.BTCCounterMomentumPct {
+				return model.OrderIntent{}, false, "BTC_COUNTER_MOMENTUM_PUMP", fmt.Sprintf("BTC_5M_PUMP_%.2f%%_EXCEEDS_COUNTER_LIMIT_%.2f%%", btc5mChangePct, cfg.BTCCounterMomentumPct)
+			}
+			if targetSide == model.SideLong && btc5mChangePct <= -cfg.BTCCounterMomentumPct {
+				return model.OrderIntent{}, false, "BTC_COUNTER_MOMENTUM_DUMP", fmt.Sprintf("BTC_5M_DUMP_%.2f%%_EXCEEDS_COUNTER_LIMIT_%.2f%%", btc5mChangePct, -cfg.BTCCounterMomentumPct)
+			}
 		}
 
 		// TIER 2: Symmetric Directional Bias (Soft Veto)
