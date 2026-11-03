@@ -86,6 +86,7 @@ type Config struct {
 	PartialTPEnabled         bool
 	PartialTP1Ratio          float64
 	PartialTP1ATRMult        float64
+	RunnerBECushionATR       float64
 	TrailingEnabled          bool
 	TrailingActivateATR      float64
 	TrailingDistanceATR      float64
@@ -463,6 +464,12 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_ATR_MULT '%s' (must be float between 0.1 and 10.0)", partialTP1ATRMultStr)
 	}
 
+	runnerBECushionATRStr := getEnv("RUNNER_BE_CUSHION_ATR", "0.35")
+	runnerBECushionATR, err := strconv.ParseFloat(runnerBECushionATRStr, 64)
+	if err != nil || runnerBECushionATR < 0.0 || runnerBECushionATR > 5.0 {
+		return nil, fmt.Errorf("config: invalid RUNNER_BE_CUSHION_ATR '%s' (must be float between 0.0 and 5.0)", runnerBECushionATRStr)
+	}
+
 	trailingEnabled := parseBoolEnv(getEnv("TRAILING_ENABLED", "true"))
 
 	trailingActivateATRStr := getEnv("TRAILING_ACTIVATE_ATR", "2.00")
@@ -629,6 +636,7 @@ func LoadConfig() (*Config, error) {
 		PartialTPEnabled:         partialTPEnabled,
 		PartialTP1Ratio:          partialTP1Ratio,
 		PartialTP1ATRMult:        partialTP1ATRMult,
+		RunnerBECushionATR:       runnerBECushionATR,
 		TrailingEnabled:          trailingEnabled,
 		TrailingActivateATR:      trailingActivateATR,
 		TrailingDistanceATR:      trailingDistATR,

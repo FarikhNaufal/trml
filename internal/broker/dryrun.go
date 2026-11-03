@@ -56,6 +56,7 @@ type DryRunConfig struct {
 	PartialTPEnabled         bool
 	PartialTP1Ratio          float64
 	PartialTP1ATRMult        float64
+	RunnerBECushionATR       float64
 	TrailingEnabled          bool
 	TrailingActivateATR      float64
 	TrailingDistanceATR      float64
@@ -782,17 +783,38 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 	pos.Qty = pos.Qty.Sub(closeQty)
 	pos.IsTP1Hit = true
 
-	// Pindahkan SL ke Break-Even (Entry +/- beOffsetRate)
+	// Pindahkan SL ke Break-Even (dengan Runner Cushion jika dikonfigurasi)
 	var newSL decimal.Decimal
-	if pos.Side == model.SideLong {
-		newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
-		if newSL.GreaterThan(pos.CurrentSLPrice) {
-			pos.CurrentSLPrice = newSL
+	if d.Cfg.RunnerBECushionATR > 0 && pos.ATRAtEntry.GreaterThan(decimal.Zero) {
+		cushionDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(d.Cfg.RunnerBECushionATR))
+		if pos.Side == model.SideLong {
+			newSL = pos.EntryPrice.Sub(cushionDist)
+			if pos.InitialSLPrice.GreaterThan(decimal.Zero) && newSL.LessThan(pos.InitialSLPrice) {
+				newSL = pos.InitialSLPrice
+			}
+			if newSL.GreaterThan(pos.CurrentSLPrice) {
+				pos.CurrentSLPrice = newSL
+			}
+		} else {
+			newSL = pos.EntryPrice.Add(cushionDist)
+			if pos.InitialSLPrice.GreaterThan(decimal.Zero) && newSL.GreaterThan(pos.InitialSLPrice) {
+				newSL = pos.InitialSLPrice
+			}
+			if newSL.LessThan(pos.CurrentSLPrice) {
+				pos.CurrentSLPrice = newSL
+			}
 		}
 	} else {
-		newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
-		if newSL.LessThan(pos.CurrentSLPrice) {
-			pos.CurrentSLPrice = newSL
+		if pos.Side == model.SideLong {
+			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
+			if newSL.GreaterThan(pos.CurrentSLPrice) {
+				pos.CurrentSLPrice = newSL
+			}
+		} else {
+			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
+			if newSL.LessThan(pos.CurrentSLPrice) {
+				pos.CurrentSLPrice = newSL
+			}
 		}
 	}
 	pos.IsBreakEvenMoved = true

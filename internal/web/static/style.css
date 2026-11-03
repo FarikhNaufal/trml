@@ -251,6 +251,7 @@ body {
 .val-green { color: var(--buy-green) !important; }
 .val-red { color: var(--sell-red) !important; }
 .val-yellow { color: var(--binance-yellow) !important; }
+.val-blue { color: #38bdf8 !important; }
 
 /* Panels & Cards */
 .panel {

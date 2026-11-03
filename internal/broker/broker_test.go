@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -2256,6 +2257,246 @@ func TestLiveBrokerRestorePositionWithATR(t *testing.T) {
 		t.Errorf("expected IsTP1Hit true")
 	}
 }
+
+func TestDryRunBroker_PartialTP1_CushionedBE(t *testing.T) {
+	now := time.Now().UTC()
+	broker := NewDryRunBroker(decimal.NewFromFloat(100.0), DryRunConfig{
+		MaxSlots:              3,
+		AccountLeverage:       5.0,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		PartialTP1ATRMult:     1.00,
+		RunnerBECushionATR:    0.35,
+		MinBreakEvenOffsetPct: 0.0010,
+		EntryOrderType:        "MARKET",
+		TakerFeeRate:          0.0005,
+		MakerFeeRate:          0.0002,
+		SlippageRate:          0.0001,
+	})
+	defer broker.Close()
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST-CUSHION-LONG",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(10.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(96.5),  // Initial SL 3.5 ATR
+		TP1Price:      decimal.NewFromFloat(102.0), // TP1 +2.0 (1.0x ATR)
+		TPPrice:       decimal.NewFromFloat(105.0),
+		ATRAtEntry:    decimal.NewFromFloat(2.0),
+		CreatedAt:     now,
+	}
+
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("expected entry to succeed, got ok=%v, err=%v", ok, err)
+	}
+
+	// Trigger TP1 at 102.0
+	broker.OnRealtimeTick("SOLUSDT", 102.0, 102.1, 102.05, 102.05, 5.0, false, now.Add(1*time.Minute))
+
+	broker.Mu.Lock()
+	defer broker.Mu.Unlock()
+	pos, exists := broker.OpenPositions["SOLUSDT"]
+	if !exists {
+		t.Fatalf("expected position to still exist")
+	}
+	if !pos.IsTP1Hit {
+		t.Errorf("expected IsTP1Hit true")
+	}
+	// Expected Cushioned SL = Entry (100.0) - Cushion (2.0 * 0.35 = 0.70) = 99.30
+	expectedSL := decimal.NewFromFloat(99.30)
+	if !pos.CurrentSLPrice.Equal(expectedSL) {
+		t.Errorf("expected Cushioned SL %s, got %s", expectedSL, pos.CurrentSLPrice)
+	}
+}
+
+func TestLiveBrokerPartialTP1AndCushionedBE(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:              3,
+		MaxDailyDrawdownPct:   -0.05,
+		MaxAccountStaleness:   60 * time.Second,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		RunnerBECushionATR:    0.35,
+		MinBreakEvenOffsetPct: 0.0010,
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+
+	b.HandleAccountUpdate(
+		decimal.NewFromFloat(10000.0),
+		decimal.Zero,
+		decimal.NewFromFloat(10000.0),
+		nil,
+		now,
+	)
+
+	filter := model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.01),
+		StepSize: decimal.NewFromFloat(0.1),
+	}
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return filter, true
+	}
+
+	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, error) {
+		return 777002, nil
+	}
+
+	var slMu sync.Mutex
+	var placedAlgoSL decimal.Decimal
+	var slOrderCount int32
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if orderType == "STOP_MARKET" {
+			slMu.Lock()
+			placedAlgoSL = triggerPrice
+			atomic.AddInt32(&slOrderCount, 1)
+			slMu.Unlock()
+			return 888002, nil
+		}
+		return 0, nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST_LIVE_CUSHION_SHORT",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(2.0),
+		LimitPrice:    decimal.NewFromFloat(2000.0),
+		SLPrice:       decimal.NewFromFloat(2070.0),
+		TPPrice:       decimal.NewFromFloat(1900.0),
+		TP1Price:      decimal.NewFromFloat(1960.0),
+		ATRAtEntry:    decimal.NewFromFloat(40.0), // 40 * 0.35 = 14.0 cushion
+		CreatedAt:     now,
+	}
+
+	ok, err := b.ReserveEntryIntent(intent)
+	if !ok || err != nil {
+		t.Fatalf("failed to reserve intent: %v", err)
+	}
+
+	b.HandleUserDataOrderUpdate("TEST_LIVE_CUSHION_SHORT", 111002, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(2.0), decimal.NewFromFloat(2000.0), decimal.Zero)
+
+	// Wait for initial SL
+	for i := 0; i < 50; i++ {
+		if atomic.LoadInt32(&slOrderCount) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Trigger TP1 at 1960.0 (Short hits markPrice <= 1960.0)
+	b.OnRealtimeTick("ETHUSDT", 1959.0, 1960.0, 1959.5, 1959.5, 1.0, true, now)
+
+	// Wait for async runner SL placement
+	for i := 0; i < 50; i++ {
+		if atomic.LoadInt32(&slOrderCount) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	slMu.Lock()
+	finalSL := placedAlgoSL
+	slMu.Unlock()
+
+	// Short Cushioned SL = Entry (2000.0) + Cushion (40.0 * 0.35 = 14.0) = 2014.0
+	expectedLiveSL := decimal.NewFromFloat(2014.0)
+	if !finalLiveSLMatches(finalSL, expectedLiveSL) {
+		t.Errorf("expected Live Cushioned SL %s, got %s", expectedLiveSL, finalSL)
+	}
+}
+
+func finalLiveSLMatches(actual, expected decimal.Decimal) bool {
+	return actual.Equal(expected)
+}
+
+func TestLiveBrokerAccountAntiStalenessAndRefresh(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxAccountStaleness: 60 * time.Second,
+		MaxDailyDrawdownPct: -0.03,
+	}
+	b := NewBinanceLiveBroker(cfg)
+
+	intent := model.OrderIntent{
+		ClientOrderID: "INTENT_STALE_TEST_1",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(0.1),
+		LimitPrice:    decimal.NewFromFloat(65000),
+		SLPrice:       decimal.NewFromFloat(64000),
+		TPPrice:       decimal.NewFromFloat(67000),
+		ATRAtEntry:    decimal.NewFromFloat(100),
+		SignalAuditID: 999111,
+	}
+
+	// 1. Awal boot: LastAccountUpdateTime masih zero -> ReserveEntryIntent harus gagal (stale)
+	ok, err := b.ReserveEntryIntent(intent)
+	if ok || err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected stale error on boot, got ok=%v, err=%v", ok, err)
+	}
+
+	// 2. Setup mock FetchAccountFn
+	fetchCalled := 0
+	b.FetchAccountFn = func(ctx context.Context) (decimal.Decimal, decimal.Decimal, decimal.Decimal, map[string]model.LivePosition, error) {
+		fetchCalled++
+		return decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), make(map[string]model.LivePosition), nil
+	}
+
+	// 3. Panggil RefreshAccount secara eksplisit
+	if err := b.RefreshAccount(context.Background()); err != nil {
+		t.Fatalf("RefreshAccount failed: %v", err)
+	}
+	if b.WalletBalanceUSDT.String() != "1000" {
+		t.Fatalf("expected wallet balance 1000, got %s", b.WalletBalanceUSDT)
+	}
+	if b.LastAccountUpdateTime.IsZero() {
+		t.Fatalf("expected LastAccountUpdateTime updated")
+	}
+
+	// 4. Sekarang data segar, ReserveEntryIntent harus sukses
+	ok, err = b.ReserveEntryIntent(intent)
+	if !ok || err != nil {
+		t.Fatalf("expected reserve success after refresh, got ok=%v, err=%v", ok, err)
+	}
+
+	// Bersihkan untuk tes SubmitLimitEntry on-demand refresh
+	b.Mu.Lock()
+	delete(b.OrdersByClient, intent.ClientOrderID)
+	// Simulasi staleness: buat LastAccountUpdateTime 70 detik yang lalu
+	b.LastAccountUpdateTime = time.Now().UTC().Add(-70 * time.Second)
+	b.Mu.Unlock()
+
+	b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+		return 888777, nil
+	}
+
+	initialFetchCount := fetchCalled
+	intent2 := model.OrderIntent{
+		ClientOrderID: "INTENT_STALE_TEST_2",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(2000),
+		SLPrice:       decimal.NewFromFloat(1900),
+		TPPrice:       decimal.NewFromFloat(2200),
+		ATRAtEntry:    decimal.NewFromFloat(20),
+		SignalAuditID: 999222,
+	}
+
+	// SubmitLimitEntry harus otomatis refresh on-demand sebelum reserve dan berhasil pasang order
+	placed, err := b.SubmitLimitEntry(intent2)
+	if !placed || err != nil {
+		t.Fatalf("expected SubmitLimitEntry success via auto-refresh, got placed=%v, err=%v", placed, err)
+	}
+	if fetchCalled <= initialFetchCount {
+		t.Fatalf("expected FetchAccountFn to be called on-demand when stale, got fetchCalled=%d", fetchCalled)
+	}
+}
+
 
 
 

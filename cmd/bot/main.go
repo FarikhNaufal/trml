@@ -263,6 +263,7 @@ func main() {
 			PartialTPEnabled:         cfg.PartialTPEnabled,
 			PartialTP1Ratio:          cfg.PartialTP1Ratio,
 			PartialTP1ATRMult:        cfg.PartialTP1ATRMult,
+			RunnerBECushionATR:       cfg.RunnerBECushionATR,
 			TrailingEnabled:          cfg.TrailingEnabled,
 			TrailingActivateATR:      cfg.TrailingActivateATR,
 			TrailingDistanceATR:      cfg.TrailingDistanceATR,
@@ -388,6 +389,7 @@ func main() {
 			PartialTPEnabled:         cfg.PartialTPEnabled,
 			PartialTP1Ratio:          cfg.PartialTP1Ratio,
 			PartialTP1ATRMult:        cfg.PartialTP1ATRMult,
+			RunnerBECushionATR:       cfg.RunnerBECushionATR,
 			TrailingEnabled:          cfg.TrailingEnabled,
 			TrailingActivateATR:      cfg.TrailingActivateATR,
 			TrailingDistanceATR:      cfg.TrailingDistanceATR,
@@ -404,6 +406,7 @@ func main() {
 		engine.liveBroker.CancelOrderFn = client.CancelOrder
 		engine.liveBroker.CancelAlgoOrderFn = client.CancelAlgoOrder
 		engine.liveBroker.QueryOrderFn = client.QueryOrder
+		engine.liveBroker.FetchAccountFn = client.FetchAccountBalance
 		engine.liveBroker.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
 			engine.filtersMu.RLock()
 			defer engine.filtersMu.RUnlock()
@@ -514,8 +517,20 @@ func main() {
 		}
 	}
 
-	// 5b. Rekonsiliasi Posisi Live Saat Boot (TD-01 & TD-02)
+	// 5b. Seeding Saldo Akun & Rekonsiliasi Posisi Live Saat Boot (TD-01, TD-02 & P0-2)
 	if engine.liveBroker != nil {
+		initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := engine.liveBroker.RefreshAccount(initCtx); err != nil {
+			slog.Error("failed to seed initial live account balance via REST", "err", err)
+		} else {
+			slog.Info("initial live account balance seeded successfully via REST",
+				"walletBalance", engine.liveBroker.WalletBalanceUSDT,
+				"availBalance", engine.liveBroker.AvailableBalanceUSDT,
+				"unrealizedPnL", engine.liveBroker.UnrealizedPnLUSDT,
+			)
+		}
+		initCancel()
+
 		slog.Info("reconciling live open positions with Binance exchange...")
 		storedLivePositions, err := repo.GetAllLivePositions(ctx)
 		if err != nil {
@@ -668,6 +683,28 @@ func main() {
 		go func() {
 			defer wg.Done()
 			engine.runUserDataStreamSupervisor(ctx)
+		}()
+
+		// Worker 3b: Periodic REST Account Balance Poller (Solusi P0 Anti-Staleness)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(25 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if engine.liveBroker != nil {
+						pollCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+						if err := engine.liveBroker.RefreshAccount(pollCtx); err != nil {
+							slog.Warn("periodic live account balance sync failed", "err", err)
+						}
+						cancel()
+					}
+				}
+			}
 		}()
 	}
 

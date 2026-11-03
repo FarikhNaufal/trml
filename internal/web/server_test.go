@@ -1,8 +1,10 @@
 package web
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -435,6 +437,103 @@ func TestAuthAndAIEndpoints(t *testing.T) {
 	server.httpServer.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 while blocked even with correct PIN, got %d", rec.Code)
+	}
+}
+
+func TestGetOverallStats_Categorization(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Clear table
+	_, _ = db.Exec("DELETE FROM trade_ledger;")
+
+	// Setup 1: Full Win (TP1 + Trailing Stop)
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES 
+		('ORDER_1_TP1', 'BTCUSDT', 'LONG', '1', '100', '102', '98', '104', '0.50', 'PARTIAL_TAKE_PROFIT', '2026-11-03 10:00:00', '2026-11-03 10:05:00', 101, '2026-11-03 10:05:00'),
+		('ORDER_1', 'BTCUSDT', 'LONG', '1', '100', '103', '98', '104', '1.00', 'TRAILING_STOP', '2026-11-03 10:00:00', '2026-11-03 10:10:00', 101, '2026-11-03 10:10:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed insert setup 1: %v", err)
+	}
+
+	// Setup 2: Partial Win (TP1 hit + Runner BE scratch)
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES 
+		('ORDER_2_TP1', 'ETHUSDT', 'LONG', '1', '100', '102', '98', '104', '0.40', 'PARTIAL_TAKE_PROFIT', '2026-11-03 11:00:00', '2026-11-03 11:05:00', 102, '2026-11-03 11:05:00'),
+		('ORDER_2', 'ETHUSDT', 'LONG', '1', '100', '100', '98', '104', '-0.00005', 'BREAK_EVEN', '2026-11-03 11:00:00', '2026-11-03 11:15:00', 102, '2026-11-03 11:15:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed insert setup 2: %v", err)
+	}
+
+	// Setup 3: Pure Break-Even (Rem Dini Tier 1 without reaching TP1)
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES 
+		('ORDER_3', 'SOLUSDT', 'LONG', '1', '100', '100', '98', '104', '-0.00004', 'BREAK_EVEN', '2026-11-03 12:00:00', '2026-11-03 12:10:00', 103, '2026-11-03 12:10:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed insert setup 3: %v", err)
+	}
+
+	// Setup 4: Full Loss (Stop Loss)
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES 
+		('ORDER_4', 'XRPUSDT', 'LONG', '1', '100', '98', '98', '104', '-1.80', 'STOP_LOSS', '2026-11-03 13:00:00', '2026-11-03 13:05:00', 104, '2026-11-03 13:05:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed insert setup 4: %v", err)
+	}
+
+	reader := &WebReader{db: db, leverage: 8.0}
+	stats, err := reader.GetOverallStats(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stats.TotalTrades != 4 {
+		t.Errorf("expected 4 total trades, got %d", stats.TotalTrades)
+	}
+	if stats.WinsCount != 2 {
+		t.Errorf("expected 2 total wins (1 full + 1 partial), got %d", stats.WinsCount)
+	}
+	if stats.FullWinsCount != 1 {
+		t.Errorf("expected 1 full win, got %d", stats.FullWinsCount)
+	}
+	if stats.PartialWinsCount != 1 {
+		t.Errorf("expected 1 partial win, got %d", stats.PartialWinsCount)
+	}
+	if stats.BreakEvenCount != 1 {
+		t.Errorf("expected 1 pure break even, got %d", stats.BreakEvenCount)
+	}
+	if stats.LossesCount != 1 {
+		t.Errorf("expected 1 loss, got %d", stats.LossesCount)
+	}
+
+	// Win Rate checks:
+	// All-inclusive WR: 2 / 4 = 50.0%
+	if math.Abs(stats.WinRatePct-50.0) > 0.01 {
+		t.Errorf("expected all-inclusive WR 50.0%%, got %f", stats.WinRatePct)
+	}
+	// Pure trading Adjusted WR: 2 / (2 + 1) = 66.67%
+	if math.Abs(stats.AdjustedWinRatePct-66.666) > 0.1 {
+		t.Errorf("expected adjusted WR ~66.7%%, got %f", stats.AdjustedWinRatePct)
+	}
+
+	// Realized RR: Full Win (+$1.50) / Loss ($1.80) = 0.833
+	if math.Abs(stats.RealizedRR-0.833) > 0.05 {
+		t.Errorf("expected RealizedRR ~0.83, got %f", stats.RealizedRR)
+	}
+
+	// Blended RR: (1.50 + 0.40)/2 / 1.80 = 0.95 / 1.80 = 0.527
+	if math.Abs(stats.BlendedRR-0.527) > 0.05 {
+		t.Errorf("expected BlendedRR ~0.53, got %f", stats.BlendedRR)
 	}
 }
 

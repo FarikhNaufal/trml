@@ -29,6 +29,7 @@ type LiveBrokerConfig struct {
 	PartialTPEnabled         bool
 	PartialTP1Ratio          float64
 	PartialTP1ATRMult        float64
+	RunnerBECushionATR       float64
 	TrailingEnabled          bool
 	TrailingActivateATR      float64
 	TrailingDistanceATR      float64
@@ -105,6 +106,7 @@ type BinanceLiveBroker struct {
 	OnTradeClosedFn        func(rec TradeClosedRecord)
 	OnPositionSavedFn      func(pos LiveOpenPosition)
 	OnPositionDeletedFn    func(symbol string)
+	FetchAccountFn         func(ctx context.Context) (walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, err error)
 }
 
 func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
@@ -348,6 +350,19 @@ func (b *BinanceLiveBroker) ReserveEntryIntent(intent model.OrderIntent) (bool, 
 
 // SubmitLimitEntry mengimplementasikan Two-Phase Commit: Reservasi Atomik -> I/O Bursa -> Update/Reconcile (Solusi P0-1)
 func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
+	// Fallback On-Demand Refresh: jika data akun belum terisi atau mendekati batas staleness,
+	// refresh langsung via REST API sebelum reservasi (Solusi P0-2).
+	if b.FetchAccountFn != nil {
+		b.Mu.Lock()
+		isStale := b.LastAccountUpdateTime.IsZero() || time.Since(b.LastAccountUpdateTime) > (b.Cfg.MaxAccountStaleness/2)
+		b.Mu.Unlock()
+		if isStale {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = b.RefreshAccount(ctx)
+			cancel()
+		}
+	}
+
 	reserved, err := b.ReserveEntryIntent(intent)
 	if !reserved {
 		return false, err
@@ -382,6 +397,20 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 	b.Mu.Unlock()
 
 	return true, nil
+}
+
+// RefreshAccount mengambil data saldo dompet dan posisi aktif terkini via REST API Binance (FetchAccountFn)
+// dan langsung memperbarui state in-memory live broker (Solusi P0-2 untuk mencegah account staleness).
+func (b *BinanceLiveBroker) RefreshAccount(ctx context.Context) error {
+	if b.FetchAccountFn == nil {
+		return nil
+	}
+	wb, up, ab, pos, err := b.FetchAccountFn(ctx)
+	if err != nil {
+		return fmt.Errorf("refresh account balance: %w", err)
+	}
+	b.HandleAccountUpdate(wb, up, ab, pos, time.Now().UTC())
+	return nil
 }
 
 // HandleAccountUpdate memproses pembaruan akun dari REST atau event ACCOUNT_UPDATE (Solusi P0-2)
@@ -1276,9 +1305,17 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				if b.PlaceAlgoOrderFn != nil {
 					exitSide := model.OppositeSide(side)
 					go func(sym string, eSide model.Side, remQty, targetSL decimal.Decimal, cSLID string, oSLID int64, oClientSLID string, generation uint64) {
-						ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
-						newSLID, slErr := b.PlaceAlgoOrderFn(ctxSL, sym, eSide, "STOP_MARKET", remQty, targetSL, cSLID)
-						cancelSL()
+						var newSLID int64
+						var slErr error
+						for attempt := 1; attempt <= 3; attempt++ {
+							ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
+							newSLID, slErr = b.PlaceAlgoOrderFn(ctxSL, sym, eSide, "STOP_MARKET", remQty, targetSL, cSLID)
+							cancelSL()
+							if slErr == nil && newSLID != 0 {
+								break
+							}
+							time.Sleep(time.Duration(attempt*250) * time.Millisecond)
+						}
 						if slErr == nil && newSLID != 0 {
 							b.Mu.Lock()
 							if p, ok := b.Protections[sym]; ok && p.PlanGeneration == generation {
@@ -1331,9 +1368,17 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						b.Mu.Unlock()
 					}()
 
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					orderID, err := b.MarketCloseFn(ctx, sym, eSide, cQty, cID)
-					cancel()
+					var orderID int64
+					var err error
+					for attempt := 1; attempt <= 3; attempt++ {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						orderID, err = b.MarketCloseFn(ctx, sym, eSide, cQty, cID)
+						cancel()
+						if err == nil && orderID != 0 {
+							break
+						}
+						time.Sleep(time.Duration(attempt*250) * time.Millisecond)
+					}
 
 					if err == nil && orderID != 0 {
 						b.Mu.Lock()
@@ -1346,13 +1391,39 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 						}
 						b.ActivePositions[sym] = remQty
 
-						// Pindahkan SL ke Break-Even (Tier 1)
+						// Pindahkan SL ke Break-Even (dengan Runner Cushion jika dikonfigurasi)
 						beOffset := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))
 						var beSL decimal.Decimal
-						if pSide == model.SideLong {
-							beSL = ePrice.Mul(decimal.NewFromFloat(1.0).Add(beOffset))
+						atr := b.ATRAtEntry[sym]
+						if b.Cfg.RunnerBECushionATR > 0 && atr.GreaterThan(decimal.Zero) {
+							cushionDist := atr.Mul(decimal.NewFromFloat(b.Cfg.RunnerBECushionATR))
+							initSL := b.InitialSLPrices[sym]
+							if pSide == model.SideLong {
+								beSL = ePrice.Sub(cushionDist)
+								if initSL.GreaterThan(decimal.Zero) && beSL.LessThan(initSL) {
+									beSL = initSL
+								}
+							} else {
+								beSL = ePrice.Add(cushionDist)
+								if initSL.GreaterThan(decimal.Zero) && beSL.GreaterThan(initSL) {
+									beSL = initSL
+								}
+							}
 						} else {
-							beSL = ePrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffset))
+							if pSide == model.SideLong {
+								beSL = ePrice.Mul(decimal.NewFromFloat(1.0).Add(beOffset))
+							} else {
+								beSL = ePrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffset))
+							}
+						}
+
+						// Defensive Ratchet Guard: Pastikan beSL tidak pernah melompat mundur dibandingkan SL aktif saat ini
+						if prot, ok := b.Protections[sym]; ok && prot.SLPrice.GreaterThan(decimal.Zero) {
+							if pSide == model.SideLong && beSL.LessThan(prot.SLPrice) {
+								beSL = prot.SLPrice
+							} else if pSide == model.SideShort && beSL.GreaterThan(prot.SLPrice) {
+								beSL = prot.SLPrice
+							}
 						}
 
 						// Kuantisasi beSL
@@ -1422,11 +1493,19 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 							go b.OnTradeClosedFn(tradeRec)
 						}
 
-						// Pasang SL baru untuk remaining lot di Break-Even
+						// Pasang SL baru untuk remaining lot di Break-Even (3-attempt retry loop)
 						if b.PlaceAlgoOrderFn != nil {
-							ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
-							newSLID, slErr := b.PlaceAlgoOrderFn(ctxSL, sym, eSide, "STOP_MARKET", remQty, beSL, clientSLID)
-							cancelSL()
+							var newSLID int64
+							var slErr error
+							for attempt := 1; attempt <= 3; attempt++ {
+								ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
+								newSLID, slErr = b.PlaceAlgoOrderFn(ctxSL, sym, eSide, "STOP_MARKET", remQty, beSL, clientSLID)
+								cancelSL()
+								if slErr == nil && newSLID != 0 {
+									break
+								}
+								time.Sleep(time.Duration(attempt*250) * time.Millisecond)
+							}
 							if slErr == nil && newSLID != 0 {
 								b.Mu.Lock()
 								if p, ok := b.Protections[sym]; ok && p.PlanGeneration == gen {

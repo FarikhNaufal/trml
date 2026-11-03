@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/shopspring/decimal"
 	"trml/internal/model"
 )
 
@@ -126,6 +127,31 @@ func TestMarketDataEndpoints(t *testing.T) {
 					"reduceOnly": true
 				}
 			]`))
+		case "/fapi/v2/account":
+			_, _ = w.Write([]byte(`{
+				"feeTier": 0,
+				"canTrade": true,
+				"totalWalletBalance": "1500.50",
+				"totalUnrealizedProfit": "25.30",
+				"availableBalance": "1200.00",
+				"assets": [
+					{
+						"asset": "USDT",
+						"walletBalance": "1500.50",
+						"unrealizedProfit": "25.30",
+						"availableBalance": "1200.00"
+					}
+				],
+				"positions": [
+					{
+						"symbol": "BTCUSDT",
+						"positionAmt": "0.100",
+						"entryPrice": "65000.00",
+						"unrealizedProfit": "25.30",
+						"positionSide": "BOTH"
+					}
+				]
+			}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -204,5 +230,23 @@ func TestMarketDataEndpoints(t *testing.T) {
 	openOrds, err := client.GetOpenOrders(ctx, "BTCUSDT")
 	if err != nil || len(openOrds) != 1 || openOrds[0].OrderID != 991122 || openOrds[0].ClientOrderID != "ALGO_SL_BTCUSDT_1" {
 		t.Fatalf("get open orders failed: %v, orders: %+v", err, openOrds)
+	}
+
+	// 10. FetchAccountBalance (P0-2 Anti-Staleness)
+	wb, up, ab, pos, err := client.FetchAccountBalance(ctx)
+	if err != nil {
+		t.Fatalf("fetch account balance failed: %v", err)
+	}
+	if !wb.Equal(decimal.RequireFromString("1500.50")) {
+		t.Errorf("expected wallet balance 1500.50, got %s", wb)
+	}
+	if !up.Equal(decimal.RequireFromString("25.30")) {
+		t.Errorf("expected unrealized PnL 25.30, got %s", up)
+	}
+	if !ab.Equal(decimal.RequireFromString("1200.00")) {
+		t.Errorf("expected available balance 1200.00, got %s", ab)
+	}
+	if p, ok := pos["BTCUSDT"]; !ok || p.Side != model.SideLong || !p.Qty.Equal(decimal.RequireFromString("0.100")) {
+		t.Errorf("unexpected position map: %+v", pos)
 	}
 }

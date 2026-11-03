@@ -59,15 +59,21 @@ type SignalItem struct {
 }
 
 type StatsItem struct {
-	TotalTrades     int     `json:"total_trades"`
-	WinsCount       int     `json:"wins_count"`
-	LossesCount     int     `json:"losses_count"`
-	BreakEvenCount  int     `json:"break_even_count"`
-	TotalNetPnLUSDT float64 `json:"total_net_pnl_usdt"`
-	WinRatePct      float64 `json:"win_rate_pct"`
-	AvgWinUSDT      float64 `json:"avg_win_usdt"`
-	AvgLossUSDT     float64 `json:"avg_loss_usdt"`
-	RealizedRR      float64 `json:"realized_rr"`
+	TotalTrades        int     `json:"total_trades"`
+	WinsCount          int     `json:"wins_count"`
+	FullWinsCount      int     `json:"full_wins_count"`
+	PartialWinsCount   int     `json:"partial_wins_count"`
+	BreakEvenCount     int     `json:"break_even_count"`
+	LossesCount        int     `json:"losses_count"`
+	TotalNetPnLUSDT    float64 `json:"total_net_pnl_usdt"`
+	WinRatePct         float64 `json:"win_rate_pct"`
+	AdjustedWinRatePct float64 `json:"adjusted_win_rate_pct"`
+	AvgWinUSDT         float64 `json:"avg_win_usdt"`
+	AvgFullWinUSDT     float64 `json:"avg_full_win_usdt"`
+	AvgLossUSDT        float64 `json:"avg_loss_usdt"`
+	RealizedRR         float64 `json:"realized_rr"`
+	BlendedRR          float64 `json:"blended_rr"`
+	ProfitFactor       float64 `json:"profit_factor"`
 }
 
 type SignalAuditSummary struct {
@@ -391,15 +397,15 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 	query := `
 		SELECT 
 			CASE 
-				WHEN signal_audit_id > 0 THEN CAST(signal_audit_id AS TEXT)
+				WHEN signal_audit_id > 0 THEN 'SIG_' || CAST(signal_audit_id AS TEXT)
 				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
 				ELSE client_order_id 
 			END AS setup_id,
 			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
-			COALESCE(
-				MAX(CASE WHEN exit_reason != 'PARTIAL_TAKE_PROFIT' THEN exit_reason ELSE NULL END),
-				'PARTIAL_TAKE_PROFIT'
-			) AS last_exit_reason
+			MAX(CASE WHEN exit_reason = 'PARTIAL_TAKE_PROFIT' THEN 1 ELSE 0 END) AS has_tp1,
+			MAX(CASE WHEN exit_reason IN ('TAKE_PROFIT', 'TRAILING_STOP', 'PROFIT_LOCK') THEN 1 ELSE 0 END) AS has_runner_win,
+			MAX(CASE WHEN exit_reason = 'BREAK_EVEN' THEN 1 ELSE 0 END) AS has_be,
+			MAX(CASE WHEN exit_reason = 'STOP_LOSS' THEN 1 ELSE 0 END) AS has_sl
 		FROM trade_ledger
 		GROUP BY setup_id;
 	`
@@ -410,40 +416,69 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 	defer rows.Close()
 
 	var stats StatsItem
-	var totalWinVal, totalLossVal float64
+	var totalWinVal, totalFullWinVal, totalLossVal float64
 
 	for rows.Next() {
-		var setupID, reason string
+		var setupID string
 		var pnl float64
-		if err := rows.Scan(&setupID, &pnl, &reason); err != nil {
+		var hasTP1, hasRunnerWin, hasBE, hasSL int
+		if err := rows.Scan(&setupID, &pnl, &hasTP1, &hasRunnerWin, &hasBE, &hasSL); err != nil {
 			continue
 		}
 		stats.TotalTrades++
 		stats.TotalNetPnLUSDT += pnl
 
-		if pnl > 0.005 || reason == "TAKE_PROFIT" || reason == "PROFIT_LOCK" || reason == "PARTIAL_TAKE_PROFIT" || reason == "TRAILING_STOP" {
+		if hasRunnerWin == 1 || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
+			// Full Win: runner mencapai target penuh (TP2, Trailing Stop, atau Profit Lock)
 			stats.WinsCount++
+			stats.FullWinsCount++
 			totalWinVal += pnl
-		} else if reason == "BREAK_EVEN" || (reason != "STOP_LOSS" && math.Abs(pnl) <= 0.05) {
+			totalFullWinVal += pnl
+		} else if hasTP1 == 1 && (hasBE == 1 || pnl > 0.005) {
+			// Partial Win: TP1 mengamankan kas cuan, runner keluar di BE
+			stats.WinsCount++
+			stats.PartialWinsCount++
+			totalWinVal += pnl
+		} else if (hasBE == 1 || (hasSL == 0 && math.Abs(pnl) <= 0.05)) && hasTP1 == 0 {
+			// Pure Break-Even: Tier 1 rem dini modal kembali utuh (~$0.00)
 			stats.BreakEvenCount++
 		} else {
+			// Full Loss: Stop Loss tersenggol
 			stats.LossesCount++
 			totalLossVal += math.Abs(pnl)
 		}
 	}
 
-
 	if stats.TotalTrades > 0 {
 		stats.WinRatePct = (float64(stats.WinsCount) / float64(stats.TotalTrades)) * 100.0
 	}
+	decisiveTrades := stats.WinsCount + stats.LossesCount
+	if decisiveTrades > 0 {
+		stats.AdjustedWinRatePct = (float64(stats.WinsCount) / float64(decisiveTrades)) * 100.0
+	}
 	if stats.WinsCount > 0 {
 		stats.AvgWinUSDT = totalWinVal / float64(stats.WinsCount)
+	}
+	if stats.FullWinsCount > 0 {
+		stats.AvgFullWinUSDT = totalFullWinVal / float64(stats.FullWinsCount)
 	}
 	if stats.LossesCount > 0 {
 		stats.AvgLossUSDT = totalLossVal / float64(stats.LossesCount)
 	}
 	if stats.AvgLossUSDT > 0 {
-		stats.RealizedRR = stats.AvgWinUSDT / stats.AvgLossUSDT
+		if stats.FullWinsCount > 0 {
+			stats.RealizedRR = stats.AvgFullWinUSDT / stats.AvgLossUSDT
+		} else if stats.WinsCount > 0 {
+			stats.RealizedRR = stats.AvgWinUSDT / stats.AvgLossUSDT
+		}
+		if stats.WinsCount > 0 {
+			stats.BlendedRR = stats.AvgWinUSDT / stats.AvgLossUSDT
+		}
+	}
+	if totalLossVal > 0 {
+		stats.ProfitFactor = totalWinVal / totalLossVal
+	} else if totalWinVal > 0 {
+		stats.ProfitFactor = 99.0
 	}
 
 	return stats, nil

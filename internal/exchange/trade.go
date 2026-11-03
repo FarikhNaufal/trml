@@ -386,4 +386,106 @@ func (c *Client) GetOpenOrders(ctx context.Context, symbol string) ([]QueryOrder
 	return resp, nil
 }
 
+type BinanceAccountResponse struct {
+	FeeTier               int    `json:"feeTier"`
+	CanTrade              bool   `json:"canTrade"`
+	TotalWalletBalance    string `json:"totalWalletBalance"`
+	TotalUnrealizedProfit string `json:"totalUnrealizedProfit"`
+	AvailableBalance      string `json:"availableBalance"`
+	Assets                []struct {
+		Asset            string `json:"asset"`
+		WalletBalance    string `json:"walletBalance"`
+		UnrealizedProfit string `json:"unrealizedProfit"`
+		AvailableBalance string `json:"availableBalance"`
+	} `json:"assets"`
+	Positions []struct {
+		Symbol           string `json:"symbol"`
+		PositionAmt      string `json:"positionAmt"`
+		EntryPrice       string `json:"entryPrice"`
+		UnrealizedProfit string `json:"unrealizedProfit"`
+		PositionSide     string `json:"positionSide"`
+	} `json:"positions"`
+}
+
+// FetchAccountBalance mengambil informasi saldo dompet riil, margin tersedia, unrealized PnL,
+// dan posisi terbuka langsung dari REST API Binance (GET /fapi/v2/account).
+// Solusi P0 untuk mencegah "account data is stale" saat market sepi dan WebSocket idle.
+func (c *Client) FetchAccountBalance(ctx context.Context) (walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, err error) {
+	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v2/account", nil, true)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account: %w", err)
+	}
+
+	var resp BinanceAccountResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account decode: %w (body: %s)", err, string(respBytes))
+	}
+
+	// 1. Ambil saldo agregat akun
+	if wb, err := decimal.NewFromString(resp.TotalWalletBalance); err == nil {
+		walletBal = wb
+	}
+	if up, err := decimal.NewFromString(resp.TotalUnrealizedProfit); err == nil {
+		unrealizedPnL = up
+	}
+	if ab, err := decimal.NewFromString(resp.AvailableBalance); err == nil {
+		availBal = ab
+	}
+
+	// Fallback ke aset USDT jika saldo agregat belum terisi
+	for _, a := range resp.Assets {
+		if strings.EqualFold(a.Asset, "USDT") {
+			if walletBal.IsZero() {
+				if wb, err := decimal.NewFromString(a.WalletBalance); err == nil {
+					walletBal = wb
+				}
+			}
+			if unrealizedPnL.IsZero() {
+				if up, err := decimal.NewFromString(a.UnrealizedProfit); err == nil {
+					unrealizedPnL = up
+				}
+			}
+			if availBal.IsZero() {
+				if ab, err := decimal.NewFromString(a.AvailableBalance); err == nil {
+					availBal = ab
+				}
+			}
+			break
+		}
+	}
+
+	// 2. Ekstrak posisi terbuka aktif (non-zero positionAmt)
+	positions = make(map[string]model.LivePosition)
+	for _, p := range resp.Positions {
+		amt, err := decimal.NewFromString(p.PositionAmt)
+		if err != nil || amt.IsZero() {
+			continue
+		}
+		var side model.Side
+		if amt.GreaterThan(decimal.Zero) {
+			side = model.SideLong
+		} else {
+			side = model.SideShort
+		}
+
+		var ep, up decimal.Decimal
+		if pEp, err := decimal.NewFromString(p.EntryPrice); err == nil {
+			ep = pEp
+		}
+		if pUp, err := decimal.NewFromString(p.UnrealizedProfit); err == nil {
+			up = pUp
+		}
+
+		positions[p.Symbol] = model.LivePosition{
+			Symbol:        p.Symbol,
+			Side:          side,
+			Qty:           amt.Abs(),
+			EntryPrice:    ep,
+			UnrealizedPnL: up,
+		}
+	}
+
+	return walletBal, unrealizedPnL, availBal, positions, nil
+}
+
 

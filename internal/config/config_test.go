@@ -257,3 +257,16 @@ func TestInlineCommentSanitizationAndBoolParsing(t *testing.T) {
 		t.Errorf("expected MinVolume24hUSDT to be 40000000, got %f", cfg.MinVolume24hUSDT)
 	}
 }
+
+func TestRunnerBECushionATRConfig(t *testing.T) {
+	_ = os.Setenv("RUNNER_BE_CUSHION_ATR", "0.45")
+	defer func() { _ = os.Unsetenv("RUNNER_BE_CUSHION_ATR") }()
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+	if cfg.RunnerBECushionATR != 0.45 {
+		t.Errorf("expected RunnerBECushionATR to be 0.45, got %f", cfg.RunnerBECushionATR)
+	}
+}

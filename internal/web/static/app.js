@@ -171,14 +171,27 @@ function renderSummary(data) {
     elPnL.textContent = formatSignedUSD(stats.total_net_pnl_usdt || 0);
     elPnL.className = 'kpi-value ' + (stats.total_net_pnl_usdt > 0 ? 'val-green' : (stats.total_net_pnl_usdt < 0 ? 'val-red' : ''));
   }
-  if (elTradesCount) elTradesCount.textContent = `${stats.total_trades || 0} Closed Trades`;
-  if (elWinRate) elWinRate.textContent = `${(stats.win_rate_pct || 0).toFixed(1)}% WR`;
+  if (elTradesCount) elTradesCount.textContent = `${stats.total_trades || 0} Closed Setups`;
+  if (elWinRate) {
+    const adjWR = stats.adjusted_win_rate_pct !== undefined && stats.adjusted_win_rate_pct > 0 
+      ? stats.adjusted_win_rate_pct 
+      : (stats.win_rate_pct || 0);
+    elWinRate.textContent = `${adjWR.toFixed(1)}% WR`;
+    elWinRate.title = `Pure Trading WR: ${adjWR.toFixed(1)}% (Wins / Wins+Losses)\nAll-inclusive WR: ${(stats.win_rate_pct || 0).toFixed(1)}% (Wins / Total)`;
+  }
 
-  // Realized R:R
+  // Realized R:R (Target Full RR terhadap SL)
   const elRR = document.getElementById('kpi-rr');
   const elRRSub = document.getElementById('kpi-rr-sub');
-  if (elRR) elRR.textContent = `${(stats.realized_rr || 0).toFixed(2)} : 1`;
-  if (elRRSub) elRRSub.textContent = `Avg +${formatUSD(stats.avg_win_usdt || 0)} / -${formatUSD(stats.avg_loss_usdt || 0)}`;
+  if (elRR) {
+    const rrVal = stats.realized_rr || stats.blended_rr || 0;
+    elRR.textContent = `${rrVal.toFixed(2)} : 1`;
+  }
+  if (elRRSub) {
+    const fullWin = stats.avg_full_win_usdt || stats.avg_win_usdt || 0;
+    const avgLoss = stats.avg_loss_usdt || 0;
+    elRRSub.textContent = `Full +${formatUSD(fullWin)} / -${formatUSD(avgLoss)}`;
+  }
 
   // Daily Drawdown
   const elDD = document.getElementById('kpi-drawdown');
@@ -198,20 +211,33 @@ function renderSummary(data) {
   // Active Slots
   const elSlots = document.getElementById('kpi-slots');
   const elSlotsSub = document.getElementById('kpi-slots-sub');
-  if (elSlots) elSlots.textContent = `${data.active_slots || 0} / ${data.max_slots || 3}`;
+  const maxSlots = data.max_slots !== undefined ? data.max_slots : 3;
+  const activeSlots = data.active_slots || 0;
+  if (elSlots) elSlots.textContent = `${activeSlots} / ${maxSlots}`;
   if (elSlotsSub) {
-    const avail = (data.max_slots || 3) - (data.active_slots || 0);
+    const avail = maxSlots - activeSlots;
     elSlotsSub.textContent = `${avail} Slots Available`;
   }
 
-  // Outcomes breakdown
+  // Outcomes breakdown: Tampilkan 4 pilar lengkap (Full TP, Part TP, Pure BE, SL)
   const elOutcomes = document.getElementById('kpi-outcomes');
+  const elOutcomesSub = document.getElementById('kpi-outcomes-sub');
   if (elOutcomes) {
+    const fullTP = stats.full_wins_count || 0;
+    const partTP = stats.partial_wins_count || 0;
+    const pureBE = stats.break_even_count || 0;
+    const sl = stats.losses_count || 0;
     elOutcomes.innerHTML = `
-      <span class="val-green">${stats.wins_count || 0} TP</span> • 
-      <span class="val-yellow">${stats.break_even_count || 0} BE</span> • 
-      <span class="val-red">${stats.losses_count || 0} SL</span>
+      <span class="val-green" title="Full Target Win (TP2 / Trailing / Profit Lock)">${fullTP} Full TP</span> &bull; 
+      <span class="val-blue" title="Partial Scale-Out Win (TP1 Hit + Runner BE)">${partTP} Part TP</span> &bull; 
+      <span class="val-yellow" title="Pure Break-Even (Rem Dini Tier 1 ~$0.00)">${pureBE} BE</span> &bull; 
+      <span class="val-red" title="Full Stop Loss">${sl} SL</span>
     `;
+  }
+  if (elOutcomesSub) {
+    const pf = stats.profit_factor ? stats.profit_factor.toFixed(2) : '—';
+    const adjWR = stats.adjusted_win_rate_pct ? stats.adjusted_win_rate_pct.toFixed(1) : (stats.win_rate_pct ? stats.win_rate_pct.toFixed(1) : '—');
+    elOutcomesSub.textContent = `Pure WR: ${adjWR}% • Profit Factor: ${pf}`;
   }
 
   // Render Active Positions
