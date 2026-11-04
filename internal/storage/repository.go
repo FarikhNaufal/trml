@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -324,6 +325,8 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 	ON CONFLICT(client_order_id) DO UPDATE SET
 		qty = excluded.qty,
 		initial_qty = excluded.initial_qty,
+		entry_price = excluded.entry_price,
+		entry_fee = excluded.entry_fee,
 		tp1_price = excluded.tp1_price,
 		is_tp1_hit = excluded.is_tp1_hit,
 		current_sl_price = excluded.current_sl_price,
@@ -461,25 +464,48 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 			return nil, fmt.Errorf("storage: failed to scan dry-run position: %w", err)
 		}
 
-		p.Qty, _ = decimal.NewFromString(qtyStr)
-		p.InitialQty, _ = decimal.NewFromString(initQtyStr)
+		var parseErr error
+		if p.Qty, parseErr = parseDecimalRequired(qtyStr, "Qty", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.InitialQty, parseErr = parseDecimalOptional(initQtyStr, p.Qty, "InitialQty", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		if p.InitialQty.IsZero() {
 			p.InitialQty = p.Qty
 		}
-		p.EntryPrice, _ = decimal.NewFromString(entryStr)
-		p.EntryFee, _ = decimal.NewFromString(feeStr)
-		p.CurrentSLPrice, _ = decimal.NewFromString(slStr)
-		p.InitialSLPrice, _ = decimal.NewFromString(initSLStr)
+		if p.EntryPrice, parseErr = parseDecimalRequired(entryStr, "EntryPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.EntryFee, parseErr = parseDecimalOptional(feeStr, decimal.Zero, "EntryFee", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.CurrentSLPrice, parseErr = parseDecimalRequired(slStr, "CurrentSLPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.InitialSLPrice, parseErr = parseDecimalOptional(initSLStr, p.CurrentSLPrice, "InitialSLPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		if p.InitialSLPrice.IsZero() {
 			p.InitialSLPrice = p.CurrentSLPrice
 		}
-		p.TPPrice, _ = decimal.NewFromString(tpStr)
-		p.TP1Price, _ = decimal.NewFromString(tp1Str)
+		if p.TPPrice, parseErr = parseDecimalOptional(tpStr, decimal.Zero, "TPPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.TP1Price, parseErr = parseDecimalOptional(tp1Str, decimal.Zero, "TP1Price", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		p.IsTP1Hit = (tpHitInt == 1)
-		p.ATRAtEntry, _ = decimal.NewFromString(atrStr)
-		p.LastMarkPrice, _ = decimal.NewFromString(markStr)
+		if p.ATRAtEntry, parseErr = parseDecimalOptional(atrStr, decimal.Zero, "ATRAtEntry", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.LastMarkPrice, parseErr = parseDecimalOptional(markStr, p.EntryPrice, "LastMarkPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		p.IsBreakEvenMoved = (beInt == 1)
-		p.PeakPrice, _ = decimal.NewFromString(peakStr)
+		if p.PeakPrice, parseErr = parseDecimalOptional(peakStr, p.EntryPrice, "PeakPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		if p.PeakPrice.IsZero() {
 			p.PeakPrice = p.EntryPrice
 		}
@@ -502,6 +528,28 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 		return nil, fmt.Errorf("storage: error iterating dry-run positions: %w", err)
 	}
 	return results, nil
+}
+
+func parseDecimalRequired(valStr, fieldName, sym string) (decimal.Decimal, error) {
+	if strings.TrimSpace(valStr) == "" {
+		return decimal.Zero, fmt.Errorf("storage: empty required decimal %s for %s", fieldName, sym)
+	}
+	d, err := decimal.NewFromString(valStr)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("storage: corrupt decimal %s '%s' for %s: %w", fieldName, valStr, sym, err)
+	}
+	return d, nil
+}
+
+func parseDecimalOptional(valStr string, fallback decimal.Decimal, fieldName, sym string) (decimal.Decimal, error) {
+	if strings.TrimSpace(valStr) == "" {
+		return fallback, nil
+	}
+	d, err := decimal.NewFromString(valStr)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("storage: corrupt optional decimal %s '%s' for %s: %w", fieldName, valStr, sym, err)
+	}
+	return d, nil
 }
 
 // UpdateTradeAutopsy menyimpan hasil analisis AI post-trade autopsy ke tabel trade_ledger
@@ -549,7 +597,7 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 	if err != nil {
 		return nil, fmt.Errorf("storage: failed to query recent exits: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	exits := make(map[string]RecentExitRecord)
 	for rows.Next() {
@@ -721,22 +769,41 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 		if err != nil {
 			return nil, fmt.Errorf("storage: failed to scan live position: %w", err)
 		}
-		p.Qty, _ = decimal.NewFromString(qtyStr)
-		p.InitialQty, _ = decimal.NewFromString(initQtyStr)
+		var parseErr error
+		if p.Qty, parseErr = parseDecimalRequired(qtyStr, "Qty", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.InitialQty, parseErr = parseDecimalOptional(initQtyStr, p.Qty, "InitialQty", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		if p.InitialQty.IsZero() {
 			p.InitialQty = p.Qty
 		}
-		p.EntryPrice, _ = decimal.NewFromString(entryStr)
-		p.SLPrice, _ = decimal.NewFromString(slStr)
-		p.InitialSLPrice, _ = decimal.NewFromString(initSLStr)
+		if p.EntryPrice, parseErr = parseDecimalRequired(entryStr, "EntryPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.SLPrice, parseErr = parseDecimalOptional(slStr, decimal.Zero, "SLPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.InitialSLPrice, parseErr = parseDecimalOptional(initSLStr, p.SLPrice, "InitialSLPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		if p.InitialSLPrice.IsZero() {
 			p.InitialSLPrice = p.SLPrice
 		}
-		p.TPPrice, _ = decimal.NewFromString(tpStr)
-		p.TP1Price, _ = decimal.NewFromString(tp1Str)
+		if p.TPPrice, parseErr = parseDecimalOptional(tpStr, decimal.Zero, "TPPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.TP1Price, parseErr = parseDecimalOptional(tp1Str, decimal.Zero, "TP1Price", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		p.IsTP1Hit = (tpHitInt == 1)
-		p.ATRAtEntry, _ = decimal.NewFromString(atrStr)
-		p.PeakPrice, _ = decimal.NewFromString(peakStr)
+		if p.ATRAtEntry, parseErr = parseDecimalOptional(atrStr, decimal.Zero, "ATRAtEntry", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
+		if p.PeakPrice, parseErr = parseDecimalOptional(peakStr, p.EntryPrice, "PeakPrice", p.Symbol); parseErr != nil {
+			return nil, parseErr
+		}
 		if p.PeakPrice.IsZero() {
 			p.PeakPrice = p.EntryPrice
 		}
@@ -757,6 +824,3 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 	}
 	return results, nil
 }
-
-
-

@@ -34,4 +34,3 @@ type ExecutionBroker interface {
 	CheckTimeouts(now time.Time)
 	GetActivePositions() []ActivePositionDTO
 }
-

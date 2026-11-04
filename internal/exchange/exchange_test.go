@@ -127,6 +127,21 @@ func TestMarketDataEndpoints(t *testing.T) {
 					"reduceOnly": true
 				}
 			]`))
+		case "/fapi/v1/openAlgoOrders":
+			_, _ = w.Write([]byte(`[
+				{
+					"algoId": 881122,
+					"clientAlgoId": "ALGO_SL_BTCUSDT_2",
+					"algoType": "CONDITIONAL",
+					"orderType": "STOP_MARKET",
+					"symbol": "BTCUSDT",
+					"side": "SELL",
+					"quantity": "0.100",
+					"algoStatus": "NEW",
+					"triggerPrice": "81000.0",
+					"reduceOnly": true
+				}
+			]`))
 		case "/fapi/v2/account":
 			_, _ = w.Write([]byte(`{
 				"feeTier": 0,
@@ -230,6 +245,12 @@ func TestMarketDataEndpoints(t *testing.T) {
 	openOrds, err := client.GetOpenOrders(ctx, "BTCUSDT")
 	if err != nil || len(openOrds) != 1 || openOrds[0].OrderID != 991122 || openOrds[0].ClientOrderID != "ALGO_SL_BTCUSDT_1" {
 		t.Fatalf("get open orders failed: %v, orders: %+v", err, openOrds)
+	}
+
+	// 9b. GetOpenAlgoOrders
+	openAlgoOrds, err := client.GetOpenAlgoOrders(ctx, "BTCUSDT")
+	if err != nil || len(openAlgoOrds) != 1 || openAlgoOrds[0].AlgoID != 881122 || openAlgoOrds[0].TriggerPrice != "81000.0" {
+		t.Fatalf("get open algo orders failed: %v, orders: %+v", err, openAlgoOrds)
 	}
 
 	// 10. FetchAccountBalance (P0-2 Anti-Staleness)

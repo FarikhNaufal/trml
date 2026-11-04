@@ -19,13 +19,16 @@ import (
 type mockBroker struct{}
 
 func (m *mockBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) { return true, nil }
-func (m *mockBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, markPrice, tradePrice, tradeQty float64, isBuyerMaker bool, now time.Time) {}
-func (m *mockBroker) GetEffectiveTotalEquityUSDT() decimal.Decimal { return decimal.NewFromFloat(1234.56) }
-func (m *mockBroker) GetAvailableBalanceUSDT() decimal.Decimal { return decimal.NewFromFloat(987.65) }
-func (m *mockBroker) GetDailyTotalDrawdownPct() float64 { return -0.015 }
-func (m *mockBroker) GetActiveSlotCount() int { return 1 }
+func (m *mockBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, markPrice, tradePrice, tradeQty float64, isBuyerMaker bool, now time.Time) {
+}
+func (m *mockBroker) GetEffectiveTotalEquityUSDT() decimal.Decimal {
+	return decimal.NewFromFloat(1234.56)
+}
+func (m *mockBroker) GetAvailableBalanceUSDT() decimal.Decimal    { return decimal.NewFromFloat(987.65) }
+func (m *mockBroker) GetDailyTotalDrawdownPct() float64           { return -0.015 }
+func (m *mockBroker) GetActiveSlotCount() int                     { return 1 }
 func (m *mockBroker) HasActiveOrderOrPosition(symbol string) bool { return symbol == "BTCUSDT" }
-func (m *mockBroker) CheckTimeouts(now time.Time) {}
+func (m *mockBroker) CheckTimeouts(now time.Time)                 {}
 func (m *mockBroker) GetActivePositions() []broker.ActivePositionDTO {
 	return []broker.ActivePositionDTO{
 		{
@@ -169,7 +172,6 @@ func TestServerEndpoints(t *testing.T) {
 	if !contains(rec.Body.String(), "TR<span>M</span>L FUTURES") {
 		t.Errorf("index.html missing brand header")
 	}
-
 
 	// 2. Test Static CSS
 	req = httptest.NewRequest("GET", "/style.css", nil)
@@ -536,4 +538,3 @@ func TestGetOverallStats_Categorization(t *testing.T) {
 		t.Errorf("expected BlendedRR ~0.53, got %f", stats.BlendedRR)
 	}
 }
-

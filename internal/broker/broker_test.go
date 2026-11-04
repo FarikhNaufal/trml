@@ -1366,8 +1366,8 @@ func TestDryRunBroker_PartialTakeProfit_ScaleOut(t *testing.T) {
 	if !pos.IsTP1Hit {
 		t.Errorf("expected pos.IsTP1Hit to be true")
 	}
-	// SL harus sudah dipindahkan ke Break-Even: 1.00 * (1 + 0.0011 fee buffer) = 1.0011
-	expectedBESL := decimal.NewFromFloat(1.0011)
+	// SL harus sudah dipindahkan ke Break-Even: EntryPrice * (1 + 0.0011 fee buffer)
+	expectedBESL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0011))
 	if !pos.CurrentSLPrice.Equal(expectedBESL) {
 		t.Errorf("expected BE SL %s, got %s", expectedBESL, pos.CurrentSLPrice)
 	}
@@ -1765,11 +1765,11 @@ func TestLiveBrokerPartialTP1AndBE(t *testing.T) {
 	var marketCloseQty decimal.Decimal
 	var marketCloseSide model.Side
 	var marketCloseCount int32
-	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, error) {
+	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, decimal.Decimal, decimal.Decimal, error) {
 		atomic.AddInt32(&marketCloseCount, 1)
 		marketCloseSide = side
 		marketCloseQty = qty
-		return 777001, nil
+		return 777001, decimal.Zero, qty, nil
 	}
 
 	var slMu sync.Mutex
@@ -1945,7 +1945,7 @@ func TestLiveBrokerTickSizeQuantization(t *testing.T) {
 		CreatedAt:     now,
 	}
 
-	b.ReserveEntryIntent(intent)
+	_, _ = b.ReserveEntryIntent(intent)
 	b.HandleUserDataOrderUpdate("TEST_TICK_QUANT", 112233, "DOGEUSDT", model.StatusFilled, decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.123456), decimal.Zero)
 
 	time.Sleep(50 * time.Millisecond)
@@ -2012,7 +2012,7 @@ func TestLiveBrokerTrailingThrottling(t *testing.T) {
 		ATRAtEntry:    decimal.NewFromFloat(5.0),
 		CreatedAt:     now,
 	}
-	b.ReserveEntryIntent(intent)
+	_, _ = b.ReserveEntryIntent(intent)
 	b.HandleUserDataOrderUpdate("TEST_THROTTLE", 445566, "SOLUSDT", model.StatusFilled, decimal.NewFromFloat(10.0), decimal.NewFromFloat(100.0), decimal.Zero)
 	time.Sleep(50 * time.Millisecond)
 
@@ -2071,7 +2071,7 @@ func TestLiveBrokerInitialSLPricePreservation(t *testing.T) {
 		ATRAtEntry:    decimal.NewFromFloat(40.0),
 		CreatedAt:     now,
 	}
-	b.ReserveEntryIntent(intent)
+	_, _ = b.ReserveEntryIntent(intent)
 	b.HandleUserDataOrderUpdate("TEST_INITIAL_SL_PRESERVE", 778899, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(2000.0), decimal.Zero)
 	time.Sleep(50 * time.Millisecond)
 
@@ -2171,7 +2171,7 @@ func TestLiveBrokerDynamicSL_RetryOnFailure(t *testing.T) {
 		ATRAtEntry:    decimal.NewFromFloat(5.0),
 		CreatedAt:     now,
 	}
-	b.ReserveEntryIntent(intent)
+	_, _ = b.ReserveEntryIntent(intent)
 	b.HandleUserDataOrderUpdate("TEST_RETRY_FAIL", 123456, "SOLUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(100.0), decimal.Zero)
 	time.Sleep(50 * time.Millisecond)
 
@@ -2305,8 +2305,8 @@ func TestDryRunBroker_PartialTP1_CushionedBE(t *testing.T) {
 	if !pos.IsTP1Hit {
 		t.Errorf("expected IsTP1Hit true")
 	}
-	// Expected Cushioned SL = Entry (100.0) - Cushion (2.0 * 0.35 = 0.70) = 99.30
-	expectedSL := decimal.NewFromFloat(99.30)
+	// Expected Cushioned SL = EntryPrice - Cushion (2.0 * 0.35 = 0.70)
+	expectedSL := pos.EntryPrice.Sub(decimal.NewFromFloat(0.70))
 	if !pos.CurrentSLPrice.Equal(expectedSL) {
 		t.Errorf("expected Cushioned SL %s, got %s", expectedSL, pos.CurrentSLPrice)
 	}
@@ -2341,8 +2341,8 @@ func TestLiveBrokerPartialTP1AndCushionedBE(t *testing.T) {
 		return filter, true
 	}
 
-	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, error) {
-		return 777002, nil
+	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, decimal.Decimal, decimal.Decimal, error) {
+		return 777002, decimal.Zero, qty, nil
 	}
 
 	var slMu sync.Mutex
@@ -2497,13 +2497,210 @@ func TestLiveBrokerAccountAntiStalenessAndRefresh(t *testing.T) {
 	}
 }
 
+func TestDryRunPartialLimitFill_TP1_ThenMoreFills(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:              3,
+		MaxDailyDrawdownPct:   -0.05,
+		AccountLeverage:       5.0,
+		BreakEvenTriggerATR:   1.0,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		PartialTP1ATRMult:     0.60,
+		RunnerBECushionATR:    0.35,
+		MinBreakEvenOffsetPct: 0.0010,
+		MakerFeeRate:          0.0002,
+		TakerFeeRate:          0.0005,
+		SlippageRate:          0.0001,
+		EntryOrderType:        "LIMIT",
+	}
+	broker := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
+	defer broker.Close()
 
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "TEST-CHUNKED-LIMIT",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(10.0),
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(120.0),
+		TP1Price:      decimal.NewFromFloat(105.0),
+		ATRAtEntry:    decimal.NewFromFloat(5.0),
+		CreatedAt:     now,
+	}
 
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("expected submit limit to succeed, got %v, %v", ok, err)
+	}
 
+	// Chunk 1: terisi 5 units (50%)
+	broker.OnRealtimeTick("SOLUSDT", 99.9, 100.1, 100.0, 100.0, 5.0, true, now)
 
+	broker.Mu.Lock()
+	pos, exists := broker.OpenPositions["SOLUSDT"]
+	if !exists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected position to exist after chunk 1")
+	}
+	if !pos.Qty.Equal(decimal.NewFromFloat(5.0)) || !pos.InitialQty.Equal(decimal.NewFromFloat(5.0)) {
+		broker.Mu.Unlock()
+		t.Fatalf("expected Qty 5 and InitialQty 5 after chunk 1, got Qty=%s InitialQty=%s", pos.Qty, pos.InitialQty)
+	}
+	broker.Mu.Unlock()
 
+	// Harga naik menyentuh TP1 (105.0) -> close 50% dari 5 unit = 2.5 unit, dan sisa limit order dibatalkan
+	broker.OnRealtimeTick("SOLUSDT", 105.0, 105.2, 105.0, 105.0, 1.0, false, now.Add(time.Second))
 
+	broker.Mu.Lock()
+	pos = broker.OpenPositions["SOLUSDT"]
+	if !pos.IsTP1Hit || !pos.Qty.Equal(decimal.NewFromFloat(2.5)) {
+		broker.Mu.Unlock()
+		t.Fatalf("expected TP1 hit and Qty 2.5, got IsTP1Hit=%v Qty=%s", pos.IsTP1Hit, pos.Qty)
+	}
+	if _, pendingExists := broker.PendingOrders["SOLUSDT"]; pendingExists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected remaining pending order to be cancelled upon TP1 hit")
+	}
+	broker.Mu.Unlock()
 
+	// Chunk 2: Percobaan fill limit order setelah TP1 harus DITOLAK
+	broker.OnRealtimeTick("SOLUSDT", 99.9, 100.1, 100.0, 100.0, 2.0, true, now.Add(2*time.Second))
 
+	broker.Mu.Lock()
+	pos = broker.OpenPositions["SOLUSDT"]
+	// Qty harus tetap 2.5 (runner murni), sisa order tidak boleh menambah ke runner
+	expectedQty := decimal.NewFromFloat(2.5)
+	if !pos.Qty.Equal(expectedQty) {
+		broker.Mu.Unlock()
+		t.Fatalf("BUG: Qty changed after TP1! expected %s, got %s", expectedQty, pos.Qty)
+	}
+	broker.Mu.Unlock()
+}
 
+func TestBrokerGracefulShutdownDrainsEvents(t *testing.T) {
+	// 1. DryRunBroker: Enqueue many events, close broker, verify all events are dispatched and processed
+	db := NewDryRunBroker(decimal.NewFromInt(1000), DryRunConfig{})
+	var drySavedCount int32
+	db.OnPositionSavedFn = func(pos VirtualOpenPosition) {
+		atomic.AddInt32(&drySavedCount, 1)
+	}
 
+	for i := 0; i < 50; i++ {
+		db.enqueuePositionEvent(PositionEvent{
+			Type: PositionEventSave,
+			Pos:  VirtualOpenPosition{Symbol: fmt.Sprintf("COIN%dUSDT", i)},
+		})
+	}
+	db.Close()
+
+	if atomic.LoadInt32(&drySavedCount) != 50 {
+		t.Fatalf("expected 50 saved events after dryrun Close(), got %d", atomic.LoadInt32(&drySavedCount))
+	}
+
+	// 2. BinanceLiveBroker: Enqueue many events, close broker, verify all events are dispatched and processed
+	lb := NewBinanceLiveBroker(LiveBrokerConfig{})
+	var liveSavedCount int32
+	lb.OnPositionSavedFn = func(pos LiveOpenPosition) {
+		atomic.AddInt32(&liveSavedCount, 1)
+	}
+
+	for i := 0; i < 50; i++ {
+		lb.enqueuePositionEvent(LivePositionEvent{
+			Type: LivePositionEventSave,
+			Pos:  LiveOpenPosition{Symbol: fmt.Sprintf("COIN%dUSDT", i)},
+		})
+	}
+	lb.Close()
+
+	if atomic.LoadInt32(&liveSavedCount) != 50 {
+		t.Fatalf("expected 50 saved events after live Close(), got %d", atomic.LoadInt32(&liveSavedCount))
+	}
+}
+
+func TestLiveBrokerRestorePositionSLVerificationAndRepair(t *testing.T) {
+	broker := NewBinanceLiveBroker(LiveBrokerConfig{})
+	defer broker.Close()
+
+	// Simulasi VerifyAlgoOrderFn: kembalikan slAlive = false (SL sudah cancel/expired di exchange)
+	broker.VerifyAlgoOrderFn = func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (bool, bool, error) {
+		return false, false, nil // Keduanya mati di bursa
+	}
+
+	var slRepairedID int64
+	broker.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if orderType == "STOP_MARKET" {
+			slRepairedID = 999111
+			return 999111, nil
+		}
+		return 888222, nil
+	}
+
+	now := time.Now().UTC()
+	broker.RestoreOpenPosition(&LiveOpenPosition{
+		Symbol:         "BTCUSDT",
+		Side:           model.SideLong,
+		Qty:            decimal.NewFromFloat(1.0),
+		EntryPrice:     decimal.NewFromFloat(60000.0),
+		SLOrderID:      12345, // ID di DB, tapi sudah mati di bursa
+		SLPrice:        decimal.NewFromFloat(59000.0),
+		InitialSLPrice: decimal.NewFromFloat(59000.0),
+		TPPrice:        decimal.NewFromFloat(62000.0),
+		OpenTime:       now.Add(-10 * time.Minute),
+		UpdatedAt:      now,
+	})
+
+	broker.Mu.Lock()
+	prot, exists := broker.Protections["BTCUSDT"]
+	if !exists {
+		broker.Mu.Unlock()
+		t.Fatalf("expected protection record to exist")
+	}
+	// Karena VerifyAlgoOrderFn mengembalikan false, SLStatus harus ProtectionFailed (bukan ProtectionAcked!)
+	if prot.SLStatus != model.ProtectionFailed || prot.SLOrderID != 0 {
+		broker.Mu.Unlock()
+		t.Fatalf("expected SLStatus to be ProtectionFailed with SLOrderID=0, got status=%v id=%d", prot.SLStatus, prot.SLOrderID)
+	}
+	broker.Mu.Unlock()
+
+	// Jalankan RepairFailedProtections: harus memasang Stop Loss baru di Binance
+	broker.RepairFailedProtections(now)
+
+	broker.Mu.Lock()
+	prot = broker.Protections["BTCUSDT"]
+	if prot.SLStatus != model.ProtectionAcked || prot.SLOrderID != 999111 || slRepairedID != 999111 {
+		broker.Mu.Unlock()
+		t.Fatalf("expected SL to be repaired to ProtectionAcked with new ID 999111, got status=%v id=%d", prot.SLStatus, prot.SLOrderID)
+	}
+	broker.Mu.Unlock()
+}
+
+func TestLiveBrokerAdoptPendingEntry(t *testing.T) {
+	broker := NewBinanceLiveBroker(LiveBrokerConfig{})
+	defer broker.Close()
+
+	rec := &model.LiveOrderRecord{
+		ClientOrderID:   "ENTRY_RECONCILED_1",
+		ExchangeOrderID: 777666,
+		Symbol:          "ETHUSDT",
+		Side:            model.SideLong,
+		TargetQty:       decimal.NewFromFloat(2.5),
+		LimitPrice:      decimal.NewFromFloat(3000.0),
+		Status:          model.StatusNew,
+	}
+
+	broker.AdoptPendingEntryRecord(rec)
+
+	broker.Mu.Lock()
+	adoptedByClient, hasClient := broker.OrdersByClient["ENTRY_RECONCILED_1"]
+	adoptedByExchange, hasExchange := broker.OrdersByExchangeID[777666]
+	broker.Mu.Unlock()
+
+	if !hasClient || !hasExchange || adoptedByClient != rec || adoptedByExchange != rec {
+		t.Fatalf("failed to adopt pending entry order into broker records")
+	}
+	if !adoptedByClient.IsEntry {
+		t.Fatalf("expected adopted record to have IsEntry=true")
+	}
+}

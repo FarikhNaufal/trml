@@ -113,9 +113,12 @@ type DryRunBroker struct {
 	OnTradeClosedFn       func(rec TradeClosedRecord)
 	OnPositionSavedFn     func(pos VirtualOpenPosition)
 	OnPositionDeletedFn   func(clientOrderIDOrSymbol string)
+	GetExchangeFilterFn   func(symbol string) (model.ExchangeFilter, bool)
 
 	eventChan        chan PositionEvent
-	eventStop        chan struct{}
+	eventWg          sync.WaitGroup
+	eventMu          sync.Mutex
+	isClosed         bool
 	lastPeriodicSync time.Time
 }
 
@@ -137,29 +140,22 @@ func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 }
 
 func (d *DryRunBroker) enqueuePositionEvent(evt PositionEvent) {
-	if d.eventChan == nil {
+	d.eventMu.Lock()
+	if d.isClosed || d.eventChan == nil {
+		d.eventMu.Unlock()
+		d.dispatchPositionEvent(evt)
 		return
 	}
-	select {
-	case d.eventChan <- evt:
-	default:
-		slog.Warn("dryrun: persistence event channel full, dropping event", "type", evt.Type)
-	}
+	d.eventChan <- evt
+	d.eventMu.Unlock()
 }
 
 func (d *DryRunBroker) startEventWorker() {
+	d.eventWg.Add(1)
 	go func() {
-		for {
-			select {
-			case <-d.eventStop:
-				for len(d.eventChan) > 0 {
-					evt := <-d.eventChan
-					d.dispatchPositionEvent(evt)
-				}
-				return
-			case evt := <-d.eventChan:
-				d.dispatchPositionEvent(evt)
-			}
+		defer d.eventWg.Done()
+		for evt := range d.eventChan {
+			d.dispatchPositionEvent(evt)
 		}
 	}()
 }
@@ -173,9 +169,18 @@ func (d *DryRunBroker) dispatchPositionEvent(evt PositionEvent) {
 }
 
 func (d *DryRunBroker) Close() {
-	if d.eventStop != nil {
-		close(d.eventStop)
+	d.eventMu.Lock()
+	if d.isClosed {
+		d.eventMu.Unlock()
+		return
 	}
+	d.isClosed = true
+	if d.eventChan != nil {
+		close(d.eventChan)
+	}
+	d.eventMu.Unlock()
+
+	d.eventWg.Wait()
 }
 
 func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBroker {
@@ -209,8 +214,7 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 		RealizedEquityUSDT: initialEquity,
 		PendingOrders:      make(map[string]*VirtualPendingOrder),
 		OpenPositions:      make(map[string]*VirtualOpenPosition),
-		eventChan:          make(chan PositionEvent, 256),
-		eventStop:          make(chan struct{}),
+		eventChan:          make(chan PositionEvent, 512),
 		lastPeriodicSync:   time.Now().UTC(),
 	}
 	broker.startEventWorker()
@@ -242,6 +246,20 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 
 	if strings.ToUpper(d.Cfg.EntryOrderType) == "MARKET" {
 		fillPrice := intent.LimitPrice
+		if d.Cfg.SlippageRate > 0 {
+			if intent.Side == model.SideLong {
+				fillPrice = fillPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
+			} else {
+				fillPrice = fillPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
+			}
+			if d.GetExchangeFilterFn != nil {
+				if f, ok := d.GetExchangeFilterFn(intent.Symbol); ok && f.TickSize.GreaterThan(decimal.Zero) {
+					if qPrice, err := model.QuantizePrice(fillPrice, f.TickSize, intent.Side == model.SideLong); err == nil {
+						fillPrice = qPrice
+					}
+				}
+			}
+		}
 		entryFee := fillPrice.Mul(intent.Qty).Mul(decimal.NewFromFloat(d.Cfg.TakerFeeRate))
 		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(entryFee)
 
@@ -396,6 +414,15 @@ func (d *DryRunBroker) OnRealtimeTick(
 				"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
 				"limitPrice", ord.Intent.LimitPrice, "timeout", d.Cfg.LimitOrderTimeout,
 				"filledQty", ord.FilledQty, "targetQty", ord.Intent.Qty)
+			if ord.FilledQty.GreaterThan(decimal.Zero) {
+				if pos, exists := d.OpenPositions[symbol]; exists {
+					pos.InitialQty = ord.FilledQty
+					d.enqueuePositionEvent(PositionEvent{
+						Type: PositionEventSave,
+						Pos:  *pos,
+					})
+				}
+			}
 			delete(d.PendingOrders, symbol)
 			return
 		}
@@ -423,7 +450,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 					d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(entryFee)
 
 					// Solusi P1-2: Segera sinkronisasikan partial fill ke OpenPositions
-					d.syncPartialFillToOpenPositionLocked(ord, now)
+					d.syncPartialFillToOpenPositionLocked(ord, fillChunk, entryFee, now)
 
 					slog.Info("dryrun: limit entry FILLED",
 						"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
@@ -551,8 +578,12 @@ func (d *DryRunBroker) OnRealtimeTick(
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-			// Tier 3: Trailing Stop untuk Runner (aktif setelah TP1 tercapai dan Peak >= Entry + trailActivateDist)
-			if d.Cfg.TrailingEnabled && pos.IsTP1Hit && pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(trailActivateDist) {
+			// Tier 3: Trailing Stop untuk Runner (aktif jika TP1 tercapai saat PartialTPEnabled, atau langsung jika PartialTP disabled)
+			canTrail := d.Cfg.TrailingEnabled && pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(trailActivateDist)
+			if d.Cfg.PartialTPEnabled {
+				canTrail = canTrail && pos.IsTP1Hit
+			}
+			if canTrail {
 				newSL := pos.PeakPrice.Sub(trailDist)
 				if newSL.GreaterThan(pos.CurrentSLPrice) {
 					pos.CurrentSLPrice = newSL
@@ -633,8 +664,12 @@ func (d *DryRunBroker) OnRealtimeTick(
 			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
 			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
 
-			// Tier 3: Trailing Stop untuk Runner (aktif setelah TP1 tercapai dan Peak <= Entry - trailActivateDist)
-			if d.Cfg.TrailingEnabled && pos.IsTP1Hit && pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(trailActivateDist) {
+			// Tier 3: Trailing Stop untuk Runner (aktif jika TP1 tercapai saat PartialTPEnabled, atau langsung jika PartialTP disabled)
+			canTrail := d.Cfg.TrailingEnabled && pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(trailActivateDist)
+			if d.Cfg.PartialTPEnabled {
+				canTrail = canTrail && pos.IsTP1Hit
+			}
+			if canTrail {
 				newSL := pos.PeakPrice.Add(trailDist)
 				if newSL.LessThan(pos.CurrentSLPrice) {
 					pos.CurrentSLPrice = newSL
@@ -680,21 +715,25 @@ func (d *DryRunBroker) OnRealtimeTick(
 	}
 }
 
-func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOrder, now time.Time) {
-	if ord.FilledQty.LessThanOrEqual(decimal.Zero) {
+func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOrder, fillChunk, chunkFee decimal.Decimal, now time.Time) {
+	if fillChunk.LessThanOrEqual(decimal.Zero) {
 		return
 	}
 	pos, exists := d.OpenPositions[ord.Intent.Symbol]
-	entryFee := ord.Intent.LimitPrice.Mul(ord.FilledQty).Mul(decimal.NewFromFloat(d.Cfg.MakerFeeRate))
+	if exists && pos.IsTP1Hit {
+		slog.Warn("dryrun: rejecting entry fill because position already reached TP1 milestone", "symbol", ord.Intent.Symbol)
+		delete(d.PendingOrders, ord.Intent.Symbol)
+		return
+	}
 	if !exists {
 		pos = &VirtualOpenPosition{
 			ClientOrderID:    ord.Intent.ClientOrderID,
 			Symbol:           ord.Intent.Symbol,
 			Side:             ord.Intent.Side,
-			Qty:              ord.FilledQty,
-			InitialQty:       ord.Intent.Qty,
+			Qty:              fillChunk,
+			InitialQty:       fillChunk,
 			EntryPrice:       ord.Intent.LimitPrice,
-			EntryFee:         entryFee,
+			EntryFee:         chunkFee,
 			CurrentSLPrice:   ord.Intent.SLPrice,
 			InitialSLPrice:   ord.Intent.SLPrice,
 			TPPrice:          ord.Intent.TPPrice,
@@ -709,8 +748,11 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 		}
 		d.OpenPositions[ord.Intent.Symbol] = pos
 	} else {
-		pos.Qty = ord.FilledQty
-		pos.EntryFee = entryFee
+		// Posisi sudah ada (bisa jadi sebagian sudah di-close oleh TP1).
+		// Tambahkan kuantitas chunk baru ke Qty & InitialQty secara inkremental tanpa menimpa status runner TP1.
+		pos.Qty = pos.Qty.Add(fillChunk)
+		pos.InitialQty = pos.InitialQty.Add(fillChunk)
+		pos.EntryFee = pos.EntryFee.Add(chunkFee)
 	}
 	d.enqueuePositionEvent(PositionEvent{
 		Type: PositionEventSave,
@@ -719,19 +761,48 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 }
 
 func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, beOffsetRate decimal.Decimal) {
+	// Batalkan antrean pending entry yang masih tersisa agar tidak terisi setelah TP1 milestone tercapai
+	if pending, exists := d.PendingOrders[pos.Symbol]; exists {
+		slog.Info("dryrun: canceling remaining pending entry order upon TP1 hit", "symbol", pos.Symbol, "clientOrderID", pending.Intent.ClientOrderID)
+		delete(d.PendingOrders, pos.Symbol)
+	}
+
 	ratio := d.Cfg.PartialTP1Ratio
 	if ratio <= 0.05 || ratio >= 0.95 {
 		ratio = 0.50
 	}
-	closeQty := pos.Qty.Mul(decimal.NewFromFloat(ratio))
-	minNotional := decimal.NewFromFloat(5.0)
-	remQty := pos.Qty.Sub(closeQty)
+	initialQty := pos.InitialQty
+	if initialQty.IsZero() {
+		initialQty = pos.Qty
+	}
+	closeQty := initialQty.Mul(decimal.NewFromFloat(ratio))
+	if d.GetExchangeFilterFn != nil {
+		if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok && f.StepSize.GreaterThan(decimal.Zero) {
+			if qQty, err := model.QuantizeQtyFloor(closeQty, f.StepSize); err == nil {
+				closeQty = qQty
+			}
+		}
+	}
 
-	// [H-04] Validasi MinNotional (5.0 USDT) agar paritas dengan batas minimum eksekusi Binance
-	splitPossible := closeQty.GreaterThan(decimal.Zero) &&
-		closeQty.LessThan(pos.Qty) &&
-		closeQty.Mul(exitPrice).GreaterThanOrEqual(minNotional) &&
-		remQty.Mul(exitPrice).GreaterThanOrEqual(minNotional)
+	// [H-04] Validasi MinNotional dan MinQty agar paritas dengan batas eksekusi bursa
+	splitPossible := closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(pos.Qty)
+	if splitPossible {
+		minNotional := decimal.NewFromFloat(5.0)
+		if d.GetExchangeFilterFn != nil {
+			if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok {
+				if f.MinNotional.GreaterThan(decimal.Zero) {
+					minNotional = f.MinNotional
+				}
+				if f.MinQty.GreaterThan(decimal.Zero) && (closeQty.LessThan(f.MinQty) || pos.Qty.Sub(closeQty).LessThan(f.MinQty)) {
+					splitPossible = false
+				}
+			}
+		}
+		remQty := pos.Qty.Sub(closeQty)
+		if closeQty.Mul(exitPrice).LessThan(minNotional) || remQty.Mul(exitPrice).LessThan(minNotional) {
+			splitPossible = false
+		}
+	}
 
 	if !splitPossible {
 		// Ukuran posisi terlalu kecil untuk dipecah (atau MinNotional < 5 USDT).
@@ -883,7 +954,6 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	// Saldo akun saat entry sudah didebet pos.EntryFee, maka penambahan saat exit adalah: grossPnL - exitFee
 	d.RealizedEquityUSDT = d.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
 
-
 	now := time.Now().UTC()
 	clientOrderID := pos.ClientOrderID
 	if clientOrderID == "" {
@@ -1034,6 +1104,15 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 				slog.Warn("dryrun: pending limit order timed out via CheckTimeouts",
 					"symbol", sym, "clientOrderID", ord.Intent.ClientOrderID,
 					"limitPrice", ord.Intent.LimitPrice, "timeout", d.Cfg.LimitOrderTimeout)
+				if ord.FilledQty.GreaterThan(decimal.Zero) {
+					if pos, exists := d.OpenPositions[sym]; exists {
+						pos.InitialQty = ord.FilledQty
+						d.enqueuePositionEvent(PositionEvent{
+							Type: PositionEventSave,
+							Pos:  *pos,
+						})
+					}
+				}
 				delete(d.PendingOrders, sym)
 			}
 		}
@@ -1117,5 +1196,3 @@ func (d *DryRunBroker) GetActivePositions() []ActivePositionDTO {
 	})
 	return result
 }
-
-

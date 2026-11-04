@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -197,5 +198,52 @@ func TestScannerVWAPProximityFilter(t *testing.T) {
 
 	if len(selected) != 0 {
 		t.Fatalf("expected PUMPUSDT to be filtered out due to VWAP distance > 2.50 ATR, got %v", selected)
+	}
+}
+
+func TestScannerNaNAndInfRejection(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := ScannerConfig{
+		MinVolume24hUSDT: 50_000_000,
+		MaxSpreadPct:     0.05,
+		MinRVOL:          1.0,
+		RVOLLookback:     20,
+		MinNATRPct:       0.20,
+		MaxNATRPct:       5.0,
+		ATRPeriod:        14,
+		EMAPeriod:        50,
+		MaxWatchedCoins:  10,
+		BootstrapCount:   100,
+		DeltaWindow:      50,
+	}
+
+	filters := map[string]model.ExchangeFilter{
+		"NANUSDT": {
+			TickSize: decimal.NewFromFloat(0.01),
+			StepSize: decimal.NewFromFloat(1.0),
+		},
+	}
+
+	// 1. NaN Volume
+	volMapNaN := map[string]float64{"NANUSDT": math.NaN()}
+	bookMapValid := map[string]model.BookQuote{"NANUSDT": {BestBid: 100.0, BestAsk: 100.02}}
+	selected := RunBulkMarketScanner(cfg, make(map[string]*model.SymbolState), filters, volMapNaN, bookMapValid, nil, now)
+	if len(selected) != 0 {
+		t.Fatalf("expected NaN volume to be rejected, got %v", selected)
+	}
+
+	// 2. NaN BestBid
+	volMapValid := map[string]float64{"NANUSDT": 100_000_000}
+	bookMapNaNBid := map[string]model.BookQuote{"NANUSDT": {BestBid: math.NaN(), BestAsk: 100.02}}
+	selected = RunBulkMarketScanner(cfg, make(map[string]*model.SymbolState), filters, volMapValid, bookMapNaNBid, nil, now)
+	if len(selected) != 0 {
+		t.Fatalf("expected NaN BestBid to be rejected, got %v", selected)
+	}
+
+	// 3. Inf BestAsk
+	bookMapInfAsk := map[string]model.BookQuote{"NANUSDT": {BestBid: 100.0, BestAsk: math.Inf(1)}}
+	selected = RunBulkMarketScanner(cfg, make(map[string]*model.SymbolState), filters, volMapValid, bookMapInfAsk, nil, now)
+	if len(selected) != 0 {
+		t.Fatalf("expected Inf BestAsk to be rejected, got %v", selected)
 	}
 }

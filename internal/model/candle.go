@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -17,6 +18,10 @@ type Candle struct {
 	TakerBuyQuoteUSDT float64 // Kline index [10] -> Bar Delta
 }
 
+func isInvalidFloat(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0)
+}
+
 // ValidateAndFilterCandles memeriksa urutan strictly-monotonic, kline closed, dan harga valid (Solusi P1-5)
 func ValidateAndFilterCandles(raw []Candle, serverTime time.Time) ([]Candle, error) {
 	var valid []Candle
@@ -24,13 +29,19 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time) ([]Candle, err
 		if !c.CloseTime.Before(serverTime) && !c.CloseTime.Equal(serverTime) {
 			continue // Lewati candle aktif yang belum tertutup
 		}
+		if isInvalidFloat(c.Open) || isInvalidFloat(c.High) || isInvalidFloat(c.Low) || isInvalidFloat(c.Close) {
+			return nil, fmt.Errorf("candle index %d has NaN/Inf price values", i)
+		}
+		if isInvalidFloat(c.VolumeBase) || isInvalidFloat(c.QuoteVolumeUSDT) || isInvalidFloat(c.TakerBuyQuoteUSDT) {
+			return nil, fmt.Errorf("candle index %d has NaN/Inf volume values", i)
+		}
 		if c.Open <= 0 || c.High <= 0 || c.Low <= 0 || c.Close <= 0 || c.Low > c.High {
 			return nil, fmt.Errorf("candle index %d has invalid price values", i)
 		}
 		if c.High < c.Open || c.High < c.Close || c.Low > c.Open || c.Low > c.Close {
 			return nil, fmt.Errorf("candle index %d violates OHLC bounds (High must >= Open,Close; Low must <= Open,Close)", i)
 		}
-		if c.VolumeBase < 0 || c.QuoteVolumeUSDT < 0 {
+		if c.VolumeBase < 0 || c.QuoteVolumeUSDT < 0 || c.TakerBuyQuoteUSDT < 0 {
 			return nil, fmt.Errorf("candle index %d has negative volume", i)
 		}
 		if len(valid) > 0 {

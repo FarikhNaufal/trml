@@ -162,113 +162,95 @@ func OpenDB(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to initialize sqlite schema: %w", err)
 	}
 
-	// Migrasi otomatis kolom signal_audit_log jika database lama belum memilikinya
-	var colCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'reject_sub_reason';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN reject_sub_reason TEXT NOT NULL DEFAULT '';`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'spread_pct';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN spread_pct REAL NOT NULL DEFAULT 0.0;`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'rvol';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN rvol REAL NOT NULL DEFAULT 0.0;`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'impulse_atr_mult';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN impulse_atr_mult REAL NOT NULL DEFAULT 0.0;`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'limit_price';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN limit_price REAL NOT NULL DEFAULT 0.0;`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'sl_price';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN sl_price REAL NOT NULL DEFAULT 0.0;`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('signal_audit_log') WHERE name = 'tp_price';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE signal_audit_log ADD COLUMN tp_price REAL NOT NULL DEFAULT 0.0;`)
+	ensureColumn := func(table, column, colDef string) error {
+		var count int
+		query := fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name = '%s';", table, column)
+		if err := conn.QueryRowContext(ctx, query).Scan(&count); err != nil {
+			return fmt.Errorf("check column %s.%s: %w", table, column, err)
+		}
+		if count == 0 {
+			alterQuery := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", table, column, colDef)
+			if _, err := conn.ExecContext(ctx, alterQuery); err != nil {
+				return fmt.Errorf("add column %s.%s: %w", table, column, err)
+			}
+		}
+		return nil
 	}
 
-	// Migrasi otomatis kolom signal_audit_id di trade_ledger jika belum ada
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('trade_ledger') WHERE name = 'signal_audit_id';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE trade_ledger ADD COLUMN signal_audit_id INTEGER NOT NULL DEFAULT 0;`)
+	// Migrasi otomatis kolom signal_audit_log
+	auditCols := []struct{ col, def string }{
+		{"reject_sub_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"spread_pct", "REAL NOT NULL DEFAULT 0.0"},
+		{"rvol", "REAL NOT NULL DEFAULT 0.0"},
+		{"impulse_atr_mult", "REAL NOT NULL DEFAULT 0.0"},
+		{"limit_price", "REAL NOT NULL DEFAULT 0.0"},
+		{"sl_price", "REAL NOT NULL DEFAULT 0.0"},
+		{"tp_price", "REAL NOT NULL DEFAULT 0.0"},
 	}
-	// Migrasi otomatis kolom ai_autopsy di trade_ledger jika belum ada
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('trade_ledger') WHERE name = 'ai_autopsy';`).Scan(&colCount)
-	if colCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE trade_ledger ADD COLUMN ai_autopsy TEXT NOT NULL DEFAULT '';`)
-	}
-
-	// Migrasi otomatis kolom protection_tier di dryrun_open_positions & live_open_positions
-	var tierCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'protection_tier';`).Scan(&tierCount)
-	if tierCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN protection_tier INTEGER NOT NULL DEFAULT 0;`)
-	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'protection_tier';`).Scan(&tierCount)
-	if tierCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN protection_tier INTEGER NOT NULL DEFAULT 0;`)
+	for _, ac := range auditCols {
+		if err := ensureColumn("signal_audit_log", ac.col, ac.def); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to migrate signal_audit_log schema: %w", err)
+		}
 	}
 
-	// Migrasi otomatis kolom partial TP (initial_qty, tp1_price, is_tp1_hit)
-	var tp1Count int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'initial_qty';`).Scan(&tp1Count)
-	if tp1Count == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN initial_qty TEXT NOT NULL DEFAULT '';`)
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN tp1_price TEXT NOT NULL DEFAULT '';`)
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN is_tp1_hit INTEGER NOT NULL DEFAULT 0;`)
+	// Migrasi otomatis kolom trade_ledger
+	ledgerCols := []struct{ col, def string }{
+		{"signal_audit_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"ai_autopsy", "TEXT NOT NULL DEFAULT ''"},
 	}
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'initial_qty';`).Scan(&tp1Count)
-	if tp1Count == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN initial_qty TEXT NOT NULL DEFAULT '';`)
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN tp1_price TEXT NOT NULL DEFAULT '';`)
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN is_tp1_hit INTEGER NOT NULL DEFAULT 0;`)
+	for _, lc := range ledgerCols {
+		if err := ensureColumn("trade_ledger", lc.col, lc.def); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to migrate trade_ledger schema: %w", err)
+		}
 	}
 
-	// Migrasi otomatis kolom initial_sl_price di dryrun_open_positions dan live_open_positions
-	var initSLCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'initial_sl_price';`).Scan(&initSLCount)
-	if initSLCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN initial_sl_price TEXT NOT NULL DEFAULT '';`)
+	// Migrasi otomatis kolom posisi (dryrun dan live)
+	posTables := []string{"dryrun_open_positions", "live_open_positions"}
+	posCols := []struct{ col, def string }{
+		{"protection_tier", "INTEGER NOT NULL DEFAULT 0"},
+		{"initial_qty", "TEXT NOT NULL DEFAULT ''"},
+		{"tp1_price", "TEXT NOT NULL DEFAULT ''"},
+		{"is_tp1_hit", "INTEGER NOT NULL DEFAULT 0"},
+		{"initial_sl_price", "TEXT NOT NULL DEFAULT ''"},
+		{"peak_price", "TEXT NOT NULL DEFAULT ''"},
 	}
-	var initSLLiveCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'initial_sl_price';`).Scan(&initSLLiveCount)
-	if initSLLiveCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN initial_sl_price TEXT NOT NULL DEFAULT '';`)
-	}
-
-	// Migrasi otomatis kolom atr_at_entry di live_open_positions
-	var atrLiveCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'atr_at_entry';`).Scan(&atrLiveCount)
-	if atrLiveCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN atr_at_entry TEXT NOT NULL DEFAULT '';`)
-	}
-
-	// Migrasi otomatis kolom peak_price di dryrun_open_positions dan live_open_positions (C-04)
-	var peakDryCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('dryrun_open_positions') WHERE name = 'peak_price';`).Scan(&peakDryCount)
-	if peakDryCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE dryrun_open_positions ADD COLUMN peak_price TEXT NOT NULL DEFAULT '';`)
-	}
-	var peakLiveCount int
-	_ = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('live_open_positions') WHERE name = 'peak_price';`).Scan(&peakLiveCount)
-	if peakLiveCount == 0 {
-		_, _ = conn.ExecContext(ctx, `ALTER TABLE live_open_positions ADD COLUMN peak_price TEXT NOT NULL DEFAULT '';`)
+	for _, tbl := range posTables {
+		for _, pc := range posCols {
+			if err := ensureColumn(tbl, pc.col, pc.def); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("failed to migrate %s schema: %w", tbl, err)
+			}
+		}
 	}
 
-	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`)
-	_, _ = conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);`)
+	// Migrasi kolom khusus live_open_positions
+	if err := ensureColumn("live_open_positions", "atr_at_entry", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to migrate live_open_positions schema: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to create index idx_trade_ledger_signal_id: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_signal_audit_log_decision_id ON signal_audit_log (decision, id DESC);`); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to create index idx_signal_audit_log_decision_id: %w", err)
+	}
 
 	// Schema version check / user_version migration guard
 	var userVersion int
-	_ = conn.QueryRowContext(ctx, "PRAGMA user_version;").Scan(&userVersion)
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version;").Scan(&userVersion); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to query pragma user_version: %w", err)
+	}
 	if userVersion == 0 {
-		_, _ = conn.ExecContext(ctx, "PRAGMA user_version = 1;")
+		if _, err := conn.ExecContext(ctx, "PRAGMA user_version = 1;"); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to update pragma user_version: %w", err)
+		}
 	}
 
 	return &DB{conn: conn}, nil

@@ -38,24 +38,24 @@ type TradeItem struct {
 }
 
 type SignalItem struct {
-	ID                 int64   `json:"id"`
-	CandleOpenTimeUTC  string  `json:"candle_open_time_utc"`
-	Symbol             string  `json:"symbol"`
-	Side               string  `json:"side"`
-	ClosePrice         float64 `json:"close_price"`
-	EMA200             float64 `json:"ema200"`
-	SessionVWAP        float64 `json:"session_vwap"`
-	ATR14              float64 `json:"atr14"`
-	BarDeltaZScore     float64 `json:"bar_delta_zscore"`
-	OIDeltaPct         float64 `json:"oi_delta_pct"`
-	FundingRate        float64 `json:"funding_rate"`
-	SpreadPct          float64 `json:"spread_pct"`
-	RVOL               float64 `json:"rvol"`
-	ImpulseATRMult     float64 `json:"impulse_atr_mult"`
-	Decision           string  `json:"decision"`
-	RejectReasonCode   string  `json:"reject_reason_code"`
-	RejectSubReason    string  `json:"reject_sub_reason"`
-	CreatedAtUTC       string  `json:"created_at_utc"`
+	ID                int64   `json:"id"`
+	CandleOpenTimeUTC string  `json:"candle_open_time_utc"`
+	Symbol            string  `json:"symbol"`
+	Side              string  `json:"side"`
+	ClosePrice        float64 `json:"close_price"`
+	EMA200            float64 `json:"ema200"`
+	SessionVWAP       float64 `json:"session_vwap"`
+	ATR14             float64 `json:"atr14"`
+	BarDeltaZScore    float64 `json:"bar_delta_zscore"`
+	OIDeltaPct        float64 `json:"oi_delta_pct"`
+	FundingRate       float64 `json:"funding_rate"`
+	SpreadPct         float64 `json:"spread_pct"`
+	RVOL              float64 `json:"rvol"`
+	ImpulseATRMult    float64 `json:"impulse_atr_mult"`
+	Decision          string  `json:"decision"`
+	RejectReasonCode  string  `json:"reject_reason_code"`
+	RejectSubReason   string  `json:"reject_sub_reason"`
+	CreatedAtUTC      string  `json:"created_at_utc"`
 }
 
 type StatsItem struct {
@@ -177,7 +177,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 	if err != nil {
 		return nil, 0, fmt.Errorf("query trades: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	items := make([]TradeItem, 0, limit)
 	for rows.Next() {
@@ -204,18 +204,18 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 			if strings.ToUpper(it.Side) == "LONG" {
 				it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
 				if slF > 0 {
-					it.PlannedSLPct = math.Abs((entryF - slF) / entryF) * 100.0
+					it.PlannedSLPct = math.Abs((entryF-slF)/entryF) * 100.0
 				}
 				if tpF > 0 {
-					it.PlannedTPPct = math.Abs((tpF - entryF) / entryF) * 100.0
+					it.PlannedTPPct = math.Abs((tpF-entryF)/entryF) * 100.0
 				}
 			} else {
 				it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
 				if slF > 0 {
-					it.PlannedSLPct = math.Abs((slF - entryF) / entryF) * 100.0
+					it.PlannedSLPct = math.Abs((slF-entryF)/entryF) * 100.0
 				}
 				if tpF > 0 {
-					it.PlannedTPPct = math.Abs((entryF - tpF) / entryF) * 100.0
+					it.PlannedTPPct = math.Abs((entryF-tpF)/entryF) * 100.0
 				}
 			}
 
@@ -281,18 +281,18 @@ func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID s
 		if strings.ToUpper(it.Side) == "LONG" {
 			it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
 			if slF > 0 {
-				it.PlannedSLPct = math.Abs((entryF - slF) / entryF) * 100.0
+				it.PlannedSLPct = math.Abs((entryF-slF)/entryF) * 100.0
 			}
 			if tpF > 0 {
-				it.PlannedTPPct = math.Abs((tpF - entryF) / entryF) * 100.0
+				it.PlannedTPPct = math.Abs((tpF-entryF)/entryF) * 100.0
 			}
 		} else {
 			it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
 			if slF > 0 {
-				it.PlannedSLPct = math.Abs((slF - entryF) / entryF) * 100.0
+				it.PlannedSLPct = math.Abs((slF-entryF)/entryF) * 100.0
 			}
 			if tpF > 0 {
-				it.PlannedTPPct = math.Abs((entryF - tpF) / entryF) * 100.0
+				it.PlannedTPPct = math.Abs((entryF-tpF)/entryF) * 100.0
 			}
 		}
 
@@ -372,7 +372,7 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 	if err != nil {
 		return nil, 0, fmt.Errorf("query signals: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	items := make([]SignalItem, 0, limit)
 	for rows.Next() {
@@ -413,7 +413,7 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 	if err != nil {
 		return StatsItem{}, fmt.Errorf("query stats: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var stats StatsItem
 	var totalWinVal, totalFullWinVal, totalLossVal float64
@@ -496,7 +496,7 @@ func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSumma
 	if err != nil {
 		return summary, fmt.Errorf("query decision counts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var dec string
@@ -526,7 +526,7 @@ func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSumma
 		LIMIT 5
 	`)
 	if err == nil {
-		defer rejRows.Close()
+		defer func() { _ = rejRows.Close() }()
 		for rejRows.Next() {
 			var code string
 			var count int
@@ -565,4 +565,3 @@ func (r *WebReader) GetTradesForPatternMiner(ctx context.Context, limit int) ([]
 	}
 	return items, nil
 }
-

@@ -273,3 +273,52 @@ func TestRunnerBECushionATRConfig(t *testing.T) {
 		t.Errorf("expected RunnerBECushionATR to be 0.45, got %f", cfg.RunnerBECushionATR)
 	}
 }
+
+func TestFeeAndSlippageValidation(t *testing.T) {
+	_ = os.Setenv("MAKER_FEE_RATE", "-0.0005")
+	_, err := LoadConfig()
+	if err == nil {
+		t.Fatalf("expected error for negative MAKER_FEE_RATE")
+	}
+	_ = os.Unsetenv("MAKER_FEE_RATE")
+
+	_ = os.Setenv("TAKER_FEE_RATE", "0.10")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Fatalf("expected error for excessive TAKER_FEE_RATE")
+	}
+	_ = os.Unsetenv("TAKER_FEE_RATE")
+
+	_ = os.Setenv("SLIPPAGE_RATE", "-0.001")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Fatalf("expected error for negative SLIPPAGE_RATE")
+	}
+	_ = os.Unsetenv("SLIPPAGE_RATE")
+}
+
+func TestNaNAndInfFloatValidation(t *testing.T) {
+	nanFields := []string{
+		"MAX_DAILY_DRAWDOWN_PCT",
+		"ACCOUNT_LEVERAGE",
+		"MIN_VOLUME_24H_USDT",
+		"MAX_SPREAD_PCT",
+		"MIN_NATR_PCT",
+		"SL_ATR_MULTIPLIER",
+		"TP_ATR_MULTIPLIER",
+		"BREAK_EVEN_TRIGGER_ATR",
+		"PARTIAL_TP1_RATIO",
+		"BTC_MAX_5M_DUMP_PCT",
+	}
+
+	for _, field := range nanFields {
+		for _, invalidVal := range []string{"NaN", "nan", "+Inf", "-Inf", "Inf"} {
+			_ = os.Setenv(field, invalidVal)
+			_, err := LoadConfig()
+			if err == nil {
+				t.Fatalf("expected error for field %s with value %s, but got nil", field, invalidVal)
+			}
+			_ = os.Unsetenv(field)
+		}
+	}
+}

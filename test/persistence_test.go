@@ -104,9 +104,8 @@ func TestDryRunBrokerFullCrashRecoveryIntegration(t *testing.T) {
 		t.Fatalf("failed to submit QNT: %v", err)
 	}
 
-	// Harga NEAR turun ke 4.4259 -> bergerak 0.0341 (> 1.15 * 0.029676 = 0.034127) -> trigger Break-Even
-	// BE offset rate: min 0.0010 -> SL baru = 4.46 * (1 - 0.0012) = 4.4546
-	b1.OnRealtimeTick("NEARUSDT", 4.4250, 4.4260, 4.4255, 4.4255, 10.0, true, now.Add(time.Second))
+	// Harga NEAR turun ke 4.4205 -> bergerak > 1.15 * ATR -> trigger Break-Even
+	b1.OnRealtimeTick("NEARUSDT", 4.4200, 4.4210, 4.4205, 4.4205, 10.0, true, now.Add(time.Second))
 
 	// Tunggu queue event memproses ke SQLite
 	time.Sleep(50 * time.Millisecond)

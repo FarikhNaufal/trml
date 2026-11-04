@@ -13,20 +13,34 @@ func CalculateEMA(candles []model.Candle, period int) float64 {
 	return val
 }
 
-// CalculateEMASafe menghitung EMA dan mengembalikan false jika panjang candle tidak mencukupi
+// CalculateEMASafe menghitung EMA dan mengembalikan false jika panjang candle tidak mencukupi atau hasil invalid
 func CalculateEMASafe(candles []model.Candle, period int) (float64, bool) {
 	if len(candles) < period || period <= 0 {
 		return 0.0, false
 	}
 	sum := 0.0
 	for i := 0; i < period; i++ {
-		sum += candles[i].Close
+		c := candles[i].Close
+		if math.IsNaN(c) || math.IsInf(c, 0) || c <= 0 {
+			return 0.0, false
+		}
+		sum += c
 	}
 	ema := sum / float64(period)
+	if math.IsNaN(ema) || math.IsInf(ema, 0) || ema <= 0 {
+		return 0.0, false
+	}
 	multiplier := 2.0 / float64(period+1)
 
 	for i := period; i < len(candles); i++ {
-		ema = (candles[i].Close-ema)*multiplier + ema
+		c := candles[i].Close
+		if math.IsNaN(c) || math.IsInf(c, 0) || c <= 0 {
+			return 0.0, false
+		}
+		ema = (c-ema)*multiplier + ema
+	}
+	if math.IsNaN(ema) || math.IsInf(ema, 0) || ema <= 0 {
+		return 0.0, false
 	}
 	return ema, true
 }
@@ -39,17 +53,26 @@ func CalculateATR(candles []model.Candle, period int) float64 {
 	return val
 }
 
-// CalculateATRSafe menghitung ATR dan mengembalikan false jika panjang candle tidak mencukupi
+// CalculateATRSafe menghitung ATR dan mengembalikan false jika panjang candle tidak mencukupi atau hasil invalid
 func CalculateATRSafe(candles []model.Candle, period int) (float64, bool) {
 	if len(candles) < period+1 || period <= 0 {
 		return 0.0, false
 	}
 	trs := make([]float64, len(candles)-1)
 	for i := 1; i < len(candles); i++ {
+		if math.IsNaN(candles[i].High) || math.IsNaN(candles[i].Low) || math.IsNaN(candles[i].Close) ||
+			math.IsNaN(candles[i-1].Close) || math.IsInf(candles[i].High, 0) || math.IsInf(candles[i].Low, 0) ||
+			math.IsInf(candles[i].Close, 0) || math.IsInf(candles[i-1].Close, 0) {
+			return 0.0, false
+		}
 		highLow := candles[i].High - candles[i].Low
 		highPrevClose := math.Abs(candles[i].High - candles[i-1].Close)
 		lowPrevClose := math.Abs(candles[i].Low - candles[i-1].Close)
-		trs[i-1] = math.Max(highLow, math.Max(highPrevClose, lowPrevClose))
+		tr := math.Max(highLow, math.Max(highPrevClose, lowPrevClose))
+		if math.IsNaN(tr) || math.IsInf(tr, 0) || tr < 0 {
+			return 0.0, false
+		}
+		trs[i-1] = tr
 	}
 
 	sumTR := 0.0
@@ -57,9 +80,15 @@ func CalculateATRSafe(candles []model.Candle, period int) (float64, bool) {
 		sumTR += trs[i]
 	}
 	atr := sumTR / float64(period)
+	if math.IsNaN(atr) || math.IsInf(atr, 0) || atr <= 0 {
+		return 0.0, false
+	}
 
 	for i := period; i < len(trs); i++ {
 		atr = ((atr * float64(period-1)) + trs[i]) / float64(period)
+	}
+	if math.IsNaN(atr) || math.IsInf(atr, 0) || atr <= 0 {
+		return 0.0, false
 	}
 	return atr, true
 }

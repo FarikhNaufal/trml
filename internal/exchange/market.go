@@ -275,4 +275,3 @@ func (c *Client) DeleteListenKey(ctx context.Context, listenKey string) error {
 	}
 	return nil
 }
-

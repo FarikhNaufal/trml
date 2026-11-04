@@ -108,4 +108,3 @@ func TestBuildUserDataStreamURL(t *testing.T) {
 		t.Errorf("expected testnet user stream URL '%s', got '%s'", expectedTestnet, testnetURL)
 	}
 }
-

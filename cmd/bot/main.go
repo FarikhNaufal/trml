@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"slices"
@@ -25,7 +26,6 @@ import (
 	"trml/internal/web"
 	"trml/internal/ws"
 )
-
 
 const BenchmarkSymbol = "BTCUSDT"
 
@@ -118,7 +118,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-
 	// 4. Inisialisasi Client REST & Broker
 	client := exchange.NewClient(cfg.RestBaseURL, cfg.APIKey, cfg.SecretKey)
 	if cfg.RecvWindowMS > 0 {
@@ -133,38 +132,38 @@ func main() {
 		cooldownExits:   make(map[string]storage.RecentExitRecord),
 		verifiedSymbols: make(map[string]bool),
 		evaluatorCfg: strategy.EvaluatorConfig{
-			MaxSlots:              cfg.MaxSlots,
-			MaxBookStaleness:      cfg.MaxBookStaleness,
-			MaxMarkStaleness:      cfg.MaxMarkStaleness,
-			MaxDataStaleness:      cfg.MaxDataStaleness,
-			MinOIInterval:         cfg.MinOIInterval,
-			MaxOIInterval:         cfg.MaxOIInterval,
-			MaxOIStaleness:        cfg.MaxOIStaleness,
-			MaxSpreadPct:          cfg.MaxSpreadPct,
-			MinNATRPct:            cfg.MinNATRPct,
-			MaxNATRPct:            cfg.MaxNATRPct,
-			EMAPeriod:             200,
-			ATRPeriod:             14,
-			DeltaZScoreWindow:     50,
-			MinBarDeltaZScore:     cfg.MinBounceZScore,
-			MinOIDeltaPct:         cfg.MinOIDeltaPct,
-			MinOIDeltaLongPct:     cfg.MinOIDeltaLongPct,
-			MinOIDeltaShortPct:    cfg.MinOIDeltaShortPct,
-			MaxAdverseFundingRate:  0.0005,
-			PullbackToleranceATR:   cfg.PullbackToleranceATR,
-			MinBounceZScore:        cfg.MinBounceZScore,
-			MinBounceZScoreLong:    cfg.MinBounceZScoreLong,
-			MinBounceZScoreShort:   cfg.MinBounceZScoreShort,
-			MinEMA200DistanceATR:   cfg.MinEMA200DistanceATR,
-			MaxEMA200DistanceATR:   cfg.MaxEMA200DistanceATR,
-			LookbackImpulseBars:    cfg.LookbackImpulseBars,
-			RetestLookbackBars:     cfg.RetestLookbackBars,
-			MinImpulseATR:          cfg.MinImpulseATR,
-			MaxEntryDistanceATR:    cfg.MaxEntryDistanceATR,
-			EntryOrderType:         cfg.EntryOrderType,
-			BTCGateEnabled:         cfg.BTCGateEnabled,
-			BTCMax5mDumpPct:        cfg.BTCMax5mDumpPct,
-			BTCMax5mPumpPct:        cfg.BTCMax5mPumpPct,
+			MaxSlots:                 cfg.MaxSlots,
+			MaxBookStaleness:         cfg.MaxBookStaleness,
+			MaxMarkStaleness:         cfg.MaxMarkStaleness,
+			MaxDataStaleness:         cfg.MaxDataStaleness,
+			MinOIInterval:            cfg.MinOIInterval,
+			MaxOIInterval:            cfg.MaxOIInterval,
+			MaxOIStaleness:           cfg.MaxOIStaleness,
+			MaxSpreadPct:             cfg.MaxSpreadPct,
+			MinNATRPct:               cfg.MinNATRPct,
+			MaxNATRPct:               cfg.MaxNATRPct,
+			EMAPeriod:                200,
+			ATRPeriod:                14,
+			DeltaZScoreWindow:        50,
+			MinBarDeltaZScore:        cfg.MinBounceZScore,
+			MinOIDeltaPct:            cfg.MinOIDeltaPct,
+			MinOIDeltaLongPct:        cfg.MinOIDeltaLongPct,
+			MinOIDeltaShortPct:       cfg.MinOIDeltaShortPct,
+			MaxAdverseFundingRate:    0.0005,
+			PullbackToleranceATR:     cfg.PullbackToleranceATR,
+			MinBounceZScore:          cfg.MinBounceZScore,
+			MinBounceZScoreLong:      cfg.MinBounceZScoreLong,
+			MinBounceZScoreShort:     cfg.MinBounceZScoreShort,
+			MinEMA200DistanceATR:     cfg.MinEMA200DistanceATR,
+			MaxEMA200DistanceATR:     cfg.MaxEMA200DistanceATR,
+			LookbackImpulseBars:      cfg.LookbackImpulseBars,
+			RetestLookbackBars:       cfg.RetestLookbackBars,
+			MinImpulseATR:            cfg.MinImpulseATR,
+			MaxEntryDistanceATR:      cfg.MaxEntryDistanceATR,
+			EntryOrderType:           cfg.EntryOrderType,
+			BTCGateEnabled:           cfg.BTCGateEnabled,
+			BTCMax5mDumpPct:          cfg.BTCMax5mDumpPct,
+			BTCMax5mPumpPct:          cfg.BTCMax5mPumpPct,
 			BTCGatePersistenceBars:   cfg.BTCGatePersistenceBars,
 			BTCCounterMomentumPct:    cfg.BTCCounterMomentumPct,
 			AllowedSide:              cfg.AllowedSide,
@@ -176,18 +175,18 @@ func main() {
 			CooldownProfitMinutes:    cfg.CooldownProfitMinutes,
 			VWAPSessionWarmupMinutes: cfg.VWAPSessionWarmupMinutes,
 			Sizing: strategy.SizingConfig{
-				RiskPerTradePct:               cfg.RiskPerTradePct,
-				MaxSlotMarginFraction:         cfg.MaxSlotMarginFrac,
+				RiskPerTradePct:                cfg.RiskPerTradePct,
+				MaxSlotMarginFraction:          cfg.MaxSlotMarginFrac,
 				AvailableBalanceBufferFraction: cfg.MaxMarginAvailFrac,
-				AccountLeverage:               cfg.Leverage,
-				SLMultiplier:                  cfg.SLATRMultiplier,
-				TPMultiplier:                  cfg.TPATRMultiplier,
-				TP1Multiplier:                 cfg.PartialTP1ATRMult,
-				MinSLDistancePct:              cfg.MinSLDistancePct,
-				MakerFeeRate:                  cfg.MakerFeeRate,
-				TakerFeeRate:                  cfg.TakerFeeRate,
-				SlippageRate:                  cfg.SlippageRate,
-				EntryOrderType:                cfg.EntryOrderType,
+				AccountLeverage:                cfg.Leverage,
+				SLMultiplier:                   cfg.SLATRMultiplier,
+				TPMultiplier:                   cfg.TPATRMultiplier,
+				TP1Multiplier:                  cfg.PartialTP1ATRMult,
+				MinSLDistancePct:               cfg.MinSLDistancePct,
+				MakerFeeRate:                   cfg.MakerFeeRate,
+				TakerFeeRate:                   cfg.TakerFeeRate,
+				SlippageRate:                   cfg.SlippageRate,
+				EntryOrderType:                 cfg.EntryOrderType,
 			},
 		},
 		scannerCfg: scanner.ScannerConfig{
@@ -337,6 +336,12 @@ func main() {
 		engine.dryRunBroker.OnPositionDeletedFn = func(clientOrderIDOrSymbol string) {
 			_ = repo.DeleteDryRunPosition(context.Background(), clientOrderIDOrSymbol)
 		}
+		engine.dryRunBroker.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+			engine.filtersMu.RLock()
+			defer engine.filtersMu.RUnlock()
+			f, ok := engine.exchangeFilters[symbol]
+			return f, ok
+		}
 
 		// Pulihkan posisi terbuka dry-run dari database jika ada (tahan restart/rebuild)
 		if storedPositions, err := repo.GetAllDryRunPositions(ctx); err == nil && len(storedPositions) > 0 {
@@ -395,8 +400,12 @@ func main() {
 			TrailingActivateATR:      cfg.TrailingActivateATR,
 			TrailingDistanceATR:      cfg.TrailingDistanceATR,
 			MinBreakEvenOffsetPct:    0.0010,
+			SlippageRate:             cfg.SlippageRate.InexactFloat64(),
+			TakerFeeRate:             cfg.TakerFeeRate.InexactFloat64(),
+			MakerFeeRate:             cfg.MakerFeeRate.InexactFloat64(),
 		}
 		engine.liveBroker = broker.NewBinanceLiveBroker(liveCfg)
+		defer engine.liveBroker.Close()
 		if cfg.EntryOrderType == "MARKET" {
 			engine.liveBroker.PlaceEntryFn = client.PlaceMarketEntry
 		} else {
@@ -406,6 +415,22 @@ func main() {
 		engine.liveBroker.MarketCloseFn = client.PlaceMarketClose
 		engine.liveBroker.CancelOrderFn = client.CancelOrder
 		engine.liveBroker.CancelAlgoOrderFn = client.CancelAlgoOrder
+		engine.liveBroker.VerifyAlgoOrderFn = func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (bool, bool, error) {
+			algoOrds, err := client.GetOpenAlgoOrders(ctx, symbol)
+			if err != nil {
+				return false, false, err
+			}
+			var slFound, tpFound bool
+			for _, ao := range algoOrds {
+				if slAlgoID != 0 && (ao.AlgoID == slAlgoID || (clientSLID != "" && ao.ClientAlgoID == clientSLID)) {
+					slFound = true
+				}
+				if tpAlgoID != 0 && (ao.AlgoID == tpAlgoID || (clientTPID != "" && ao.ClientAlgoID == clientTPID)) {
+					tpFound = true
+				}
+			}
+			return slFound, tpFound, nil
+		}
 		engine.liveBroker.QueryOrderFn = client.QueryOrder
 		engine.liveBroker.FetchAccountFn = client.FetchAccountBalance
 		engine.liveBroker.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
@@ -414,9 +439,9 @@ func main() {
 			f, ok := engine.exchangeFilters[symbol]
 			return f, ok
 		}
-		engine.liveBroker.EmergencyMarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error {
-			slog.Warn("TRIGGERING EMERGENCY MARKET CLOSE", "symbol", symbol, "side", side, "qty", qty, "reason", reason)
-			return client.EmergencyMarketClose(ctx, symbol, side, qty)
+		engine.liveBroker.EmergencyMarketCloseFn = func(ctx context.Context, symbol string, positionSide model.Side, qty decimal.Decimal, reason string) error {
+			slog.Warn("TRIGGERING EMERGENCY MARKET CLOSE", "symbol", symbol, "positionSide", positionSide, "qty", qty, "reason", reason)
+			return client.EmergencyMarketClose(ctx, symbol, positionSide, qty)
 		}
 		engine.liveBroker.OnPositionSavedFn = func(pos broker.LiveOpenPosition) {
 			_ = repo.SaveLivePosition(context.Background(), storage.StoredLivePosition{
@@ -568,6 +593,68 @@ func main() {
 				})
 			}
 		} else {
+			// 0. Rekonsiliasi & batalkan/adopsi pending entry orders dari downtime sebelumnya
+			ctxOpen, cancelOpen := context.WithTimeout(ctx, 15*time.Second)
+			allOpenOrders, errOpen := client.GetOpenOrders(ctxOpen, "")
+			cancelOpen()
+			if errOpen == nil && len(allOpenOrders) > 0 {
+				for _, ord := range allOpenOrders {
+					// Identifikasi entry non-reduceOnly agar tidak tertinggal tanpa manajemen
+					if !ord.ReduceOnly && ord.Type != "STOP_MARKET" && ord.Type != "STOP" && ord.Type != "TAKE_PROFIT_MARKET" {
+						slog.Warn("FOUND PENDING ENTRY ORDER FROM DOWNTIME - ATTEMPTING CANCELLATION",
+							"symbol", ord.Symbol, "orderID", ord.OrderID, "clientOrderID", ord.ClientOrderID, "side", ord.Side, "price", ord.Price, "origQty", ord.OrigQty)
+						ctxCancel, cancelC := context.WithTimeout(ctx, 5*time.Second)
+						cancelErr := client.CancelOrder(ctxCancel, ord.Symbol, ord.OrderID, ord.ClientOrderID)
+						cancelC()
+						if cancelErr != nil {
+							slog.Warn("failed to cancel pending entry order; adopting order into live broker", "symbol", ord.Symbol, "orderID", ord.OrderID, "err", cancelErr)
+							ordSide := model.SideLong
+							if ord.Side == "SELL" {
+								ordSide = model.SideShort
+							}
+							tQty, _ := decimal.NewFromString(ord.OrigQty)
+							cQty, _ := decimal.NewFromString(ord.ExecutedQty)
+							lPrice, _ := decimal.NewFromString(ord.Price)
+							var ordStatus model.OrderLifecycleStatus
+							switch ord.Status {
+							case "NEW":
+								ordStatus = model.StatusNew
+							case "PARTIALLY_FILLED":
+								ordStatus = model.StatusPartiallyFilled
+							case "FILLED":
+								ordStatus = model.StatusFilled
+							default:
+								ordStatus = model.StatusNew
+							}
+							engine.liveBroker.AdoptPendingEntryRecord(&model.LiveOrderRecord{
+								ClientOrderID:       ord.ClientOrderID,
+								ExchangeOrderID:     ord.OrderID,
+								Symbol:              ord.Symbol,
+								Side:                ordSide,
+								TargetQty:           tQty,
+								CumulativeFilledQty: cQty,
+								LimitPrice:          lPrice,
+								Status:              ordStatus,
+								IsEntry:             true,
+								CreatedAt:           time.UnixMilli(ord.Time).UTC(),
+							})
+						} else {
+							slog.Info("successfully canceled stale pending entry order from downtime", "symbol", ord.Symbol, "orderID", ord.OrderID)
+						}
+					}
+				}
+			}
+
+			// Refresh posisi bursa SETELAH pembatalan/adopsi open orders agar data posisi 100% akurat
+			ctxPos, cancelPos := context.WithTimeout(ctx, 10*time.Second)
+			freshPositions, errFresh := client.GetPositionRisk(ctxPos, "")
+			cancelPos()
+			if errFresh == nil {
+				exchangePositions = freshPositions
+			} else {
+				slog.Error("failed to refresh position risk after order reconciliation; using cached positions", "err", errFresh)
+			}
+
 			activeOnExchange := make(map[string]exchange.PositionRiskResponse)
 			for _, ep := range exchangePositions {
 				if ep.PositionAmt.Abs().GreaterThan(decimal.Zero) {
@@ -583,6 +670,25 @@ func main() {
 			// 1. Rekonsiliasi posisi tersimpan
 			for sym, sp := range storedMap {
 				if ep, exists := activeOnExchange[sym]; exists {
+					// Verifikasi apakah SL bursa masih aktif untuk posisi tersimpan ini
+					if sp.SLOrderID != 0 {
+						ctxVer, cancelVer := context.WithTimeout(ctx, 5*time.Second)
+						algoOrds, _ := client.GetOpenAlgoOrders(ctxVer, sym)
+						cancelVer()
+						slFound := false
+						for _, ao := range algoOrds {
+							if ao.AlgoID == sp.SLOrderID || (sp.SLClientAlgoID != "" && ao.ClientAlgoID == sp.SLClientAlgoID) {
+								slFound = true
+								break
+							}
+						}
+						if !slFound {
+							slog.Warn("stored SL order not found active on Binance; marking unverified for repair", "symbol", sym, "storedSLID", sp.SLOrderID)
+							sp.SLOrderID = 0
+							sp.SLClientAlgoID = ""
+						}
+					}
+
 					engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
 						Symbol:         sp.Symbol,
 						Side:           model.Side(sp.Side),
@@ -625,14 +731,92 @@ func main() {
 					}
 					slog.Warn("DETECTED UNMANAGED LIVE POSITION ON BINANCE (missing from DB)",
 						"symbol", sym, "side", side, "qty", ep.PositionAmt.Abs(), "entryPrice", ep.EntryPrice)
-					engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
-						Symbol:     sym,
-						Side:       side,
-						Qty:        ep.PositionAmt.Abs(),
-						EntryPrice: ep.EntryPrice,
-						OpenTime:   time.Now().UTC(),
-						UpdatedAt:  time.Now().UTC(),
-					})
+
+					// Periksa apakah posisi memiliki Stop Loss aktif di Binance (cek Algo Orders & Normal Orders)
+					ctxOrphan, cancelOrphan := context.WithTimeout(ctx, 10*time.Second)
+					algoOrds, algoErr := client.GetOpenAlgoOrders(ctxOrphan, sym)
+					openOrds, ordErr := client.GetOpenOrders(ctxOrphan, sym)
+					cancelOrphan()
+
+					var hasActiveSL bool
+					var slAlgoID int64
+					var slClientID string
+					var activeSLPrice decimal.Decimal
+
+					expectedExitSide := "SELL"
+					if side == model.SideShort {
+						expectedExitSide = "BUY"
+					}
+
+					// 1. Cek dari open algo orders (primary path karena Stop Loss live dibuat via POST /fapi/v1/algoOrder)
+					if algoErr == nil {
+						for i := range algoOrds {
+							ord := &algoOrds[i]
+							if ord.Side == expectedExitSide && (ord.OrderType == "STOP_MARKET" || ord.OrderType == "STOP") {
+								tpDec, err := decimal.NewFromString(ord.TriggerPrice)
+								if err == nil && tpDec.GreaterThan(decimal.Zero) {
+									hasActiveSL = true
+									slAlgoID = ord.AlgoID
+									slClientID = ord.ClientAlgoID
+									activeSLPrice = tpDec
+									break
+								}
+							}
+						}
+					}
+
+					// 2. Fallback cek open normal orders jika belum ditemukan
+					if !hasActiveSL && ordErr == nil {
+						for i := range openOrds {
+							ord := &openOrds[i]
+							if ord.Side == expectedExitSide && (ord.Type == "STOP_MARKET" || ord.Type == "STOP") {
+								spDec, err := decimal.NewFromString(ord.StopPrice)
+								if err == nil && spDec.GreaterThan(decimal.Zero) {
+									hasActiveSL = true
+									slAlgoID = ord.OrderID
+									slClientID = ord.ClientOrderID
+									activeSLPrice = spDec
+									break
+								}
+							}
+						}
+					}
+
+					if !hasActiveSL && cfg.OrphanPositionPolicy == "CLOSE" {
+						// OPSI B (Default): Posisi unmanaged tanpa Stop Loss aktif ditutup seketika untuk melindungi modal
+						slog.Error("CRITICAL: UNMANAGED LIVE POSITION HAS NO ACTIVE STOP LOSS ORDER ON BINANCE - EXECUTING EMERGENCY MARKET CLOSE (Option B)",
+							"symbol", sym, "side", side, "qty", ep.PositionAmt.Abs())
+						ctxEmg, cancelEmg := context.WithTimeout(ctx, 10*time.Second)
+						closeErr := client.EmergencyMarketClose(ctxEmg, sym, side, ep.PositionAmt.Abs())
+						cancelEmg()
+						if closeErr != nil {
+							slog.Error("FAILED TO EMERGENCY CLOSE UNMANAGED ORPHAN POSITION", "symbol", sym, "err", closeErr)
+						} else {
+							slog.Info("EMERGENCY MARKET CLOSE SUCCESSFUL FOR UNMANAGED ORPHAN POSITION", "symbol", sym)
+						}
+					} else {
+						// Posisi memiliki SL aktif atau policy=ADOPT: adopsi posisi ke memory
+						if hasActiveSL {
+							slog.Info("unmanaged live position has active SL on Binance; adopting with existing protection",
+								"symbol", sym, "slOrderID", slAlgoID, "slPrice", activeSLPrice)
+						} else {
+							slog.Warn("adopting unmanaged live position WITHOUT active SL order (policy=ADOPT)", "symbol", sym)
+						}
+
+						engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
+							Symbol:         sym,
+							Side:           side,
+							Qty:            ep.PositionAmt.Abs(),
+							InitialQty:     ep.PositionAmt.Abs(),
+							EntryPrice:     ep.EntryPrice,
+							SLOrderID:      slAlgoID,
+							SLClientAlgoID: slClientID,
+							SLPrice:        activeSLPrice,
+							InitialSLPrice: activeSLPrice,
+							OpenTime:       time.Now().UTC(),
+							UpdatedAt:      time.Now().UTC(),
+						})
+					}
 				}
 			}
 		}
@@ -879,7 +1063,6 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 	}
 	return result
 }
-
 
 func (e *BotEngine) runMarketScan(ctx context.Context) {
 	filters, err := e.client.FetchExchangeInfo(ctx)
@@ -1140,7 +1323,7 @@ func (e *BotEngine) pollOpenInterest(ctx context.Context) {
 						samples = append(samples, model.OISample{
 							Value:        val,
 							Timestamp:    time.UnixMilli(item.Timestamp).UTC(), // Pengawal 4: Timestamp asli bursa dipertahankan
-							Bootstrapped: true,                                  // Pengawal 5: Flag Bootstrapped
+							Bootstrapped: true,                                 // Pengawal 5: Flag Bootstrapped
 						})
 					}
 				}
@@ -1325,18 +1508,36 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 				decision = "APPROVE"
 			}
 			ema200 := indicator.CalculateEMA(snap.ClosedCandles, e.evaluatorCfg.EMAPeriod)
+			if math.IsNaN(ema200) || math.IsInf(ema200, 0) {
+				ema200 = 0.0
+			}
 			atr14 := indicator.CalculateATR(snap.ClosedCandles, e.evaluatorCfg.ATRPeriod)
+			if math.IsNaN(atr14) || math.IsInf(atr14, 0) {
+				atr14 = 0.0
+			}
 			zScore, _ := indicator.CalculateBarDeltaZScore(snap.ClosedBarDeltasUSDT, e.evaluatorCfg.DeltaZScoreWindow)
+			if math.IsNaN(zScore) || math.IsInf(zScore, 0) {
+				zScore = 0.0
+			}
 			var oiDelta float64
 			if snap.PrevOpenInterest > 0 {
 				oiDelta = ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
+				if math.IsNaN(oiDelta) || math.IsInf(oiDelta, 0) {
+					oiDelta = 0.0
+				}
 			}
 
 			spreadPct := 0.0
 			if snap.BestBid > 0 && snap.BestAsk > snap.BestBid {
 				spreadPct = ((snap.BestAsk - snap.BestBid) / snap.BestBid) * 100.0
+				if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) {
+					spreadPct = 0.0
+				}
 			}
 			rvol := indicator.CalculateRVOL(snap.ClosedCandles, 20)
+			if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
+				rvol = 0.0
+			}
 
 			lookback := e.evaluatorCfg.LookbackImpulseBars
 			if lookback <= 0 {

@@ -195,7 +195,7 @@ retryLoop:
 		}
 		return AIResponse{Error: "GEMINI_UNAVAILABLE", Source: "fallback"}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		slog.Warn("ai_gemini: upstream rate limited", "status", resp.StatusCode)

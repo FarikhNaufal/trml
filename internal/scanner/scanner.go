@@ -50,14 +50,18 @@ func RunBulkMarketScanner(
 		if !strings.HasSuffix(sym, "USDT") {
 			continue
 		}
-		if vol24hMap[sym] < cfg.MinVolume24hUSDT {
+		vol := vol24hMap[sym]
+		if math.IsNaN(vol) || math.IsInf(vol, 0) || vol < cfg.MinVolume24hUSDT {
 			continue
 		}
 		bk, ok := bookMap[sym]
-		if !ok || bk.BestBid <= 0 || bk.BestAsk <= bk.BestBid {
+		if !ok || math.IsNaN(bk.BestBid) || math.IsNaN(bk.BestAsk) || math.IsInf(bk.BestBid, 0) || math.IsInf(bk.BestAsk, 0) || bk.BestBid <= 0 || bk.BestAsk <= bk.BestBid {
 			continue
 		}
 		spreadPct := ((bk.BestAsk - bk.BestBid) / bk.BestBid) * 100.0
+		if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) {
+			continue
+		}
 		maxScanSpread := cfg.MaxSpreadPct * 0.8
 		if maxScanSpread <= 0 {
 			maxScanSpread = cfg.MaxSpreadPct
@@ -107,26 +111,33 @@ func RunBulkMarketScanner(
 			}
 
 			atr14 := indicator.CalculateATR(validKlines, cfg.ATRPeriod)
+			if math.IsNaN(atr14) || math.IsInf(atr14, 0) || atr14 <= 0 {
+				return
+			}
 			lastClose := validKlines[len(validKlines)-1].Close
-			if lastClose <= 0 {
+			if math.IsNaN(lastClose) || math.IsInf(lastClose, 0) || lastClose <= 0 {
 				return
 			}
 			natrPct := (atr14 / lastClose) * 100.0
-			if natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
+			if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) || natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
 				return
 			}
 
 			if cfg.MaxScannerVWAPDistATR > 0 && atr14 > 0 {
 				sessionVWAP := indicator.CalculateSessionVWAP(validKlines)
-				if sessionVWAP > 0 {
-					distFromVWAP := math.Abs(lastClose - sessionVWAP)
-					if (distFromVWAP / atr14) > cfg.MaxScannerVWAPDistATR {
-						return
-					}
+				if math.IsNaN(sessionVWAP) || math.IsInf(sessionVWAP, 0) || sessionVWAP <= 0 {
+					return
+				}
+				distFromVWAP := math.Abs(lastClose - sessionVWAP)
+				if (distFromVWAP / atr14) > cfg.MaxScannerVWAPDistATR {
+					return
 				}
 			}
 
 			rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
+			if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
+				return
+			}
 			cand := Candidate{Symbol: symbol, RVOL: rvol, Candles: validKlines}
 			resultsChan <- scanResult{cand: cand, isPassed: rvol >= cfg.MinRVOL}
 		}(sym)
@@ -178,17 +189,18 @@ func RunBulkMarketScanner(
 	})
 
 	var selected []string
-	for i := 0; i < len(passed) && i < cfg.MaxWatchedCoins; i++ {
+	for i := 0; i < len(passed) && len(selected) < cfg.MaxWatchedCoins; i++ {
 		cand := passed[i]
-		selected = append(selected, cand.Symbol)
 		st, exists := activeStates[cand.Symbol]
 		if !exists {
 			st = model.NewSymbolState(cand.Symbol, perpetualFilters[cand.Symbol], cfg.BootstrapCount, cfg.DeltaWindow+1)
 			activeStates[cand.Symbol] = st
 		}
 		if err := BootstrapSymbolState(st, cand.Candles, serverTime, cfg.BootstrapCount, cfg.DeltaWindow+1); err != nil {
-			slog.Warn("scanner: failed to bootstrap symbol state", "symbol", cand.Symbol, "err", err)
+			slog.Warn("scanner: failed to bootstrap symbol state, skipping symbol", "symbol", cand.Symbol, "err", err)
+			continue
 		}
+		selected = append(selected, cand.Symbol)
 	}
 	return selected
 }

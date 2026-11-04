@@ -133,6 +133,25 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 		resp, err := c.HTTPClient.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("exchange: network error on %s %s: %w", method, endpoint, err)
+
+			// Pencegahan Order Ganda: Jika POST order mengalami network error, cek apakah order sebenarnya sudah diterima Binance
+			if method == http.MethodPost && (strings.Contains(endpoint, "/order") || strings.Contains(endpoint, "/algoOrder")) {
+				clientOID := params.Get("newClientOrderId")
+				if clientOID == "" {
+					clientOID = params.Get("clientAlgoId")
+				}
+				symbol := params.Get("symbol")
+				if clientOID != "" && symbol != "" {
+					qParams := url.Values{}
+					qParams.Set("symbol", symbol)
+					qParams.Set("origClientOrderId", clientOID)
+					checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/order", qParams, true)
+					if checkErr == nil && len(checkBody) > 0 {
+						return checkBody, nil
+					}
+				}
+			}
+
 			// Network error sementara: tunggu sebelum retry
 			if attempt < maxRetries-1 {
 				time.Sleep(time.Duration(250*(1<<attempt)) * time.Millisecond)
@@ -151,6 +170,23 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 
 		// Tangani Rate Limit (429/418) dan Server Error (5xx) dengan retry bounded
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 418 || (resp.StatusCode >= 500 && resp.StatusCode <= 504) {
+			if method == http.MethodPost && (strings.Contains(endpoint, "/order") || strings.Contains(endpoint, "/algoOrder")) {
+				clientOID := params.Get("newClientOrderId")
+				if clientOID == "" {
+					clientOID = params.Get("clientAlgoId")
+				}
+				symbol := params.Get("symbol")
+				if clientOID != "" && symbol != "" {
+					qParams := url.Values{}
+					qParams.Set("symbol", symbol)
+					qParams.Set("origClientOrderId", clientOID)
+					checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/order", qParams, true)
+					if checkErr == nil && len(checkBody) > 0 {
+						return checkBody, nil
+					}
+				}
+			}
+
 			retryDelay := time.Duration(500*(1<<attempt)) * time.Millisecond
 			if retryHeader := resp.Header.Get("Retry-After"); retryHeader != "" {
 				if s, err := strconv.Atoi(retryHeader); err == nil && s > 0 {
@@ -183,4 +219,67 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 		return lastBody, lastErr
 	}
 	return lastBody, fmt.Errorf("exchange: request failed after %d retries", maxRetries)
+}
+
+func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, params url.Values, signed bool) ([]byte, error) {
+	if params == nil {
+		params = url.Values{}
+	}
+	attemptParams := make(url.Values, len(params)+3)
+	for k, v := range params {
+		attemptParams[k] = append([]string(nil), v...)
+	}
+	if signed {
+		ts := time.Now().UnixMilli() + c.TimeOffset
+		attemptParams.Set("timestamp", strconv.FormatInt(ts, 10))
+		recvWin := c.RecvWindow
+		if recvWin <= 0 {
+			recvWin = 5000
+		}
+		attemptParams.Set("recvWindow", strconv.FormatInt(recvWin, 10))
+		sig := c.signQuery(attemptParams)
+		attemptParams.Set("signature", sig)
+	}
+
+	reqURL := fmt.Sprintf("%s%s", c.BaseURL, endpoint)
+	var req *http.Request
+	var err error
+
+	if method == http.MethodGet || method == http.MethodDelete {
+		if len(attemptParams) > 0 {
+			reqURL = fmt.Sprintf("%s?%s", reqURL, attemptParams.Encode())
+		}
+		req, err = http.NewRequestWithContext(ctx, method, reqURL, nil)
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, reqURL, strings.NewReader(attemptParams.Encode()))
+		if req != nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("exchange: failed to create request: %w", err)
+	}
+	if c.APIKey != "" {
+		req.Header.Set("X-MBX-APIKEY", c.APIKey)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	if readErr != nil {
+		return nil, readErr
+	}
+	if resp.StatusCode >= 400 {
+		var apiErr APIError
+		if jsonErr := json.Unmarshal(body, &apiErr); jsonErr == nil && apiErr.Code != 0 {
+			apiErr.HTTPStatusCode = resp.StatusCode
+			return body, &apiErr
+		}
+		return body, fmt.Errorf("exchange: API returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -20,13 +21,13 @@ const (
 )
 
 type Config struct {
-	Env              Environment
-	APIKey           string
-	SecretKey        string
-	DryRun           bool
-	DatabasePath     string
-	LogLevel         string
-	HTTPPort         string
+	Env          Environment
+	APIKey       string
+	SecretKey    string
+	DryRun       bool
+	DatabasePath string
+	LogLevel     string
+	HTTPPort     string
 
 	// URL Bursa
 	RestBaseURL      string
@@ -36,12 +37,12 @@ type Config struct {
 	WSAPIOrderURL    string
 
 	// Tipe Order Entry ("MARKET" atau "LIMIT")
-	EntryOrderType   string
+	EntryOrderType string
 
 	// Parameter Biaya & Slippage
-	MakerFeeRate     decimal.Decimal
-	TakerFeeRate     decimal.Decimal
-	SlippageRate     decimal.Decimal
+	MakerFeeRate decimal.Decimal
+	TakerFeeRate decimal.Decimal
+	SlippageRate decimal.Decimal
 
 	// Parameter Risiko Terkunci
 	InitialEquity      decimal.Decimal
@@ -53,26 +54,26 @@ type Config struct {
 	Leverage           float64
 
 	// Parameter Scanner
-	MinVolume24hUSDT float64
-	MinFallbackRVOL  float64
-	MaxSpreadPct     float64
+	MinVolume24hUSDT      float64
+	MinFallbackRVOL       float64
+	MaxSpreadPct          float64
 	MinNATRPct            float64
 	MaxNATRPct            float64
 	MaxScannerVWAPDistATR float64
 	MaxWatchedCoins       int
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
-	PullbackToleranceATR float64
-	MinBounceZScore      float64
-	MinEMA200DistanceATR float64
-	MaxEMA200DistanceATR float64
-	LookbackImpulseBars  int
-	RetestLookbackBars   int
-	MinImpulseATR        float64
-	MaxEntryDistanceATR  float64
-	MinOIDeltaPct        float64
-	MinOIDeltaLongPct    float64
-	MinOIDeltaShortPct   float64
+	PullbackToleranceATR     float64
+	MinBounceZScore          float64
+	MinEMA200DistanceATR     float64
+	MaxEMA200DistanceATR     float64
+	LookbackImpulseBars      int
+	RetestLookbackBars       int
+	MinImpulseATR            float64
+	MaxEntryDistanceATR      float64
+	MinOIDeltaPct            float64
+	MinOIDeltaLongPct        float64
+	MinOIDeltaShortPct       float64
 	SLATRMultiplier          float64
 	TPATRMultiplier          float64
 	BreakEvenTriggerATR      float64
@@ -106,17 +107,18 @@ type Config struct {
 	VWAPSessionWarmupMinutes int
 
 	// Batas Waktu & Staleness
-	ScannerInterval   time.Duration
-	MaxBookStaleness  time.Duration
-	MaxMarkStaleness  time.Duration
-	MaxDataStaleness  time.Duration
-	MaxAccountStale   time.Duration
-	MinOIInterval     time.Duration
-	MaxOIInterval     time.Duration
-	MaxOIStaleness    time.Duration
-	LimitOrderTimeout  time.Duration
-	MaxHoldingDuration time.Duration
-	RecvWindowMS       int64
+	ScannerInterval      time.Duration
+	MaxBookStaleness     time.Duration
+	MaxMarkStaleness     time.Duration
+	MaxDataStaleness     time.Duration
+	MaxAccountStale      time.Duration
+	MinOIInterval        time.Duration
+	MaxOIInterval        time.Duration
+	MaxOIStaleness       time.Duration
+	LimitOrderTimeout    time.Duration
+	MaxHoldingDuration   time.Duration
+	OrphanPositionPolicy string
+	RecvWindowMS         int64
 
 	// Keamanan Dashboard & AI Copilot
 	DashboardPIN     string
@@ -214,16 +216,16 @@ func LoadConfig() (*Config, error) {
 	logLevel := strings.ToUpper(getEnv("LOG_LEVEL", "INFO"))
 
 	makerFee, err := decimal.NewFromString(getEnv("MAKER_FEE_RATE", "0.0002"))
-	if err != nil {
-		return nil, fmt.Errorf("config: invalid MAKER_FEE_RATE: %w", err)
+	if err != nil || makerFee.IsNegative() || makerFee.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid MAKER_FEE_RATE '%s' (must be between 0.0 and 0.05)", getEnv("MAKER_FEE_RATE", "0.0002"))
 	}
 	takerFee, err := decimal.NewFromString(getEnv("TAKER_FEE_RATE", "0.0005"))
-	if err != nil {
-		return nil, fmt.Errorf("config: invalid TAKER_FEE_RATE: %w", err)
+	if err != nil || takerFee.IsNegative() || takerFee.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid TAKER_FEE_RATE '%s' (must be between 0.0 and 0.05)", getEnv("TAKER_FEE_RATE", "0.0005"))
 	}
 	slippage, err := decimal.NewFromString(getEnv("SLIPPAGE_RATE", "0.0002"))
-	if err != nil {
-		return nil, fmt.Errorf("config: invalid SLIPPAGE_RATE: %w", err)
+	if err != nil || slippage.IsNegative() || slippage.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid SLIPPAGE_RATE '%s' (must be between 0.0 and 0.05)", getEnv("SLIPPAGE_RATE", "0.0002"))
 	}
 
 	initEqStr := getEnv("INITIAL_EQUITY", "1000.0")
@@ -244,7 +246,7 @@ func LoadConfig() (*Config, error) {
 
 	// C5 Fix: Validasi numerik drawdown, slots, leverage
 	ddStr := getEnv("MAX_DAILY_DRAWDOWN_PCT", "-0.03")
-	ddFloat, err := strconv.ParseFloat(ddStr, 64)
+	ddFloat, err := parseFloatEnv(ddStr)
 	if err != nil || ddFloat >= 0 || ddFloat < -1.00 {
 		return nil, fmt.Errorf("config: invalid MAX_DAILY_DRAWDOWN_PCT '%s' (must be negative float between -0.01 and -1.00)", ddStr)
 	}
@@ -263,7 +265,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	levStr := getEnv("ACCOUNT_LEVERAGE", "5.0")
-	lev, err := strconv.ParseFloat(levStr, 64)
+	lev, err := parseFloatEnv(levStr)
 	if err != nil || lev < 1.0 || lev > 20.0 {
 		return nil, fmt.Errorf("config: invalid ACCOUNT_LEVERAGE '%s' (must be float between 1.0 and 20.0)", levStr)
 	}
@@ -278,7 +280,7 @@ func LoadConfig() (*Config, error) {
 		defaultMinVol = 0.0
 	}
 	minVolStr := getEnv("MIN_VOLUME_24H_USDT", strconv.FormatFloat(defaultMinVol, 'f', 1, 64))
-	minVol, err := strconv.ParseFloat(minVolStr, 64)
+	minVol, err := parseFloatEnv(minVolStr)
 	if err != nil || minVol < 0.0 {
 		return nil, fmt.Errorf("config: invalid MIN_VOLUME_24H_USDT '%s' (must be a non-negative float)", minVolStr)
 	}
@@ -290,37 +292,37 @@ func LoadConfig() (*Config, error) {
 	}
 
 	pullbackTolStr := getEnv("PULLBACK_TOLERANCE_ATR", "0.35")
-	pullbackTol, err := strconv.ParseFloat(pullbackTolStr, 64)
+	pullbackTol, err := parseFloatEnv(pullbackTolStr)
 	if err != nil || pullbackTol <= 0 || pullbackTol > 2.0 {
 		return nil, fmt.Errorf("config: invalid PULLBACK_TOLERANCE_ATR '%s' (must be float between 0.05 and 2.0)", pullbackTolStr)
 	}
 
 	minBounceZStr := getEnv("MIN_BOUNCE_ZSCORE", "0.40")
-	minBounceZ, err := strconv.ParseFloat(minBounceZStr, 64)
+	minBounceZ, err := parseFloatEnv(minBounceZStr)
 	if err != nil || minBounceZ <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
 	}
 
 	minEMA200DistStr := getEnv("MIN_EMA200_DISTANCE_ATR", "0.15")
-	minEMA200Dist, err := strconv.ParseFloat(minEMA200DistStr, 64)
+	minEMA200Dist, err := parseFloatEnv(minEMA200DistStr)
 	if err != nil || minEMA200Dist < 0 || minEMA200Dist > 5.0 {
 		return nil, fmt.Errorf("config: invalid MIN_EMA200_DISTANCE_ATR '%s' (must be float between 0.0 and 5.0)", minEMA200DistStr)
 	}
 
 	maxEMA200DistStr := getEnv("MAX_EMA200_DISTANCE_ATR", "3.20")
-	maxEMA200Dist, err := strconv.ParseFloat(maxEMA200DistStr, 64)
+	maxEMA200Dist, err := parseFloatEnv(maxEMA200DistStr)
 	if err != nil || maxEMA200Dist <= 0 || maxEMA200Dist > 20.0 {
 		return nil, fmt.Errorf("config: invalid MAX_EMA200_DISTANCE_ATR '%s' (must be float between 0.1 and 20.0)", maxEMA200DistStr)
 	}
 
 	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "0.40")
-	minBounceZLong, err := strconv.ParseFloat(minBounceZLongStr, 64)
+	minBounceZLong, err := parseFloatEnv(minBounceZLongStr)
 	if err != nil || minBounceZLong <= 0 {
 		minBounceZLong = minBounceZ
 	}
 
 	minBounceZShortStr := getEnv("MIN_BOUNCE_ZSCORE_SHORT", minBounceZStr)
-	minBounceZShort, err := strconv.ParseFloat(minBounceZShortStr, 64)
+	minBounceZShort, err := parseFloatEnv(minBounceZShortStr)
 	if err != nil || minBounceZShort <= 0 {
 		minBounceZShort = minBounceZ
 	}
@@ -338,13 +340,13 @@ func LoadConfig() (*Config, error) {
 	}
 
 	minImpulseATRStr := getEnv("MIN_IMPULSE_ATR", "0.6")
-	minImpulseATR, err := strconv.ParseFloat(minImpulseATRStr, 64)
+	minImpulseATR, err := parseFloatEnv(minImpulseATRStr)
 	if err != nil || minImpulseATR <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR '%s' (must be positive float)", minImpulseATRStr)
 	}
 
 	maxEntryDistStr := getEnv("MAX_ENTRY_DISTANCE_ATR", "1.20")
-	maxEntryDist, err := strconv.ParseFloat(maxEntryDistStr, 64)
+	maxEntryDist, err := parseFloatEnv(maxEntryDistStr)
 	if err != nil || maxEntryDist <= 0 || maxEntryDist > 5.0 {
 		return nil, fmt.Errorf("config: invalid MAX_ENTRY_DISTANCE_ATR '%s' (must be float between 0.1 and 5.0)", maxEntryDistStr)
 	}
@@ -355,31 +357,31 @@ func LoadConfig() (*Config, error) {
 	}
 
 	minFallbackRVOLStr := getEnv("MIN_FALLBACK_RVOL", "0.60")
-	minFallbackRVOL, err := strconv.ParseFloat(minFallbackRVOLStr, 64)
+	minFallbackRVOL, err := parseFloatEnv(minFallbackRVOLStr)
 	if err != nil || minFallbackRVOL <= 0 {
 		return nil, fmt.Errorf("config: invalid MIN_FALLBACK_RVOL '%s' (must be positive float)", minFallbackRVOLStr)
 	}
 
 	maxSpreadStr := getEnv("MAX_SPREAD_PCT", "0.06")
-	maxSpread, err := strconv.ParseFloat(maxSpreadStr, 64)
+	maxSpread, err := parseFloatEnv(maxSpreadStr)
 	if err != nil || maxSpread <= 0 || maxSpread > 1.0 {
 		return nil, fmt.Errorf("config: invalid MAX_SPREAD_PCT '%s' (must be float between 0.001 and 1.0)", maxSpreadStr)
 	}
 
 	minNATRStr := getEnv("MIN_NATR_PCT", "0.75")
-	minNATR, err := strconv.ParseFloat(minNATRStr, 64)
+	minNATR, err := parseFloatEnv(minNATRStr)
 	if err != nil || minNATR <= 0 || minNATR > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_NATR_PCT '%s' (must be float between 0.01 and 10.0)", minNATRStr)
 	}
 
 	maxNATRStr := getEnv("MAX_NATR_PCT", "2.50")
-	maxNATR, err := strconv.ParseFloat(maxNATRStr, 64)
+	maxNATR, err := parseFloatEnv(maxNATRStr)
 	if err != nil || maxNATR < minNATR || maxNATR > 20.0 {
 		return nil, fmt.Errorf("config: invalid MAX_NATR_PCT '%s' (must be float >= MIN_NATR_PCT and <= 20.0)", maxNATRStr)
 	}
 
 	maxScannerVWAPDistStr := getEnv("MAX_SCANNER_VWAP_DIST_ATR", "2.50")
-	maxScannerVWAPDist, err := strconv.ParseFloat(maxScannerVWAPDistStr, 64)
+	maxScannerVWAPDist, err := parseFloatEnv(maxScannerVWAPDistStr)
 	if err != nil || maxScannerVWAPDist < 0 || maxScannerVWAPDist > 20.0 {
 		return nil, fmt.Errorf("config: invalid MAX_SCANNER_VWAP_DIST_ATR '%s' (must be float between 0.0 and 20.0)", maxScannerVWAPDistStr)
 	}
@@ -391,62 +393,74 @@ func LoadConfig() (*Config, error) {
 	}
 
 	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.00")
-	minOIDelta, err := strconv.ParseFloat(minOIDeltaStr, 64)
+	minOIDelta, err := parseFloatEnv(minOIDeltaStr)
 	if err != nil || minOIDelta < -5.0 || minOIDelta > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaStr)
 	}
 
 	minOIDeltaLongStr := getEnv("MIN_OI_DELTA_LONG_PCT", "0.00")
-	minOIDeltaLong, err := strconv.ParseFloat(minOIDeltaLongStr, 64)
+	minOIDeltaLong, err := parseFloatEnv(minOIDeltaLongStr)
 	if err != nil || minOIDeltaLong < -5.0 || minOIDeltaLong > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_LONG_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaLongStr)
 	}
 
 	minOIDeltaShortStr := getEnv("MIN_OI_DELTA_SHORT_PCT", "-0.02")
-	minOIDeltaShort, err := strconv.ParseFloat(minOIDeltaShortStr, 64)
+	minOIDeltaShort, err := parseFloatEnv(minOIDeltaShortStr)
 	if err != nil || minOIDeltaShort < -5.0 || minOIDeltaShort > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_SHORT_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaShortStr)
 	}
 
 	slMultStr := getEnv("SL_ATR_MULTIPLIER", "1.5")
-	slMult, err := strconv.ParseFloat(slMultStr, 64)
+	slMult, err := parseFloatEnv(slMultStr)
 	if err != nil || slMult <= 0.1 || slMult > 10.0 {
 		return nil, fmt.Errorf("config: invalid SL_ATR_MULTIPLIER '%s' (must be float between 0.1 and 10.0)", slMultStr)
 	}
 
 	tpMultStr := getEnv("TP_ATR_MULTIPLIER", "2.25")
-	tpMult, err := strconv.ParseFloat(tpMultStr, 64)
+	tpMult, err := parseFloatEnv(tpMultStr)
 	if err != nil || tpMult <= 0.1 || tpMult > 20.0 {
 		return nil, fmt.Errorf("config: invalid TP_ATR_MULTIPLIER '%s' (must be float between 0.1 and 20.0)", tpMultStr)
 	}
 
 	beTriggerStr := getEnv("BREAK_EVEN_TRIGGER_ATR", "1.15")
-	beTrigger, err := strconv.ParseFloat(beTriggerStr, 64)
+	beTrigger, err := parseFloatEnv(beTriggerStr)
 	if err != nil || beTrigger <= 0.1 || beTrigger > 10.0 {
 		return nil, fmt.Errorf("config: invalid BREAK_EVEN_TRIGGER_ATR '%s' (must be float between 0.1 and 10.0)", beTriggerStr)
 	}
 
 	tier1BEEnabled := parseBoolEnv(getEnv("TIER1_BE_ENABLED", "false"))
-	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "0.70")
-	t1BETriggerLong, err := strconv.ParseFloat(t1BETriggerLongStr, 64)
-	if err != nil || t1BETriggerLong <= 0.05 || t1BETriggerLong > 10.0 {
-		t1BETriggerLong = 0.70
+	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "")
+	var t1BETriggerLong float64
+	if t1BETriggerLongStr != "" {
+		val, err := parseFloatEnv(t1BETriggerLongStr)
+		if err == nil && val >= 0.05 && val <= 10.0 {
+			t1BETriggerLong = val
+		}
+	}
+	if t1BETriggerLong == 0 {
+		t1BETriggerLong = beTrigger
 	}
 
-	t1BETriggerShortStr := getEnv("TIER1_BE_TRIGGER_SHORT_ATR", "0.90")
-	t1BETriggerShort, err := strconv.ParseFloat(t1BETriggerShortStr, 64)
-	if err != nil || t1BETriggerShort <= 0.05 || t1BETriggerShort > 10.0 {
-		t1BETriggerShort = 0.90
+	t1BETriggerShortStr := getEnv("TIER1_BE_TRIGGER_SHORT_ATR", "")
+	var t1BETriggerShort float64
+	if t1BETriggerShortStr != "" {
+		val, err := parseFloatEnv(t1BETriggerShortStr)
+		if err == nil && val >= 0.05 && val <= 10.0 {
+			t1BETriggerShort = val
+		}
+	}
+	if t1BETriggerShort == 0 {
+		t1BETriggerShort = beTrigger
 	}
 
 	t2ProfitLockStr := getEnv("TIER2_PROFIT_LOCK_ATR", "1.80")
-	t2ProfitLock, err := strconv.ParseFloat(t2ProfitLockStr, 64)
+	t2ProfitLock, err := parseFloatEnv(t2ProfitLockStr)
 	if err != nil || t2ProfitLock <= 0.1 || t2ProfitLock > 10.0 {
 		t2ProfitLock = 1.80
 	}
 
 	t2OffsetStr := getEnv("TIER2_PROFIT_LOCK_OFFSET_ATR", "0.90")
-	t2Offset, err := strconv.ParseFloat(t2OffsetStr, 64)
+	t2Offset, err := parseFloatEnv(t2OffsetStr)
 	if err != nil || t2Offset <= 0.05 || t2Offset > 10.0 {
 		t2Offset = 0.90
 	}
@@ -460,19 +474,19 @@ func LoadConfig() (*Config, error) {
 	partialTPEnabled := parseBoolEnv(getEnv("PARTIAL_TP_ENABLED", "true"))
 
 	partialTP1RatioStr := getEnv("PARTIAL_TP1_RATIO", "0.50")
-	partialTP1Ratio, err := strconv.ParseFloat(partialTP1RatioStr, 64)
+	partialTP1Ratio, err := parseFloatEnv(partialTP1RatioStr)
 	if err != nil || partialTP1Ratio <= 0.05 || partialTP1Ratio >= 0.95 {
 		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_RATIO '%s' (must be float between 0.05 and 0.95)", partialTP1RatioStr)
 	}
 
 	partialTP1ATRMultStr := getEnv("PARTIAL_TP1_ATR_MULT", "1.20")
-	partialTP1ATRMult, err := strconv.ParseFloat(partialTP1ATRMultStr, 64)
+	partialTP1ATRMult, err := parseFloatEnv(partialTP1ATRMultStr)
 	if err != nil || partialTP1ATRMult <= 0.1 || partialTP1ATRMult > 10.0 {
 		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_ATR_MULT '%s' (must be float between 0.1 and 10.0)", partialTP1ATRMultStr)
 	}
 
 	runnerBECushionATRStr := getEnv("RUNNER_BE_CUSHION_ATR", "0.35")
-	runnerBECushionATR, err := strconv.ParseFloat(runnerBECushionATRStr, 64)
+	runnerBECushionATR, err := parseFloatEnv(runnerBECushionATRStr)
 	if err != nil || runnerBECushionATR < 0.0 || runnerBECushionATR > 5.0 {
 		return nil, fmt.Errorf("config: invalid RUNNER_BE_CUSHION_ATR '%s' (must be float between 0.0 and 5.0)", runnerBECushionATRStr)
 	}
@@ -480,13 +494,13 @@ func LoadConfig() (*Config, error) {
 	trailingEnabled := parseBoolEnv(getEnv("TRAILING_ENABLED", "true"))
 
 	trailingActivateATRStr := getEnv("TRAILING_ACTIVATE_ATR", "2.00")
-	trailingActivateATR, err := strconv.ParseFloat(trailingActivateATRStr, 64)
+	trailingActivateATR, err := parseFloatEnv(trailingActivateATRStr)
 	if err != nil || trailingActivateATR <= 0.1 || trailingActivateATR > 10.0 {
 		trailingActivateATR = 2.00
 	}
 
 	trailingDistATRStr := getEnv("TRAILING_DISTANCE_ATR", "0.80")
-	trailingDistATR, err := strconv.ParseFloat(trailingDistATRStr, 64)
+	trailingDistATR, err := parseFloatEnv(trailingDistATRStr)
 	if err != nil || trailingDistATR <= 0.05 || trailingDistATR > 10.0 {
 		trailingDistATR = 0.80
 	}
@@ -495,13 +509,13 @@ func LoadConfig() (*Config, error) {
 	btcGateEnabled := parseBoolEnv(btcGateEnabledStr)
 
 	btcMaxDumpStr := getEnv("BTC_MAX_5M_DUMP_PCT", "0.60")
-	btcMaxDump, err := strconv.ParseFloat(btcMaxDumpStr, 64)
+	btcMaxDump, err := parseFloatEnv(btcMaxDumpStr)
 	if err != nil || btcMaxDump <= 0.05 || btcMaxDump > 10.0 {
 		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_DUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxDumpStr)
 	}
 
 	btcMaxPumpStr := getEnv("BTC_MAX_5M_PUMP_PCT", "0.60")
-	btcMaxPump, err := strconv.ParseFloat(btcMaxPumpStr, 64)
+	btcMaxPump, err := parseFloatEnv(btcMaxPumpStr)
 	if err != nil || btcMaxPump <= 0.05 || btcMaxPump > 10.0 {
 		return nil, fmt.Errorf("config: invalid BTC_MAX_5M_PUMP_PCT '%s' (must be positive float between 0.05 and 10.0)", btcMaxPumpStr)
 	}
@@ -518,25 +532,25 @@ func LoadConfig() (*Config, error) {
 	}
 
 	maxFrenzyRVOLStr := getEnv("MAX_FRENZY_RVOL", "2.50")
-	maxFrenzyRVOL, err := strconv.ParseFloat(maxFrenzyRVOLStr, 64)
+	maxFrenzyRVOL, err := parseFloatEnv(maxFrenzyRVOLStr)
 	if err != nil || maxFrenzyRVOL <= 0 {
 		return nil, fmt.Errorf("config: invalid MAX_FRENZY_RVOL '%s' (must be positive float)", maxFrenzyRVOLStr)
 	}
 
 	maxCounterImpulseATRStr := getEnv("MAX_COUNTER_IMPULSE_ATR", "1.50")
-	maxCounterImpulseATR, err := strconv.ParseFloat(maxCounterImpulseATRStr, 64)
+	maxCounterImpulseATR, err := parseFloatEnv(maxCounterImpulseATRStr)
 	if err != nil || maxCounterImpulseATR <= 0 {
 		return nil, fmt.Errorf("config: invalid MAX_COUNTER_IMPULSE_ATR '%s' (must be positive float)", maxCounterImpulseATRStr)
 	}
 
 	btcCounterMomStr := getEnv("BTC_COUNTER_MOMENTUM_PCT", "0.25")
-	btcCounterMom, err := strconv.ParseFloat(btcCounterMomStr, 64)
+	btcCounterMom, err := parseFloatEnv(btcCounterMomStr)
 	if err != nil || btcCounterMom < 0.0 || btcCounterMom > 5.0 {
 		return nil, fmt.Errorf("config: invalid BTC_COUNTER_MOMENTUM_PCT '%s' (must be float between 0.0 and 5.0)", btcCounterMomStr)
 	}
 
 	minSignalRVOLStr := getEnv("MIN_SIGNAL_RVOL", "0.75")
-	minSignalRVOL, err := strconv.ParseFloat(minSignalRVOLStr, 64)
+	minSignalRVOL, err := parseFloatEnv(minSignalRVOLStr)
 	if err != nil || minSignalRVOL < 0.0 || minSignalRVOL > 5.0 {
 		return nil, fmt.Errorf("config: invalid MIN_SIGNAL_RVOL '%s' (must be float between 0.0 and 5.0)", minSignalRVOLStr)
 	}
@@ -564,6 +578,11 @@ func LoadConfig() (*Config, error) {
 		maxHoldingDuration = 4 * time.Hour
 	}
 
+	orphanPolicy := strings.ToUpper(getEnv("ORPHAN_POSITION_POLICY", "CLOSE"))
+	if orphanPolicy != "ADOPT" && orphanPolicy != "CLOSE" {
+		orphanPolicy = "CLOSE"
+	}
+
 	cooldownMinsStr := getEnv("COOLDOWN_AFTER_EXIT_MINUTES", "20")
 	cooldownMins, err := strconv.Atoi(cooldownMinsStr)
 	if err != nil || cooldownMins < 0 {
@@ -589,32 +608,32 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return &Config{
-		Env:                  env,
-		APIKey:               apiKey,
-		SecretKey:            secretKey,
-		DryRun:               dryRun,
-		DatabasePath:         dbPath,
-		LogLevel:             logLevel,
-		HTTPPort:             httpPort,
-		EntryOrderType:       entryOrderType,
-		RestBaseURL:          restURL,
-		WSPublicURL:          wsPublic,
-		WSMarketURL:          wsMarket,
-		WSPrivateBaseURL:     wsPrivate,
-		WSAPIOrderURL:        wsAPI,
-		MakerFeeRate:         makerFee,
-		TakerFeeRate:         takerFee,
-		SlippageRate:         slippage,
-		InitialEquity:        initEq,
-		RiskPerTradePct:      riskPct,
-		MaxDailyDrawdown:     ddFloat,
-		MaxSlots:             slots,
-		MaxSlotMarginFrac:    marginFrac,
-		MaxMarginAvailFrac:   availMarginFrac,
-		Leverage:             lev,
-		MinVolume24hUSDT:     minVol,
-		MinFallbackRVOL:      minFallbackRVOL,
-		MaxSpreadPct:         maxSpread,
+		Env:                      env,
+		APIKey:                   apiKey,
+		SecretKey:                secretKey,
+		DryRun:                   dryRun,
+		DatabasePath:             dbPath,
+		LogLevel:                 logLevel,
+		HTTPPort:                 httpPort,
+		EntryOrderType:           entryOrderType,
+		RestBaseURL:              restURL,
+		WSPublicURL:              wsPublic,
+		WSMarketURL:              wsMarket,
+		WSPrivateBaseURL:         wsPrivate,
+		WSAPIOrderURL:            wsAPI,
+		MakerFeeRate:             makerFee,
+		TakerFeeRate:             takerFee,
+		SlippageRate:             slippage,
+		InitialEquity:            initEq,
+		RiskPerTradePct:          riskPct,
+		MaxDailyDrawdown:         ddFloat,
+		MaxSlots:                 slots,
+		MaxSlotMarginFrac:        marginFrac,
+		MaxMarginAvailFrac:       availMarginFrac,
+		Leverage:                 lev,
+		MinVolume24hUSDT:         minVol,
+		MinFallbackRVOL:          minFallbackRVOL,
+		MaxSpreadPct:             maxSpread,
 		MinNATRPct:               minNATR,
 		MaxNATRPct:               maxNATR,
 		MaxScannerVWAPDistATR:    maxScannerVWAPDist,
@@ -662,17 +681,18 @@ func LoadConfig() (*Config, error) {
 		CooldownProfitMinutes:    cooldownProfitMins,
 		VWAPSessionWarmupMinutes: vwapWarmupMins,
 
-		ScannerInterval:    15 * time.Minute,
-		MaxBookStaleness:   5 * time.Second,
-		MaxMarkStaleness:   15 * time.Second,
-		MaxDataStaleness:   330 * time.Second,
-		MaxAccountStale:    60 * time.Second,
-		MinOIInterval:      1 * time.Minute,
-		MaxOIInterval:      8 * time.Minute,
-		MaxOIStaleness:     330 * time.Second,
-		LimitOrderTimeout:  45 * time.Second,
-		MaxHoldingDuration: maxHoldingDuration,
-		RecvWindowMS:       recvWin,
+		ScannerInterval:      15 * time.Minute,
+		MaxBookStaleness:     5 * time.Second,
+		MaxMarkStaleness:     15 * time.Second,
+		MaxDataStaleness:     330 * time.Second,
+		MaxAccountStale:      60 * time.Second,
+		MinOIInterval:        1 * time.Minute,
+		MaxOIInterval:        8 * time.Minute,
+		MaxOIStaleness:       330 * time.Second,
+		LimitOrderTimeout:    45 * time.Second,
+		MaxHoldingDuration:   maxHoldingDuration,
+		OrphanPositionPolicy: orphanPolicy,
+		RecvWindowMS:         recvWin,
 
 		DashboardPIN:     dashPIN,
 		GeminiAPIKey:     geminiKey,
@@ -698,4 +718,15 @@ func getEnv(key, defaultVal string) string {
 func parseBoolEnv(val string) bool {
 	clean := strings.ToLower(strings.TrimSpace(val))
 	return clean == "true" || clean == "1" || clean == "yes" || clean == "y"
+}
+
+func parseFloatEnv(val string) (float64, error) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("value cannot be NaN or Inf")
+	}
+	return v, nil
 }

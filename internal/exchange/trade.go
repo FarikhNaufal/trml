@@ -20,6 +20,9 @@ type OrderResponse struct {
 	OrderID       int64  `json:"orderId"`
 	ClientOrderID string `json:"clientOrderId"`
 	Status        string `json:"status"`
+	AvgPrice      string `json:"avgPrice"`
+	ExecutedQty   string `json:"executedQty"`
+	CumQuote      string `json:"cumQuote"`
 }
 
 type QueryOrderResponse struct {
@@ -28,11 +31,14 @@ type QueryOrderResponse struct {
 	Symbol        string `json:"symbol"`
 	Side          string `json:"side"`
 	Status        string `json:"status"`
+	Type          string `json:"type"`
 	OrigQty       string `json:"origQty"`
 	ExecutedQty   string `json:"executedQty"`
 	ReduceOnly    bool   `json:"reduceOnly"`
 	Price         string `json:"price"`
+	AvgPrice      string `json:"avgPrice"`
 	StopPrice     string `json:"stopPrice"`
+	CumQuote      string `json:"cumQuote"`
 	Time          int64  `json:"time"`
 }
 
@@ -41,6 +47,20 @@ type AlgoOrderResponse struct {
 	ClientAlgoID string `json:"clientAlgoId"`
 	Code         int    `json:"code"`
 	Msg          string `json:"msg"`
+}
+
+type QueryAlgoOrderResponse struct {
+	AlgoID       int64  `json:"algoId"`
+	ClientAlgoID string `json:"clientAlgoId"`
+	AlgoType     string `json:"algoType"`
+	OrderType    string `json:"orderType"`
+	Symbol       string `json:"symbol"`
+	Side         string `json:"side"`
+	Quantity     string `json:"quantity"`
+	AlgoStatus   string `json:"algoStatus"`
+	TriggerPrice string `json:"triggerPrice"`
+	Price        string `json:"price"`
+	ReduceOnly   bool   `json:"reduceOnly"`
 }
 
 type DualSidePositionResponse struct {
@@ -176,18 +196,22 @@ func (c *Client) CancelAlgoOrder(ctx context.Context, symbol string, algoID int6
 	return nil
 }
 
-// EmergencyMarketClose mengeksekusi penutupan posisi darurat dengan order MARKET reduceOnly
-func (c *Client) EmergencyMarketClose(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal) error {
+// EmergencyMarketClose mengeksekusi penutupan posisi darurat dengan order MARKET reduceOnly.
+// Menerima positionSide (SideLong untuk posisi beli, SideShort untuk posisi jual).
+// Untuk menutup posisi LONG, bursa menerima order SELL.
+// Untuk menutup posisi SHORT, bursa menerima order BUY.
+func (c *Client) EmergencyMarketClose(ctx context.Context, symbol string, positionSide model.Side, qty decimal.Decimal) error {
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	if side == model.SideLong {
-		params.Set("side", "BUY")
-	} else {
+	if positionSide == model.SideLong {
 		params.Set("side", "SELL")
+	} else {
+		params.Set("side", "BUY")
 	}
 	params.Set("type", "MARKET")
 	params.Set("reduceOnly", "true")
 	params.Set("quantity", qty.String())
+	params.Set("newClientOrderId", fmt.Sprintf("live_emg_%s_%d", symbol, time.Now().UnixNano()))
 
 	_, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
 	if err != nil {
@@ -197,7 +221,7 @@ func (c *Client) EmergencyMarketClose(ctx context.Context, symbol string, side m
 }
 
 // PlaceMarketClose mengirimkan order MARKET penutupan parsial/penuh dengan reduceOnly=true (POST /fapi/v1/order)
-func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, error) {
+func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, decimal.Decimal, decimal.Decimal, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	if side == model.SideLong {
@@ -214,15 +238,17 @@ func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model
 
 	respBytes, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
 	if err != nil {
-		return 0, fmt.Errorf("place market close: %w (body: %s)", err, string(respBytes))
+		return 0, decimal.Zero, decimal.Zero, fmt.Errorf("place market close: %w (body: %s)", err, string(respBytes))
 	}
 
 	var resp OrderResponse
 	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
-		return 0, fmt.Errorf("place market close: failed to decode response: %w", err)
+		return 0, decimal.Zero, decimal.Zero, fmt.Errorf("place market close: failed to decode response: %w", err)
 	}
 
-	return resp.OrderID, nil
+	avgPrice, _ := decimal.NewFromString(resp.AvgPrice)
+	executedQty, _ := decimal.NewFromString(resp.ExecutedQty)
+	return resp.OrderID, avgPrice, executedQty, nil
 }
 
 // InitAndVerifySymbol memverifikasi One-Way mode, isolasi margin, dan leverage 5x (Solusi P0-5 & P0-7)
@@ -285,9 +311,10 @@ func (c *Client) QueryOrder(ctx context.Context, symbol, clientOrderID string) (
 	}
 
 	var side model.Side
-	if resp.Side == "BUY" {
+	switch resp.Side {
+	case "BUY":
 		side = model.SideLong
-	} else if resp.Side == "SELL" {
+	case "SELL":
 		side = model.SideShort
 	}
 
@@ -312,6 +339,8 @@ func (c *Client) QueryOrder(ctx context.Context, symbol, clientOrderID string) (
 
 	origQty, _ := decimal.NewFromString(resp.OrigQty)
 	cumQty, _ := decimal.NewFromString(resp.ExecutedQty)
+	lPrice, _ := decimal.NewFromString(resp.Price)
+	avgP, _ := decimal.NewFromString(resp.AvgPrice)
 
 	createdAt := time.Now().UTC()
 	if resp.Time > 0 {
@@ -328,6 +357,8 @@ func (c *Client) QueryOrder(ctx context.Context, symbol, clientOrderID string) (
 		Status:              status,
 		TargetQty:           origQty,
 		CumulativeFilledQty: cumQty,
+		LimitPrice:          lPrice,
+		AvgPrice:            avgP,
 		CreatedAt:           createdAt,
 	}, nil
 }
@@ -361,6 +392,26 @@ func (c *Client) GetPositionRisk(ctx context.Context, symbol string) ([]Position
 	var resp []PositionRiskResponse
 	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
 		return nil, fmt.Errorf("get position risk decode: %w", err)
+	}
+
+	return resp, nil
+}
+
+// GetOpenAlgoOrders mengambil semua pesanan algo/conditional terbuka dari GET /fapi/v1/openAlgoOrders
+func (c *Client) GetOpenAlgoOrders(ctx context.Context, symbol string) ([]QueryAlgoOrderResponse, error) {
+	params := url.Values{}
+	if symbol != "" {
+		params.Set("symbol", symbol)
+	}
+
+	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v1/openAlgoOrders", params, true)
+	if err != nil {
+		return nil, fmt.Errorf("get open algo orders: %w", err)
+	}
+
+	var resp []QueryAlgoOrderResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return nil, fmt.Errorf("get open algo orders decode: %w", err)
 	}
 
 	return resp, nil
@@ -487,5 +538,3 @@ func (c *Client) FetchAccountBalance(ctx context.Context) (walletBal, unrealized
 
 	return walletBal, unrealizedPnL, availBal, positions, nil
 }
-
-

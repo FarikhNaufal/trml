@@ -178,21 +178,21 @@ func TestEvaluateSignalVWAPPullbackLong(t *testing.T) {
 	barDeltas[59] = 2000.0    // strong positive delta spike -> high Z-score
 
 	snap := model.MarketSnapshot{
-		Symbol:               "SOLUSDT",
-		BestBid:              105.70,
-		BestAsk:              105.72,
-		BookUpdatedAt:        now.Add(-1 * time.Second),
-		MarkPrice:            105.71,
-		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
-		FundingRate:          0.0001,
-		FundingUpdatedAt:     now.Add(-10 * time.Second),
-		PrevOpenInterest:     10000.0,
-		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
-		CurrOpenInterest:     10050.0, // +0.5%
-		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
-		CurrentSessionVWAP:   vwap,
-		ClosedCandles:        candles,
-		ClosedBarDeltasUSDT:  barDeltas,
+		Symbol:              "SOLUSDT",
+		BestBid:             105.70,
+		BestAsk:             105.72,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           105.71,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0, // +0.5%
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  vwap,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -280,21 +280,21 @@ func TestEvaluateSignalVWAPPullbackShort(t *testing.T) {
 	barDeltas[59] = -2000.0  // strong negative delta spike -> low negative Z-score
 
 	snap := model.MarketSnapshot{
-		Symbol:               "SOLUSDT",
-		BestBid:              99.28,
-		BestAsk:              99.30,
-		BookUpdatedAt:        now.Add(-1 * time.Second),
-		MarkPrice:            99.29,
-		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
-		FundingRate:          -0.0001,
-		FundingUpdatedAt:     now.Add(-10 * time.Second),
-		PrevOpenInterest:     10000.0,
-		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
-		CurrOpenInterest:     10050.0,
-		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
-		CurrentSessionVWAP:   vwap,
-		ClosedCandles:        candles,
-		ClosedBarDeltasUSDT:  barDeltas,
+		Symbol:              "SOLUSDT",
+		BestBid:             99.28,
+		BestAsk:             99.30,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           99.29,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         -0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  vwap,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -368,21 +368,21 @@ func TestEvaluateSignalRejectsNoImpulse(t *testing.T) {
 	}
 
 	snap := model.MarketSnapshot{
-		Symbol:               "SOLUSDT",
-		BestBid:              100.10,
-		BestAsk:              100.12,
-		BookUpdatedAt:        now.Add(-1 * time.Second),
-		MarkPrice:            100.11,
-		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
-		FundingRate:          0.0001,
-		FundingUpdatedAt:     now.Add(-10 * time.Second),
-		PrevOpenInterest:     10000.0,
-		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
-		CurrOpenInterest:     10050.0,
-		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
-		CurrentSessionVWAP:   100.0,
-		ClosedCandles:        candles,
-		ClosedBarDeltasUSDT:  barDeltas,
+		Symbol:              "SOLUSDT",
+		BestBid:             100.10,
+		BestAsk:             100.12,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           100.11,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  100.0,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -463,21 +463,21 @@ func TestEvaluateSignalVWAPPullbackMarketOrder(t *testing.T) {
 	barDeltas[59] = 2000.0
 
 	snapLong := model.MarketSnapshot{
-		Symbol:               "SOLUSDT",
-		BestBid:              105.70,
-		BestAsk:              105.72,
-		BookUpdatedAt:        now.Add(-1 * time.Second),
-		MarkPrice:            105.71,
-		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
-		FundingRate:          0.0001,
-		FundingUpdatedAt:     now.Add(-10 * time.Second),
-		PrevOpenInterest:     10000.0,
-		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
-		CurrOpenInterest:     10050.0,
-		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
-		CurrentSessionVWAP:   vwap,
-		ClosedCandles:        candles,
-		ClosedBarDeltasUSDT:  barDeltas,
+		Symbol:              "SOLUSDT",
+		BestBid:             105.70,
+		BestAsk:             105.72,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           105.71,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  vwap,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -559,21 +559,21 @@ func TestEvaluateSignalRejectsEntryTooFarFromVWAP(t *testing.T) {
 	barDeltas[59] = 2000.0
 
 	snap := model.MarketSnapshot{
-		Symbol:               "SOLUSDT",
-		BestBid:              107.98,
-		BestAsk:              108.00,
-		BookUpdatedAt:        now.Add(-1 * time.Second),
-		MarkPrice:            107.99,
-		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
-		FundingRate:          0.0001,
-		FundingUpdatedAt:     now.Add(-10 * time.Second),
-		PrevOpenInterest:     10000.0,
-		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
-		CurrOpenInterest:     10050.0,
-		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
-		CurrentSessionVWAP:   vwap,
-		ClosedCandles:        candles,
-		ClosedBarDeltasUSDT:  barDeltas,
+		Symbol:              "SOLUSDT",
+		BestBid:             107.98,
+		BestAsk:             108.00,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           107.99,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  vwap,
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -652,21 +652,21 @@ func TestEvaluateSignalEntryTooFarFromEMA200(t *testing.T) {
 	barDeltas[59] = 2000.0
 
 	snap := model.MarketSnapshot{
-		Symbol:               "SOLUSDT",
-		BestBid:              109.98,
-		BestAsk:              110.00,
-		BookUpdatedAt:        now.Add(-1 * time.Second),
-		MarkPrice:            109.99,
-		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
-		FundingRate:          0.0001,
-		FundingUpdatedAt:     now.Add(-10 * time.Second),
-		PrevOpenInterest:     10000.0,
-		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
-		CurrOpenInterest:     10050.0,
-		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
-		CurrentSessionVWAP:   109.8, // VWAP dekat sehingga tidak kena ENTRY_TOO_FAR_FROM_VWAP
-		ClosedCandles:        candles,
-		ClosedBarDeltasUSDT:  barDeltas,
+		Symbol:              "SOLUSDT",
+		BestBid:             109.98,
+		BestAsk:             110.00,
+		BookUpdatedAt:       now.Add(-1 * time.Second),
+		MarkPrice:           109.99,
+		MarkPriceUpdatedAt:  now.Add(-2 * time.Second),
+		FundingRate:         0.0001,
+		FundingUpdatedAt:    now.Add(-10 * time.Second),
+		PrevOpenInterest:    10000.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOpenInterest:    10050.0,
+		CurrOIUpdatedAt:     now.Add(-30 * time.Second),
+		CurrentSessionVWAP:  109.8, // VWAP dekat sehingga tidak kena ENTRY_TOO_FAR_FROM_VWAP
+		ClosedCandles:       candles,
+		ClosedBarDeltasUSDT: barDeltas,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -745,19 +745,19 @@ func TestEvaluateSignalBTCMacroGateFlashDumpVetoLong(t *testing.T) {
 	deltas[59] = 2000.0 // Z-score tinggi
 
 	altSnap := model.MarketSnapshot{
-		Symbol:             "ALTUSDT",
-		BestBid:            105.70,
-		BestAsk:            105.72,
-		BookUpdatedAt:      now,
-		MarkPriceUpdatedAt: now,
-		FundingUpdatedAt:   now,
-		CurrentSessionVWAP: 105.0,
-		ClosedCandles:      candles,
+		Symbol:              "ALTUSDT",
+		BestBid:             105.70,
+		BestAsk:             105.72,
+		BookUpdatedAt:       now,
+		MarkPriceUpdatedAt:  now,
+		FundingUpdatedAt:    now,
+		CurrentSessionVWAP:  105.0,
+		ClosedCandles:       candles,
 		ClosedBarDeltasUSDT: deltas,
-		PrevOpenInterest:   1000.0,
-		CurrOpenInterest:   1050.0,
-		PrevOIUpdatedAt:    now.Add(-5 * time.Minute),
-		CurrOIUpdatedAt:    now,
+		PrevOpenInterest:    1000.0,
+		CurrOpenInterest:    1050.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:     now,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -771,8 +771,8 @@ func TestEvaluateSignalBTCMacroGateFlashDumpVetoLong(t *testing.T) {
 	btcCandles := make([]model.Candle, 55)
 	for i := 0; i < 54; i++ {
 		btcCandles[i] = model.Candle{
-			OpenTime:  now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:      84000.0, High: 84100.0, Low: 83900.0, Close: 84000.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     84000.0, High: 84100.0, Low: 83900.0, Close: 84000.0,
 			VolumeBase: 100.0,
 		}
 	}
@@ -866,8 +866,8 @@ func TestEvaluateSignalBTCMacroGateTrendBullishVetoShort(t *testing.T) {
 		}
 		deltas[i] = -100.0 - float64(i%7)*15.0
 	}
-	candles[50].Low = 95.0   // Prior bearish impulse
-	candles[58].High = 99.5  // Retest VWAP
+	candles[50].Low = 95.0  // Prior bearish impulse
+	candles[58].High = 99.5 // Retest VWAP
 	// Bar terkini bounce ke bawah
 	candles[59] = model.Candle{
 		OpenTime:  now.Add(-5 * time.Minute),
@@ -878,19 +878,19 @@ func TestEvaluateSignalBTCMacroGateTrendBullishVetoShort(t *testing.T) {
 	deltas[59] = -2000.0 // Delta Z-score negatif kuat
 
 	altSnapShort := model.MarketSnapshot{
-		Symbol:             "TIAUSDT",
-		BestBid:            99.20,
-		BestAsk:            99.21,
-		BookUpdatedAt:      now,
-		MarkPriceUpdatedAt: now,
-		FundingUpdatedAt:   now,
-		CurrentSessionVWAP: 99.5,
-		ClosedCandles:      candles,
+		Symbol:              "TIAUSDT",
+		BestBid:             99.20,
+		BestAsk:             99.21,
+		BookUpdatedAt:       now,
+		MarkPriceUpdatedAt:  now,
+		FundingUpdatedAt:    now,
+		CurrentSessionVWAP:  99.5,
+		ClosedCandles:       candles,
 		ClosedBarDeltasUSDT: deltas,
-		PrevOpenInterest:   1000.0,
-		CurrOpenInterest:   1050.0,
-		PrevOIUpdatedAt:    now.Add(-5 * time.Minute),
-		CurrOIUpdatedAt:    now,
+		PrevOpenInterest:    1000.0,
+		CurrOpenInterest:    1050.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:     now,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -905,8 +905,8 @@ func TestEvaluateSignalBTCMacroGateTrendBullishVetoShort(t *testing.T) {
 	for i := 0; i < 55; i++ {
 		p := 83000.0 + float64(i)*40.0 // Tren naik stabil
 		btcCandlesBull[i] = model.Candle{
-			OpenTime:  now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:      p, High: p + 30.0, Low: p - 10.0, Close: p + 20.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     p, High: p + 30.0, Low: p - 10.0, Close: p + 20.0,
 			VolumeBase: 100.0,
 		}
 	}
@@ -995,10 +995,10 @@ func TestEvaluateSignalBTCMacroGateTrendBearishVetoLong(t *testing.T) {
 		CurrentSessionVWAP:  104.5,
 		ClosedCandles:       candles,
 		ClosedBarDeltasUSDT: deltas,
-		PrevOpenInterest:   1000.0,
-		CurrOpenInterest:   1050.0,
-		PrevOIUpdatedAt:    now.Add(-5 * time.Minute),
-		CurrOIUpdatedAt:    now,
+		PrevOpenInterest:    1000.0,
+		CurrOpenInterest:    1050.0,
+		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
+		CurrOIUpdatedAt:     now,
 		Filter: model.ExchangeFilter{
 			TickSize:    decimal.NewFromFloat(0.01),
 			StepSize:    decimal.NewFromFloat(0.1),
@@ -1013,8 +1013,8 @@ func TestEvaluateSignalBTCMacroGateTrendBearishVetoLong(t *testing.T) {
 	for i := 0; i < 55; i++ {
 		p := 85000.0 - float64(i)*50.0 // Tren turun perlahan
 		btcCandlesBear[i] = model.Candle{
-			OpenTime:  now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:      p, High: p + 10.0, Low: p - 30.0, Close: p - 20.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     p, High: p + 10.0, Low: p - 30.0, Close: p - 20.0,
 			VolumeBase: 100.0,
 		}
 	}
@@ -1304,8 +1304,8 @@ func TestEvaluateSignal_BTCGate_BearishLongVeto_OrCondition(t *testing.T) {
 	for i := 0; i < 55; i++ {
 		p := 85000.0 - float64(i)*50.0 // Tren turun, Close terakhir ~82300, EMA ~84000
 		btcCandlesA[i] = model.Candle{
-			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:       p, High: p + 10.0, Low: p - 30.0, Close: p - 20.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     p, High: p + 10.0, Low: p - 30.0, Close: p - 20.0,
 			VolumeBase: 100.0,
 		}
 	}
@@ -1326,8 +1326,8 @@ func TestEvaluateSignal_BTCGate_BearishLongVeto_OrCondition(t *testing.T) {
 	for i := 0; i < 55; i++ {
 		p := 83000.0 + float64(i)*50.0 // Tren naik perlahan, EMA ~84000, Close ~85700
 		btcCandlesB[i] = model.Candle{
-			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:       p, High: p + 30.0, Low: p - 10.0, Close: p + 20.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     p, High: p + 30.0, Low: p - 10.0, Close: p + 20.0,
 			VolumeBase: 100.0,
 		}
 	}
@@ -1391,9 +1391,9 @@ func TestEvaluateSignal_AsymmetricHurdle(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		p := 100.0 + float64(i)*0.1
 		candles[i] = model.Candle{
-			OpenTime:   now.Add(time.Duration(i-60) * 5 * time.Minute),
-			CloseTime:  now.Add(time.Duration(i-59) * 5 * time.Minute),
-			Open:       p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
+			OpenTime:  now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:      p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
 			VolumeBase: 1000.0,
 		}
 		deltas[i] = 100.0
@@ -1401,9 +1401,9 @@ func TestEvaluateSignal_AsymmetricHurdle(t *testing.T) {
 	candles[50].High = 110.0 // Prior bullish impulse
 	candles[58].Low = 104.5  // Retest VWAP
 	candles[59] = model.Candle{
-		OpenTime:   now.Add(-5 * time.Minute),
-		CloseTime:  now,
-		Open:       105.0, High: 106.0, Low: 104.9, Close: 105.8,
+		OpenTime:  now.Add(-5 * time.Minute),
+		CloseTime: now,
+		Open:      105.0, High: 106.0, Low: 104.9, Close: 105.8,
 		VolumeBase: 2000.0,
 	}
 
@@ -1514,9 +1514,9 @@ func TestEvaluateSignal_BTCGatePersistenceBuffer(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		p := 100.0 + float64(i)*0.1
 		candles[i] = model.Candle{
-			OpenTime:   now.Add(time.Duration(i-60) * 5 * time.Minute),
-			CloseTime:  now.Add(time.Duration(i-59) * 5 * time.Minute),
-			Open:       p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
+			OpenTime:  now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:      p, High: p + 1.0, Low: p - 0.5, Close: p + 0.5,
 			VolumeBase: 1000.0,
 		}
 		deltas[i] = 100.0 + float64(i%7)*15.0
@@ -1524,9 +1524,9 @@ func TestEvaluateSignal_BTCGatePersistenceBuffer(t *testing.T) {
 	candles[50].High = 110.0
 	candles[58].Low = 104.5
 	candles[59] = model.Candle{
-		OpenTime:   now.Add(-5 * time.Minute),
-		CloseTime:  now,
-		Open:       105.0, High: 106.0, Low: 104.9, Close: 105.8,
+		OpenTime:  now.Add(-5 * time.Minute),
+		CloseTime: now,
+		Open:      105.0, High: 106.0, Low: 104.9, Close: 105.8,
 		VolumeBase: 2000.0,
 	}
 	deltas[59] = 2000.0
@@ -1559,15 +1559,15 @@ func TestEvaluateSignal_BTCGatePersistenceBuffer(t *testing.T) {
 	btcCandles := make([]model.Candle, 55)
 	for i := 0; i < 54; i++ {
 		btcCandles[i] = model.Candle{
-			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:       84000.0, High: 84020.0, Low: 83980.0, Close: 84000.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     84000.0, High: 84020.0, Low: 83980.0, Close: 84000.0,
 			VolumeBase: 100.0,
 		}
 	}
 	btcCandles[54] = model.Candle{
-		OpenTime:   now.Add(-5 * time.Minute),
-		CloseTime:  now,
-		Open:       84000.0, High: 84100.0, Low: 84000.0, Close: 84050.0, // Pantulan 1 bar
+		OpenTime:  now.Add(-5 * time.Minute),
+		CloseTime: now,
+		Open:      84000.0, High: 84100.0, Low: 84000.0, Close: 84050.0, // Pantulan 1 bar
 		VolumeBase: 200.0,
 	}
 
@@ -1667,13 +1667,13 @@ func TestBuildSafeDecimalOrderIntent_StopDistanceFloorAndTP1(t *testing.T) {
 
 func TestBuildSafeDecimalOrderIntent_MarketVsLimitFriction(t *testing.T) {
 	snap := model.MarketSnapshot{
-		Symbol: "BTCUSDT",
+		Symbol:  "BTCUSDT",
 		BestBid: 100.0,
 		BestAsk: 100.0,
 		Filter: model.ExchangeFilter{
-			TickSize: decimal.NewFromFloat(0.01),
-			StepSize: decimal.NewFromFloat(0.001),
-			MinQty:   decimal.NewFromFloat(0.001),
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.001),
+			MinQty:      decimal.NewFromFloat(0.001),
 			MinNotional: decimal.NewFromFloat(5.0),
 		},
 	}
@@ -1832,25 +1832,25 @@ func TestEvaluateSignal_VWAPSessionWarmup(t *testing.T) {
 func TestEvaluateSignal_CapitulationOIFloor(t *testing.T) {
 	now := time.Date(2026, 10, 29, 14, 0, 0, 0, time.UTC)
 	cfg := EvaluatorConfig{
-		MaxSlots:                 3,
-		MaxBookStaleness:         5 * time.Second,
-		MaxMarkStaleness:         15 * time.Second,
-		MaxDataStaleness:         330 * time.Second,
-		MinOIInterval:            4 * time.Minute,
-		MaxOIInterval:            7 * time.Minute,
-		MaxOIStaleness:           300 * time.Second,
-		MaxSpreadPct:             0.05,
-		MinNATRPct:               0.40,
-		MaxNATRPct:               5.00,
-		EMAPeriod:                10,
-		ATRPeriod:                10,
-		MinOIDeltaShortPct:       -0.02,
-		MinBounceZScoreShort:     0.40,
-		LookbackImpulseBars:      15,
-		RetestLookbackBars:       5,
-		PullbackToleranceATR:     0.50,
-		MaxEntryDistanceATR:      1.50,
-		DeltaZScoreWindow:        20,
+		MaxSlots:             3,
+		MaxBookStaleness:     5 * time.Second,
+		MaxMarkStaleness:     15 * time.Second,
+		MaxDataStaleness:     330 * time.Second,
+		MinOIInterval:        4 * time.Minute,
+		MaxOIInterval:        7 * time.Minute,
+		MaxOIStaleness:       300 * time.Second,
+		MaxSpreadPct:         0.05,
+		MinNATRPct:           0.40,
+		MaxNATRPct:           5.00,
+		EMAPeriod:            10,
+		ATRPeriod:            10,
+		MinOIDeltaShortPct:   -0.02,
+		MinBounceZScoreShort: 0.40,
+		LookbackImpulseBars:  15,
+		RetestLookbackBars:   5,
+		PullbackToleranceATR: 0.50,
+		MaxEntryDistanceATR:  1.50,
+		DeltaZScoreWindow:    20,
 	}
 
 	// 20 candle dengan tren bearish di bawah EMA200 dan VWAP
@@ -1875,14 +1875,14 @@ func TestEvaluateSignal_CapitulationOIFloor(t *testing.T) {
 	deltas[29] = -25.0 // Z-score agresif short
 
 	snap := model.MarketSnapshot{
-		Symbol:              "BLESSUSDT",
-		Now:                 now,
-		BookUpdatedAt:       now,
-		MarkPriceUpdatedAt:  now,
-		FundingUpdatedAt:    now,
-		BestBid:             97.98,
-		BestAsk:             98.00,
-		PrevOpenInterest:    10000.0,
+		Symbol:             "BLESSUSDT",
+		Now:                now,
+		BookUpdatedAt:      now,
+		MarkPriceUpdatedAt: now,
+		FundingUpdatedAt:   now,
+		BestBid:            97.98,
+		BestAsk:            98.00,
+		PrevOpenInterest:   10000.0,
 		// Penurunan OI sebesar -0.30% (melebihi batas kapitulasi -0.10%)
 		CurrOpenInterest:    9970.0,
 		PrevOIUpdatedAt:     now.Add(-5 * time.Minute),
@@ -1979,15 +1979,15 @@ func TestEvaluateSignal_BTCGatePersistenceBuffer_Short(t *testing.T) {
 	btcCandles := make([]model.Candle, 55)
 	for i := 0; i < 54; i++ {
 		btcCandles[i] = model.Candle{
-			OpenTime:   now.Add(time.Duration(i-55) * 5 * time.Minute),
-			Open:       84050.0, High: 84100.0, Low: 84000.0, Close: 84050.0,
+			OpenTime: now.Add(time.Duration(i-55) * 5 * time.Minute),
+			Open:     84050.0, High: 84100.0, Low: 84000.0, Close: 84050.0,
 			VolumeBase: 100.0,
 		}
 	}
 	btcCandles[54] = model.Candle{
-		OpenTime:   now.Add(-5 * time.Minute),
-		CloseTime:  now,
-		Open:       84050.0, High: 84050.0, Low: 83900.0, Close: 83950.0, // Retrace 1 bar
+		OpenTime:  now.Add(-5 * time.Minute),
+		CloseTime: now,
+		Open:      84050.0, High: 84050.0, Low: 83900.0, Close: 83950.0, // Retrace 1 bar
 		VolumeBase: 200.0,
 	}
 
@@ -2165,9 +2165,3 @@ func TestEvaluateSignal_MinSignalRVOL(t *testing.T) {
 		t.Fatalf("expected rvol=0.85 to pass LOW_SIGNAL_RVOL, got reason=%s", reasonPass)
 	}
 }
-
-
-
-
-
-

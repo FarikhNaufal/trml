@@ -33,17 +33,17 @@ type EvaluatorConfig struct {
 	MaxAdverseFundingRate float64
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
-	PullbackToleranceATR   float64
-	MinBounceZScore        float64
-	MinBounceZScoreLong    float64
-	MinBounceZScoreShort   float64
-	MinEMA200DistanceATR   float64
-	MaxEMA200DistanceATR   float64
-	LookbackImpulseBars    int
-	RetestLookbackBars     int
-	MinImpulseATR          float64
-	MaxEntryDistanceATR    float64
-	EntryOrderType         string
+	PullbackToleranceATR float64
+	MinBounceZScore      float64
+	MinBounceZScoreLong  float64
+	MinBounceZScoreShort float64
+	MinEMA200DistanceATR float64
+	MaxEMA200DistanceATR float64
+	LookbackImpulseBars  int
+	RetestLookbackBars   int
+	MinImpulseATR        float64
+	MaxEntryDistanceATR  float64
+	EntryOrderType       string
 
 	// Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
 	BTCGateEnabled         bool
@@ -127,16 +127,19 @@ func EvaluateSignal(
 	if snap.FundingUpdatedAt.IsZero() || snap.Now.Sub(snap.FundingUpdatedAt) > cfg.MaxDataStaleness {
 		return model.OrderIntent{}, false, "STALE_FUNDING_FEED", ""
 	}
-	if snap.BestBid <= 0 || snap.BestAsk <= snap.BestBid {
+	if snap.BestBid <= 0 || snap.BestAsk <= snap.BestBid || math.IsNaN(snap.BestBid) || math.IsNaN(snap.BestAsk) || math.IsInf(snap.BestBid, 0) || math.IsInf(snap.BestAsk, 0) {
 		return model.OrderIntent{}, false, "INVALID_BID_ASK", ""
 	}
 	spreadPct := ((snap.BestAsk - snap.BestBid) / snap.BestBid) * 100.0
-	if spreadPct > cfg.MaxSpreadPct {
+	if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) || spreadPct > cfg.MaxSpreadPct {
 		return model.OrderIntent{}, false, "SPREAD_EXCEEDED", fmt.Sprintf("SPREAD_%.3f%%_MAX_%.3f%%", spreadPct, cfg.MaxSpreadPct)
 	}
 
 	// Gatekeeper 3: Validasi Jarak Waktu Sampel Delta Open Interest (Solusi P1-6)
-	if snap.PrevOpenInterest <= 0 || snap.CurrOpenInterest <= 0 || snap.PrevOIUpdatedAt.IsZero() {
+	if snap.PrevOpenInterest <= 0 || snap.CurrOpenInterest <= 0 ||
+		math.IsNaN(snap.PrevOpenInterest) || math.IsInf(snap.PrevOpenInterest, 0) ||
+		math.IsNaN(snap.CurrOpenInterest) || math.IsInf(snap.CurrOpenInterest, 0) ||
+		snap.PrevOIUpdatedAt.IsZero() {
 		return model.OrderIntent{}, false, "MISSING_OI_DATA", "OI_WARMING_UP"
 	}
 	if snap.CurrOIUpdatedAt.IsZero() || snap.Now.Sub(snap.CurrOIUpdatedAt) > cfg.MaxOIStaleness {
@@ -154,19 +157,22 @@ func EvaluateSignal(
 
 	// KONFIRMASI 1: Filter Tren Makro (EMA 200 mature)
 	ema200 := indicator.CalculateEMA(snap.ClosedCandles, cfg.EMAPeriod)
+	if math.IsNaN(ema200) || math.IsInf(ema200, 0) || ema200 <= 0 {
+		return model.OrderIntent{}, false, "INVALID_EMA", ""
+	}
 
 	// ATR14 & NATR
 	atr14 := indicator.CalculateATR(snap.ClosedCandles, cfg.ATRPeriod)
-	if atr14 <= 0 {
+	if math.IsNaN(atr14) || math.IsInf(atr14, 0) || atr14 <= 0 {
 		return model.OrderIntent{}, false, "INVALID_ATR", ""
 	}
 	natrPct := (atr14 / latest.Close) * 100.0
-	if natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
+	if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) || natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
 		return model.OrderIntent{}, false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("NATR_%.2f%%_OUTSIDE_%.2f%%_%.2f%%", natrPct, cfg.MinNATRPct, cfg.MaxNATRPct)
 	}
 
 	vwap := snap.CurrentSessionVWAP
-	if vwap <= 0 {
+	if math.IsNaN(vwap) || math.IsInf(vwap, 0) || vwap <= 0 {
 		return model.OrderIntent{}, false, "INVALID_VWAP", ""
 	}
 
@@ -237,8 +243,8 @@ func EvaluateSignal(
 
 	var hasPriorBullishImpulse bool
 	var hasPriorBearishImpulse bool
-	var latestImpulseIdxLong int = -1
-	var latestImpulseIdxShort int = -1
+	latestImpulseIdxLong := -1
+	latestImpulseIdxShort := -1
 	bullishImpulseThreshold := vwap + (minImpulseATR * atr14)
 	bearishImpulseThreshold := vwap - (minImpulseATR * atr14)
 
@@ -307,7 +313,7 @@ func EvaluateSignal(
 
 	// KONFIRMASI 4: Pantulan Candlestick & Agresi Orderflow
 	barDeltaZScore, zOk := indicator.CalculateBarDeltaZScore(snap.ClosedBarDeltasUSDT, cfg.DeltaZScoreWindow)
-	if !zOk {
+	if !zOk || math.IsNaN(barDeltaZScore) || math.IsInf(barDeltaZScore, 0) {
 		return model.OrderIntent{}, false, "INVALID_ZSCORE_BASELINE", ""
 	}
 
@@ -320,12 +326,18 @@ func EvaluateSignal(
 
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
 	rawOIDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
+	if math.IsNaN(rawOIDeltaPct) || math.IsInf(rawOIDeltaPct, 0) {
+		return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
+	}
 	oiDeltaPct := rawOIDeltaPct
 	if !snap.PrevOIUpdatedAt.IsZero() && !snap.CurrOIUpdatedAt.IsZero() {
 		elapsedSec := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt).Seconds()
 		if elapsedSec >= 60.0 && elapsedSec <= 600.0 {
 			// Normalisasi laju perubahan Open Interest ke basis standar 300 detik (5 menit)
 			oiDeltaPct = rawOIDeltaPct * (300.0 / elapsedSec)
+			if math.IsNaN(oiDeltaPct) || math.IsInf(oiDeltaPct, 0) {
+				return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
+			}
 		}
 	}
 
@@ -553,6 +565,12 @@ func EvaluateSignal(
 			if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
 				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
 				btcVWAP := btcSnap.CurrentSessionVWAP
+				if math.IsNaN(btcEMA) || math.IsInf(btcEMA, 0) || btcEMA <= 0 {
+					return model.OrderIntent{}, false, "INVALID_BTC_EMA", ""
+				}
+				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
+					return model.OrderIntent{}, false, "INVALID_BTC_VWAP", ""
+				}
 				if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
 					return model.OrderIntent{}, false, "BTC_TREND_BULLISH_SHORT_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_ABOVE_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
 				}
@@ -580,6 +598,12 @@ func EvaluateSignal(
 			if targetSide == model.SideLong && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
 				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
 				btcVWAP := btcSnap.CurrentSessionVWAP
+				if math.IsNaN(btcEMA) || math.IsInf(btcEMA, 0) || btcEMA <= 0 {
+					return model.OrderIntent{}, false, "INVALID_BTC_EMA", ""
+				}
+				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
+					return model.OrderIntent{}, false, "INVALID_BTC_VWAP", ""
+				}
 				if latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP) {
 					return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_OR_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
 				}
@@ -612,4 +636,3 @@ func EvaluateSignal(
 	}
 	return intent, true, "SIGNAL_APPROVED", ""
 }
-

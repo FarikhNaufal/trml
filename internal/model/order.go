@@ -70,6 +70,8 @@ type LiveOrderRecord struct {
 	Status              OrderLifecycleStatus
 	TargetQty           decimal.Decimal
 	CumulativeFilledQty decimal.Decimal
+	LimitPrice          decimal.Decimal
+	AvgPrice            decimal.Decimal
 	SLPrice             decimal.Decimal
 	InitialSLPrice      decimal.Decimal
 	TPPrice             decimal.Decimal
@@ -98,6 +100,7 @@ type LivePositionProtection struct {
 	IsTP1Hit        bool
 	LastAttemptTime time.Time
 	LastError       string
+	SLRetryCount    int
 	TPRetryCount    int
 	LastTPAttempt   time.Time
 	SignalAuditID   int64

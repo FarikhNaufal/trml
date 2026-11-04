@@ -185,9 +185,11 @@ func TestSQLiteRepository(t *testing.T) {
 		t.Fatalf("expected dryrun PeakPrice 4.4200, got %s", positions[0].PeakPrice)
 	}
 
-	// Update break-even
+	// Update break-even, entry fee and price (e.g. after further fills)
 	pos1.CurrentSLPrice = decimal.NewFromFloat(4.4550)
 	pos1.IsBreakEvenMoved = true
+	pos1.EntryFee = decimal.NewFromFloat(0.0450)
+	pos1.EntryPrice = decimal.NewFromFloat(4.5100)
 	if err := repo.SaveDryRunPosition(ctx, pos1); err != nil {
 		t.Fatalf("failed to upsert dry-run position: %v", err)
 	}
@@ -195,6 +197,9 @@ func TestSQLiteRepository(t *testing.T) {
 	positionsAfterUpdate, _ := repo.GetAllDryRunPositions(ctx)
 	if len(positionsAfterUpdate) != 1 || !positionsAfterUpdate[0].IsBreakEvenMoved || !positionsAfterUpdate[0].CurrentSLPrice.Equal(decimal.NewFromFloat(4.4550)) {
 		t.Fatalf("upsert failed: %+v", positionsAfterUpdate[0])
+	}
+	if !positionsAfterUpdate[0].EntryFee.Equal(decimal.NewFromFloat(0.0450)) || !positionsAfterUpdate[0].EntryPrice.Equal(decimal.NewFromFloat(4.5100)) {
+		t.Fatalf("upsert entry_fee or entry_price failed: %+v", positionsAfterUpdate[0])
 	}
 
 	// Delete
@@ -306,5 +311,39 @@ func TestSQLiteRepository(t *testing.T) {
 		t.Fatalf("unexpected SOLUSDT exit timestamp: %s", solExit.ClosedAt)
 	} else if solExit.ExitReason != "STOP_LOSS" {
 		t.Fatalf("expected SOLUSDT exit reason STOP_LOSS, got: %s", solExit.ExitReason)
+	}
+}
+
+func TestCorruptDecimalFailClosed(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory sqlite db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	// Insert row with corrupt tp_price
+	_, err = db.conn.ExecContext(ctx, `
+		INSERT INTO dryrun_open_positions (
+			client_order_id, symbol, side, qty, initial_qty, entry_price, entry_fee,
+			current_sl_price, initial_sl_price, tp_price, atr_at_entry, last_mark_price,
+			is_tp1_hit, is_breakeven_moved, protection_tier, signal_audit_id,
+			max_mae, max_mfe, peak_price, mark_updated_at_utc, opened_at_utc
+		) VALUES (
+			'ORDER_CORRUPT', 'ETHUSDT', 'LONG', '1.0', '1.0', '2000.0', '1.0',
+			'1950.0', '1950.0', 'NOT_A_DECIMAL', '10.0', '2000.0',
+			0, 0, 0, 0,
+			0, 0, '2000.0', datetime('now'), datetime('now')
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to insert test corrupt row: %v", err)
+	}
+
+	_, err = repo.GetAllDryRunPositions(ctx)
+	if err == nil {
+		t.Fatalf("expected error loading positions with corrupt optional decimal, got nil")
 	}
 }

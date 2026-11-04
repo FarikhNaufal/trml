@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -91,6 +92,25 @@ func TestValidateAndFilterCandles(t *testing.T) {
 	_, err = ValidateAndFilterCandles([]Candle{cBadOHLC}, now)
 	if err == nil {
 		t.Errorf("expected error for High < Open")
+	}
+
+	// Test NaN and Inf in OHLC and Volume
+	cNaNPrice := c1
+	cNaNPrice.Open = math.NaN()
+	if _, err := ValidateAndFilterCandles([]Candle{cNaNPrice}, now); err == nil {
+		t.Errorf("expected error for NaN Open price")
+	}
+
+	cInfPrice := c1
+	cInfPrice.High = math.Inf(1)
+	if _, err := ValidateAndFilterCandles([]Candle{cInfPrice}, now); err == nil {
+		t.Errorf("expected error for Inf High price")
+	}
+
+	cNaNVol := c1
+	cNaNVol.VolumeBase = math.NaN()
+	if _, err := ValidateAndFilterCandles([]Candle{cNaNVol}, now); err == nil {
+		t.Errorf("expected error for NaN VolumeBase")
 	}
 }
 
@@ -251,4 +271,3 @@ func TestSeedOpenInterestBootstrap(t *testing.T) {
 		t.Fatalf("expected IsOIBootstrapped false after live polling aged into place")
 	}
 }
-

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -11,27 +12,27 @@ type SymbolState struct {
 	Filter                     ExchangeFilter
 	IsLeverageIsolatedVerified bool
 
-	BestBid                    float64
-	BestAsk                    float64
-	BookUpdatedAt              time.Time
+	BestBid       float64
+	BestAsk       float64
+	BookUpdatedAt time.Time
 
-	MarkPrice                  float64
-	MarkPriceUpdatedAt         time.Time
+	MarkPrice          float64
+	MarkPriceUpdatedAt time.Time
 
-	FundingRate                float64
-	FundingUpdatedAt           time.Time
+	FundingRate      float64
+	FundingUpdatedAt time.Time
 
-	PrevOpenInterest           float64
-	CurrOpenInterest           float64
-	PrevOIUpdatedAt            time.Time
-	CurrOIUpdatedAt            time.Time
-	IsOIBootstrapped           bool
-	OISamples                  []OISample
+	PrevOpenInterest float64
+	CurrOpenInterest float64
+	PrevOIUpdatedAt  time.Time
+	CurrOIUpdatedAt  time.Time
+	IsOIBootstrapped bool
+	OISamples        []OISample
 
-	SessionEpochDayUTC         int64
-	CumulativeTypicalPVBase    float64
-	CumulativeVolumeBase       float64
-	CurrentSessionVWAP         float64
+	SessionEpochDayUTC      int64
+	CumulativeTypicalPVBase float64
+	CumulativeVolumeBase    float64
+	CurrentSessionVWAP      float64
 
 	LastProcessedCandleOpenTime time.Time
 	ClosedCandles               []Candle
@@ -93,7 +94,7 @@ func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
 	// 3. Cari sampel terdekat dengan target 5 menit lalu (antara 3m50s dan 6m50s)
 	targetTime := now.Add(-5 * time.Minute)
 	var bestSample *OISample
-	var bestDiff time.Duration = 100 * time.Hour
+	bestDiff := 100 * time.Hour
 
 	for i := range s.OISamples {
 		sample := &s.OISamples[i]
@@ -179,7 +180,7 @@ func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now ti
 	// Resolusi PrevOpenInterest (Pengawal 4: cari sampel ~5m lalu)
 	targetTime := now.Add(-5 * time.Minute)
 	var bestSample *OISample
-	var bestDiff time.Duration = 100 * time.Hour
+	bestDiff := 100 * time.Hour
 
 	for i := range s.OISamples {
 		sample := &s.OISamples[i]
@@ -227,13 +228,22 @@ func (s *SymbolState) ApplyClosedCandleLocked(candle Candle, bootstrapCap int, d
 	}
 
 	typicalPrice := (candle.High + candle.Low + candle.Close) / 3.0
-	s.CumulativeTypicalPVBase += typicalPrice * candle.VolumeBase
-	s.CumulativeVolumeBase += candle.VolumeBase
-	if s.CumulativeVolumeBase > 0 {
-		s.CurrentSessionVWAP = s.CumulativeTypicalPVBase / s.CumulativeVolumeBase
+	if !math.IsNaN(typicalPrice) && !math.IsInf(typicalPrice, 0) &&
+		!math.IsNaN(candle.VolumeBase) && !math.IsInf(candle.VolumeBase, 0) && candle.VolumeBase >= 0 {
+		s.CumulativeTypicalPVBase += typicalPrice * candle.VolumeBase
+		s.CumulativeVolumeBase += candle.VolumeBase
+		if s.CumulativeVolumeBase > 0 {
+			vwap := s.CumulativeTypicalPVBase / s.CumulativeVolumeBase
+			if !math.IsNaN(vwap) && !math.IsInf(vwap, 0) && vwap > 0 {
+				s.CurrentSessionVWAP = vwap
+			}
+		}
 	}
 
 	barDeltaUSDT := (2.0 * candle.TakerBuyQuoteUSDT) - candle.QuoteVolumeUSDT
+	if math.IsNaN(barDeltaUSDT) || math.IsInf(barDeltaUSDT, 0) {
+		barDeltaUSDT = 0.0
+	}
 
 	s.ClosedCandles = AppendCandleWithCap(s.ClosedCandles, candle, bootstrapCap)
 	s.ClosedBarDeltasUSDT = AppendFloatWithCap(s.ClosedBarDeltasUSDT, barDeltaUSDT, deltaCap)
