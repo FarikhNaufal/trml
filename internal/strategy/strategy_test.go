@@ -592,6 +592,99 @@ func TestEvaluateSignalRejectsEntryTooFarFromVWAP(t *testing.T) {
 	}
 }
 
+func TestEvaluateSignalEntryTooFarFromEMA200(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := EvaluatorConfig{
+		MaxSlots:              3,
+		MaxBookStaleness:      5 * time.Second,
+		MaxMarkStaleness:      15 * time.Second,
+		MaxDataStaleness:      330 * time.Second,
+		MinOIInterval:         4 * time.Minute,
+		MaxOIInterval:         7 * time.Minute,
+		MaxOIStaleness:        300 * time.Second,
+		MaxSpreadPct:          0.05,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		EMAPeriod:             50,
+		ATRPeriod:             14,
+		DeltaZScoreWindow:     50,
+		MinBarDeltaZScore:     1.20,
+		MinOIDeltaPct:         -0.10,
+		MaxAdverseFundingRate: 0.0005,
+		PullbackToleranceATR:  0.35,
+		MinBounceZScore:       1.20,
+		LookbackImpulseBars:   18,
+		MinImpulseATR:         1.0,
+		MaxEntryDistanceATR:   1.50,
+		MaxEMA200DistanceATR:  3.20,
+		Sizing: SizingConfig{
+			RiskPerTradePct:       decimal.NewFromFloat(0.01),
+			MaxSlotMarginFraction: decimal.NewFromFloat(0.30),
+			AccountLeverage:       5.0,
+			SLMultiplier:          1.0,
+			TPMultiplier:          2.0,
+			MakerFeeRate:          decimal.NewFromFloat(0.0002),
+			TakerFeeRate:          decimal.NewFromFloat(0.0005),
+			SlippageRate:          decimal.NewFromFloat(0.0002),
+		},
+	}
+
+	candles := make([]model.Candle, 60)
+	barDeltas := make([]float64, 60)
+	for i := 0; i < 60; i++ {
+		candles[i] = model.Candle{
+			OpenTime:   now.Add(time.Duration(-60+i) * 5 * time.Minute),
+			CloseTime:  now.Add(time.Duration(-59+i) * 5 * time.Minute),
+			Open:       95.0 + float64(i)*0.15,
+			High:       96.0 + float64(i)*0.15,
+			Low:        94.5 + float64(i)*0.15,
+			Close:      95.5 + float64(i)*0.15,
+			VolumeBase: 1000.0,
+		}
+		barDeltas[i] = 100.0 + float64(i%7)*15.0
+	}
+
+	// Candle 59 closes at 110.0 (dist from EMA ~100.0 is ~10.0, ATR is ~1.5 -> dist is ~6.6 ATR > 3.20 ATR)
+	candles[59].Open = 105.0
+	candles[59].Low = 104.8
+	candles[59].High = 110.5
+	candles[59].Close = 110.0
+	barDeltas[59] = 2000.0
+
+	snap := model.MarketSnapshot{
+		Symbol:               "SOLUSDT",
+		BestBid:              109.98,
+		BestAsk:              110.00,
+		BookUpdatedAt:        now.Add(-1 * time.Second),
+		MarkPrice:            109.99,
+		MarkPriceUpdatedAt:   now.Add(-2 * time.Second),
+		FundingRate:          0.0001,
+		FundingUpdatedAt:     now.Add(-10 * time.Second),
+		PrevOpenInterest:     10000.0,
+		PrevOIUpdatedAt:      now.Add(-5 * time.Minute),
+		CurrOpenInterest:     10050.0,
+		CurrOIUpdatedAt:      now.Add(-30 * time.Second),
+		CurrentSessionVWAP:   109.8, // VWAP dekat sehingga tidak kena ENTRY_TOO_FAR_FROM_VWAP
+		ClosedCandles:        candles,
+		ClosedBarDeltasUSDT:  barDeltas,
+		Filter: model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+		Now: now,
+	}
+
+	_, ok, reason, subReason := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if ok || reason != "ENTRY_TOO_FAR_FROM_EMA200" {
+		t.Fatalf("expected ENTRY_TOO_FAR_FROM_EMA200, got ok=%v, reason=%s, subReason=%s", ok, reason, subReason)
+	}
+	if !strings.Contains(subReason, "MAX_3.20_ATR") {
+		t.Errorf("expected subReason to contain MAX_3.20_ATR, got %s", subReason)
+	}
+}
+
 func TestEvaluateSignalBTCMacroGateFlashDumpVetoLong(t *testing.T) {
 	now := time.Now().UTC()
 	cfg := EvaluatorConfig{

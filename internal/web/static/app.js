@@ -631,6 +631,7 @@ function formatAuditReason(decision, code, subReason) {
     'NATR_OUT_OF_BOUNDS': 'NATR Out of Bounds',
     'SPREAD_EXCEEDED': 'Spread Exceeded',
     'ENTRY_TOO_FAR_FROM_VWAP': 'Entry Too Far From VWAP',
+    'ENTRY_TOO_FAR_FROM_EMA200': 'Entry Too Far From EMA200 (Overextended)',
     'STALE_MARK_PRICE_FEED': 'Stale Mark Price Feed',
     'INVALID_OI_INTERVAL': 'Invalid OI Interval',
     'MISSING_OI_DATA': 'Missing OI Data'

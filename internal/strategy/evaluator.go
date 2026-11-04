@@ -38,6 +38,7 @@ type EvaluatorConfig struct {
 	MinBounceZScoreLong    float64
 	MinBounceZScoreShort   float64
 	MinEMA200DistanceATR   float64
+	MaxEMA200DistanceATR   float64
 	LookbackImpulseBars    int
 	RetestLookbackBars     int
 	MinImpulseATR          float64
@@ -189,6 +190,15 @@ func EvaluateSignal(
 	if distFromVWAP > maxEntryDistATR*atr14 {
 		distATR := distFromVWAP / atr14
 		return model.OrderIntent{}, false, "ENTRY_TOO_FAR_FROM_VWAP", fmt.Sprintf("DIST_%.2f_ATR_MAX_%.2f_ATR", distATR, maxEntryDistATR)
+	}
+
+	// Filter Anti-Overextension: Batasi jarak maksimal penutupan candle dari EMA200 (Anti-Pucuk/Dasar)
+	if cfg.MaxEMA200DistanceATR > 0 {
+		distFromEMA := math.Abs(latest.Close - ema200)
+		if distFromEMA > cfg.MaxEMA200DistanceATR*atr14 {
+			distATR := distFromEMA / atr14
+			return model.OrderIntent{}, false, "ENTRY_TOO_FAR_FROM_EMA200", fmt.Sprintf("DIST_%.2f_ATR_MAX_%.2f_ATR", distATR, cfg.MaxEMA200DistanceATR)
+		}
 	}
 
 	// Defaults jika konfigurasi belum terisi

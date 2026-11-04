@@ -72,6 +72,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MinEMA200DistanceATR != 0.15 {
 		t.Errorf("expected default MinEMA200DistanceATR 0.15, got %f", cfg.MinEMA200DistanceATR)
 	}
+	if cfg.MaxEMA200DistanceATR != 3.20 {
+		t.Errorf("expected default MaxEMA200DistanceATR 3.20, got %f", cfg.MaxEMA200DistanceATR)
+	}
 	if cfg.MinSignalRVOL != 0.75 {
 		t.Errorf("expected default MinSignalRVOL 0.75, got %f", cfg.MinSignalRVOL)
 	}

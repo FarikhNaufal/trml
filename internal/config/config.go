@@ -65,6 +65,7 @@ type Config struct {
 	PullbackToleranceATR float64
 	MinBounceZScore      float64
 	MinEMA200DistanceATR float64
+	MaxEMA200DistanceATR float64
 	LookbackImpulseBars  int
 	RetestLookbackBars   int
 	MinImpulseATR        float64
@@ -304,6 +305,12 @@ func LoadConfig() (*Config, error) {
 	minEMA200Dist, err := strconv.ParseFloat(minEMA200DistStr, 64)
 	if err != nil || minEMA200Dist < 0 || minEMA200Dist > 5.0 {
 		return nil, fmt.Errorf("config: invalid MIN_EMA200_DISTANCE_ATR '%s' (must be float between 0.0 and 5.0)", minEMA200DistStr)
+	}
+
+	maxEMA200DistStr := getEnv("MAX_EMA200_DISTANCE_ATR", "3.20")
+	maxEMA200Dist, err := strconv.ParseFloat(maxEMA200DistStr, 64)
+	if err != nil || maxEMA200Dist <= 0 || maxEMA200Dist > 20.0 {
+		return nil, fmt.Errorf("config: invalid MAX_EMA200_DISTANCE_ATR '%s' (must be float between 0.1 and 20.0)", maxEMA200DistStr)
 	}
 
 	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "0.40")
@@ -615,6 +622,7 @@ func LoadConfig() (*Config, error) {
 		PullbackToleranceATR:     pullbackTol,
 		MinBounceZScore:          minBounceZ,
 		MinEMA200DistanceATR:     minEMA200Dist,
+		MaxEMA200DistanceATR:     maxEMA200Dist,
 		MinBounceZScoreLong:      minBounceZLong,
 		MinBounceZScoreShort:     minBounceZShort,
 		LookbackImpulseBars:      lookbackBars,

@@ -156,6 +156,7 @@ func main() {
 			MinBounceZScoreLong:    cfg.MinBounceZScoreLong,
 			MinBounceZScoreShort:   cfg.MinBounceZScoreShort,
 			MinEMA200DistanceATR:   cfg.MinEMA200DistanceATR,
+			MaxEMA200DistanceATR:   cfg.MaxEMA200DistanceATR,
 			LookbackImpulseBars:    cfg.LookbackImpulseBars,
 			RetestLookbackBars:     cfg.RetestLookbackBars,
 			MinImpulseATR:          cfg.MinImpulseATR,
