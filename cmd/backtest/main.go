@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -12,8 +11,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/backtest/data"
@@ -489,47 +486,7 @@ func getAvailableCachedSymbols(cacheDir string) []string {
 	return syms
 }
 
-func getSymbolsFromDB(dbPath string) ([]string, error) {
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil, err
-	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = db.Close() }()
-
-	rows, err := db.Query("SELECT DISTINCT symbol FROM signal_audit_log WHERE symbol != '' ORDER BY symbol")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var syms []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err == nil && s != "" {
-			syms = append(syms, s)
-		}
-	}
-	return syms, nil
-}
-
 func splitSymbols(s string) []string {
-	clean := strings.ToLower(strings.TrimSpace(s))
-	if clean == "db" || clean == "sqlite" || clean == "history" {
-		syms, err := getSymbolsFromDB(filepath.Join("data", "trml.db"))
-		if err == nil && len(syms) > 0 {
-			return syms
-		}
-		slog.Warn("Gagal memuat koin dari database trml.db, fallback ke Top20Universe", "err", err)
-	}
-	if clean == "top20" || clean == "all" || clean == "universe" || clean == "" {
-		return append([]string(nil), Top20Universe...)
-	}
-	if clean == "top10" {
-		return append([]string(nil), Top20Universe[:10]...)
-	}
 	parts := strings.Split(s, ",")
 	res := make([]string, 0, len(parts))
 	for _, p := range parts {
