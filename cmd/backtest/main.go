@@ -49,13 +49,15 @@ func main() {
 func printHelp() {
 	fmt.Println("TRML Backtest Engine - 100% Pure Binance Ground Truth")
 	fmt.Println("\nUsage:")
-	fmt.Println("  backtest data fetch   --symbols <sym1,sym2> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--cache-dir <path>]")
-	fmt.Println("  backtest data verify  --symbols <sym1,sym2> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--cache-dir <path>]")
-	fmt.Println("  backtest run          --symbols <sym1,sym2> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--out <report.md>] [--equity <USDT>]")
-	fmt.Println("  backtest ablate       --symbols <sym1,sym2> --from <YYYY-MM-DD> --to <YYYY-MM-DD>")
+	fmt.Println("  backtest data fetch   [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
+	fmt.Println("  backtest data verify  [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
+	fmt.Println("  backtest run          [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--out <report.md>] [--equity <USDT>]")
+	fmt.Println("  backtest ablate       [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month]")
 	fmt.Println("\nContoh:")
-	fmt.Println("  backtest data fetch --symbols BTCUSDT,ETHUSDT,SOLUSDT --from 2024-01-01 --to 2024-06-30")
-	fmt.Println("  backtest run --symbols BTCUSDT,ETHUSDT,SOLUSDT --from 2024-01-01 --to 2024-06-30 --out ./report_h1_2024.md")
+	fmt.Println("  # Replay simulasi 1 bulan kebelakang (seperti dryrun 20 koin likuid):")
+	fmt.Println("  backtest run --past-month --symbols top20 --out ./reports/past_month.md")
+	fmt.Println("\n  # Replay rentang kustom koin tertentu:")
+	fmt.Println("  backtest run --symbols SOLUSDT,DOGEUSDT --from 2026-10-01 --to 2026-10-31")
 }
 
 func handleDataCommand(args []string) {
@@ -66,33 +68,41 @@ func handleDataCommand(args []string) {
 
 	sub := args[0]
 	fs := flag.NewFlagSet("data "+sub, flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "BTCUSDT,ETHUSDT,SOLUSDT", "Comma-separated symbols")
-	fromFlag := fs.String("from", "2024-01-01", "Start date (YYYY-MM-DD)")
-	toFlag := fs.String("to", "2024-06-30", "End date (YYYY-MM-DD)")
+	symbolsFlag := fs.String("symbols", "top20", "Comma-separated symbols or 'top20'")
+	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
+	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
+	pastMonthFlag := fs.Bool("past-month", false, "Use past completed 1 month range (e.g. 2026-10-01 to 2026-10-31)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	_ = fs.Parse(args[1:])
 
-	from, err := time.Parse("2006-01-02", *fromFlag)
-	if err != nil {
-		slog.Error("Invalid --from format", "err", err)
-		os.Exit(1)
+	var from, to time.Time
+	var err error
+	if *pastMonthFlag {
+		from, to = getPastMonthRange()
+	} else {
+		from, err = time.Parse("2006-01-02", *fromFlag)
+		if err != nil {
+			slog.Error("Invalid --from format", "err", err)
+			os.Exit(1)
+		}
+		to, err = time.Parse("2006-01-02", *toFlag)
+		if err != nil {
+			slog.Error("Invalid --to format", "err", err)
+			os.Exit(1)
+		}
+		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
-	to, err := time.Parse("2006-01-02", *toFlag)
-	if err != nil {
-		slog.Error("Invalid --to format", "err", err)
-		os.Exit(1)
-	}
-	to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 
 	symbols := splitSymbols(*symbolsFlag)
 	downloader := data.NewDownloader(*cacheDirFlag)
 
 	switch sub {
 	case "fetch":
-		fmt.Printf("Mengunduh candlestick 5m resmi dari data.binance.vision untuk %d simbol...\n", len(symbols))
+		fmt.Printf("Mengunduh candlestick 5m resmi dari data.binance.vision untuk %d simbol [%s s/d %s]...\n",
+			len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
 		ctx := context.Background()
 		for _, sym := range symbols {
-			fmt.Printf("--> Fetching %s [%s s/d %s]...\n", sym, *fromFlag, *toFlag)
+			fmt.Printf("--> Fetching %s...\n", sym)
 			candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
 			if err != nil {
 				slog.Error("Gagal fetch simbol", "symbol", sym, "err", err)
@@ -104,7 +114,8 @@ func handleDataCommand(args []string) {
 		fmt.Println("Selesai mengunduh data.")
 
 	case "verify":
-		fmt.Printf("Memverifikasi integritas data cache untuk %d simbol...\n", len(symbols))
+		fmt.Printf("Memverifikasi integritas data cache untuk %d simbol [%s s/d %s]...\n",
+			len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
 		ctx := context.Background()
 		for _, sym := range symbols {
 			candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
@@ -130,25 +141,32 @@ func handleDataCommand(args []string) {
 
 func handleRunCommand(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "BTCUSDT,ETHUSDT,SOLUSDT", "Comma-separated symbols")
-	fromFlag := fs.String("from", "2024-01-01", "Start date (YYYY-MM-DD)")
-	toFlag := fs.String("to", "2024-06-30", "End date (YYYY-MM-DD)")
+	symbolsFlag := fs.String("symbols", "top20", "Comma-separated symbols or 'top20'")
+	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
+	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
+	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	outFlag := fs.String("out", "", "Output report markdown file path")
 	equityFlag := fs.Float64("equity", 1000.0, "Initial Equity USDT")
 	_ = fs.Parse(args)
 
-	from, err := time.Parse("2006-01-02", *fromFlag)
-	if err != nil {
-		slog.Error("Invalid --from format", "err", err)
-		os.Exit(1)
+	var from, to time.Time
+	var err error
+	if *pastMonthFlag {
+		from, to = getPastMonthRange()
+	} else {
+		from, err = time.Parse("2006-01-02", *fromFlag)
+		if err != nil {
+			slog.Error("Invalid --from format", "err", err)
+			os.Exit(1)
+		}
+		to, err = time.Parse("2006-01-02", *toFlag)
+		if err != nil {
+			slog.Error("Invalid --to format", "err", err)
+			os.Exit(1)
+		}
+		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
-	to, err := time.Parse("2006-01-02", *toFlag)
-	if err != nil {
-		slog.Error("Invalid --to format", "err", err)
-		os.Exit(1)
-	}
-	to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 
 	symbols := splitSymbols(*symbolsFlag)
 	hasBTC := false
@@ -168,7 +186,8 @@ func handleRunCommand(args []string) {
 	candleMap := make(map[string][]data.HistoricalCandle)
 	filters := make(map[string]model.ExchangeFilter)
 
-	fmt.Printf("Memuat data candlestick 5m untuk %d simbol...\n", len(symbols))
+	fmt.Printf("Memuat data candlestick 5m untuk %d simbol [%s s/d %s]...\n",
+		len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
 	for _, sym := range symbols {
 		candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
 		if err != nil {
@@ -236,8 +255,8 @@ func handleRunCommand(args []string) {
 	// Buat metadata laporan
 	meta := report.ReportMeta{
 		CommitHash:    getGitCommitHash(),
-		DataRangeFrom: *fromFlag,
-		DataRangeTo:   *toFlag,
+		DataRangeFrom: from.Format("2006-01-02"),
+		DataRangeTo:   to.Format("2006-01-02"),
 		Symbols:       symbols,
 		ExecutionMode: "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage 5 bps",
 		FeeModel:      "Maker 2.0 bps, Taker 5.0 bps, Funding Active",
@@ -263,15 +282,21 @@ func handleRunCommand(args []string) {
 
 func handleAblateCommand(args []string) {
 	fs := flag.NewFlagSet("ablate", flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "BTCUSDT,ETHUSDT,SOLUSDT", "Comma-separated symbols")
-	fromFlag := fs.String("from", "2024-01-01", "Start date (YYYY-MM-DD)")
-	toFlag := fs.String("to", "2024-06-30", "End date (YYYY-MM-DD)")
+	symbolsFlag := fs.String("symbols", "top20", "Comma-separated symbols or 'top20'")
+	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
+	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
+	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	_ = fs.Parse(args)
 
-	from, _ := time.Parse("2006-01-02", *fromFlag)
-	to, _ := time.Parse("2006-01-02", *toFlag)
-	to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+	var from, to time.Time
+	if *pastMonthFlag {
+		from, to = getPastMonthRange()
+	} else {
+		from, _ = time.Parse("2006-01-02", *fromFlag)
+		to, _ = time.Parse("2006-01-02", *toFlag)
+		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+	}
 
 	symbols := splitSymbols(*symbolsFlag)
 	downloader := data.NewDownloader(*cacheDirFlag)
@@ -367,13 +392,36 @@ func handleAblateCommand(args []string) {
 	fmt.Println("========================================================================================")
 }
 
+// Top20Universe mendefinisikan 20 instrumen futures terlikuid di Binance
+var Top20Universe = []string{
+	"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
+	"XRPUSDT", "AVAXUSDT", "NEARUSDT", "LINKUSDT", "SUIUSDT",
+	"1000PEPEUSDT", "WIFUSDT", "ADAUSDT", "APTUSDT", "OPUSDT",
+	"ARBUSDT", "INJUSDT", "TIAUSDT", "FETUSDT", "RENDERUSDT",
+}
+
+func getPastMonthRange() (time.Time, time.Time) {
+	now := time.Now().UTC()
+	firstOfThisMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	lastOfPastMonth := firstOfThisMonth.Add(-time.Nanosecond)
+	firstOfPastMonth := time.Date(lastOfPastMonth.Year(), lastOfPastMonth.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return firstOfPastMonth, lastOfPastMonth
+}
+
 func splitSymbols(s string) []string {
+	clean := strings.ToLower(strings.TrimSpace(s))
+	if clean == "top20" || clean == "all" || clean == "universe" || clean == "" {
+		return append([]string(nil), Top20Universe...)
+	}
+	if clean == "top10" {
+		return append([]string(nil), Top20Universe[:10]...)
+	}
 	parts := strings.Split(s, ",")
 	res := make([]string, 0, len(parts))
 	for _, p := range parts {
-		clean := strings.TrimSpace(p)
-		if clean != "" {
-			res = append(res, clean)
+		c := strings.TrimSpace(p)
+		if c != "" {
+			res = append(res, c)
 		}
 	}
 	return res
