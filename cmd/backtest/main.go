@@ -22,6 +22,7 @@ import (
 	"trml/internal/backtest/simbroker"
 	"trml/internal/config"
 	"trml/internal/model"
+	"trml/internal/scanner"
 	"trml/internal/strategy"
 )
 
@@ -148,6 +149,7 @@ func handleRunCommand(args []string) {
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
+	scannerFlag := fs.Bool("scanner", false, "Enable dynamic rolling market scanner (selects active coins every interval)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	outFlag := fs.String("out", "", "Output report markdown file path")
 	equityFlag := fs.Float64("equity", 1000.0, "Initial Equity USDT")
@@ -236,10 +238,13 @@ func handleRunCommand(args []string) {
 
 	// Inisialisasi Replay Engine
 	replayCfg := replay.ReplayConfig{
-		WarmupBars:   200,
-		SpreadPct:    0.0002,
-		FundingRate:  0.0001,
-		BenchmarkSym: "BTCUSDT",
+		WarmupBars:            200,
+		SpreadPct:             0.0002,
+		FundingRate:           0.0001,
+		BenchmarkSym:          "BTCUSDT",
+		DynamicScannerEnabled: *scannerFlag,
+		ScannerInterval:       15 * time.Minute,
+		ScannerCfg:            buildDefaultScannerConfig(),
 	}
 	engine := replay.NewReplayEngine(replayCfg, evaluatorCfg, sim, candleMap, filters)
 
@@ -289,6 +294,7 @@ func handleAblateCommand(args []string) {
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
+	scannerFlag := fs.Bool("scanner", false, "Enable dynamic rolling market scanner (selects active coins every interval)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	_ = fs.Parse(args)
 
@@ -380,10 +386,13 @@ func handleAblateCommand(args []string) {
 		exp.modifierFn(&evalCfg)
 
 		replayCfg := replay.ReplayConfig{
-			WarmupBars:   200,
-			SpreadPct:    0.0002,
-			FundingRate:  0.0001,
-			BenchmarkSym: "BTCUSDT",
+			WarmupBars:            200,
+			SpreadPct:             0.0002,
+			FundingRate:           0.0001,
+			BenchmarkSym:          "BTCUSDT",
+			DynamicScannerEnabled: *scannerFlag,
+			ScannerInterval:       15 * time.Minute,
+			ScannerCfg:            buildDefaultScannerConfig(),
 		}
 		eng := replay.NewReplayEngine(replayCfg, evalCfg, sim, candleMap, filters)
 		_ = eng.Run(ctx)
@@ -419,13 +428,13 @@ func getSymbolsFromDB(dbPath string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows, err := db.Query("SELECT DISTINCT symbol FROM signal_audit_log WHERE symbol != '' ORDER BY symbol")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var syms []string
 	for rows.Next() {
@@ -605,6 +614,40 @@ func buildDefaultEvaluatorConfig() strategy.EvaluatorConfig {
 			SlippageRate:                   cfg.SlippageRate,
 			EntryOrderType:                 cfg.EntryOrderType,
 		},
+	}
+}
+
+func buildDefaultScannerConfig() scanner.ScannerConfig {
+	cfg, err := config.LoadConfig()
+	if err == nil && cfg != nil {
+		return scanner.ScannerConfig{
+			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
+			MaxSpreadPct:          cfg.MaxSpreadPct,
+			MinRVOL:               1.80,
+			MinFallbackRVOL:       cfg.MinFallbackRVOL,
+			RVOLLookback:          20,
+			MinNATRPct:            cfg.MinNATRPct,
+			MaxNATRPct:            cfg.MaxNATRPct,
+			MaxScannerVWAPDistATR: cfg.MaxScannerVWAPDistATR,
+			ATRPeriod:             14,
+			EMAPeriod:             200,
+			MaxWatchedCoins:       cfg.MaxWatchedCoins,
+			BootstrapCount:        250,
+		}
+	}
+	return scanner.ScannerConfig{
+		MinVolume24hUSDT:      25000000.0,
+		MaxSpreadPct:          0.0006,
+		MinRVOL:               1.80,
+		MinFallbackRVOL:       0.60,
+		RVOLLookback:          20,
+		MinNATRPct:            0.0050,
+		MaxNATRPct:            0.0180,
+		MaxScannerVWAPDistATR: 2.50,
+		ATRPeriod:             14,
+		EMAPeriod:             200,
+		MaxWatchedCoins:       20,
+		BootstrapCount:        250,
 	}
 }
 

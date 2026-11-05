@@ -12,14 +12,18 @@ import (
 	"trml/internal/backtest/simbroker"
 	"trml/internal/indicator"
 	"trml/internal/model"
+	"trml/internal/scanner"
 	"trml/internal/strategy"
 )
 
 type ReplayConfig struct {
-	WarmupBars   int     // jumlah bar awal untuk warmup indikator (default 200)
-	SpreadPct    float64 // default estimasi spread (0.02% = 0.0002)
-	FundingRate  float64 // default estimasi funding (0.01% = 0.0001)
-	BenchmarkSym string  // default "BTCUSDT"
+	WarmupBars            int                   // jumlah bar awal untuk warmup indikator (default 200)
+	SpreadPct             float64               // default estimasi spread (0.02% = 0.0002)
+	FundingRate           float64               // default estimasi funding (0.01% = 0.0001)
+	BenchmarkSym          string                // default "BTCUSDT"
+	DynamicScannerEnabled bool                  // apakah dynamic rolling scanner aktif
+	ScannerInterval       time.Duration         // interval scanning ulang (default 15 menit)
+	ScannerCfg            scanner.ScannerConfig // konfigurasi scanner produksi
 }
 
 type lastExitInfo struct {
@@ -61,6 +65,9 @@ func NewReplayEngine(
 	if evaluatorCfg.MaxDailyDrawdownPct >= 0 {
 		evaluatorCfg.MaxDailyDrawdownPct = -0.05
 	}
+	if cfg.DynamicScannerEnabled && cfg.ScannerInterval <= 0 {
+		cfg.ScannerInterval = 15 * time.Minute
+	}
 
 	return &ReplayEngine{
 		cfg:           cfg,
@@ -99,6 +106,9 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 	candleIndices := make(map[string]int)
 	rollingCandles := make(map[string][]model.Candle)
 	rollingDeltas := make(map[string][]float64)
+
+	var lastScanTime time.Time
+	watchedSymbols := make(map[string]bool)
 
 	// Inisialisasi filter bursa pada simbroker
 	for sym, f := range r.filters {
@@ -175,7 +185,63 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			}
 		}
 
-		// C. Evaluasi Sinyal per Simbol
+		// C. Dynamic Rolling Scanner: update watchlist aktif jika diaktifkan
+		if r.cfg.DynamicScannerEnabled && (lastScanTime.IsZero() || simTime.Sub(lastScanTime) >= r.cfg.ScannerInterval) {
+			lastScanTime = simTime
+			vol24hMap := make(map[string]float64, len(rollingCandles))
+			bookMap := make(map[string]model.BookQuote, len(rollingCandles))
+			activeStates := make(map[string]*model.SymbolState)
+
+			for sym, cList := range rollingCandles {
+				if len(cList) == 0 {
+					continue
+				}
+				startIdx := len(cList) - 288
+				if startIdx < 0 {
+					startIdx = 0
+				}
+				var sumVol float64
+				for _, c := range cList[startIdx:] {
+					sumVol += c.QuoteVolumeUSDT
+				}
+				vol24hMap[sym] = sumVol
+
+				lastClose := cList[len(cList)-1].Close
+				bookMap[sym] = model.BookQuote{
+					BestBid: lastClose * (1.0 - r.cfg.SpreadPct/2.0),
+					BestAsk: lastClose * (1.0 + r.cfg.SpreadPct/2.0),
+				}
+			}
+
+			fetchKlinesFn := func(symbol string, limit int) []model.Candle {
+				cList := rollingCandles[symbol]
+				if len(cList) == 0 {
+					return nil
+				}
+				start := len(cList) - limit
+				if start < 0 {
+					start = 0
+				}
+				return cList[start:]
+			}
+
+			selectedSyms := scanner.RunBulkMarketScanner(
+				r.cfg.ScannerCfg,
+				activeStates,
+				r.filters,
+				vol24hMap,
+				bookMap,
+				fetchKlinesFn,
+				simTime,
+			)
+
+			watchedSymbols = make(map[string]bool, len(selectedSyms))
+			for _, sym := range selectedSyms {
+				watchedSymbols[sym] = true
+			}
+		}
+
+		// D. Evaluasi Sinyal per Simbol
 		activeSlots := r.broker.GetActiveSlotCount()
 		availBal := r.broker.GetAvailableBalanceUSDT()
 		totEq := r.broker.GetEffectiveTotalEquityUSDT()
@@ -184,6 +250,11 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		for sym, cList := range rollingCandles {
 			// Lewati benchmark symbol jika bukan target trading
 			if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
+				continue
+			}
+
+			// Lewati koin jika dynamic scanner aktif dan tidak masuk watchlist (kecuali sedang memegang posisi aktif)
+			if r.cfg.DynamicScannerEnabled && !watchedSymbols[sym] && !r.broker.HasActiveOrderOrPosition(sym) {
 				continue
 			}
 
