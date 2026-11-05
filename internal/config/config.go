@@ -167,7 +167,13 @@ func loadDotEnv(filepath string) {
 }
 
 func LoadConfig() (*Config, error) {
-	loadDotEnv(".env")
+	return LoadConfigFile(".env")
+}
+
+func LoadConfigFile(envPath string) (*Config, error) {
+	if envPath != "" {
+		loadDotEnv(envPath)
+	}
 
 	envStr := strings.ToLower(getEnv("BINANCE_ENV", "testnet"))
 	var env Environment

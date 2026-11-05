@@ -155,7 +155,8 @@ func handleRunCommand(args []string) {
 	scannerFlag := fs.Bool("scanner", false, "Enable dynamic rolling market scanner (selects active coins every interval)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	outFlag := fs.String("out", "", "Output report markdown file path")
-	equityFlag := fs.Float64("equity", 1000.0, "Initial Equity USDT")
+	equityFlag := fs.Float64("equity", 125.0, "Initial Equity USDT (default 125.0)")
+	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
 	_ = fs.Parse(args)
 
 	var from, to time.Time
@@ -247,8 +248,8 @@ func handleRunCommand(args []string) {
 	}
 	sim := simbroker.NewSimBroker(brokerCfg)
 
-	// Evaluator Config dari konfigurasi produksi
-	evaluatorCfg := buildDefaultEvaluatorConfig()
+	// Evaluator Config dari konfigurasi backtest
+	evaluatorCfg := buildDefaultEvaluatorConfig(*envFlag)
 
 	// Inisialisasi Replay Engine
 	warmupBars := 200
@@ -262,7 +263,7 @@ func handleRunCommand(args []string) {
 		BenchmarkSym:          "BTCUSDT",
 		DynamicScannerEnabled: *scannerFlag,
 		ScannerInterval:       15 * time.Minute,
-		ScannerCfg:            buildDefaultScannerConfig(),
+		ScannerCfg:            buildDefaultScannerConfig(*envFlag),
 	}
 	engine := replay.NewReplayEngine(replayCfg, evaluatorCfg, sim, candleMap, filters)
 
@@ -319,6 +320,7 @@ func handleAblateCommand(args []string) {
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
 	scannerFlag := fs.Bool("scanner", false, "Enable dynamic rolling market scanner (selects active coins every interval)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
+	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
 	_ = fs.Parse(args)
 
 	var from, to time.Time
@@ -412,7 +414,7 @@ func handleAblateCommand(args []string) {
 			MaxHoldingDuration:      4 * time.Hour,
 		}
 		sim := simbroker.NewSimBroker(brokerCfg)
-		evalCfg := buildDefaultEvaluatorConfig()
+		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
 		exp.modifierFn(&evalCfg)
 
 		replayCfg := replay.ReplayConfig{
@@ -422,7 +424,7 @@ func handleAblateCommand(args []string) {
 			BenchmarkSym:          "BTCUSDT",
 			DynamicScannerEnabled: *scannerFlag,
 			ScannerInterval:       15 * time.Minute,
-			ScannerCfg:            buildDefaultScannerConfig(),
+			ScannerCfg:            buildDefaultScannerConfig(*envFlag),
 		}
 		eng := replay.NewReplayEngine(replayCfg, evalCfg, sim, candleMap, filters)
 		_ = eng.Run(ctx)
@@ -522,8 +524,20 @@ func getStandardFilter(symbol string) model.ExchangeFilter {
 	}
 }
 
-func buildDefaultEvaluatorConfig() strategy.EvaluatorConfig {
-	cfg, err := config.LoadConfig()
+func loadConfigForBacktest(envPath string) (*config.Config, error) {
+	if envPath != "" {
+		if _, err := os.Stat(envPath); err == nil {
+			return config.LoadConfigFile(envPath)
+		}
+	}
+	if _, err := os.Stat("backtest.env"); err == nil {
+		return config.LoadConfigFile("backtest.env")
+	}
+	return config.LoadConfig()
+}
+
+func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
+	cfg, err := loadConfigForBacktest(envPath)
 	if err != nil {
 		// Fallback default Revisi v6
 		return strategy.EvaluatorConfig{
@@ -643,8 +657,8 @@ func buildDefaultEvaluatorConfig() strategy.EvaluatorConfig {
 	}
 }
 
-func buildDefaultScannerConfig() scanner.ScannerConfig {
-	cfg, err := config.LoadConfig()
+func buildDefaultScannerConfig(envPath string) scanner.ScannerConfig {
+	cfg, err := loadConfigForBacktest(envPath)
 	if err == nil && cfg != nil {
 		return scanner.ScannerConfig{
 			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
