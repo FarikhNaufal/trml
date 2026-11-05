@@ -52,20 +52,14 @@ func main() {
 
 func printHelp() {
 	fmt.Println("TRML Backtest Engine - 100% Pure Binance Ground Truth")
-	fmt.Println("\nUsage:")
-	fmt.Println("  backtest run          [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--scanner] [--out <report.md>] [--equity <USDT>]")
-	fmt.Println("  backtest ablate       [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--scanner]")
-	fmt.Println("  backtest data fetch   [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
-	fmt.Println("  backtest data verify  [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
-	fmt.Println("\nContoh Perintah Praktis:")
-	fmt.Println("  # 1. Replay 1 bulan kebelakang persis seperti dry-run (dengan dynamic scanner):")
-	fmt.Println("  go run ./cmd/backtest run --past-month --scanner")
-	fmt.Println("\n  # 2. Replay koin-koin yang ada di riwayat scanner bot:")
-	fmt.Println("  go run ./cmd/backtest run --symbols db --past-month --scanner --out ./reports/past_month.md")
-	fmt.Println("\n  # 3. Ablation test (menguji kontribusi tiap filter):")
-	fmt.Println("  go run ./cmd/backtest ablate --past-month --scanner")
-	fmt.Println("\n  # 4. Replay rentang kustom koin tertentu:")
-	fmt.Println("  go run ./cmd/backtest run --symbols SOLUSDT,DOGEUSDT --from 2026-10-01 --to 2026-10-31")
+	fmt.Println("\nPenggunaan Sederhana:")
+	fmt.Println("  go run ./cmd/backtest run --symbols <koin1,koin2,...> [--equity <USDT>] [--scanner] [--out <report.md>]")
+	fmt.Println("\nParameter Utama:")
+	fmt.Println("  --symbols   Daftar koin yang ingin diuji dipisah koma (contoh: SOLUSDT,DOGEUSDT,NEARUSDT)")
+	fmt.Println("  --equity    Modal simulasi USDT (contoh: 1000 atau 500, default: 1000)")
+	fmt.Println("  --scanner   Aktifkan scanner dinamis pasar (menyeleksi koin aktif secara otomatis)")
+	fmt.Println("\nContoh Langsung:")
+	fmt.Println("  go run ./cmd/backtest run --symbols SOLUSDT,DOGEUSDT,NEARUSDT --equity 1000 --scanner")
 }
 
 func handleDataCommand(args []string) {
@@ -76,7 +70,7 @@ func handleDataCommand(args []string) {
 
 	sub := args[0]
 	fs := flag.NewFlagSet("data "+sub, flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "top20", "Comma-separated symbols or 'top20'")
+	symbolsFlag := fs.String("symbols", "SOLUSDT,DOGEUSDT,NEARUSDT", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT)")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Use past completed 1 month range (e.g. 2026-10-01 to 2026-10-31)")
@@ -149,7 +143,7 @@ func handleDataCommand(args []string) {
 
 func handleRunCommand(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "top20", "Comma-separated symbols or 'top20'")
+	symbolsFlag := fs.String("symbols", "SOLUSDT,DOGEUSDT,NEARUSDT", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT)")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
@@ -294,7 +288,7 @@ func handleRunCommand(args []string) {
 
 func handleAblateCommand(args []string) {
 	fs := flag.NewFlagSet("ablate", flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "top20", "Comma-separated symbols or 'top20'")
+	symbolsFlag := fs.String("symbols", "SOLUSDT,DOGEUSDT,NEARUSDT", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT)")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
