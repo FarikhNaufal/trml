@@ -11,7 +11,7 @@ bin/
 *.dylib
 
 # Data & SQLite Database
-data/
+/data/
 *.db
 *.db-wal
 *.db-shm

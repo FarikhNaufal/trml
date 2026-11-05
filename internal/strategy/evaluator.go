@@ -30,6 +30,7 @@ type EvaluatorConfig struct {
 	MinOIDeltaPct         float64
 	MinOIDeltaLongPct     float64
 	MinOIDeltaShortPct    float64
+	DisableOIFilter       bool
 	MaxAdverseFundingRate float64
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
@@ -136,18 +137,20 @@ func EvaluateSignal(
 	}
 
 	// Gatekeeper 3: Validasi Jarak Waktu Sampel Delta Open Interest (Solusi P1-6)
-	if snap.PrevOpenInterest <= 0 || snap.CurrOpenInterest <= 0 ||
-		math.IsNaN(snap.PrevOpenInterest) || math.IsInf(snap.PrevOpenInterest, 0) ||
-		math.IsNaN(snap.CurrOpenInterest) || math.IsInf(snap.CurrOpenInterest, 0) ||
-		snap.PrevOIUpdatedAt.IsZero() {
-		return model.OrderIntent{}, false, "MISSING_OI_DATA", "OI_WARMING_UP"
-	}
-	if snap.CurrOIUpdatedAt.IsZero() || snap.Now.Sub(snap.CurrOIUpdatedAt) > cfg.MaxOIStaleness {
-		return model.OrderIntent{}, false, "STALE_OI_SAMPLE", ""
-	}
-	oiInterval := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt)
-	if oiInterval < cfg.MinOIInterval || oiInterval > cfg.MaxOIInterval {
-		return model.OrderIntent{}, false, "INVALID_OI_INTERVAL", fmt.Sprintf("INTERVAL_%s_OUTSIDE_%s_%s", oiInterval, cfg.MinOIInterval, cfg.MaxOIInterval)
+	if !cfg.DisableOIFilter {
+		if snap.PrevOpenInterest <= 0 || snap.CurrOpenInterest <= 0 ||
+			math.IsNaN(snap.PrevOpenInterest) || math.IsInf(snap.PrevOpenInterest, 0) ||
+			math.IsNaN(snap.CurrOpenInterest) || math.IsInf(snap.CurrOpenInterest, 0) ||
+			snap.PrevOIUpdatedAt.IsZero() {
+			return model.OrderIntent{}, false, "MISSING_OI_DATA", "OI_WARMING_UP"
+		}
+		if snap.CurrOIUpdatedAt.IsZero() || snap.Now.Sub(snap.CurrOIUpdatedAt) > cfg.MaxOIStaleness {
+			return model.OrderIntent{}, false, "STALE_OI_SAMPLE", ""
+		}
+		oiInterval := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt)
+		if oiInterval < cfg.MinOIInterval || oiInterval > cfg.MaxOIInterval {
+			return model.OrderIntent{}, false, "INVALID_OI_INTERVAL", fmt.Sprintf("INTERVAL_%s_OUTSIDE_%s_%s", oiInterval, cfg.MinOIInterval, cfg.MaxOIInterval)
+		}
 	}
 
 	if len(snap.ClosedCandles) < cfg.EMAPeriod {
@@ -332,18 +335,21 @@ func EvaluateSignal(
 	shortBounce := isBearishShape && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
 
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
-	rawOIDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
-	if math.IsNaN(rawOIDeltaPct) || math.IsInf(rawOIDeltaPct, 0) {
-		return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
-	}
-	oiDeltaPct := rawOIDeltaPct
-	if !snap.PrevOIUpdatedAt.IsZero() && !snap.CurrOIUpdatedAt.IsZero() {
-		elapsedSec := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt).Seconds()
-		if elapsedSec >= 60.0 && elapsedSec <= 600.0 {
-			// Normalisasi laju perubahan Open Interest ke basis standar 300 detik (5 menit)
-			oiDeltaPct = rawOIDeltaPct * (300.0 / elapsedSec)
-			if math.IsNaN(oiDeltaPct) || math.IsInf(oiDeltaPct, 0) {
-				return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
+	var oiDeltaPct float64
+	if !cfg.DisableOIFilter {
+		rawOIDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
+		if math.IsNaN(rawOIDeltaPct) || math.IsInf(rawOIDeltaPct, 0) {
+			return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
+		}
+		oiDeltaPct = rawOIDeltaPct
+		if !snap.PrevOIUpdatedAt.IsZero() && !snap.CurrOIUpdatedAt.IsZero() {
+			elapsedSec := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt).Seconds()
+			if elapsedSec >= 60.0 && elapsedSec <= 600.0 {
+				// Normalisasi laju perubahan Open Interest ke basis standar 300 detik (5 menit)
+				oiDeltaPct = rawOIDeltaPct * (300.0 / elapsedSec)
+				if math.IsNaN(oiDeltaPct) || math.IsInf(oiDeltaPct, 0) {
+					return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
+				}
 			}
 		}
 	}
@@ -363,9 +369,11 @@ func EvaluateSignal(
 	const minCapitulationOIDeltaShort = -0.10 // Max OI drop -0.10% untuk Short
 	const minCapitulationOIDeltaLong = -0.05  // Max OI drop -0.05% untuk Long
 
-	oiValidLong := (oiDeltaPct >= minOIDeltaLong) ||
+	oiValidLong := cfg.DisableOIFilter ||
+		(oiDeltaPct >= minOIDeltaLong) ||
 		(barDeltaZScore >= 1.20 && oiDeltaPct >= minCapitulationOIDeltaLong)
-	oiValidShort := (oiDeltaPct >= minOIDeltaShort) ||
+	oiValidShort := cfg.DisableOIFilter ||
+		(oiDeltaPct >= minOIDeltaShort) ||
 		(barDeltaZScore <= -1.20 && oiDeltaPct >= minCapitulationOIDeltaShort)
 
 	// Filter Tren Struktural & Anti-Chop EMA200: Jarak Close ke EMA200 minimal MinEMA200DistanceATR
