@@ -112,3 +112,4 @@ func parseExchangeInfoJSON(data []byte) (map[string]model.ExchangeFilter, error)
 
 	return filters, nil
 }
+

@@ -366,3 +366,4 @@ func parseFundingCSV(r io.Reader) ([]HistoricalFundingRate, error) {
 
 	return res, nil
 }
+
