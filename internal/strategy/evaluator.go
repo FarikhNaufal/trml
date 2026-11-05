@@ -318,8 +318,15 @@ func EvaluateSignal(
 	}
 
 	latestRange := latest.High - latest.Low
-	isBullishShape := (latest.Close > latest.Open) || (latestRange > 0 && (latest.Close-latest.Low) >= latestRange*0.50)
-	isBearishShape := (latest.Close < latest.Open) || (latestRange > 0 && (latest.High-latest.Close) >= latestRange*0.50)
+	upperWick := latest.High - math.Max(latest.Open, latest.Close)
+	lowerWick := math.Min(latest.Open, latest.Close) - latest.Low
+
+	// Symmetrical Counter-Trend Wick Rejection:
+	// Long: Tolak jika upper wick >= 50% dari total range (rejection keras dari seller / Shooting Star).
+	isBullishShape := (latest.Close > latest.Open) && (latestRange <= 0 || upperWick < latestRange*0.50)
+
+	// Short: Tolak jika lower wick >= 50% dari total range (rejection keras dari buyer / Hammer).
+	isBearishShape := (latest.Close < latest.Open) && (latestRange <= 0 || lowerWick < latestRange*0.50)
 
 	longBounce := isBullishShape && (latest.Close >= vwap) && (barDeltaZScore >= minBounceZLong)
 	shortBounce := isBearishShape && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)

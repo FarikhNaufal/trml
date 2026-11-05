@@ -2165,3 +2165,39 @@ func TestEvaluateSignal_MinSignalRVOL(t *testing.T) {
 		t.Fatalf("expected rvol=0.85 to pass LOW_SIGNAL_RVOL, got reason=%s", reasonPass)
 	}
 }
+
+func TestEvaluateSignal_SymmetricalWickRejection(t *testing.T) {
+	now := time.Now().UTC()
+
+	// 1. Test LONG with Shooting Star (Close > Open but Upper Wick >= 50%)
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+	lastIdxL := len(snapLong.ClosedCandles) - 1
+	// Open 105.1, High 106.0, Close 105.2, Low 105.1 -> Range 0.9, Upper Wick = 106.0 - 105.2 = 0.8 (88.9% >= 50%)
+	snapLong.ClosedCandles[lastIdxL].Open = 105.1
+	snapLong.ClosedCandles[lastIdxL].High = 106.0
+	snapLong.ClosedCandles[lastIdxL].Low = 105.1
+	snapLong.ClosedCandles[lastIdxL].Close = 105.2
+	snapLong.BestBid = 105.19
+	snapLong.BestAsk = 105.21
+	snapLong.MarkPrice = 105.20
+	_, okL, reasonL, subReasonL := EvaluateSignal(snapLong, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if okL || reasonL != "CONDITIONS_NOT_MET" || !strings.Contains(subReasonL, "CANDLE_NOT_BULLISH") {
+		t.Fatalf("expected Long rejection with CANDLE_NOT_BULLISH for shooting star, got ok=%v, reason=%s, subReason=%s", okL, reasonL, subReasonL)
+	}
+
+	// 2. Test SHORT with Hammer (Close < Open but Lower Wick >= 50%)
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	lastIdxS := len(snapShort.ClosedCandles) - 1
+	// Open 99.8, High 99.8, Close 99.7, Low 98.8 -> Range 1.0, Lower Wick = 99.7 - 98.8 = 0.9 (90% >= 50%)
+	snapShort.ClosedCandles[lastIdxS].Open = 99.8
+	snapShort.ClosedCandles[lastIdxS].High = 99.8
+	snapShort.ClosedCandles[lastIdxS].Close = 99.7
+	snapShort.ClosedCandles[lastIdxS].Low = 98.8
+	snapShort.BestBid = 99.69
+	snapShort.BestAsk = 99.71
+	snapShort.MarkPrice = 99.70
+	_, okS, reasonS, subReasonS := EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if okS || reasonS != "CONDITIONS_NOT_MET" || !strings.Contains(subReasonS, "CANDLE_NOT_BEARISH") {
+		t.Fatalf("expected Short rejection with CANDLE_NOT_BEARISH for hammer, got ok=%v, reason=%s, subReason=%s", okS, reasonS, subReasonS)
+	}
+}
