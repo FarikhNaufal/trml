@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -70,7 +71,7 @@ func handleDataCommand(args []string) {
 
 	sub := args[0]
 	fs := flag.NewFlagSet("data "+sub, flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "SOLUSDT,DOGEUSDT,NEARUSDT", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT)")
+	symbolsFlag := fs.String("symbols", "", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT). If omitted with --scanner, automatically scans all available market coins")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Use past completed 1 month range (e.g. 2026-10-01 to 2026-10-31)")
@@ -95,7 +96,12 @@ func handleDataCommand(args []string) {
 		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
 
-	symbols := splitSymbols(*symbolsFlag)
+	var symbols []string
+	if *symbolsFlag != "" {
+		symbols = splitSymbols(*symbolsFlag)
+	} else {
+		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
+	}
 	downloader := data.NewDownloader(*cacheDirFlag)
 
 	switch sub {
@@ -143,7 +149,7 @@ func handleDataCommand(args []string) {
 
 func handleRunCommand(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "SOLUSDT,DOGEUSDT,NEARUSDT", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT)")
+	symbolsFlag := fs.String("symbols", "", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT). If omitted with --scanner, automatically scans all available market coins")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
@@ -177,7 +183,14 @@ func handleRunCommand(args []string) {
 		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
 
-	symbols := splitSymbols(*symbolsFlag)
+	var symbols []string
+	if *symbolsFlag != "" {
+		symbols = splitSymbols(*symbolsFlag)
+	} else if *scannerFlag {
+		symbols = getAvailableCachedSymbols(*cacheDirFlag)
+	} else {
+		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
+	}
 	hasBTC := false
 	for _, s := range symbols {
 		if s == "BTCUSDT" {
@@ -271,7 +284,7 @@ func handleRunCommand(args []string) {
 	// Buat metadata laporan
 	metaFrom := from.Format("2006-01-02")
 	if *todayFlag {
-		metaFrom = "2026-11-05 (Today)"
+		metaFrom = time.Now().UTC().Format("2006-01-02") + " (Today)"
 	}
 	meta := report.ReportMeta{
 		CommitHash:    getGitCommitHash(),
@@ -303,7 +316,7 @@ func handleRunCommand(args []string) {
 
 func handleAblateCommand(args []string) {
 	fs := flag.NewFlagSet("ablate", flag.ExitOnError)
-	symbolsFlag := fs.String("symbols", "SOLUSDT,DOGEUSDT,NEARUSDT", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT)")
+	symbolsFlag := fs.String("symbols", "", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT). If omitted with --scanner, automatically scans all available market coins")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
@@ -320,7 +333,14 @@ func handleAblateCommand(args []string) {
 		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
 
-	symbols := splitSymbols(*symbolsFlag)
+	var symbols []string
+	if *symbolsFlag != "" {
+		symbols = splitSymbols(*symbolsFlag)
+	} else if *scannerFlag {
+		symbols = getAvailableCachedSymbols(*cacheDirFlag)
+	} else {
+		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
+	}
 	downloader := data.NewDownloader(*cacheDirFlag)
 	ctx := context.Background()
 
@@ -434,17 +454,39 @@ func getPastMonthRange() (time.Time, time.Time) {
 }
 
 func getPastWeekRange() (time.Time, time.Time) {
-	to := time.Date(2026, 11, 4, 23, 59, 59, 0, time.UTC)
-	from := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
-	return from, to
+	now := time.Now().UTC()
+	// Kemarin sebagai penutupan hari penuh bursa terakhir
+	yesterday := time.Date(now.Year(), now.Month(), now.Day()-1, 23, 59, 59, 0, time.UTC)
+	// 7 hari ke belakang dari kemarin
+	from := yesterday.AddDate(0, 0, -6)
+	from = time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC)
+	return from, yesterday
 }
 
 func getTodayRange() (time.Time, time.Time) {
-	// Memuat data dari kemarin (2026-11-04) untuk 288 bar warmup indikator,
-	// dan hari ini (2026-11-05 UTC) untuk trading aktif
-	from := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
-	to := time.Date(2026, 11, 5, 23, 59, 59, 0, time.UTC)
-	return from, to
+	now := time.Now().UTC()
+	// Warmup 1 hari sebelum hari ini (kemarin 00:00:00 UTC) untuk mengisi 288 bar indikator
+	yesterday := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC)
+	return yesterday, now
+}
+
+func getAvailableCachedSymbols(cacheDir string) []string {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return append([]string(nil), Top20Universe...)
+	}
+	var syms []string
+	for _, e := range entries {
+		name := strings.ToUpper(e.Name())
+		if e.IsDir() && strings.HasSuffix(name, "USDT") {
+			syms = append(syms, name)
+		}
+	}
+	if len(syms) == 0 {
+		return append([]string(nil), Top20Universe...)
+	}
+	sort.Strings(syms)
+	return syms
 }
 
 func getSymbolsFromDB(dbPath string) ([]string, error) {
