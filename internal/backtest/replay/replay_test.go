@@ -156,3 +156,4 @@ func TestReplayEngine_EndToEndSyntheticSimulation(t *testing.T) {
 	t.Logf("Replay completed: %d signals evaluated, %d approved, %d rejected, %d closed trades",
 		engine.TotalSignalsEvaluated, engine.SignalsApproved, engine.SignalsRejected, len(sim.ClosedTrades))
 }
+

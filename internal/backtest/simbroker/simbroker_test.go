@@ -228,3 +228,4 @@ func TestSimBroker_PartialTP1AndTrailing(t *testing.T) {
 		t.Errorf("expected ratcheted trailing SL at 107.50, got %s", pos.CurrentSLPrice)
 	}
 }
+

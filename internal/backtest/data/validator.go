@@ -71,3 +71,4 @@ func ValidateCandles(symbol string, candles []HistoricalCandle, expectedStep tim
 
 	return res
 }
+

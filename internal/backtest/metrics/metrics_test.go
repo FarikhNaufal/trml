@@ -92,3 +92,4 @@ func TestBootstrapConfidenceInterval(t *testing.T) {
 		t.Errorf("confidence interval out of reasonable sample bounds: [%f, %f]", lower, upper)
 	}
 }
+

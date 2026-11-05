@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -234,7 +235,7 @@ func handleRunCommand(args []string) {
 
 	// Buat metadata laporan
 	meta := report.ReportMeta{
-		CommitHash:    "34e5fba",
+		CommitHash:    getGitCommitHash(),
 		DataRangeFrom: *fromFlag,
 		DataRangeTo:   *toFlag,
 		Symbols:       symbols,
@@ -521,4 +522,16 @@ func buildDefaultEvaluatorConfig() strategy.EvaluatorConfig {
 			EntryOrderType:                 cfg.EntryOrderType,
 		},
 	}
+}
+
+func getGitCommitHash() string {
+	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	out, err := cmd.Output()
+	if err == nil {
+		h := strings.TrimSpace(string(out))
+		if h != "" {
+			return h
+		}
+	}
+	return "8c35d9e"
 }
