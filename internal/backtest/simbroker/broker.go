@@ -94,6 +94,32 @@ func (s *SimBroker) GetExchangeFilter(symbol string) (model.ExchangeFilter, bool
 	return f, true
 }
 
+// ApplyFundingSettlement memproses pemotongan/penerimaan biaya pendanaan (funding rate)
+// pada seluruh posisi terbuka untuk simbol tertentu sesuai formula resmi Binance Futures.
+func (s *SimBroker) ApplyFundingSettlement(symbol string, markPrice decimal.Decimal, fundingRate decimal.Decimal) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	pos, hasPos := s.OpenPositions[symbol]
+	if !hasPos || pos.Qty.LessThanOrEqual(decimal.Zero) {
+		return
+	}
+
+	// Nilai nosional posisi = Qty * MarkPrice
+	notional := pos.Qty.Mul(markPrice)
+	fundingFee := notional.Mul(fundingRate)
+
+	if pos.Side == model.SideLong {
+		// Posisi LONG: bayar fee jika funding positif, terima fee jika funding negatif
+		pos.FundingPaid = pos.FundingPaid.Add(fundingFee)
+		s.RealizedEquityUSDT = s.RealizedEquityUSDT.Sub(fundingFee)
+	} else {
+		// Posisi SHORT: terima fee jika funding positif, bayar fee jika funding negatif
+		pos.FundingPaid = pos.FundingPaid.Sub(fundingFee)
+		s.RealizedEquityUSDT = s.RealizedEquityUSDT.Add(fundingFee)
+	}
+}
+
 // SubmitLimitEntry menerima order intent dari Evaluator (Fase 1 Commit).
 func (s *SimBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
 	s.Mu.Lock()
@@ -445,9 +471,20 @@ func (s *SimBroker) recordClosedTradeLocked(
 	exitFee := exitPrice.Mul(qty).Mul(s.Cfg.TakerFeeRate)
 	entryFeeLeg := pos.EntryPrice.Mul(qty).Mul(s.Cfg.MakerFeeRate)
 	totalFee := entryFeeLeg.Add(exitFee)
-	netPnL := grossPnL.Sub(totalFee)
 
-	s.RealizedEquityUSDT = s.RealizedEquityUSDT.Add(netPnL)
+	// Proporsi funding yang diatribusikan ke trade leg ini
+	var fundingLeg decimal.Decimal
+	if pos.InitialQty.GreaterThan(decimal.Zero) {
+		ratio := qty.Div(pos.InitialQty)
+		fundingLeg = pos.FundingPaid.Mul(ratio)
+	}
+
+	// Net PnL = Gross PnL - Trading Fees - Funding Paid (+ Funding Received jika negatif)
+	netPnL := grossPnL.Sub(totalFee).Sub(fundingLeg)
+
+	// RealizedEquityUSDT sudah dipotong entryFee dan funding secara real-time saat kejadian.
+	// Saat exit, kita membukukan grossPnL dikurangi exitFee ke RealizedEquityUSDT.
+	s.RealizedEquityUSDT = s.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
 
 	tradeID := fmt.Sprintf("SIM_%s_%d", pos.Symbol, closedAt.UnixNano())
 	rec := SimTradeRecord{
@@ -466,6 +503,7 @@ func (s *SimBroker) recordClosedTradeLocked(
 		GrossPnL:      grossPnL,
 		NetPnL:        netPnL,
 		FeeTotal:      totalFee,
+		FundingTotal:  fundingLeg,
 		ExitReason:    reason,
 		MAE:           pos.MaxMAE,
 		MFE:           pos.MaxMFE,

@@ -2767,6 +2767,18 @@ func TestLiveBrokerTimeStopEmergencyClose_GhostOrderAndExitReason(t *testing.T) 
 	// Simulate entry fill
 	broker.HandleUserDataOrderUpdate(origClientOrderID, 1001, "ADAUSDT", model.StatusFilled, decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.50), decimal.Zero)
 
+	// Wait until async protection orders (SL/TP) are placed
+	deadlinePlace := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadlinePlace) {
+		broker.Mu.Lock()
+		prot, hasProt := broker.Protections["ADAUSDT"]
+		broker.Mu.Unlock()
+		if hasProt && prot != nil && prot.SLOrderID > 0 && prot.TPOrderID > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	// Backdate PositionOpenTimes beyond MaxHoldingDuration
 	broker.Mu.Lock()
 	broker.PositionOpenTimes["ADAUSDT"] = now.Add(-4*time.Hour - 10*time.Minute)
@@ -2782,7 +2794,17 @@ func TestLiveBrokerTimeStopEmergencyClose_GhostOrderAndExitReason(t *testing.T) 
 	// 3. Simulate emergency exit fill on Binance
 	broker.HandleUserDataOrderUpdate(emgClientOrderID, 9999, "ADAUSDT", model.StatusFilled, decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.49), decimal.NewFromFloat(-1.0))
 
-	time.Sleep(50 * time.Millisecond)
+	// Wait up to 500ms for async cancellations to complete
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		cancelMu.Lock()
+		count := len(cancelledAlgoIDs)
+		cancelMu.Unlock()
+		if count >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// 4. Assert: BOTH SL and TP algo orders were cancelled (Bug 1 Fix: No Ghost Orders)
 	cancelMu.Lock()
@@ -2805,6 +2827,17 @@ func TestLiveBrokerTimeStopEmergencyClose_GhostOrderAndExitReason(t *testing.T) 
 	}
 
 	// 5. Assert: Trade record exit reason is TIME_STOP_MAX_HOLDING (NOT TAKE_PROFIT)
+	deadlineClose := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadlineClose) {
+		closeMu.Lock()
+		rec := closedRec
+		closeMu.Unlock()
+		if rec != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	closeMu.Lock()
 	defer closeMu.Unlock()
 	if closedRec == nil {

@@ -50,7 +50,8 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 	fmt.Fprintf(&sb, "| **95%% Bootstrap CI** | `[+$%.2f, +$%.2f]` | Interval kepercayaan 1.000 iterasi |\n", summary.CI95LowerUSDT, summary.CI95UpperUSDT)
 	fmt.Fprintf(&sb, "| **Max Drawdown (Peak-to-Trough)** | `-%.2f%%` (-$%.2f) | Penurunan modal terdalam |\n", summary.MaxDrawdownPct, summary.MaxDrawdownUSDT)
 	fmt.Fprintf(&sb, "| **Losing Streak Terpanjang** | `%d` trade berturut | Rekor kerugian berurutan |\n", summary.MaxLosingStreak)
-	fmt.Fprintf(&sb, "| **Fee & Friction Drag** | `%.2f%%` | Total fee ($%.2f) vs Profit Kotor |\n\n", summary.FeeDragPct, summary.TotalFees)
+	fmt.Fprintf(&sb, "| **Fee & Friction Drag** | `%.2f%%` | Total fee ($%.2f) vs Profit Kotor |\n", summary.FeeDragPct, summary.TotalFees)
+	fmt.Fprintf(&sb, "| **Net Funding Fee** | `$%.4f USDT` | Total pendanaan Binance dibayar/diterima |\n\n", summary.TotalFunding)
 
 	sb.WriteString("### 2. Distribusi Alasan Keluar (Exit Ladder)\n\n")
 	sb.WriteString("| Alasan Exit | Jumlah Frekuensi | Persentase |\n")
@@ -70,19 +71,19 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 
 	if len(meta.Trades) > 0 {
 		sb.WriteString("### 3. Log Eksekusi Trade Selesai\n\n")
-		sb.WriteString("| No | Waktu Entry (UTC) | Simbol | Posisi | Entry Price | Exit Price | Alasan Exit | Net PnL | Fee |\n")
-		sb.WriteString("| :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+		sb.WriteString("| No | Waktu Entry (UTC) | Simbol | Posisi | Entry Price | Exit Price | Alasan Exit | Net PnL | Fee | Funding |\n")
+		sb.WriteString("| :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
 		maxDisplay := 50
 		for i, tr := range meta.Trades {
 			if i >= maxDisplay {
-				fmt.Fprintf(&sb, "| ... | *Menampilkan %d dari %d trade total* | | | | | | | |\n", maxDisplay, len(meta.Trades))
+				fmt.Fprintf(&sb, "| ... | *Menampilkan %d dari %d trade total* | | | | | | | | |\n", maxDisplay, len(meta.Trades))
 				break
 			}
 			pnlSign := "+"
 			if tr.NetPnL.IsNegative() {
 				pnlSign = ""
 			}
-			fmt.Fprintf(&sb, "| %d | %s | `%s` | %s | %s | %s | `%s` | `%s$%s` | $%.4f |\n",
+			fmt.Fprintf(&sb, "| %d | %s | `%s` | %s | %s | %s | `%s` | `%s$%s` | $%.4f | $%.4f |\n",
 				i+1,
 				tr.EntryTime.UTC().Format("2006-01-02 15:04"),
 				tr.Symbol,
@@ -93,6 +94,7 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 				pnlSign,
 				tr.NetPnL.StringFixed(2),
 				tr.FeeTotal.InexactFloat64(),
+				tr.FundingTotal.InexactFloat64(),
 			)
 		}
 		sb.WriteString("\n")

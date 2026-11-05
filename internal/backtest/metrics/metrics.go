@@ -27,6 +27,7 @@ type BacktestSummary struct {
 	TotalNetPnL        float64        `json:"total_net_pnl"`
 	TotalGrossPnL      float64        `json:"total_gross_pnl"`
 	TotalFees          float64        `json:"total_fees"`
+	TotalFunding       float64        `json:"total_funding"`
 	FeeDragPct         float64        `json:"fee_drag_pct"` // TotalFees / GrossProfit
 	ExpectancyUSDT     float64        `json:"expectancy_usdt"`
 	CI95LowerUSDT      float64        `json:"ci95_lower_usdt"`
@@ -47,6 +48,7 @@ type AggregatedTrade struct {
 	GrossPnL    float64
 	NetPnL      float64
 	TotalFees   float64
+	FundingPaid float64
 	ExitReasons []string
 	HoldingBars int
 }
@@ -91,10 +93,12 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 		gPnL, _ := tr.GrossPnL.Float64()
 		nPnL, _ := tr.NetPnL.Float64()
 		fee, _ := tr.FeeTotal.Float64()
+		funding, _ := tr.FundingTotal.Float64()
 
 		agg.GrossPnL += gPnL
 		agg.NetPnL += nPnL
 		agg.TotalFees += fee
+		agg.FundingPaid += funding
 		agg.ExitReasons = append(agg.ExitReasons, tr.ExitReason)
 		if tr.ExitTime.After(agg.ExitTime) {
 			agg.ExitTime = tr.ExitTime
@@ -132,6 +136,7 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 		res.TotalNetPnL += pnl
 		res.TotalGrossPnL += t.GrossPnL
 		res.TotalFees += t.TotalFees
+		res.TotalFunding += t.FundingPaid
 
 		if t.GrossPnL > 0 {
 			grossProfit += t.GrossPnL

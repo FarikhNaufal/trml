@@ -18,8 +18,9 @@ import (
 
 type ReplayConfig struct {
 	WarmupBars            int                   // jumlah bar awal untuk warmup indikator (default 200)
-	SpreadPct             float64               // default estimasi spread (0.02% = 0.0002)
-	FundingRate           float64               // default estimasi funding (0.01% = 0.0001)
+	SpreadPct             float64               // baseline estimasi spread jika dyn calc gagal (default 0.0002)
+	FundingRate           float64               // default fallback funding jika manager kosong (0.01% = 0.0001)
+	FundingMgr            *data.FundingManager  // manager data historical funding rate Binance Vision/API
 	BenchmarkSym          string                // default "BTCUSDT"
 	DynamicScannerEnabled bool                  // apakah dynamic rolling scanner aktif
 	ScannerInterval       time.Duration         // interval scanning ulang (default 15 menit)
@@ -37,6 +38,7 @@ type ReplayEngine struct {
 	broker       *simbroker.SimBroker
 	candleMap    map[string][]data.HistoricalCandle
 	filters      map[string]model.ExchangeFilter
+	fundingMgr   *data.FundingManager
 	lastExits    map[string]lastExitInfo
 
 	// Signal observability
@@ -75,9 +77,15 @@ func NewReplayEngine(
 		broker:        broker,
 		candleMap:     candleMap,
 		filters:       filters,
+		fundingMgr:    cfg.FundingMgr,
 		lastExits:     make(map[string]lastExitInfo),
 		RejectReasons: make(map[string]int64),
 	}
+}
+
+// SetFundingManager menyetel atau memperbarui data funding rate historis Binance.
+func (r *ReplayEngine) SetFundingManager(fm *data.FundingManager) {
+	r.fundingMgr = fm
 }
 
 // Run mengeksekusi replay tersinkronisasi bar-demi-bar lintas seluruh simbol.
@@ -130,6 +138,13 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			if idx < len(candles) && candles[idx].CloseTime.Equal(simTime) {
 				c := candles[idx]
 
+				// Simbroker mengevaluasi settlement biaya pendanaan (funding rate) jika bar ini tepat melintasi waktu settlement
+				if r.fundingMgr != nil {
+					if rate, isSettlement := r.fundingMgr.CheckSettlement(sym, c.OpenTime, c.CloseTime); isSettlement {
+						r.broker.ApplyFundingSettlement(sym, decimal.NewFromFloat(c.Close), decimal.NewFromFloat(rate))
+					}
+				}
+
 				// Simbroker mengevaluasi fill pending order dan exit ladder posisi aktif
 				r.broker.ProcessCandle(c, int64(barIdx))
 
@@ -171,12 +186,13 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			if btcCandles, ok := rollingCandles[r.cfg.BenchmarkSym]; ok && len(btcCandles) >= 30 {
 				lastBTC := btcCandles[len(btcCandles)-1]
 				vwapBTC := indicator.CalculateSessionVWAP(btcCandles)
+				btcSpread := calculateDynamicSpread(btcCandles, lastBTC.Close, r.cfg.SpreadPct)
 				bSnap := model.MarketSnapshot{
 					Symbol:              r.cfg.BenchmarkSym,
 					Now:                 simTime,
 					MarkPrice:           lastBTC.Close,
-					BestBid:             lastBTC.Close * (1.0 - r.cfg.SpreadPct/2.0),
-					BestAsk:             lastBTC.Close * (1.0 + r.cfg.SpreadPct/2.0),
+					BestBid:             lastBTC.Close * (1.0 - btcSpread/2.0),
+					BestAsk:             lastBTC.Close * (1.0 + btcSpread/2.0),
 					CurrentSessionVWAP:  vwapBTC,
 					ClosedCandles:       btcCandles,
 					ClosedBarDeltasUSDT: rollingDeltas[r.cfg.BenchmarkSym],
@@ -207,9 +223,10 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 				vol24hMap[sym] = sumVol
 
 				lastClose := cList[len(cList)-1].Close
+				symSpread := calculateDynamicSpread(cList, lastClose, r.cfg.SpreadPct)
 				bookMap[sym] = model.BookQuote{
-					BestBid: lastClose * (1.0 - r.cfg.SpreadPct/2.0),
-					BestAsk: lastClose * (1.0 + r.cfg.SpreadPct/2.0),
+					BestBid: lastClose * (1.0 - symSpread/2.0),
+					BestAsk: lastClose * (1.0 + symSpread/2.0),
 				}
 			}
 
@@ -281,16 +298,22 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 			exitInfo := r.lastExits[sym]
 
+			dynSpread := calculateDynamicSpread(cList, lastC.Close, r.cfg.SpreadPct)
+			fundingRate := r.cfg.FundingRate
+			if r.fundingMgr != nil {
+				fundingRate = r.fundingMgr.GetFundingRate(sym, simTime)
+			}
+
 			snap := model.MarketSnapshot{
 				Symbol:              sym,
 				Filter:              filter,
 				Now:                 simTime,
-				BestBid:             lastC.Close * (1.0 - r.cfg.SpreadPct/2.0),
-				BestAsk:             lastC.Close * (1.0 + r.cfg.SpreadPct/2.0),
+				BestBid:             lastC.Close * (1.0 - dynSpread/2.0),
+				BestAsk:             lastC.Close * (1.0 + dynSpread/2.0),
 				BookUpdatedAt:       simTime,
 				MarkPrice:           lastC.Close,
 				MarkPriceUpdatedAt:  simTime,
-				FundingRate:         r.cfg.FundingRate,
+				FundingRate:         fundingRate,
 				FundingUpdatedAt:    simTime,
 				CurrentSessionVWAP:  sessionVWAP,
 				ClosedCandles:       cList,
@@ -331,4 +354,21 @@ func (r *ReplayEngine) isSymbolTarget(symbol string) bool {
 	// Simbol target trading valid jika terdaftar di filters
 	_, ok := r.filters[symbol]
 	return ok
+}
+
+// calculateDynamicSpread menghitung estimasi bid-ask spread secara dinamis berdasarkan volatilitas (NATR).
+// Pada bursa berjangka Binance, instrumen dengan volatilitas tinggi memiliki orderbook yang lebih renggang.
+func calculateDynamicSpread(cList []model.Candle, lastClose float64, fallbackSpread float64) float64 {
+	if len(cList) < 14 || lastClose <= 0 {
+		if fallbackSpread > 0 {
+			return fallbackSpread
+		}
+		return 0.0002
+	}
+	atr := indicator.CalculateATR(cList, 14)
+	natrPct := atr / lastClose
+	// Model likuiditas dinamis:
+	// Base spread 1.2 bps (0.00012) berskala linier terhadap NATR.
+	// Diklem secara realistis antara 1.0 bps (0.0001) s/d 6.0 bps (0.0006).
+	return math.Max(0.0001, math.Min(0.0006, 0.00012+natrPct*0.02))
 }

@@ -203,6 +203,13 @@ func handleRunCommand(args []string) {
 	downloader := data.NewDownloader(*cacheDirFlag)
 	ctx := context.Background()
 
+	// Muat filter resmi bursa Binance Futures (tickSize, stepSize, minNotional)
+	fmt.Printf("Memuat filter bursa resmi Binance Futures (exchangeInfo)...\n")
+	exchangeFilters, err := data.LoadExchangeFilters(ctx, *cacheDirFlag)
+	if err != nil {
+		slog.Warn("Gagal memuat exchange filters resmi dari Binance API, menggunakan fail-safe", "err", err)
+	}
+
 	candleMap := make(map[string][]data.HistoricalCandle)
 	filters := make(map[string]model.ExchangeFilter)
 
@@ -215,8 +222,17 @@ func handleRunCommand(args []string) {
 			continue
 		}
 		candleMap[sym] = candles
-		filters[sym] = getStandardFilter(sym)
-		fmt.Printf("  -> %s: %d bar dimuat\n", sym, len(candles))
+		if ef, ok := exchangeFilters[sym]; ok {
+			filters[sym] = ef
+		} else {
+			filters[sym] = model.ExchangeFilter{
+				TickSize:    decimal.NewFromFloat(0.01),
+				StepSize:    decimal.NewFromFloat(0.1),
+				MinNotional: decimal.NewFromFloat(5.0),
+				MinQty:      decimal.NewFromFloat(0.1),
+			}
+		}
+		fmt.Printf("  -> %s: %d bar dimuat (tick: %s, step: %s)\n", sym, len(candles), filters[sym].TickSize, filters[sym].StepSize)
 	}
 
 	if len(candleMap) == 0 {
@@ -224,22 +240,30 @@ func handleRunCommand(args []string) {
 		os.Exit(1)
 	}
 
-	// Inisialisasi SimBroker pesimistis
+	// Evaluator Config dari konfigurasi backtest
+	evaluatorCfg := buildDefaultEvaluatorConfig(*envFlag)
+
+	// Muat data tingkat pendanaan (funding rate) historis resmi Binance
+	fundingMgr := data.NewFundingManager(*cacheDirFlag)
+	fmt.Printf("Memuat data tingkat pendanaan (funding rate) historis Binance untuk %d simbol...\n", len(symbols))
+	_ = fundingMgr.LoadFundingRates(ctx, symbols, from, to)
+
+	// Inisialisasi SimBroker pesimistis dengan fee & leverage dinamis dari environment
 	brokerCfg := simbroker.SimBrokerConfig{
 		InitialEquityUSDT:       decimal.NewFromFloat(*equityFlag),
-		MaxSlots:                3,
-		MaxDailyDrawdownPct:     -0.05,
-		AccountLeverage:         8.0,
-		MakerFeeRate:            decimal.NewFromFloat(0.0002), // 2.0 bps
-		TakerFeeRate:            decimal.NewFromFloat(0.0005), // 5.0 bps
-		SlippageRate:            decimal.NewFromFloat(0.0005), // 5.0 bps
+		MaxSlots:                evaluatorCfg.MaxSlots,
+		MaxDailyDrawdownPct:     evaluatorCfg.MaxDailyDrawdownPct,
+		AccountLeverage:         evaluatorCfg.Sizing.AccountLeverage,
+		MakerFeeRate:            evaluatorCfg.Sizing.MakerFeeRate,
+		TakerFeeRate:            evaluatorCfg.Sizing.TakerFeeRate,
+		SlippageRate:            evaluatorCfg.Sizing.SlippageRate,
 		SignalDelayBars:         1,
 		LimitTimeoutBars:        1,
 		PenetrationTicks:        1,
 		IntrabarConflictSLFirst: true, // pesimistis default
 		PartialTPEnabled:        true,
 		PartialTP1Ratio:         0.50,
-		PartialTP1ATRMult:       1.00,
+		PartialTP1ATRMult:       evaluatorCfg.Sizing.TP1Multiplier,
 		TrailingEnabled:         true,
 		TrailingActivateATR:     1.10,
 		TrailingDistanceATR:     0.55,
@@ -248,9 +272,6 @@ func handleRunCommand(args []string) {
 	}
 	sim := simbroker.NewSimBroker(brokerCfg)
 
-	// Evaluator Config dari konfigurasi backtest
-	evaluatorCfg := buildDefaultEvaluatorConfig(*envFlag)
-
 	// Inisialisasi Replay Engine
 	warmupBars := 200
 	if *todayFlag {
@@ -258,8 +279,9 @@ func handleRunCommand(args []string) {
 	}
 	replayCfg := replay.ReplayConfig{
 		WarmupBars:            warmupBars,
-		SpreadPct:             0.0002,
+		SpreadPct:             evaluatorCfg.MaxSpreadPct,
 		FundingRate:           0.0001,
+		FundingMgr:            fundingMgr,
 		BenchmarkSym:          "BTCUSDT",
 		DynamicScannerEnabled: *scannerFlag,
 		ScannerInterval:       15 * time.Minute,
@@ -284,14 +306,19 @@ func handleRunCommand(args []string) {
 	if *todayFlag {
 		metaFrom = time.Now().UTC().Format("2006-01-02") + " (Today)"
 	}
+	makerBps := evaluatorCfg.Sizing.MakerFeeRate.Mul(decimal.NewFromFloat(10000)).InexactFloat64()
+	takerBps := evaluatorCfg.Sizing.TakerFeeRate.Mul(decimal.NewFromFloat(10000)).InexactFloat64()
+	slipBps := evaluatorCfg.Sizing.SlippageRate.Mul(decimal.NewFromFloat(10000)).InexactFloat64()
+	feeModelStr := fmt.Sprintf("Maker %.1f bps, Taker %.1f bps, Slippage %.1f bps | Real Binance Funding & Dynamic Spread", makerBps, takerBps, slipBps)
+
 	meta := report.ReportMeta{
 		CommitHash:    getGitCommitHash(),
 		DataRangeFrom: metaFrom,
 		DataRangeTo:   to.Format("2006-01-02"),
 		Symbols:       symbols,
-		ExecutionMode: "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage 5 bps",
-		FeeModel:      "Maker 2.0 bps, Taker 5.0 bps, Funding Active",
-		FeaturesMode:  "Kline 5m + Exact Net Bar Delta (Binance Ground Truth)",
+		ExecutionMode: "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage Active",
+		FeeModel:      feeModelStr,
+		FeaturesMode:  "Kline 5m + Exact Net Bar Delta + Real Binance Filters & Funding",
 		Trades:        sim.ClosedTrades,
 	}
 
@@ -343,13 +370,23 @@ func handleAblateCommand(args []string) {
 	downloader := data.NewDownloader(*cacheDirFlag)
 	ctx := context.Background()
 
+	exchangeFilters, _ := data.LoadExchangeFilters(ctx, *cacheDirFlag)
+
 	candleMap := make(map[string][]data.HistoricalCandle)
 	filters := make(map[string]model.ExchangeFilter)
 	for _, sym := range symbols {
 		candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
 		if err == nil && len(candles) > 0 {
 			candleMap[sym] = candles
-			filters[sym] = getStandardFilter(sym)
+			if ef, ok := exchangeFilters[sym]; ok {
+				filters[sym] = ef
+			} else {
+				filters[sym] = model.ExchangeFilter{
+					TickSize:    decimal.NewFromFloat(0.01),
+					StepSize:    decimal.NewFromFloat(0.1),
+					MinNotional: decimal.NewFromFloat(5.0),
+				}
+			}
 		}
 	}
 
@@ -357,6 +394,9 @@ func handleAblateCommand(args []string) {
 		fmt.Println("Tidak ada data candle lokal. Jalankan 'backtest data fetch' terlebih dahulu.")
 		return
 	}
+
+	fundingMgr := data.NewFundingManager(*cacheDirFlag)
+	_ = fundingMgr.LoadFundingRates(ctx, symbols, from, to)
 
 	fmt.Println("========================================================================================")
 	fmt.Println("TRML ABLATION TEST RUNNER (FILTER KNOCKOUT ANALYSIS)")
@@ -393,34 +433,36 @@ func handleAblateCommand(args []string) {
 	fmt.Println("|:---------------------------------------|:-----------|:-------------|:-------------|:---------------|")
 
 	for _, exp := range experiments {
+		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
+		exp.modifierFn(&evalCfg)
+
 		brokerCfg := simbroker.SimBrokerConfig{
 			InitialEquityUSDT:       decimal.NewFromFloat(1000.0),
-			MaxSlots:                3,
-			MaxDailyDrawdownPct:     -0.05,
-			AccountLeverage:         8.0,
-			MakerFeeRate:            decimal.NewFromFloat(0.0002),
-			TakerFeeRate:            decimal.NewFromFloat(0.0005),
-			SlippageRate:            decimal.NewFromFloat(0.0005),
+			MaxSlots:                evalCfg.MaxSlots,
+			MaxDailyDrawdownPct:     evalCfg.MaxDailyDrawdownPct,
+			AccountLeverage:         evalCfg.Sizing.AccountLeverage,
+			MakerFeeRate:            evalCfg.Sizing.MakerFeeRate,
+			TakerFeeRate:            evalCfg.Sizing.TakerFeeRate,
+			SlippageRate:            evalCfg.Sizing.SlippageRate,
 			SignalDelayBars:         1,
 			LimitTimeoutBars:        1,
 			PenetrationTicks:        1,
 			IntrabarConflictSLFirst: true,
 			PartialTPEnabled:        true,
 			PartialTP1Ratio:         0.50,
-			PartialTP1ATRMult:       1.00,
+			PartialTP1ATRMult:       evalCfg.Sizing.TP1Multiplier,
 			TrailingEnabled:         true,
 			TrailingActivateATR:     1.10,
 			TrailingDistanceATR:     0.55,
 			MaxHoldingDuration:      4 * time.Hour,
 		}
 		sim := simbroker.NewSimBroker(brokerCfg)
-		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
-		exp.modifierFn(&evalCfg)
 
 		replayCfg := replay.ReplayConfig{
 			WarmupBars:            200,
-			SpreadPct:             0.0002,
+			SpreadPct:             evalCfg.MaxSpreadPct,
 			FundingRate:           0.0001,
+			FundingMgr:            fundingMgr,
 			BenchmarkSym:          "BTCUSDT",
 			DynamicScannerEnabled: *scannerFlag,
 			ScannerInterval:       15 * time.Minute,
@@ -498,30 +540,6 @@ func splitSymbols(s string) []string {
 		}
 	}
 	return res
-}
-
-func getStandardFilter(symbol string) model.ExchangeFilter {
-	// Standard Binance Futures Filter (bisa disesuaikan per pair)
-	tick := decimal.NewFromFloat(0.01)
-	step := decimal.NewFromFloat(0.001)
-
-	if strings.HasPrefix(symbol, "BTC") {
-		tick = decimal.NewFromFloat(0.10)
-		step = decimal.NewFromFloat(0.001)
-	} else if strings.HasPrefix(symbol, "ETH") {
-		tick = decimal.NewFromFloat(0.01)
-		step = decimal.NewFromFloat(0.01)
-	} else if strings.HasPrefix(symbol, "SOL") {
-		tick = decimal.NewFromFloat(0.01)
-		step = decimal.NewFromFloat(0.1)
-	}
-
-	return model.ExchangeFilter{
-		TickSize:    tick,
-		StepSize:    step,
-		MinNotional: decimal.NewFromFloat(5.0),
-		MinQty:      step,
-	}
 }
 
 func loadConfigForBacktest(envPath string) (*config.Config, error) {

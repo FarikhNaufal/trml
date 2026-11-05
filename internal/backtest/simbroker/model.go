@@ -48,6 +48,7 @@ type SimTradeRecord struct {
 	GrossPnL      decimal.Decimal `json:"gross_pnl"`
 	NetPnL        decimal.Decimal `json:"net_pnl"`
 	FeeTotal      decimal.Decimal `json:"fee_total"`
+	FundingTotal  decimal.Decimal `json:"funding_total"`
 	SlippageTotal decimal.Decimal `json:"slippage_total"`
 	ExitReason    string          `json:"exit_reason"`
 	MAE           float64         `json:"mae"`
@@ -70,6 +71,7 @@ type SimPosition struct {
 	InitialQty     decimal.Decimal
 	EntryPrice     decimal.Decimal
 	EntryFee       decimal.Decimal
+	FundingPaid    decimal.Decimal
 	CurrentSLPrice decimal.Decimal
 	InitialSLPrice decimal.Decimal
 	TPPrice        decimal.Decimal

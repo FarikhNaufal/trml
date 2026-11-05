@@ -229,3 +229,96 @@ func TestSimBroker_PartialTP1AndTrailing(t *testing.T) {
 	}
 }
 
+func TestSimBroker_FundingSettlement(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		MakerFeeRate:      decimal.NewFromFloat(0.0002),
+		TakerFeeRate:      decimal.NewFromFloat(0.0005),
+	}
+	broker := NewSimBroker(cfg)
+	broker.SetExchangeFilter("SOLUSDT", model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.01),
+		StepSize: decimal.NewFromFloat(0.1),
+	})
+
+	now := time.Date(2026, 1, 1, 7, 55, 0, 0, time.UTC)
+
+	// Submit Long: 10 SOL at 100.0 (Notional $1000)
+	intent := model.OrderIntent{
+		Symbol:     "SOLUSDT",
+		Side:       model.SideLong,
+		Qty:        decimal.NewFromFloat(10.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(95.0),
+		TPPrice:    decimal.NewFromFloat(110.0),
+		CreatedAt:  now,
+	}
+	_, _ = broker.SubmitLimitEntry(intent)
+
+	// Fill order at 100.0 (Low penetrates to 99.5)
+	c1 := data.HistoricalCandle{
+		OpenTime:  now,
+		CloseTime: now.Add(5*time.Minute - time.Millisecond),
+		Symbol:    "SOLUSDT",
+		Open:      100.5,
+		High:      100.5,
+		Low:       99.5,
+		Close:     100.0,
+	}
+	broker.ProcessCandle(c1, 1)
+
+	// Initial Equity: 1000 - EntryFee (1000 * 0.0002 = 0.20) = 999.80
+	if !broker.RealizedEquityUSDT.Equal(decimal.NewFromFloat(999.80)) {
+		t.Fatalf("expected realized equity 999.80, got %s", broker.RealizedEquityUSDT)
+	}
+
+	// At 08:00 UTC, funding rate = 0.0001 (0.01% positive)
+	// Long pays 1000 * 0.0001 = $0.10
+	broker.ApplyFundingSettlement("SOLUSDT", decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.0001))
+
+	// Equity should now be 999.80 - 0.10 = 999.70
+	if !broker.RealizedEquityUSDT.Equal(decimal.NewFromFloat(999.70)) {
+		t.Fatalf("expected realized equity 999.70 after funding, got %s", broker.RealizedEquityUSDT)
+	}
+
+	// Exit at TP 110.0
+	c2 := data.HistoricalCandle{
+		OpenTime:  now.Add(10 * time.Minute),
+		CloseTime: now.Add(15*time.Minute - time.Millisecond),
+		Symbol:    "SOLUSDT",
+		Open:      105.0,
+		High:      111.0,
+		Low:       104.0,
+		Close:     110.0,
+	}
+	broker.ProcessCandle(c2, 2)
+
+	broker.Mu.Lock()
+	trades := broker.ClosedTrades
+	broker.Mu.Unlock()
+
+	if len(trades) != 1 {
+		t.Fatalf("expected 1 closed trade, got %d", len(trades))
+	}
+	tr := trades[0]
+
+	// Gross PnL: (110 - 100) * 10 = +$100.00
+	// Exit fee: 1100 * 0.0005 = $0.55
+	// Entry fee: $0.20
+	// Total fee: $0.75
+	// Funding paid: $0.10
+	// Net PnL: 100 - 0.75 - 0.10 = $99.15
+	if !tr.FundingTotal.Equal(decimal.NewFromFloat(0.10)) {
+		t.Errorf("expected trade funding total $0.10, got %s", tr.FundingTotal)
+	}
+	if !tr.NetPnL.Equal(decimal.NewFromFloat(99.15)) {
+		t.Errorf("expected trade net PnL $99.15, got %s", tr.NetPnL)
+	}
+
+	// Final Realized Equity: 1000 + 99.15 = 1099.15
+	if !broker.RealizedEquityUSDT.Equal(decimal.NewFromFloat(1099.15)) {
+		t.Errorf("expected final realized equity 1099.15, got %s", broker.RealizedEquityUSDT)
+	}
+}
+
+
