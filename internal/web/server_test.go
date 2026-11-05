@@ -26,6 +26,7 @@ func (m *mockBroker) GetEffectiveTotalEquityUSDT() decimal.Decimal {
 }
 func (m *mockBroker) GetAvailableBalanceUSDT() decimal.Decimal    { return decimal.NewFromFloat(987.65) }
 func (m *mockBroker) GetDailyTotalDrawdownPct() float64           { return -0.015 }
+func (m *mockBroker) IsCircuitBreakerTripped() bool               { return false }
 func (m *mockBroker) GetActiveSlotCount() int                     { return 1 }
 func (m *mockBroker) HasActiveOrderOrPosition(symbol string) bool { return symbol == "BTCUSDT" }
 func (m *mockBroker) CheckTimeouts(now time.Time)                 {}
@@ -536,5 +537,57 @@ func TestGetOverallStats_Categorization(t *testing.T) {
 	// Blended RR: (1.50 + 0.40)/2 / 1.80 = 0.95 / 1.80 = 0.527
 	if math.Abs(stats.BlendedRR-0.527) > 0.05 {
 		t.Errorf("expected BlendedRR ~0.53, got %f", stats.BlendedRR)
+	}
+}
+
+func TestGetOverallStats_AlgoTP1AndFallbackGrouping(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Clear table
+	_, _ = db.Exec("DELETE FROM trade_ledger;")
+
+	// Setup 1: Legacy live order with ALGO_TP1_ and ALGO_LIVE_ without signal_audit_id
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES
+		('ALGO_TP1_BTC_123', 'BTCUSDT', 'LONG', '1', '100', '102', '98', '104', '0.50', 'PARTIAL_TAKE_PROFIT', '2026-11-03 10:00:00', '2026-11-03 10:05:00', 0, '2026-11-03 10:05:00'),
+		('ALGO_LIVE_BTC_123', 'BTCUSDT', 'LONG', '1', '100', '103', '98', '104', '1.00', 'TRAILING_STOP', '2026-11-03 10:00:00', '2026-11-03 10:10:00', 0, '2026-11-03 10:10:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed insert setup 1: %v", err)
+	}
+
+	// Setup 2: Standard deterministic order with %_TP1 without signal_audit_id
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES
+		('BOT_ETH_LONG_999_TP1', 'ETHUSDT', 'LONG', '1', '100', '102', '98', '104', '0.40', 'PARTIAL_TAKE_PROFIT', '2026-11-03 11:00:00', '2026-11-03 11:05:00', 0, '2026-11-03 11:05:00'),
+		('BOT_ETH_LONG_999', 'ETHUSDT', 'LONG', '1', '100', '100', '98', '104', '-0.00005', 'BREAK_EVEN', '2026-11-03 11:00:00', '2026-11-03 11:15:00', 0, '2026-11-03 11:15:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed insert setup 2: %v", err)
+	}
+
+	reader := &WebReader{db: db, leverage: 8.0}
+	stats, err := reader.GetOverallStats(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 4 ledger rows should map to exactly 2 trades
+	if stats.TotalTrades != 2 {
+		t.Errorf("expected 2 grouped trades, got %d", stats.TotalTrades)
+	}
+	if stats.WinsCount != 2 {
+		t.Errorf("expected 2 wins, got %d", stats.WinsCount)
+	}
+	if stats.FullWinsCount != 1 {
+		t.Errorf("expected 1 full win, got %d", stats.FullWinsCount)
+	}
+	if stats.PartialWinsCount != 1 {
+		t.Errorf("expected 1 partial win, got %d", stats.PartialWinsCount)
 	}
 }

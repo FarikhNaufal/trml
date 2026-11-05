@@ -399,6 +399,7 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 			CASE 
 				WHEN signal_audit_id > 0 THEN 'SIG_' || CAST(signal_audit_id AS TEXT)
 				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
+				WHEN client_order_id LIKE 'ALGO_TP1_%' THEN 'ALGO_LIVE_' || SUBSTR(client_order_id, 10)
 				ELSE client_order_id 
 			END AS setup_id,
 			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,

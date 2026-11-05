@@ -2704,3 +2704,310 @@ func TestLiveBrokerAdoptPendingEntry(t *testing.T) {
 		t.Fatalf("expected adopted record to have IsEntry=true")
 	}
 }
+
+func TestLiveBrokerTimeStopEmergencyClose_GhostOrderAndExitReason(t *testing.T) {
+	broker := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxHoldingDuration:  4 * time.Hour,
+		MaxAccountStaleness: 60 * time.Second,
+	})
+	defer broker.Close()
+	now := time.Now().UTC()
+	broker.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	var cancelledAlgoIDs []int64
+	var cancelMu sync.Mutex
+	broker.CancelAlgoOrderFn = func(ctx context.Context, symbol string, algoOrderID int64) error {
+		cancelMu.Lock()
+		cancelledAlgoIDs = append(cancelledAlgoIDs, algoOrderID)
+		cancelMu.Unlock()
+		return nil
+	}
+
+	var closedRec *TradeClosedRecord
+	var closeMu sync.Mutex
+	broker.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closeMu.Lock()
+		closedRec = &rec
+		closeMu.Unlock()
+	}
+
+	var emgClientOrderID string
+	broker.EmergencyMarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error {
+		emgClientOrderID = fmt.Sprintf("live_emg_%s_%d", symbol, time.Now().UnixNano())
+		return nil
+	}
+
+	broker.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if orderType == "STOP_MARKET" {
+			return 2001, nil
+		}
+		return 2002, nil
+	}
+
+	// 1. Setup entry and initial position
+	origClientOrderID := "BOT_ADAUSDT_LONG_1234567890_001"
+	intent := model.OrderIntent{
+		ClientOrderID: origClientOrderID,
+		Symbol:        "ADAUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(100.0),
+		LimitPrice:    decimal.NewFromFloat(0.50),
+		SLPrice:       decimal.NewFromFloat(0.48),
+		TPPrice:       decimal.NewFromFloat(0.55),
+		CreatedAt:     now.Add(-5 * time.Hour),
+		SignalAuditID: 777,
+	}
+	resOk, resErr := broker.ReserveEntryIntent(intent)
+	if !resOk || resErr != nil {
+		t.Fatalf("ReserveEntryIntent failed: %v", resErr)
+	}
+
+	// Simulate entry fill
+	broker.HandleUserDataOrderUpdate(origClientOrderID, 1001, "ADAUSDT", model.StatusFilled, decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.50), decimal.Zero)
+
+	// Backdate PositionOpenTimes beyond MaxHoldingDuration
+	broker.Mu.Lock()
+	broker.PositionOpenTimes["ADAUSDT"] = now.Add(-4*time.Hour - 10*time.Minute)
+	broker.Mu.Unlock()
+
+	// 2. Trigger CheckMaxHoldingTimeouts
+	broker.CheckMaxHoldingTimeouts(now)
+
+	if emgClientOrderID == "" {
+		t.Fatalf("expected EmergencyMarketCloseFn to be invoked")
+	}
+
+	// 3. Simulate emergency exit fill on Binance
+	broker.HandleUserDataOrderUpdate(emgClientOrderID, 9999, "ADAUSDT", model.StatusFilled, decimal.NewFromFloat(100.0), decimal.NewFromFloat(0.49), decimal.NewFromFloat(-1.0))
+
+	time.Sleep(50 * time.Millisecond)
+
+	// 4. Assert: BOTH SL and TP algo orders were cancelled (Bug 1 Fix: No Ghost Orders)
+	cancelMu.Lock()
+	defer cancelMu.Unlock()
+	if len(cancelledAlgoIDs) != 2 {
+		t.Fatalf("expected 2 algo orders cancelled (SL & TP), got %d: %v", len(cancelledAlgoIDs), cancelledAlgoIDs)
+	}
+	hasSL := false
+	hasTP := false
+	for _, id := range cancelledAlgoIDs {
+		if id == 2001 {
+			hasSL = true
+		}
+		if id == 2002 {
+			hasTP = true
+		}
+	}
+	if !hasSL || !hasTP {
+		t.Errorf("expected SL(2001) and TP(2002) to be cancelled, got %v", cancelledAlgoIDs)
+	}
+
+	// 5. Assert: Trade record exit reason is TIME_STOP_MAX_HOLDING (NOT TAKE_PROFIT)
+	closeMu.Lock()
+	defer closeMu.Unlock()
+	if closedRec == nil {
+		t.Fatalf("expected OnTradeClosedFn to be called")
+	}
+	if closedRec.ExitReason != "TIME_STOP_MAX_HOLDING" {
+		t.Errorf("expected ExitReason 'TIME_STOP_MAX_HOLDING', got '%s'", closedRec.ExitReason)
+	}
+	if closedRec.ClientOrderID != origClientOrderID {
+		t.Errorf("expected preserved ClientOrderID '%s', got '%s'", origClientOrderID, closedRec.ClientOrderID)
+	}
+	if closedRec.SignalAuditID != 777 {
+		t.Errorf("expected SignalAuditID 777, got %d", closedRec.SignalAuditID)
+	}
+}
+
+func TestBrokerIsCircuitBreakerTrippedParity(t *testing.T) {
+	now := time.Now().UTC()
+
+	// 1. DryRunBroker parity
+	dry := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+		MaxDailyDrawdownPct: -0.05,
+	})
+	if dry.IsCircuitBreakerTripped() {
+		t.Errorf("expected initial circuit breaker not tripped in dry-run")
+	}
+
+	// Cause -6% drawdown in dryrun
+	dry.Mu.Lock()
+	dry.SessionStartEquity = decimal.NewFromFloat(1000.0)
+	dry.RealizedEquityUSDT = decimal.NewFromFloat(940.0) // -6%
+	dry.Mu.Unlock()
+
+	if !dry.IsCircuitBreakerTripped() {
+		t.Errorf("expected circuit breaker tripped after -6%% drawdown")
+	}
+
+	// Bounce equity to -4% drawdown; breaker should remain tripped (latched)
+	dry.Mu.Lock()
+	dry.RealizedEquityUSDT = decimal.NewFromFloat(960.0) // -4%
+	dry.Mu.Unlock()
+
+	if !dry.IsCircuitBreakerTripped() {
+		t.Errorf("expected circuit breaker to remain tripped after rebound")
+	}
+
+	// 2. BinanceLiveBroker parity
+	live := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxDailyDrawdownPct: -0.05,
+	})
+	defer live.Close()
+
+	live.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, now)
+	if live.IsCircuitBreakerTripped() {
+		t.Errorf("expected initial circuit breaker not tripped in live")
+	}
+
+	// Cause -6% drawdown in live
+	live.HandleAccountUpdate(decimal.NewFromFloat(940.0), decimal.Zero, decimal.NewFromFloat(940.0), nil, now)
+	if !live.IsCircuitBreakerTripped() {
+		t.Errorf("expected live circuit breaker tripped after -6%% drawdown")
+	}
+
+	// Bounce equity to -4% drawdown; breaker should remain tripped
+	live.HandleAccountUpdate(decimal.NewFromFloat(960.0), decimal.Zero, decimal.NewFromFloat(960.0), nil, now)
+	if !live.IsCircuitBreakerTripped() {
+		t.Errorf("expected live circuit breaker to remain tripped after rebound")
+	}
+}
+
+func TestLiveBrokerRepairProtectionsTickSizeQuantization(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+	})
+	defer b.Close()
+	now := time.Now().UTC()
+
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	// TickSize = 0.005
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.005),
+			StepSize: decimal.NewFromFloat(1.0),
+		}, true
+	}
+
+	var placedSLPrice decimal.Decimal
+	var placedTPPrice decimal.Decimal
+	var mu sync.Mutex
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		mu.Lock()
+		switch orderType {
+		case "STOP_MARKET":
+			placedSLPrice = triggerPrice
+		case "TAKE_PROFIT_MARKET":
+			placedTPPrice = triggerPrice
+		}
+		mu.Unlock()
+		return 888111, nil
+	}
+
+	b.Mu.Lock()
+	b.ActivePositions["XRPUSDT"] = decimal.NewFromFloat(100)
+	b.PositionSides["XRPUSDT"] = model.SideLong
+	b.Protections["XRPUSDT"] = &model.LivePositionProtection{
+		Symbol:         "XRPUSDT",
+		Side:           model.SideLong,
+		ProtectedQty:   decimal.NewFromFloat(100),
+		InitialQty:     decimal.NewFromFloat(100),
+		SLPrice:        decimal.NewFromFloat(0.481234), // Not a multiple of 0.005
+		TPPrice:        decimal.NewFromFloat(0.612345), // Not a multiple of 0.005
+		SLStatus:       model.ProtectionFailed,
+		TPStatus:       model.ProtectionPending,
+		SLRetryCount:   0,
+		TPRetryCount:   0,
+		PlanGeneration: 1,
+	}
+	b.Mu.Unlock()
+
+	b.RepairFailedProtections(now)
+
+	mu.Lock()
+	sl := placedSLPrice
+	tp := placedTPPrice
+	mu.Unlock()
+
+	remSL := sl.Mod(decimal.NewFromFloat(0.005))
+	if !remSL.IsZero() {
+		t.Errorf("repaired SL price %s is not multiple of 0.005 (remainder: %s)", sl, remSL)
+	}
+
+	remTP := tp.Mod(decimal.NewFromFloat(0.005))
+	if !remTP.IsZero() {
+		t.Errorf("repaired TP price %s is not multiple of 0.005 (remainder: %s)", tp, remTP)
+	}
+}
+
+func TestLiveBrokerTP1FormattingAndReaderStats(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+		TakerFeeRate:        0.0005,
+		PartialTPEnabled:    true,
+		PartialTP1Ratio:     0.50,
+	})
+	defer b.Close()
+	now := time.Now().UTC()
+
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		return 112233, nil
+	}
+
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		}, true
+	}
+
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	origCID := "BOT_ETHUSDT_LONG_1700000000_001"
+	intent := model.OrderIntent{
+		ClientOrderID: origCID,
+		Symbol:        "ETHUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(2.0),
+		LimitPrice:    decimal.NewFromFloat(3000.0),
+		SLPrice:       decimal.NewFromFloat(2900.0),
+		TPPrice:       decimal.NewFromFloat(3300.0),
+		TP1Price:      decimal.NewFromFloat(3100.0),
+		CreatedAt:     now,
+	}
+	_, _ = b.ReserveEntryIntent(intent)
+	b.HandleUserDataOrderUpdate(origCID, 1001, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(2.0), decimal.NewFromFloat(3000.0), decimal.Zero)
+
+	var closedClientOrderID string
+	var closeMu sync.Mutex
+	b.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closeMu.Lock()
+		closedClientOrderID = rec.ClientOrderID
+		closeMu.Unlock()
+	}
+
+	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, decimal.Decimal, decimal.Decimal, error) {
+		return 555666, decimal.NewFromFloat(3100.0), decimal.NewFromFloat(1.0), nil
+	}
+
+	// Trigger tick to hit TP1 (price >= 3100)
+	b.OnRealtimeTick("ETHUSDT", 3105.0, 3105.0, 3105.0, 3105.0, 10.0, true, now)
+
+	time.Sleep(50 * time.Millisecond)
+
+	closeMu.Lock()
+	tp1CID := closedClientOrderID
+	closeMu.Unlock()
+
+	expectedTP1CID := origCID + "_TP1"
+	if tp1CID != expectedTP1CID {
+		t.Errorf("expected TP1 client order ID '%s', got '%s'", expectedTP1CID, tp1CID)
+	}
+}

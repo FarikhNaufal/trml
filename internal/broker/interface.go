@@ -29,6 +29,7 @@ type ExecutionBroker interface {
 	GetEffectiveTotalEquityUSDT() decimal.Decimal
 	GetAvailableBalanceUSDT() decimal.Decimal
 	GetDailyTotalDrawdownPct() float64
+	IsCircuitBreakerTripped() bool
 	GetActiveSlotCount() int
 	HasActiveOrderOrPosition(symbol string) bool
 	CheckTimeouts(now time.Time)

@@ -1072,6 +1072,12 @@ func (d *DryRunBroker) GetDailyTotalDrawdownPct() float64 {
 	return ddFloat
 }
 
+func (d *DryRunBroker) IsCircuitBreakerTripped() bool {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	return d.isDailyDrawdownBreachedLocked()
+}
+
 func (d *DryRunBroker) GetActiveSlotCount() int {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()

@@ -1478,7 +1478,7 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 			totEq := e.broker.GetEffectiveTotalEquityUSDT()
 
 			// C3 & M1 FIX: Evaluasi sinyal dengan equity, available balance, status drawdown, dan active symbol riil
-			isDailyBreached := e.broker.GetDailyTotalDrawdownPct() <= e.cfg.MaxDailyDrawdown
+			isDailyBreached := e.broker.IsCircuitBreakerTripped() || (e.broker.GetDailyTotalDrawdownPct() <= e.cfg.MaxDailyDrawdown)
 			hasActiveSymbol := e.broker.HasActiveOrderOrPosition(snap.Symbol)
 
 			var btcSnap *model.MarketSnapshot
