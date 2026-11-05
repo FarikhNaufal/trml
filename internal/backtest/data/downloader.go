@@ -56,6 +56,7 @@ func (d *Downloader) FetchCandleRange(
 	// Kumpulkan seluruh bulan yang bersinggungan dengan rentang [from..to]
 	cur := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, time.UTC)
 	endMonth := time.Date(to.Year(), to.Month(), 1, 0, 0, 0, 0, time.UTC)
+	nowUTC := time.Now().UTC()
 
 	var allCandles []HistoricalCandle
 
@@ -63,9 +64,19 @@ func (d *Downloader) FetchCandleRange(
 		year := cur.Year()
 		month := int(cur.Month())
 
-		candles, err := d.fetchMonthly(ctx, symbol, interval, year, month, symDir)
+		isCurrentMonth := year == nowUTC.Year() && time.Month(month) == nowUTC.Month()
+		var candles []HistoricalCandle
+		var err error
+		if !isCurrentMonth {
+			candles, err = d.fetchMonthly(ctx, symbol, interval, year, month, symDir)
+		} else {
+			err = fmt.Errorf("current month has no monthly archive")
+		}
+
 		if err != nil {
-			slog.Info("monthly archive not available, falling back to daily klines", "symbol", symbol, "year", year, "month", month)
+			if !isCurrentMonth {
+				slog.Info("monthly archive not available, falling back to daily klines", "symbol", symbol, "year", year, "month", month)
+			}
 			// Fallback ke unduhan harian jika arsip bulanan belum ada (misal bulan berjalan)
 			monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 			for day := monthStart; day.Month() == time.Month(month) && !day.After(to); day = day.AddDate(0, 0, 1) {
@@ -194,11 +205,12 @@ func (d *Downloader) fetchDaily(
 	fileName := fmt.Sprintf("%s-%s-%s.csv", symbol, interval, dateStr)
 	cacheFile := filepath.Join(symDir, fileName)
 
-	// 1. Cek apakah CSV sudah ada di cache lokal (jika bukan hari ini)
+	// 1. Cek apakah CSV sudah ada di cache lokal
 	nowUTC := time.Now().UTC()
 	isToday := date.Year() == nowUTC.Year() && date.Month() == nowUTC.Month() && date.Day() == nowUTC.Day()
-	if !isToday {
-		if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
+	if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
+		info, sErr := os.Stat(cacheFile)
+		if !isToday || (sErr == nil && time.Since(info.ModTime()) < 15*time.Minute) {
 			return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol)
 		}
 	}
@@ -306,10 +318,7 @@ func (d *Downloader) fetchFromLiveAPI(
 	}
 
 	csvBytes := []byte(sb.String())
-	nowUTC := time.Now().UTC()
-	if date.Year() != nowUTC.Year() || date.Month() != nowUTC.Month() || date.Day() != nowUTC.Day() {
-		_ = os.WriteFile(cacheFile, csvBytes, 0644)
-	}
+	_ = os.WriteFile(cacheFile, csvBytes, 0644)
 
 	return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
 }

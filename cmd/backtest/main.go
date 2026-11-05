@@ -260,27 +260,7 @@ func handleRunCommand(args []string) {
 	_ = fundingMgr.LoadFundingRates(ctx, symbols, from, to)
 
 	// Inisialisasi SimBroker pesimistis dengan fee & leverage dinamis dari environment
-	brokerCfg := simbroker.SimBrokerConfig{
-		InitialEquityUSDT:       decimal.NewFromFloat(*equityFlag),
-		MaxSlots:                evaluatorCfg.MaxSlots,
-		MaxDailyDrawdownPct:     evaluatorCfg.MaxDailyDrawdownPct,
-		AccountLeverage:         evaluatorCfg.Sizing.AccountLeverage,
-		MakerFeeRate:            evaluatorCfg.Sizing.MakerFeeRate,
-		TakerFeeRate:            evaluatorCfg.Sizing.TakerFeeRate,
-		SlippageRate:            evaluatorCfg.Sizing.SlippageRate,
-		SignalDelayBars:         1,
-		LimitTimeoutBars:        1,
-		PenetrationTicks:        1,
-		IntrabarConflictSLFirst: true, // pesimistis default
-		PartialTPEnabled:        true,
-		PartialTP1Ratio:         0.50,
-		PartialTP1ATRMult:       evaluatorCfg.Sizing.TP1Multiplier,
-		TrailingEnabled:         true,
-		TrailingActivateATR:     1.10,
-		TrailingDistanceATR:     0.55,
-		MaxHoldingDuration:      4 * time.Hour,
-		EquityModeCompounding:   false, // fixed equity
-	}
+	brokerCfg := buildSimBrokerConfig(*envFlag, *equityFlag)
 	sim := simbroker.NewSimBroker(brokerCfg)
 
 	// Inisialisasi Replay Engine
@@ -447,26 +427,7 @@ func handleAblateCommand(args []string) {
 		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
 		exp.modifierFn(&evalCfg)
 
-		brokerCfg := simbroker.SimBrokerConfig{
-			InitialEquityUSDT:       decimal.NewFromFloat(1000.0),
-			MaxSlots:                evalCfg.MaxSlots,
-			MaxDailyDrawdownPct:     evalCfg.MaxDailyDrawdownPct,
-			AccountLeverage:         evalCfg.Sizing.AccountLeverage,
-			MakerFeeRate:            evalCfg.Sizing.MakerFeeRate,
-			TakerFeeRate:            evalCfg.Sizing.TakerFeeRate,
-			SlippageRate:            evalCfg.Sizing.SlippageRate,
-			SignalDelayBars:         1,
-			LimitTimeoutBars:        1,
-			PenetrationTicks:        1,
-			IntrabarConflictSLFirst: true,
-			PartialTPEnabled:        true,
-			PartialTP1Ratio:         0.50,
-			PartialTP1ATRMult:       evalCfg.Sizing.TP1Multiplier,
-			TrailingEnabled:         true,
-			TrailingActivateATR:     1.10,
-			TrailingDistanceATR:     0.55,
-			MaxHoldingDuration:      4 * time.Hour,
-		}
+		brokerCfg := buildSimBrokerConfig(*envFlag, 1000.0)
 		sim := simbroker.NewSimBroker(brokerCfg)
 
 		replayCfg := replay.ReplayConfig{
@@ -563,6 +524,82 @@ func loadConfigForBacktest(envPath string) (*config.Config, error) {
 		return config.LoadConfigFile("backtest.env")
 	}
 	return config.LoadConfig()
+}
+
+func buildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerConfig {
+	cfg, err := loadConfigForBacktest(envPath)
+	if err != nil || cfg == nil {
+		return simbroker.SimBrokerConfig{
+			InitialEquityUSDT:       decimal.NewFromFloat(equity),
+			MaxSlots:                3,
+			MaxDailyDrawdownPct:     -0.05,
+			AccountLeverage:         8.0,
+			MakerFeeRate:            decimal.NewFromFloat(0.0002),
+			TakerFeeRate:            decimal.NewFromFloat(0.0005),
+			SlippageRate:            decimal.NewFromFloat(0.0002),
+			SignalDelayBars:         1,
+			LimitTimeoutBars:        1,
+			PenetrationTicks:        1,
+			IntrabarConflictSLFirst: true,
+			PartialTPEnabled:        true,
+			PartialTP1Ratio:         0.50,
+			PartialTP1ATRMult:       1.00,
+			TrailingEnabled:         true,
+			TrailingActivateATR:     1.10,
+			TrailingDistanceATR:     0.55,
+			MaxHoldingDuration:      4 * time.Hour,
+			EquityModeCompounding:   false,
+		}
+	}
+
+	maxDD := cfg.MaxDailyDrawdown
+	if maxDD >= 0 {
+		maxDD = -0.05
+	}
+	pRatio := cfg.PartialTP1Ratio
+	if pRatio <= 0 {
+		pRatio = 0.50
+	}
+	tp1Mult := cfg.PartialTP1ATRMult
+	if tp1Mult <= 0 {
+		tp1Mult = 1.00
+	}
+	trailAct := cfg.TrailingActivateATR
+	if trailAct <= 0 {
+		trailAct = 1.10
+	}
+	trailDist := cfg.TrailingDistanceATR
+	if trailDist <= 0 {
+		trailDist = 0.55
+	}
+
+	maxHold := 4 * time.Hour
+	if cfg.MaxHoldingDuration > 0 {
+		maxHold = cfg.MaxHoldingDuration
+	}
+
+	return simbroker.SimBrokerConfig{
+		InitialEquityUSDT:       decimal.NewFromFloat(equity),
+		MaxSlots:                cfg.MaxSlots,
+		MaxDailyDrawdownPct:     maxDD,
+		AccountLeverage:         cfg.Leverage,
+		MakerFeeRate:            cfg.MakerFeeRate,
+		TakerFeeRate:            cfg.TakerFeeRate,
+		SlippageRate:            cfg.SlippageRate,
+		SignalDelayBars:         1,
+		LimitTimeoutBars:        1,
+		PenetrationTicks:        1,
+		IntrabarConflictSLFirst: true,
+		PartialTPEnabled:        cfg.PartialTPEnabled,
+		PartialTP1Ratio:         pRatio,
+		PartialTP1ATRMult:       tp1Mult,
+		RunnerBECushionATR:      cfg.RunnerBECushionATR,
+		TrailingEnabled:         cfg.TrailingEnabled,
+		TrailingActivateATR:     trailAct,
+		TrailingDistanceATR:     trailDist,
+		MaxHoldingDuration:      maxHold,
+		EquityModeCompounding:   false,
+	}
 }
 
 func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
