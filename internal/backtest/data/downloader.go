@@ -64,7 +64,18 @@ func (d *Downloader) FetchCandleRange(
 
 		candles, err := d.fetchMonthly(ctx, symbol, interval, year, month, symDir)
 		if err != nil {
-			slog.Warn("failed to fetch monthly kline; attempting fallback or partial range", "symbol", symbol, "year", year, "month", month, "err", err)
+			slog.Info("monthly archive not available, falling back to daily klines", "symbol", symbol, "year", year, "month", month)
+			// Fallback ke unduhan harian jika arsip bulanan belum ada (misal bulan berjalan)
+			monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+			for day := monthStart; day.Month() == time.Month(month) && !day.After(to); day = day.AddDate(0, 0, 1) {
+				if day.Before(time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC)) {
+					continue
+				}
+				dCandles, dErr := d.fetchDaily(ctx, symbol, interval, day, symDir)
+				if dErr == nil {
+					allCandles = append(allCandles, dCandles...)
+				}
+			}
 		} else {
 			allCandles = append(allCandles, candles...)
 		}
@@ -165,6 +176,73 @@ func (d *Downloader) fetchMonthly(
 			_ = os.WriteFile(cacheFile, csvBytes, 0644)
 
 			// Parse ke data struct
+			return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
+		}
+	}
+
+	return nil, fmt.Errorf("no .csv file found inside %s", zipName)
+}
+
+func (d *Downloader) fetchDaily(
+	ctx context.Context,
+	symbol, interval string,
+	date time.Time,
+	symDir string,
+) ([]HistoricalCandle, error) {
+	dateStr := date.Format("2006-01-02")
+	fileName := fmt.Sprintf("%s-%s-%s.csv", symbol, interval, dateStr)
+	cacheFile := filepath.Join(symDir, fileName)
+
+	// 1. Cek apakah CSV sudah ada di cache lokal
+	if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
+		return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol)
+	}
+
+	// 2. Download ZIP harian dari Binance Vision
+	zipName := fmt.Sprintf("%s-%s-%s.zip", symbol, interval, dateStr)
+	url := fmt.Sprintf("%s/daily/klines/%s/%s/%s", d.baseURL, symbol, interval, zipName)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http get %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("daily archive not found (HTTP 404): %s", url)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
+	}
+
+	zipBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading response body: %w", err)
+	}
+
+	zipReader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("failed unzipping archive from %s: %w", url, err)
+	}
+
+	for _, f := range zipReader.File {
+		if strings.HasSuffix(f.Name, ".csv") {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, fmt.Errorf("failed opening %s inside zip: %w", f.Name, err)
+			}
+			csvBytes, err := io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed reading csv %s: %w", f.Name, err)
+			}
+
+			_ = os.WriteFile(cacheFile, csvBytes, 0644)
 			return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"trml/internal/backtest/metrics"
+	"trml/internal/backtest/simbroker"
 )
 
 type ReportMeta struct {
@@ -16,6 +17,7 @@ type ReportMeta struct {
 	ExecutionMode string
 	FeeModel      string
 	FeaturesMode  string
+	Trades        []simbroker.SimTradeRecord
 }
 
 // GenerateMarkdownReport menghasilkan teks laporan markdown lengkap yang dapat langsung disimpan atau dicetak.
@@ -66,8 +68,38 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 	}
 	sb.WriteString("\n")
 
+	if len(meta.Trades) > 0 {
+		sb.WriteString("### 3. Log Eksekusi Trade Selesai\n\n")
+		sb.WriteString("| No | Waktu Entry (UTC) | Simbol | Posisi | Entry Price | Exit Price | Alasan Exit | Net PnL | Fee |\n")
+		sb.WriteString("| :- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+		maxDisplay := 50
+		for i, tr := range meta.Trades {
+			if i >= maxDisplay {
+				fmt.Fprintf(&sb, "| ... | *Menampilkan %d dari %d trade total* | | | | | | | |\n", maxDisplay, len(meta.Trades))
+				break
+			}
+			pnlSign := "+"
+			if tr.NetPnL.IsNegative() {
+				pnlSign = ""
+			}
+			fmt.Fprintf(&sb, "| %d | %s | `%s` | %s | %s | %s | `%s` | `%s$%s` | $%.4f |\n",
+				i+1,
+				tr.EntryTime.UTC().Format("2006-01-02 15:04"),
+				tr.Symbol,
+				tr.Side,
+				tr.EntryPrice.StringFixed(4),
+				tr.ExitPrice.StringFixed(4),
+				tr.ExitReason,
+				pnlSign,
+				tr.NetPnL.StringFixed(2),
+				tr.FeeTotal.InexactFloat64(),
+			)
+		}
+		sb.WriteString("\n")
+	}
+
 	if len(rejectReasons) > 0 {
-		sb.WriteString("### 3. Audit Gatekeeper Sinyal (Top Filter Rejections)\n\n")
+		sb.WriteString("### 4. Audit Gatekeeper Sinyal (Top Filter Rejections)\n\n")
 		sb.WriteString("| Alasan Penolakan Sinyal | Jumlah Sinyal Disaring |\n")
 		sb.WriteString("| :--- | :--- |\n")
 		for reason, cnt := range rejectReasons {
@@ -76,7 +108,7 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("### 4. Evaluasi & Kepatuhan Batas Statistik\n\n")
+	sb.WriteString("### 5. Evaluasi & Kepatuhan Batas Statistik\n\n")
 	if summary.SampleWarning {
 		sb.WriteString("> [!WARNING] **Sample Size Alert:** Total trade (< 200 setup) belum memenuhi syarat signifikansi statistik penuh. Perluas rentang tanggal pengujian.\n\n")
 	}

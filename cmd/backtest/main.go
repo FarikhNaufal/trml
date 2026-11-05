@@ -147,6 +147,7 @@ func handleRunCommand(args []string) {
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
+	pastWeekFlag := fs.Bool("past-week", false, "Simulate past 1 week (latest 7 days: 2026-10-29 to 2026-11-04)")
 	scannerFlag := fs.Bool("scanner", false, "Enable dynamic rolling market scanner (selects active coins every interval)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	outFlag := fs.String("out", "", "Output report markdown file path")
@@ -155,7 +156,9 @@ func handleRunCommand(args []string) {
 
 	var from, to time.Time
 	var err error
-	if *pastMonthFlag {
+	if *pastWeekFlag {
+		from, to = getPastWeekRange()
+	} else if *pastMonthFlag {
 		from, to = getPastMonthRange()
 	} else {
 		from, err = time.Parse("2006-01-02", *fromFlag)
@@ -267,6 +270,7 @@ func handleRunCommand(args []string) {
 		ExecutionMode: "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage 5 bps",
 		FeeModel:      "Maker 2.0 bps, Taker 5.0 bps, Funding Active",
 		FeaturesMode:  "Kline 5m + Exact Net Bar Delta (Binance Ground Truth)",
+		Trades:        sim.ClosedTrades,
 	}
 
 	reportMarkdown := report.GenerateMarkdownReport(summary, meta, engine.RejectReasons)
@@ -416,6 +420,12 @@ func getPastMonthRange() (time.Time, time.Time) {
 	lastOfPastMonth := firstOfThisMonth.Add(-time.Nanosecond)
 	firstOfPastMonth := time.Date(lastOfPastMonth.Year(), lastOfPastMonth.Month(), 1, 0, 0, 0, 0, time.UTC)
 	return firstOfPastMonth, lastOfPastMonth
+}
+
+func getPastWeekRange() (time.Time, time.Time) {
+	to := time.Date(2026, 11, 4, 23, 59, 59, 0, time.UTC)
+	from := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	return from, to
 }
 
 func getSymbolsFromDB(dbPath string) ([]string, error) {
