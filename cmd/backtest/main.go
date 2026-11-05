@@ -53,15 +53,19 @@ func main() {
 func printHelp() {
 	fmt.Println("TRML Backtest Engine - 100% Pure Binance Ground Truth")
 	fmt.Println("\nUsage:")
-	fmt.Println("  backtest data fetch   [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
-	fmt.Println("  backtest data verify  [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
-	fmt.Println("  backtest run          [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--out <report.md>] [--equity <USDT>]")
-	fmt.Println("  backtest ablate       [--symbols <sym1,sym2|top20>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month]")
-	fmt.Println("\nContoh:")
-	fmt.Println("  # Replay simulasi 1 bulan kebelakang (seperti dryrun 20 koin likuid):")
-	fmt.Println("  backtest run --past-month --symbols top20 --out ./reports/past_month.md")
-	fmt.Println("\n  # Replay rentang kustom koin tertentu:")
-	fmt.Println("  backtest run --symbols SOLUSDT,DOGEUSDT --from 2026-10-01 --to 2026-10-31")
+	fmt.Println("  backtest run          [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--scanner] [--out <report.md>] [--equity <USDT>]")
+	fmt.Println("  backtest ablate       [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--scanner]")
+	fmt.Println("  backtest data fetch   [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
+	fmt.Println("  backtest data verify  [--symbols <sym1,sym2|top20|db>] [--from <YYYY-MM-DD> --to <YYYY-MM-DD> | --past-month] [--cache-dir <path>]")
+	fmt.Println("\nContoh Perintah Praktis:")
+	fmt.Println("  # 1. Replay 1 bulan kebelakang persis seperti dry-run (dengan dynamic scanner):")
+	fmt.Println("  go run ./cmd/backtest run --past-month --scanner")
+	fmt.Println("\n  # 2. Replay koin-koin yang ada di riwayat scanner bot:")
+	fmt.Println("  go run ./cmd/backtest run --symbols db --past-month --scanner --out ./reports/past_month.md")
+	fmt.Println("\n  # 3. Ablation test (menguji kontribusi tiap filter):")
+	fmt.Println("  go run ./cmd/backtest ablate --past-month --scanner")
+	fmt.Println("\n  # 4. Replay rentang kustom koin tertentu:")
+	fmt.Println("  go run ./cmd/backtest run --symbols SOLUSDT,DOGEUSDT --from 2026-10-01 --to 2026-10-31")
 }
 
 func handleDataCommand(args []string) {
