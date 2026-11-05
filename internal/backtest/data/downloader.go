@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -193,9 +194,13 @@ func (d *Downloader) fetchDaily(
 	fileName := fmt.Sprintf("%s-%s-%s.csv", symbol, interval, dateStr)
 	cacheFile := filepath.Join(symDir, fileName)
 
-	// 1. Cek apakah CSV sudah ada di cache lokal
-	if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
-		return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol)
+	// 1. Cek apakah CSV sudah ada di cache lokal (jika bukan hari ini)
+	nowUTC := time.Now().UTC()
+	isToday := date.Year() == nowUTC.Year() && date.Month() == nowUTC.Month() && date.Day() == nowUTC.Day()
+	if !isToday {
+		if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
+			return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol)
+		}
 	}
 
 	// 2. Download ZIP harian dari Binance Vision
@@ -214,7 +219,9 @@ func (d *Downloader) fetchDaily(
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("daily archive not found (HTTP 404): %s", url)
+		// Fallback ke live Binance Futures API jika arsip Vision belum terbit (hari ini / ongoing)
+		slog.Info("Binance Vision daily archive 404, attempting live Binance Futures API fallback", "symbol", symbol, "date", dateStr)
+		return d.fetchFromLiveAPI(ctx, symbol, interval, date, cacheFile)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
@@ -248,4 +255,61 @@ func (d *Downloader) fetchDaily(
 	}
 
 	return nil, fmt.Errorf("no .csv file found inside %s", zipName)
+}
+
+func (d *Downloader) fetchFromLiveAPI(
+	ctx context.Context,
+	symbol, interval string,
+	date time.Time,
+	cacheFile string,
+) ([]HistoricalCandle, error) {
+	startMs := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC).UnixMilli()
+	endMs := startMs + (24*time.Hour - time.Millisecond).Milliseconds()
+
+	apiURL := fmt.Sprintf("https://fapi.binance.com/fapi/v1/klines?symbol=%s&interval=%s&startTime=%d&endTime=%d&limit=1500",
+		symbol, interval, startMs, endMs)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http get live api %s: %w", apiURL, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("live api status %d for %s", resp.StatusCode, apiURL)
+	}
+
+	var rawKlines [][]interface{}
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	if err := dec.Decode(&rawKlines); err != nil {
+		return nil, fmt.Errorf("failed decoding live klines: %w", err)
+	}
+
+	if len(rawKlines) == 0 {
+		return nil, fmt.Errorf("no live klines returned for %s on %s", symbol, date.Format("2006-01-02"))
+	}
+
+	var sb strings.Builder
+	sb.WriteString("open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n")
+	for _, k := range rawKlines {
+		if len(k) < 11 {
+			continue
+		}
+		fmt.Fprintf(&sb, "%v,%v,%v,%v,%v,%v,%v,%v,%v,%v,%v,%v\n",
+			k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8], k[9], k[10], 0)
+	}
+
+	csvBytes := []byte(sb.String())
+	nowUTC := time.Now().UTC()
+	if date.Year() != nowUTC.Year() || date.Month() != nowUTC.Month() || date.Day() != nowUTC.Day() {
+		_ = os.WriteFile(cacheFile, csvBytes, 0644)
+	}
+
+	return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
 }

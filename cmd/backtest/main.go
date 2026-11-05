@@ -148,6 +148,7 @@ func handleRunCommand(args []string) {
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
 	pastWeekFlag := fs.Bool("past-week", false, "Simulate past 1 week (latest 7 days: 2026-10-29 to 2026-11-04)")
+	todayFlag := fs.Bool("today", false, "Simulate today (ongoing UTC day: 2026-11-05 with full live data)")
 	scannerFlag := fs.Bool("scanner", false, "Enable dynamic rolling market scanner (selects active coins every interval)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	outFlag := fs.String("out", "", "Output report markdown file path")
@@ -156,7 +157,9 @@ func handleRunCommand(args []string) {
 
 	var from, to time.Time
 	var err error
-	if *pastWeekFlag {
+	if *todayFlag {
+		from, to = getTodayRange()
+	} else if *pastWeekFlag {
 		from, to = getPastWeekRange()
 	} else if *pastMonthFlag {
 		from, to = getPastMonthRange()
@@ -238,8 +241,12 @@ func handleRunCommand(args []string) {
 	evaluatorCfg := buildDefaultEvaluatorConfig()
 
 	// Inisialisasi Replay Engine
+	warmupBars := 200
+	if *todayFlag {
+		warmupBars = 288 // Seluruh 288 bar kemarin digunakan murni untuk warmup indikator
+	}
 	replayCfg := replay.ReplayConfig{
-		WarmupBars:            200,
+		WarmupBars:            warmupBars,
 		SpreadPct:             0.0002,
 		FundingRate:           0.0001,
 		BenchmarkSym:          "BTCUSDT",
@@ -262,9 +269,13 @@ func handleRunCommand(args []string) {
 	summary := metrics.CalculateMetrics(sim.ClosedTrades, *equityFlag)
 
 	// Buat metadata laporan
+	metaFrom := from.Format("2006-01-02")
+	if *todayFlag {
+		metaFrom = "2026-11-05 (Today)"
+	}
 	meta := report.ReportMeta{
 		CommitHash:    getGitCommitHash(),
-		DataRangeFrom: from.Format("2006-01-02"),
+		DataRangeFrom: metaFrom,
 		DataRangeTo:   to.Format("2006-01-02"),
 		Symbols:       symbols,
 		ExecutionMode: "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage 5 bps",
@@ -425,6 +436,14 @@ func getPastMonthRange() (time.Time, time.Time) {
 func getPastWeekRange() (time.Time, time.Time) {
 	to := time.Date(2026, 11, 4, 23, 59, 59, 0, time.UTC)
 	from := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	return from, to
+}
+
+func getTodayRange() (time.Time, time.Time) {
+	// Memuat data dari kemarin (2026-11-04) untuk 288 bar warmup indikator,
+	// dan hari ini (2026-11-05 UTC) untuk trading aktif
+	from := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 11, 5, 23, 59, 59, 0, time.UTC)
 	return from, to
 }
 
