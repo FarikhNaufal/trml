@@ -170,6 +170,7 @@ func handleRunCommand(args []string) {
 	equityFlag := fs.Float64("equity", 125.0, "Initial Equity USDT (default 125.0)")
 	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
 	unconstrainedFlag := fs.Bool("unconstrained", false, "Mode evaluasi sinyal murni (unconstrained 1 R per setup, abaikan slot portofolio & cooldown)")
+	compoundingFlag := fs.Bool("compounding", false, "Aktifkan mode compounding equity (position sizing dinamis mengikuti pertumbuhan saldo)")
 	_ = fs.Parse(args)
 
 	var from, to time.Time
@@ -249,6 +250,10 @@ func handleRunCommand(args []string) {
 
 	// Inisialisasi SimBroker pesimistis dengan fee & leverage dinamis dari environment
 	brokerCfg := buildSimBrokerConfig(*envFlag, *equityFlag)
+	if *compoundingFlag || isCompoundingConfigured(*envFlag) {
+		brokerCfg.EquityModeCompounding = true
+		fmt.Printf("Mode Compounding AKTIF: Ukuran posisi dinamis mengikuti equity berjalan.\n")
+	}
 	if *unconstrainedFlag {
 		brokerCfg.MaxSlots = 1000
 		evaluatorCfg.MaxSlots = 1000
@@ -798,4 +803,30 @@ func getGitCommitHash() string {
 		}
 	}
 	return "8c35d9e"
+}
+
+func isCompoundingConfigured(envPath string) bool {
+	if os.Getenv("EQUITY_MODE_COMPOUNDING") == "true" {
+		return true
+	}
+	if envPath == "" {
+		envPath = "backtest.env"
+	}
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) == "EQUITY_MODE_COMPOUNDING" {
+			val := strings.ToLower(strings.TrimSpace(parts[1]))
+			return val == "true" || val == "1"
+		}
+	}
+	return false
 }
