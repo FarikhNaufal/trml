@@ -167,6 +167,7 @@ func handleRunCommand(args []string) {
 	outFlag := fs.String("out", "", "Output report markdown file path")
 	equityFlag := fs.Float64("equity", 125.0, "Initial Equity USDT (default 125.0)")
 	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
+	unconstrainedFlag := fs.Bool("unconstrained", false, "Mode evaluasi sinyal murni (unconstrained 1 R per setup, abaikan slot portofolio & cooldown)")
 	_ = fs.Parse(args)
 
 	var from, to time.Time
@@ -267,6 +268,13 @@ func handleRunCommand(args []string) {
 
 	// Inisialisasi SimBroker pesimistis dengan fee & leverage dinamis dari environment
 	brokerCfg := buildSimBrokerConfig(*envFlag, *equityFlag)
+	if *unconstrainedFlag {
+		brokerCfg.MaxSlots = 1000
+		evaluatorCfg.MaxSlots = 1000
+		evaluatorCfg.CooldownAfterExitMinutes = 0
+		evaluatorCfg.CooldownLossMinutes = 0
+		evaluatorCfg.CooldownProfitMinutes = 0
+	}
 	sim := simbroker.NewSimBroker(brokerCfg)
 
 	// Inisialisasi Replay Engine
@@ -283,6 +291,7 @@ func handleRunCommand(args []string) {
 		DynamicScannerEnabled: *scannerFlag,
 		ScannerInterval:       15 * time.Minute,
 		ScannerCfg:            buildDefaultScannerConfig(*envFlag),
+		UnconstrainedMode:     *unconstrainedFlag,
 	}
 	engine := replay.NewReplayEngine(replayCfg, evaluatorCfg, sim, candleMap, filters)
 
@@ -308,12 +317,17 @@ func handleRunCommand(args []string) {
 	slipBps := evaluatorCfg.Sizing.SlippageRate.Mul(decimal.NewFromFloat(10000)).InexactFloat64()
 	feeModelStr := fmt.Sprintf("Maker %.1f bps, Taker %.1f bps, Slippage %.1f bps | Real Binance Funding & Dynamic Spread", makerBps, takerBps, slipBps)
 
+	execMode := "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage Active"
+	if *unconstrainedFlag {
+		execMode = "UNCONSTRAINED SIGNAL EVALUATION (1 R flat, unlimited concurrent slots, 0 cooldown)"
+	}
+
 	meta := report.ReportMeta{
 		CommitHash:    getGitCommitHash(),
 		DataRangeFrom: metaFrom,
 		DataRangeTo:   to.Format("2006-01-02"),
 		Symbols:       symbols,
-		ExecutionMode: "LIMIT Penetration 1 Tick, Intrabar SL-First, Slippage Active",
+		ExecutionMode: execMode,
 		FeeModel:      feeModelStr,
 		FeaturesMode:  "Kline 5m + Exact Net Bar Delta + Real Binance Filters & Funding",
 		Trades:        sim.ClosedTrades,

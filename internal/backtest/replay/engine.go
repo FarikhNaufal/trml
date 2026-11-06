@@ -25,6 +25,7 @@ type ReplayConfig struct {
 	DynamicScannerEnabled bool                  // apakah dynamic rolling scanner aktif
 	ScannerInterval       time.Duration         // interval scanning ulang (default 15 menit)
 	ScannerCfg            scanner.ScannerConfig // konfigurasi scanner produksi
+	UnconstrainedMode     bool                  // mode evaluasi sinyal murni (tanpa batas slot portofolio & cooldown)
 }
 
 type lastExitInfo struct {
@@ -264,6 +265,12 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		totEq := r.broker.GetEffectiveTotalEquityUSDT()
 		isDailyBreached := r.broker.IsCircuitBreakerTripped() || (r.broker.GetDailyTotalDrawdownPct() <= r.evaluatorCfg.MaxDailyDrawdownPct)
 
+		if r.cfg.UnconstrainedMode {
+			activeSlots = 0
+			isDailyBreached = false
+			availBal = decimal.NewFromFloat(1000000.0)
+		}
+
 		for sym, cList := range rollingCandles {
 			// Lewati benchmark symbol jika bukan target trading
 			if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
@@ -297,6 +304,9 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			}
 
 			exitInfo := r.lastExits[sym]
+			if r.cfg.UnconstrainedMode {
+				exitInfo = lastExitInfo{}
+			}
 
 			dynSpread := calculateDynamicSpread(cList, lastC.Close, r.cfg.SpreadPct)
 			fundingRate := r.cfg.FundingRate
