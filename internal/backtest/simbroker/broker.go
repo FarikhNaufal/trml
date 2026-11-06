@@ -511,6 +511,7 @@ func (s *SimBroker) recordClosedTradeLocked(
 		MFE:           pos.MaxMFE,
 		HoldingBars:   holdingBars,
 		SignalAuditID: pos.SignalAuditID,
+		ATRAtEntry:    pos.ATRAtEntry,
 	}
 
 	s.ClosedTrades = append(s.ClosedTrades, rec)

@@ -55,6 +55,7 @@ type SimTradeRecord struct {
 	MFE           float64         `json:"mfe"`
 	HoldingBars   int             `json:"holding_bars"`
 	SignalAuditID int64           `json:"signal_audit_id"`
+	ATRAtEntry    decimal.Decimal `json:"atr_at_entry"`
 }
 
 type SimPendingOrder struct {

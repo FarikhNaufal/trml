@@ -100,8 +100,67 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("\n")
 	}
 
+	// 4. Analisis Segmentasi Trade Bebas Path-Dependency
+	if summary.TotalTrades > 0 && len(summary.Segmentation.NATRSegments) > 0 {
+		sb.WriteString("### 4. Analisis Segmentasi Trade (Bebas Path-Dependency)\n\n")
+
+		// Segmentasi NATR
+		sb.WriteString("#### A. Segmentasi Berdasarkan Volatilitas (NATR)\n\n")
+		sb.WriteString("| Kategori NATR | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n")
+		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+		for _, seg := range summary.Segmentation.NATRSegments {
+			sign := "+"
+			if seg.TotalNetPnL < 0 {
+				sign = ""
+			}
+			avgSign := "+"
+			if seg.AvgPnLUSDT < 0 {
+				avgSign = ""
+			}
+			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s$%.2f` | `%s$%.2f` | %.2f |\n",
+				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, sign, seg.TotalNetPnL, avgSign, seg.AvgPnLUSDT, seg.ProfitFactor)
+		}
+		sb.WriteString("\n")
+
+		// Segmentasi Jam / Sesi
+		sb.WriteString("#### B. Segmentasi Berdasarkan Sesi Waktu (UTC)\n\n")
+		sb.WriteString("| Sesi Pasar | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n")
+		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+		for _, seg := range summary.Segmentation.SessionSegments {
+			sign := "+"
+			if seg.TotalNetPnL < 0 {
+				sign = ""
+			}
+			avgSign := "+"
+			if seg.AvgPnLUSDT < 0 {
+				avgSign = ""
+			}
+			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s$%.2f` | `%s$%.2f` | %.2f |\n",
+				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, sign, seg.TotalNetPnL, avgSign, seg.AvgPnLUSDT, seg.ProfitFactor)
+		}
+		sb.WriteString("\n")
+
+		// Segmentasi Posisi Arah
+		sb.WriteString("#### C. Segmentasi Berdasarkan Arah Posisi (LONG vs SHORT)\n\n")
+		sb.WriteString("| Arah Posisi | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n")
+		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+		for _, seg := range summary.Segmentation.SideSegments {
+			sign := "+"
+			if seg.TotalNetPnL < 0 {
+				sign = ""
+			}
+			avgSign := "+"
+			if seg.AvgPnLUSDT < 0 {
+				avgSign = ""
+			}
+			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s$%.2f` | `%s$%.2f` | %.2f |\n",
+				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, sign, seg.TotalNetPnL, avgSign, seg.AvgPnLUSDT, seg.ProfitFactor)
+		}
+		sb.WriteString("\n")
+	}
+
 	if len(rejectReasons) > 0 {
-		sb.WriteString("### 4. Audit Gatekeeper Sinyal (Top Filter Rejections)\n\n")
+		sb.WriteString("### 5. Audit Gatekeeper Sinyal (Top Filter Rejections)\n\n")
 		sb.WriteString("| Alasan Penolakan Sinyal | Jumlah Sinyal Disaring |\n")
 		sb.WriteString("| :--- | :--- |\n")
 		for reason, cnt := range rejectReasons {
@@ -110,7 +169,7 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("### 5. Evaluasi & Kepatuhan Batas Statistik\n\n")
+	sb.WriteString("### 6. Evaluasi & Kepatuhan Batas Statistik\n\n")
 	if summary.SampleWarning {
 		sb.WriteString("> [!WARNING] **Sample Size Alert:** Total trade (< 200 setup) belum memenuhi syarat signifikansi statistik penuh. Perluas rentang tanggal pengujian.\n\n")
 	}

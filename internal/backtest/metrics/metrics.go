@@ -34,23 +34,29 @@ type BacktestSummary struct {
 	CI95UpperUSDT      float64        `json:"ci95_upper_usdt"`
 	MaxDrawdownPct     float64        `json:"max_drawdown_pct"`
 	MaxDrawdownUSDT    float64        `json:"max_drawdown_usdt"`
-	MaxLosingStreak    int            `json:"max_losing_streak"`
-	ExitDistribution   map[string]int `json:"exit_distribution"`
-	SampleWarning      bool           `json:"sample_warning"`
+	MaxLosingStreak    int               `json:"max_losing_streak"`
+	ExitDistribution   map[string]int     `json:"exit_distribution"`
+	SampleWarning      bool               `json:"sample_warning"`
+	Trades             []AggregatedTrade  `json:"trades,omitempty"`
+	Segmentation       SegmentationReport `json:"segmentation,omitempty"`
 }
 
 // AggregatedTrade merepresentasikan 1 trade setup utuh (menggabungkan leg partial TP1 dan leg runner).
 type AggregatedTrade struct {
-	SetupID     string
-	Symbol      string
-	EntryTime   time.Time
-	ExitTime    time.Time
-	GrossPnL    float64
-	NetPnL      float64
-	TotalFees   float64
-	FundingPaid float64
-	ExitReasons []string
-	HoldingBars int
+	SetupID     string    `json:"setup_id"`
+	Symbol      string    `json:"symbol"`
+	Side        string    `json:"side"`
+	EntryPrice  float64   `json:"entry_price"`
+	ATRAtEntry  float64   `json:"atr_at_entry"`
+	NATRPct     float64   `json:"natr_pct"`
+	EntryTime   time.Time `json:"entry_time"`
+	ExitTime    time.Time `json:"exit_time"`
+	GrossPnL    float64   `json:"gross_pnl"`
+	NetPnL      float64   `json:"net_pnl"`
+	TotalFees   float64   `json:"total_fees"`
+	FundingPaid float64   `json:"funding_paid"`
+	ExitReasons []string  `json:"exit_reasons"`
+	HoldingBars int       `json:"holding_bars"`
 }
 
 // CalculateMetrics mengagregasikan seluruh record trade mentah menjadi metrik performa statistik standar.
@@ -79,9 +85,19 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 		}
 		agg, exists := grouped[key]
 		if !exists {
+			ePrice, _ := tr.EntryPrice.Float64()
+			atr, _ := tr.ATRAtEntry.Float64()
+			natr := 0.0
+			if ePrice > 0 {
+				natr = (atr / ePrice) * 100.0
+			}
 			agg = &AggregatedTrade{
 				SetupID:     tr.ID,
 				Symbol:      tr.Symbol,
+				Side:        string(tr.Side),
+				EntryPrice:  ePrice,
+				ATRAtEntry:  atr,
+				NATRPct:     natr,
 				EntryTime:   tr.EntryTime,
 				ExitTime:    tr.ExitTime,
 				ExitReasons: make([]string, 0),
@@ -118,6 +134,7 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 		TotalTrades:      len(trades),
 		ExitDistribution: make(map[string]int),
 		SampleWarning:    len(trades) < 200,
+		Trades:           trades,
 	}
 
 	var sumWin, sumLoss float64
@@ -236,6 +253,9 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 	ciLower, ciUpper := BootstrapConfidenceInterval(pnlList, 1000, 0.95)
 	res.CI95LowerUSDT = ciLower
 	res.CI95UpperUSDT = ciUpper
+
+	// 4. Analisis Segmentasi Trade (Bebas Path-Dependency)
+	res.Segmentation = CalculateSegmentation(trades)
 
 	return res
 }
