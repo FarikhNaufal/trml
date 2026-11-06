@@ -167,8 +167,13 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		}
 
 		// Update data last exit dari closed trades broker
+		// Abaikan PARTIAL_TAKE_PROFIT agar status exit terakhir mencerminkan terminal exit
+		// dan selaras dengan production storage (internal/storage/repository.go)
 		r.broker.Mu.Lock()
 		for _, tr := range r.broker.ClosedTrades {
+			if tr.ExitReason == "PARTIAL_TAKE_PROFIT" {
+				continue
+			}
 			r.lastExits[tr.Symbol] = lastExitInfo{
 				time:   tr.ExitTime,
 				reason: tr.ExitReason,

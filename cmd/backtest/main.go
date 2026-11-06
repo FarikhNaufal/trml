@@ -345,6 +345,8 @@ func handleAblateCommand(args []string) {
 	scannerFlag := fs.Bool("scanner", true, "Enable dynamic rolling market scanner (default: true, use --scanner=false to disable)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
+	equityFlag := fs.Float64("equity", 125.0, "Initial Equity USDT (default 125.0)")
+	compoundingFlag := fs.Bool("compounding", false, "Aktifkan mode compounding equity")
 	_ = fs.Parse(args)
 
 	var from, to time.Time
@@ -420,7 +422,10 @@ func handleAblateCommand(args []string) {
 		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
 		exp.modifierFn(&evalCfg)
 
-		brokerCfg := buildSimBrokerConfig(*envFlag, 1000.0)
+		brokerCfg := buildSimBrokerConfig(*envFlag, *equityFlag)
+		if *compoundingFlag || isCompoundingConfigured(*envFlag) {
+			brokerCfg.EquityModeCompounding = true
+		}
 		sim := simbroker.NewSimBroker(brokerCfg)
 
 		replayCfg := replay.ReplayConfig{
@@ -436,7 +441,7 @@ func handleAblateCommand(args []string) {
 		eng := replay.NewReplayEngine(replayCfg, evalCfg, sim, candleMap, filters)
 		_ = eng.Run(ctx)
 
-		summary := metrics.CalculateMetrics(sim.ClosedTrades, 1000.0)
+		summary := metrics.CalculateMetrics(sim.ClosedTrades, *equityFlag)
 		fmt.Printf("| %-38s | %-10d | %-10.2f%%  | $%-10.2f | $%-12.2f |\n",
 			exp.name, summary.TotalTrades, summary.WinRatePct, summary.TotalNetPnL, summary.ExpectancyUSDT)
 	}

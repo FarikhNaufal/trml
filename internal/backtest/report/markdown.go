@@ -20,6 +20,15 @@ type ReportMeta struct {
 	Trades        []simbroker.SimTradeRecord
 }
 
+func formatSignedUSD(val float64) string {
+	if val > 0.0001 {
+		return fmt.Sprintf("+$%.2f", val)
+	} else if val < -0.0001 {
+		return fmt.Sprintf("-$%.2f", -val)
+	}
+	return "$0.00"
+}
+
 // GenerateMarkdownReport menghasilkan teks laporan markdown lengkap yang dapat langsung disimpan atau dicetak.
 func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, rejectReasons map[string]int64) string {
 	var sb strings.Builder
@@ -45,13 +54,13 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 	fmt.Fprintf(&sb, "| **Payoff Ratio (Avg W/L)** | `%.2f` | Rata-rata Win ($%.2f) / Loss ($%.2f) |\n", summary.PayoffRatio, summary.AvgWinUSDT, summary.AvgLossUSDT)
 	fmt.Fprintf(&sb, "| **Break-Even Win Rate** | `%.2f%%` | Ambang batas minimum impas |\n", summary.BreakEvenWinRate)
 	fmt.Fprintf(&sb, "| **Profit Factor** | `%.2f` | Total Profit Kotor / Loss Kotor |\n", summary.ProfitFactor)
-	fmt.Fprintf(&sb, "| **Total Net PnL** | `+$%.2f USDT` | Setelah potongan fee & slippage |\n", summary.TotalNetPnL)
-	fmt.Fprintf(&sb, "| **Net Expectancy per Trade** | `+$%.2f USDT` | Rata-rata keuntungan bersih per trade |\n", summary.ExpectancyUSDT)
-	fmt.Fprintf(&sb, "| **95%% Bootstrap CI** | `[+$%.2f, +$%.2f]` | Interval kepercayaan 1.000 iterasi |\n", summary.CI95LowerUSDT, summary.CI95UpperUSDT)
+	fmt.Fprintf(&sb, "| **Total Net PnL** | `%s USDT` | Setelah potongan fee & slippage |\n", formatSignedUSD(summary.TotalNetPnL))
+	fmt.Fprintf(&sb, "| **Net Expectancy per Trade** | `%s USDT` | Rata-rata keuntungan bersih per trade |\n", formatSignedUSD(summary.ExpectancyUSDT))
+	fmt.Fprintf(&sb, "| **95%% Bootstrap CI** | `[%s, %s]` | Interval kepercayaan 1.000 iterasi |\n", formatSignedUSD(summary.CI95LowerUSDT), formatSignedUSD(summary.CI95UpperUSDT))
 	fmt.Fprintf(&sb, "| **Max Drawdown (Peak-to-Trough)** | `-%.2f%%` (-$%.2f) | Penurunan modal terdalam |\n", summary.MaxDrawdownPct, summary.MaxDrawdownUSDT)
 	fmt.Fprintf(&sb, "| **Losing Streak Terpanjang** | `%d` trade berturut | Rekor kerugian berurutan |\n", summary.MaxLosingStreak)
 	fmt.Fprintf(&sb, "| **Fee & Friction Drag** | `%.2f%%` | Total fee ($%.2f) vs Profit Kotor |\n", summary.FeeDragPct, summary.TotalFees)
-	fmt.Fprintf(&sb, "| **Net Funding Fee** | `$%.4f USDT` | Total pendanaan Binance dibayar/diterima |\n\n", summary.TotalFunding)
+	fmt.Fprintf(&sb, "| **Net Funding Fee** | `%s USDT` | Total pendanaan Binance dibayar/diterima |\n\n", formatSignedUSD(summary.TotalFunding))
 
 	sb.WriteString("### 2. Distribusi Alasan Keluar (Exit Ladder)\n\n")
 	sb.WriteString("| Alasan Exit | Jumlah Frekuensi | Persentase |\n")
@@ -79,11 +88,13 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 				fmt.Fprintf(&sb, "| ... | *Menampilkan %d dari %d trade total* | | | | | | | | |\n", maxDisplay, len(meta.Trades))
 				break
 			}
-			pnlSign := "+"
+			pnlStr := fmt.Sprintf("+$%s", tr.NetPnL.StringFixed(2))
 			if tr.NetPnL.IsNegative() {
-				pnlSign = ""
+				pnlStr = fmt.Sprintf("-$%s", tr.NetPnL.Abs().StringFixed(2))
+			} else if tr.NetPnL.IsZero() {
+				pnlStr = "$0.00"
 			}
-			fmt.Fprintf(&sb, "| %d | %s | `%s` | %s | %s | %s | `%s` | `%s$%s` | $%.4f | $%.4f |\n",
+			fmt.Fprintf(&sb, "| %d | %s | `%s` | %s | %s | %s | `%s` | `%s` | $%.4f | $%.4f |\n",
 				i+1,
 				tr.EntryTime.UTC().Format("2006-01-02 15:04"),
 				tr.Symbol,
@@ -91,8 +102,7 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 				tr.EntryPrice.StringFixed(4),
 				tr.ExitPrice.StringFixed(4),
 				tr.ExitReason,
-				pnlSign,
-				tr.NetPnL.StringFixed(2),
+				pnlStr,
 				tr.FeeTotal.InexactFloat64(),
 				tr.FundingTotal.InexactFloat64(),
 			)
@@ -109,16 +119,8 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("| Kategori NATR | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
 		for _, seg := range summary.Segmentation.NATRSegments {
-			sign := "+"
-			if seg.TotalNetPnL < 0 {
-				sign = ""
-			}
-			avgSign := "+"
-			if seg.AvgPnLUSDT < 0 {
-				avgSign = ""
-			}
-			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s$%.2f` | `%s$%.2f` | %.2f |\n",
-				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, sign, seg.TotalNetPnL, avgSign, seg.AvgPnLUSDT, seg.ProfitFactor)
+			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s` | `%s` | %.2f |\n",
+				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, formatSignedUSD(seg.TotalNetPnL), formatSignedUSD(seg.AvgPnLUSDT), seg.ProfitFactor)
 		}
 		sb.WriteString("\n")
 
@@ -127,16 +129,8 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("| Sesi Pasar | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
 		for _, seg := range summary.Segmentation.SessionSegments {
-			sign := "+"
-			if seg.TotalNetPnL < 0 {
-				sign = ""
-			}
-			avgSign := "+"
-			if seg.AvgPnLUSDT < 0 {
-				avgSign = ""
-			}
-			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s$%.2f` | `%s$%.2f` | %.2f |\n",
-				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, sign, seg.TotalNetPnL, avgSign, seg.AvgPnLUSDT, seg.ProfitFactor)
+			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s` | `%s` | %.2f |\n",
+				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, formatSignedUSD(seg.TotalNetPnL), formatSignedUSD(seg.AvgPnLUSDT), seg.ProfitFactor)
 		}
 		sb.WriteString("\n")
 
@@ -145,16 +139,8 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("| Arah Posisi | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
 		for _, seg := range summary.Segmentation.SideSegments {
-			sign := "+"
-			if seg.TotalNetPnL < 0 {
-				sign = ""
-			}
-			avgSign := "+"
-			if seg.AvgPnLUSDT < 0 {
-				avgSign = ""
-			}
-			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s$%.2f` | `%s$%.2f` | %.2f |\n",
-				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, sign, seg.TotalNetPnL, avgSign, seg.AvgPnLUSDT, seg.ProfitFactor)
+			fmt.Fprintf(&sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s` | `%s` | %.2f |\n",
+				seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, formatSignedUSD(seg.TotalNetPnL), formatSignedUSD(seg.AvgPnLUSDT), seg.ProfitFactor)
 		}
 		sb.WriteString("\n")
 	}
