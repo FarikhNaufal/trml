@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -192,11 +191,19 @@ func handleRunCommand(args []string) {
 		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
 
+	ctx := context.Background()
+	scannerCfg := buildDefaultScannerConfig(*envFlag)
+
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
 	} else if *scannerFlag {
-		symbols = getAvailableCachedSymbols(*cacheDirFlag)
+		var err error
+		symbols, err = data.DiscoverMarketSymbols(ctx, *cacheDirFlag, scannerCfg.MinVolume24hUSDT)
+		if err != nil {
+			slog.Warn("Gagal discover simbol real Binance, menggunakan fallback koin utama", "err", err)
+			symbols = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+		}
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
@@ -212,7 +219,6 @@ func handleRunCommand(args []string) {
 	}
 
 	downloader := data.NewDownloader(*cacheDirFlag)
-	ctx := context.Background()
 
 	// Muat filter resmi bursa Binance Futures (tickSize, stepSize, minNotional)
 	fmt.Printf("Memuat filter bursa resmi Binance Futures (exchangeInfo)...\n")
@@ -350,16 +356,17 @@ func handleAblateCommand(args []string) {
 		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
 	}
 
+	downloader := data.NewDownloader(*cacheDirFlag)
+	ctx := context.Background()
+
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
 	} else if *scannerFlag {
-		symbols = getAvailableCachedSymbols(*cacheDirFlag)
+		symbols, _ = data.DiscoverMarketSymbols(ctx, *cacheDirFlag, 25000000.0)
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
-	downloader := data.NewDownloader(*cacheDirFlag)
-	ctx := context.Background()
 
 	exchangeFilters, _ := data.LoadExchangeFilters(ctx, *cacheDirFlag)
 
@@ -450,14 +457,6 @@ func handleAblateCommand(args []string) {
 	fmt.Println("========================================================================================")
 }
 
-// Top20Universe mendefinisikan 20 instrumen futures terlikuid di Binance
-var Top20Universe = []string{
-	"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT",
-	"XRPUSDT", "AVAXUSDT", "NEARUSDT", "LINKUSDT", "SUIUSDT",
-	"1000PEPEUSDT", "WIFUSDT", "ADAUSDT", "APTUSDT", "OPUSDT",
-	"ARBUSDT", "INJUSDT", "TIAUSDT", "FETUSDT", "RENDERUSDT",
-}
-
 func getPastMonthRange() (time.Time, time.Time) {
 	now := time.Now().UTC()
 	firstOfThisMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
@@ -481,25 +480,6 @@ func getTodayRange() (time.Time, time.Time) {
 	// Warmup 1 hari sebelum hari ini (kemarin 00:00:00 UTC) untuk mengisi 288 bar indikator
 	yesterday := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC)
 	return yesterday, now
-}
-
-func getAvailableCachedSymbols(cacheDir string) []string {
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		return append([]string(nil), Top20Universe...)
-	}
-	var syms []string
-	for _, e := range entries {
-		name := strings.ToUpper(e.Name())
-		if e.IsDir() && strings.HasSuffix(name, "USDT") {
-			syms = append(syms, name)
-		}
-	}
-	if len(syms) == 0 {
-		return append([]string(nil), Top20Universe...)
-	}
-	sort.Strings(syms)
-	return syms
 }
 
 func splitSymbols(s string) []string {
