@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,16 +46,44 @@ func NewFundingManager(cacheDir string) *FundingManager {
 	}
 }
 
-// LoadFundingRates memuat funding rates untuk sekumpulan simbol dalam rentang tanggal [from..to].
+// LoadFundingRates memuat funding rates untuk sekumpulan simbol dalam rentang tanggal [from..to] secara paralel.
 func (fm *FundingManager) LoadFundingRates(ctx context.Context, symbols []string, from, to time.Time) error {
-	for _, sym := range symbols {
-		rates, err := fm.fetchSymbolFunding(ctx, sym, from, to)
-		if err != nil {
-			slog.Warn("Gagal memuat funding rate historis simbol, fallback default", "symbol", sym, "err", err)
-			continue
-		}
-		fm.rates[sym] = rates
+	total := len(symbols)
+	if total == 0 {
+		return nil
 	}
+
+	taskChan := make(chan string, total)
+	for _, sym := range symbols {
+		taskChan <- sym
+	}
+	close(taskChan)
+
+	numWorkers := 16
+	if total < numWorkers {
+		numWorkers = total
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sym := range taskChan {
+				rates, err := fm.fetchSymbolFunding(ctx, sym, from, to)
+				if err != nil {
+					slog.Debug("Gagal memuat funding rate historis simbol, fallback default", "symbol", sym, "err", err)
+					continue
+				}
+				mu.Lock()
+				fm.rates[sym] = rates
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
 	return nil
 }
 

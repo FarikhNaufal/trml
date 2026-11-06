@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -228,30 +230,9 @@ func handleRunCommand(args []string) {
 		slog.Warn("Gagal memuat exchange filters resmi dari Binance API, menggunakan fail-safe", "err", err)
 	}
 
-	candleMap := make(map[string][]data.HistoricalCandle)
-	filters := make(map[string]model.ExchangeFilter)
-
-	fmt.Printf("Memuat data candlestick 5m untuk %d simbol [%s s/d %s]...\n",
+	fmt.Printf("Memuat data candlestick 5m untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
 		len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
-	for _, sym := range symbols {
-		candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
-		if err != nil {
-			slog.Error("Gagal memuat candle simbol", "symbol", sym, "err", err)
-			continue
-		}
-		candleMap[sym] = candles
-		if ef, ok := exchangeFilters[sym]; ok {
-			filters[sym] = ef
-		} else {
-			filters[sym] = model.ExchangeFilter{
-				TickSize:    decimal.NewFromFloat(0.01),
-				StepSize:    decimal.NewFromFloat(0.1),
-				MinNotional: decimal.NewFromFloat(5.0),
-				MinQty:      decimal.NewFromFloat(0.1),
-			}
-		}
-		fmt.Printf("  -> %s: %d bar dimuat (tick: %s, step: %s)\n", sym, len(candles), filters[sym].TickSize, filters[sym].StepSize)
-	}
+	candleMap, filters := loadCandlesParallel(ctx, downloader, symbols, "5m", from, to, exchangeFilters)
 
 	if len(candleMap) == 0 {
 		slog.Error("Tidak ada data candle yang tersedia untuk backtest. Jalankan 'backtest data fetch' terlebih dahulu.")
@@ -384,23 +365,9 @@ func handleAblateCommand(args []string) {
 
 	exchangeFilters, _ := data.LoadExchangeFilters(ctx, *cacheDirFlag)
 
-	candleMap := make(map[string][]data.HistoricalCandle)
-	filters := make(map[string]model.ExchangeFilter)
-	for _, sym := range symbols {
-		candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
-		if err == nil && len(candles) > 0 {
-			candleMap[sym] = candles
-			if ef, ok := exchangeFilters[sym]; ok {
-				filters[sym] = ef
-			} else {
-				filters[sym] = model.ExchangeFilter{
-					TickSize:    decimal.NewFromFloat(0.01),
-					StepSize:    decimal.NewFromFloat(0.1),
-					MinNotional: decimal.NewFromFloat(5.0),
-				}
-			}
-		}
-	}
+	fmt.Printf("Memuat data candlestick 5m untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
+		len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
+	candleMap, filters := loadCandlesParallel(ctx, downloader, symbols, "5m", from, to, exchangeFilters)
 
 	if len(candleMap) == 0 {
 		fmt.Println("Tidak ada data candle lokal. Jalankan 'backtest data fetch' terlebih dahulu.")
@@ -494,6 +461,76 @@ func getTodayRange() (time.Time, time.Time) {
 	// Warmup 1 hari sebelum hari ini (kemarin 00:00:00 UTC) untuk mengisi 288 bar indikator
 	yesterday := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, time.UTC)
 	return yesterday, now
+}
+
+func loadCandlesParallel(
+	ctx context.Context,
+	downloader *data.Downloader,
+	symbols []string,
+	interval string,
+	from, to time.Time,
+	exchangeFilters map[string]model.ExchangeFilter,
+) (map[string][]data.HistoricalCandle, map[string]model.ExchangeFilter) {
+	candleMap := make(map[string][]data.HistoricalCandle)
+	filters := make(map[string]model.ExchangeFilter)
+	var mu sync.Mutex
+
+	total := len(symbols)
+	if total == 0 {
+		return candleMap, filters
+	}
+
+	taskChan := make(chan string, total)
+	for _, s := range symbols {
+		taskChan <- s
+	}
+	close(taskChan)
+
+	numWorkers := 16
+	if total < numWorkers {
+		numWorkers = total
+	}
+
+	var wg sync.WaitGroup
+	var completed int32
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sym := range taskChan {
+				candles, err := downloader.FetchCandleRange(ctx, sym, interval, from, to)
+				curr := atomic.AddInt32(&completed, 1)
+
+				if err != nil || len(candles) == 0 {
+					slog.Debug("Gagal memuat candle simbol", "symbol", sym, "err", err)
+					continue
+				}
+
+				var ef model.ExchangeFilter
+				if f, ok := exchangeFilters[sym]; ok {
+					ef = f
+				} else {
+					ef = model.ExchangeFilter{
+						TickSize:    decimal.NewFromFloat(0.01),
+						StepSize:    decimal.NewFromFloat(0.1),
+						MinNotional: decimal.NewFromFloat(5.0),
+						MinQty:      decimal.NewFromFloat(0.1),
+					}
+				}
+
+				mu.Lock()
+				candleMap[sym] = candles
+				filters[sym] = ef
+				mu.Unlock()
+
+				fmt.Printf("[%3d/%3d] %-12s: %5d bar dimuat (tick: %s, step: %s)\n",
+					curr, total, sym, len(candles), ef.TickSize, ef.StepSize)
+			}
+		}()
+	}
+	wg.Wait()
+	return candleMap, filters
 }
 
 func splitSymbols(s string) []string {

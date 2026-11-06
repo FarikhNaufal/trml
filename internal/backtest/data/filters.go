@@ -115,16 +115,62 @@ func parseExchangeInfoJSON(data []byte) (map[string]model.ExchangeFilter, error)
 }
 
 // DiscoverMarketSymbols mengembalikan daftar koin real dari Binance Futures USDT.
-// Urutan prioritas:
-// 1. Jika folder cache lokal memiliki subfolder koin USDT, gunakan daftar tersebut (cepat & offline).
-// 2. Jika cache kosong, fetch langsung dari endpoint publik Binance 24h ticker:
-//    - Filter koin perpetual USDT yang memiliki volume 24 jam >= minVolumeUSDT.
+// Urutan:
+// 1. Fetch langsung dari endpoint publik Binance 24h ticker:
+//    - Filter seluruh koin perpetual USDT yang memiliki volume 24 jam >= minVolumeUSDT (100% data real bursa).
+// 2. Jika offline/koneksi gagal, fallback ke subfolder koin USDT di cache lokal.
 func DiscoverMarketSymbols(ctx context.Context, cacheDir string, minVolumeUSDT float64) ([]string, error) {
 	if cacheDir == "" {
 		cacheDir = filepath.Join("data", "backtest", "cache")
 	}
 
-	// 1. Cek apakah di cache lokal sudah ada subfolder koin USDT
+	// 1. Ambil daftar koin real langsung dari Binance publik REST API
+	apiURL := "https://fapi.binance.com/fapi/v1/ticker/24hr"
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if reqErr == nil {
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, respErr := client.Do(req)
+		if respErr == nil && resp.StatusCode == http.StatusOK {
+			defer func() { _ = resp.Body.Close() }()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr == nil {
+				var tickers []struct {
+					Symbol      string `json:"symbol"`
+					QuoteVolume string `json:"quoteVolume"`
+				}
+				if json.Unmarshal(body, &tickers) == nil {
+					if minVolumeUSDT <= 0 {
+						minVolumeUSDT = 25000000.0 // default $25M
+					}
+
+					var syms []string
+					hasBTC := false
+					for _, t := range tickers {
+						sym := strings.ToUpper(t.Symbol)
+						if !strings.HasSuffix(sym, "USDT") {
+							continue
+						}
+						if sym == "BTCUSDT" {
+							hasBTC = true
+						}
+						vol, _ := decimal.NewFromString(t.QuoteVolume)
+						if vol.GreaterThanOrEqual(decimal.NewFromFloat(minVolumeUSDT)) {
+							syms = append(syms, sym)
+						}
+					}
+					if !hasBTC {
+						syms = append([]string{"BTCUSDT"}, syms...)
+					}
+					if len(syms) > 0 {
+						sort.Strings(syms)
+						return syms, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Fallback offline: jika gagal konek ke Binance, baca koin yang ada di cache lokal
 	if entries, err := os.ReadDir(cacheDir); err == nil && len(entries) > 0 {
 		var cachedSyms []string
 		for _, e := range entries {
@@ -139,62 +185,6 @@ func DiscoverMarketSymbols(ctx context.Context, cacheDir string, minVolumeUSDT f
 		}
 	}
 
-	// 2. Jika cache belum ada, ambil daftar koin real dari Binance publik REST API
-	apiURL := "https://fapi.binance.com/fapi/v1/ticker/24hr"
-	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if reqErr != nil {
-		return nil, reqErr
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, respErr := client.Do(req)
-	if respErr != nil {
-		return nil, fmt.Errorf("fetch 24hr tickers: %w", respErr)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("24hr tickers status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read 24hr tickers body: %w", err)
-	}
-
-	var tickers []struct {
-		Symbol      string `json:"symbol"`
-		QuoteVolume string `json:"quoteVolume"`
-	}
-	if err := json.Unmarshal(body, &tickers); err != nil {
-		return nil, fmt.Errorf("parse 24hr tickers JSON: %w", err)
-	}
-
-	if minVolumeUSDT <= 0 {
-		minVolumeUSDT = 25000000.0 // default $25M
-	}
-
-	var syms []string
-	hasBTC := false
-	for _, t := range tickers {
-		sym := strings.ToUpper(t.Symbol)
-		if !strings.HasSuffix(sym, "USDT") {
-			continue
-		}
-		if sym == "BTCUSDT" {
-			hasBTC = true
-		}
-		vol, _ := decimal.NewFromString(t.QuoteVolume)
-		if vol.GreaterThanOrEqual(decimal.NewFromFloat(minVolumeUSDT)) {
-			syms = append(syms, sym)
-		}
-	}
-
-	if !hasBTC {
-		syms = append([]string{"BTCUSDT"}, syms...)
-	}
-
-	sort.Strings(syms)
-	return syms, nil
+	return nil, fmt.Errorf("gagal mendapatkan simbol dari Binance dan cache lokal kosong")
 }
 
