@@ -321,4 +321,125 @@ func TestSimBroker_FundingSettlement(t *testing.T) {
 	}
 }
 
+func TestSimBroker_CircuitBreakerDrawdownParity(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT:     decimal.NewFromFloat(1000.0),
+		EquityModeCompounding: false,
+		MaxDailyDrawdownPct:   -0.05, // -5% breaker
+		AccountLeverage:       5.0,
+		MaxSlots:              1,
+		PenetrationTicks:      1,
+		SignalDelayBars:       0,
+	}
+	broker := NewSimBroker(cfg)
+	broker.SetExchangeFilter("BTCUSDT", model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(1.0),
+		StepSize: decimal.NewFromFloat(0.01),
+	})
+
+	now := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+
+	// Inisialisasi awal: Breaker tidak aktif
+	if broker.IsCircuitBreakerTripped() {
+		t.Fatalf("expected circuit breaker not tripped initially")
+	}
+
+	// Submit posisi LONG BTCUSDT: Qty = 0.1, Entry = 10000
+	intent := model.OrderIntent{
+		ClientOrderID: "ORD1",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(0.1),
+		LimitPrice:    decimal.NewFromFloat(10000.0),
+		SLPrice:       decimal.NewFromFloat(9000.0),
+		TPPrice:       decimal.NewFromFloat(12000.0),
+		TP1Price:      decimal.NewFromFloat(11000.0),
+		CreatedAt:     now,
+	}
+	ok, err := broker.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("failed to submit limit entry: %v", err)
+	}
+
+	// Candle 1: Terisi di 10000 (Low menembus ke 9990)
+	c1 := data.HistoricalCandle{
+		OpenTime:  now,
+		CloseTime: now.Add(5 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      10000.0,
+		High:      10050.0,
+		Low:       9990.0,
+		Close:     10000.0,
+	}
+	broker.ProcessCandle(c1, 1)
+
+	if !broker.HasActiveOrderOrPosition("BTCUSDT") {
+		t.Fatalf("expected active position for BTCUSDT")
+	}
+
+	// Floating loss belum mencapai 5%: Close = 9700 -> Unrealized = (9700 - 10000)*0.1 = -30 USDT (-3%)
+	c2 := data.HistoricalCandle{
+		OpenTime:  now.Add(5 * time.Minute),
+		CloseTime: now.Add(10 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      10000.0,
+		High:      10000.0,
+		Low:       9650.0,
+		Close:     9700.0,
+	}
+	broker.ProcessCandle(c2, 2)
+
+	if broker.IsCircuitBreakerTripped() {
+		t.Fatalf("expected breaker NOT tripped at -3%% floating drawdown")
+	}
+
+	// Floating loss menembus 5%: Close = 9400 -> Unrealized = (9400 - 10000)*0.1 = -60 USDT (-6%)
+	c3 := data.HistoricalCandle{
+		OpenTime:  now.Add(10 * time.Minute),
+		CloseTime: now.Add(15 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      9700.0,
+		High:      9700.0,
+		Low:       9350.0,
+		Close:     9400.0,
+	}
+	broker.ProcessCandle(c3, 3)
+
+	if !broker.IsCircuitBreakerTripped() {
+		t.Fatalf("expected breaker TRIPPED at -6%% floating drawdown")
+	}
+
+	// Pastikan order baru ditolak saat circuit breaker aktif
+	intent2 := model.OrderIntent{
+		ClientOrderID: "ORD2",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(2000.0),
+		CreatedAt:     now.Add(15 * time.Minute),
+	}
+	ok2, err2 := broker.SubmitLimitEntry(intent2)
+	if ok2 || err2 == nil {
+		t.Fatalf("expected order submission to be rejected when circuit breaker is active")
+	}
+
+	// Rollover hari berikutnya (00:00 UTC): Breaker harus reset
+	nextDay := now.Add(24 * time.Hour)
+	cNextDay := data.HistoricalCandle{
+		OpenTime:  nextDay,
+		CloseTime: nextDay.Add(5 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      9400.0,
+		High:      9500.0,
+		Low:       9390.0,
+		Close:     9450.0,
+	}
+	broker.ProcessCandle(cNextDay, 100)
+
+	if broker.IsCircuitBreakerTripped() {
+		t.Fatalf("expected breaker to reset on new UTC day rollover")
+	}
+}
+
+
 

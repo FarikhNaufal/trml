@@ -168,7 +168,7 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 			} else {
 				res.PartialWinsCount++
 			}
-		} else if math.Abs(pnl) <= 0.05 || strings.Contains(finalReason, "BREAK_EVEN") {
+		} else if math.Abs(pnl) <= 0.0001 || (strings.Contains(finalReason, "BREAK_EVEN") && pnl >= -0.05) {
 			res.BreakEvenCount++
 			currentLosingStreak = 0
 		} else {

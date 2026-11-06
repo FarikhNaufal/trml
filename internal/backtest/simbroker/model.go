@@ -85,4 +85,5 @@ type SimPosition struct {
 	MaxMFE         float64
 	SignalAuditID  int64
 	ProtectionTier int
+	LastClosePrice decimal.Decimal
 }

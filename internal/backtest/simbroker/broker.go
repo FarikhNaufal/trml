@@ -166,7 +166,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	epochDay := c.OpenTime.UTC().Unix() / 86400
 	if s.SessionDayEpochUTC != epochDay || s.SessionStartEquity.LessThanOrEqual(decimal.Zero) {
 		s.SessionDayEpochUTC = epochDay
-		s.SessionStartEquity = s.calculateEffectiveEquityLocked()
+		s.SessionStartEquity = s.calculateRealEffectiveEquityLocked()
 		s.CircuitBreakerTripped = false
 	}
 
@@ -233,6 +233,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 					OpenTime:       c.OpenTime,
 					OpenBarIndex:   barIndex,
 					SignalAuditID:  pending.Intent.SignalAuditID,
+					LastClosePrice: decimal.NewFromFloat(c.Close),
 				}
 				s.OpenPositions[c.Symbol] = pos
 				delete(s.PendingOrders, c.Symbol)
@@ -248,6 +249,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	if !hasPos || pos.Qty.LessThanOrEqual(decimal.Zero) {
 		return
 	}
+	pos.LastClosePrice = decimal.NewFromFloat(c.Close)
 
 	// Update Peak Price dan MAE/MFE
 	ePriceF, _ := pos.EntryPrice.Float64()
@@ -514,12 +516,30 @@ func (s *SimBroker) recordClosedTradeLocked(
 	s.ClosedTrades = append(s.ClosedTrades, rec)
 }
 
+func (s *SimBroker) calculateRealEffectiveEquityLocked() decimal.Decimal {
+	unrealized := decimal.Zero
+	for _, pos := range s.OpenPositions {
+		mark := pos.LastClosePrice
+		if mark.IsZero() {
+			mark = pos.EntryPrice
+		}
+		if mark.GreaterThan(decimal.Zero) {
+			if pos.Side == model.SideLong {
+				unrealized = unrealized.Add(mark.Sub(pos.EntryPrice).Mul(pos.Qty))
+			} else {
+				unrealized = unrealized.Add(pos.EntryPrice.Sub(mark).Mul(pos.Qty))
+			}
+		}
+	}
+	return s.RealizedEquityUSDT.Add(unrealized)
+}
+
 func (s *SimBroker) calculateEffectiveEquityLocked() decimal.Decimal {
-	// Mode fixed: equity tidak compounding
+	// Mode fixed: equity sizing tidak compounding
 	if !s.Cfg.EquityModeCompounding {
 		return s.Cfg.InitialEquityUSDT
 	}
-	return s.RealizedEquityUSDT
+	return s.calculateRealEffectiveEquityLocked()
 }
 
 func (s *SimBroker) isDailyDrawdownBreachedLocked() bool {
@@ -529,7 +549,7 @@ func (s *SimBroker) isDailyDrawdownBreachedLocked() bool {
 	if s.SessionStartEquity.LessThanOrEqual(decimal.Zero) {
 		return false
 	}
-	effEquity := s.calculateEffectiveEquityLocked()
+	effEquity := s.calculateRealEffectiveEquityLocked()
 	ddDec := effEquity.Sub(s.SessionStartEquity).Div(s.SessionStartEquity)
 	ddFloat, _ := ddDec.Float64()
 	if ddFloat <= s.Cfg.MaxDailyDrawdownPct {
@@ -564,7 +584,7 @@ func (s *SimBroker) GetAvailableBalanceUSDT() decimal.Decimal {
 		usedMargin = usedMargin.Add(notional.Div(lev))
 	}
 
-	eff := s.calculateEffectiveEquityLocked()
+	eff := s.calculateRealEffectiveEquityLocked()
 	avail := eff.Sub(usedMargin)
 	if avail.LessThan(decimal.Zero) {
 		return decimal.Zero
@@ -578,7 +598,7 @@ func (s *SimBroker) GetDailyTotalDrawdownPct() float64 {
 	if s.SessionStartEquity.LessThanOrEqual(decimal.Zero) {
 		return 0.0
 	}
-	eff := s.calculateEffectiveEquityLocked()
+	eff := s.calculateRealEffectiveEquityLocked()
 	ddDec := eff.Sub(s.SessionStartEquity).Div(s.SessionStartEquity)
 	ddFloat, _ := ddDec.Float64()
 	return ddFloat
