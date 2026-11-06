@@ -399,7 +399,8 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	}
 
 	// C. Eksekusi Full Take Profit
-	if tpFullTouched {
+	// Jika Trailing Stop aktif dan TP1 sudah tercapai, posisi runner dibiarkan trailing tanpa hard-cap kaku (selaras dengan Live & DryRun)
+	if tpFullTouched && (!s.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
 		s.recordClosedTradeLocked(pos, pos.Qty, pos.TPPrice, "TAKE_PROFIT", c.CloseTime, int(barIndex-pos.OpenBarIndex))
 		delete(s.OpenPositions, c.Symbol)
 		return

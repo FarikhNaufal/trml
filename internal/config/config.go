@@ -321,7 +321,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_EMA200_DISTANCE_ATR '%s' (must be float between 0.1 and 20.0)", maxEMA200DistStr)
 	}
 
-	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", "0.40")
+	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", minBounceZStr)
 	minBounceZLong, err := parseFloatEnv(minBounceZLongStr)
 	if err != nil || minBounceZLong <= 0 {
 		minBounceZLong = minBounceZ
