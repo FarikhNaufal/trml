@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -149,8 +150,22 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 		sb.WriteString("### 5. Audit Gatekeeper Sinyal (Top Filter Rejections)\n\n")
 		sb.WriteString("| Alasan Penolakan Sinyal | Jumlah Sinyal Disaring |\n")
 		sb.WriteString("| :--- | :--- |\n")
+		type rejectEntry struct {
+			reason string
+			cnt    int64
+		}
+		var sortedRejects []rejectEntry
 		for reason, cnt := range rejectReasons {
-			fmt.Fprintf(&sb, "| `%s` | %d |\n", reason, cnt)
+			sortedRejects = append(sortedRejects, rejectEntry{reason, cnt})
+		}
+		sort.Slice(sortedRejects, func(i, j int) bool {
+			if sortedRejects[i].cnt != sortedRejects[j].cnt {
+				return sortedRejects[i].cnt > sortedRejects[j].cnt
+			}
+			return sortedRejects[i].reason < sortedRejects[j].reason
+		})
+		for _, e := range sortedRejects {
+			fmt.Fprintf(&sb, "| `%s` | %d |\n", e.reason, e.cnt)
 		}
 		sb.WriteString("\n")
 	}

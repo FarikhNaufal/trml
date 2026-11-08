@@ -2,12 +2,12 @@ package simbroker
 
 import (
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/backtest/data"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -325,11 +325,19 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	// A. Eksekusi Stop Loss
 	if slTouched {
 		exitPrice := pos.CurrentSLPrice
-		// Terapkan slippage pada SL market exit
-		if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
-			if pos.Side == model.SideLong {
+		openDec := decimal.NewFromFloat(c.Open)
+		if pos.Side == model.SideLong {
+			if openDec.LessThan(exitPrice) {
+				exitPrice = openDec // Gap down: terisi di harga pembukaan bar
+			}
+			if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
 				exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Sub(s.Cfg.SlippageRate))
-			} else {
+			}
+		} else {
+			if openDec.GreaterThan(exitPrice) {
+				exitPrice = openDec // Gap up: terisi di harga pembukaan bar
+			}
+			if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
 				exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Add(s.Cfg.SlippageRate))
 			}
 		}
@@ -338,6 +346,8 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		switch pos.ProtectionTier {
 		case 3:
 			exitReason = "TRAILING_STOP"
+		case 2:
+			exitReason = "PROFIT_LOCK"
 		case 1:
 			exitReason = "BREAK_EVEN"
 		}
@@ -362,37 +372,8 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			pos.Qty = pos.Qty.Sub(closeQty)
 			pos.IsTP1Hit = true
 
-			// Geser SL ke Break-Even (+ Runner Cushion jika ada)
-			beOffset := decimal.NewFromFloat(math.Max(s.Cfg.MinBreakEvenOffsetPct, 0.0010))
-			var beSL decimal.Decimal
-			if s.Cfg.RunnerBECushionATR > 0 && pos.ATRAtEntry.GreaterThan(decimal.Zero) {
-				cushion := pos.ATRAtEntry.Mul(decimal.NewFromFloat(s.Cfg.RunnerBECushionATR))
-				if pos.Side == model.SideLong {
-					beSL = pos.EntryPrice.Sub(cushion)
-					if pos.InitialSLPrice.GreaterThan(decimal.Zero) && beSL.LessThan(pos.InitialSLPrice) {
-						beSL = pos.InitialSLPrice
-					}
-				} else {
-					beSL = pos.EntryPrice.Add(cushion)
-					if pos.InitialSLPrice.GreaterThan(decimal.Zero) && beSL.GreaterThan(pos.InitialSLPrice) {
-						beSL = pos.InitialSLPrice
-					}
-				}
-			} else {
-				if pos.Side == model.SideLong {
-					beSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffset))
-				} else {
-					beSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffset))
-				}
-			}
-
-			// Kuantisasi ke tick size
-			if filter.TickSize.GreaterThan(decimal.Zero) {
-				if qSL, err := model.QuantizePrice(beSL, filter.TickSize, pos.Side == model.SideShort); err == nil {
-					beSL = qSL
-				}
-			}
-
+			// Geser SL ke Break-Even (+ Runner Cushion jika ada) via Unified Protection Engine
+			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
 			pos.CurrentSLPrice = beSL
 			pos.ProtectionTier = 1
 		}
@@ -406,40 +387,11 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		return
 	}
 
-	// D. Trailing Stop Ratchet (Hanya aktif setelah TP1 tercapai)
-	if pos.IsTP1Hit && s.Cfg.TrailingEnabled && pos.ATRAtEntry.GreaterThan(decimal.Zero) {
-		actDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(s.Cfg.TrailingActivateATR))
-		trailDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(s.Cfg.TrailingDistanceATR))
-
-		if pos.Side == model.SideLong {
-			if pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(actDist) {
-				newSL := pos.PeakPrice.Sub(trailDist)
-				if filter.TickSize.GreaterThan(decimal.Zero) {
-					if qSL, err := model.QuantizePrice(newSL, filter.TickSize, false); err == nil {
-						newSL = qSL
-					}
-				}
-				// Ratchet Guard: SL tidak boleh mundur
-				if newSL.GreaterThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.ProtectionTier = 3
-				}
-			}
-		} else {
-			if pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(actDist) {
-				newSL := pos.PeakPrice.Add(trailDist)
-				if filter.TickSize.GreaterThan(decimal.Zero) {
-					if qSL, err := model.QuantizePrice(newSL, filter.TickSize, true); err == nil {
-						newSL = qSL
-					}
-				}
-				// Ratchet Guard: SL tidak boleh mundur
-				if newSL.LessThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.ProtectionTier = 3
-				}
-			}
-		}
+	// D. Unified Position Protection Engine (Tier 1 Early BE, Tier 2 Profit Lock, Tier 3 Trailing Ratchet)
+	protDec := protection.EvaluatePositionProtection(pos.toSnapshot(filter.TickSize), decimal.NewFromFloat(c.Close), s.toProtectionConfig())
+	if protDec.ShouldUpdate {
+		pos.CurrentSLPrice = protDec.NewSLPrice
+		pos.ProtectionTier = int(protDec.NewTier)
 	}
 
 	// E. Time-Stop Holding Timeout (4 Jam = 48 bar 5m)
@@ -481,6 +433,8 @@ func (s *SimBroker) recordClosedTradeLocked(
 		ratio := qty.Div(pos.InitialQty)
 		fundingLeg = pos.FundingPaid.Mul(ratio)
 	}
+	pos.FundingPaid = pos.FundingPaid.Sub(fundingLeg)
+	pos.InitialQty = pos.InitialQty.Sub(qty)
 
 	// Net PnL = Gross PnL - Trading Fees - Funding Paid (+ Funding Received jika negatif)
 	netPnL := grossPnL.Sub(totalFee).Sub(fundingLeg)
@@ -643,3 +597,37 @@ func (s *SimBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, markPrice, t
 }
 
 func (s *SimBroker) Close() {}
+
+func (s *SimBroker) toProtectionConfig() protection.ProtectionConfig {
+	return protection.ProtectionConfig{
+		Tier1BEEnabled:           s.Cfg.Tier1BEEnabled,
+		Tier1BETriggerLongATR:    0.70,
+		Tier1BETriggerShortATR:   0.90,
+		Tier2ProfitLockEnabled:   s.Cfg.Tier2ProfitLockEnabled,
+		Tier2ProfitLockATR:       s.Cfg.Tier2ProfitLockATR,
+		Tier2ProfitLockOffsetATR: s.Cfg.Tier2ProfitLockOffsetATR,
+		TrailingEnabled:          s.Cfg.TrailingEnabled,
+		TrailingActivateATR:      s.Cfg.TrailingActivateATR,
+		TrailingDistanceATR:      s.Cfg.TrailingDistanceATR,
+		PartialTPEnabled:         s.Cfg.PartialTPEnabled,
+		MinBreakEvenOffsetPct:    s.Cfg.MinBreakEvenOffsetPct,
+		RunnerBECushionATR:       s.Cfg.RunnerBECushionATR,
+		TakerFeeRate:             s.Cfg.TakerFeeRate,
+		SlippageRate:             s.Cfg.SlippageRate,
+	}
+}
+
+func (pos *SimPosition) toSnapshot(tickSize decimal.Decimal) protection.PositionSnapshot {
+	return protection.PositionSnapshot{
+		Symbol:         pos.Symbol,
+		Side:           pos.Side,
+		EntryPrice:     pos.EntryPrice,
+		CurrentSLPrice: pos.CurrentSLPrice,
+		InitialSLPrice: pos.InitialSLPrice,
+		PeakPrice:      pos.PeakPrice,
+		ATRAtEntry:     pos.ATRAtEntry,
+		ProtectionTier: protection.ProtectionTier(pos.ProtectionTier),
+		IsTP1Hit:       pos.IsTP1Hit,
+		TickSize:       tickSize,
+	}
+}

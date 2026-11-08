@@ -32,6 +32,7 @@ type ExecutionBroker interface {
 	IsCircuitBreakerTripped() bool
 	GetActiveSlotCount() int
 	HasActiveOrderOrPosition(symbol string) bool
+	GetMonitoredSymbols() []string
 	CheckTimeouts(now time.Time)
 	GetActivePositions() []ActivePositionDTO
 }

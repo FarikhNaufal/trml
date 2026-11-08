@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math"
 	"strings"
 	"time"
@@ -61,6 +62,10 @@ type EvaluatorConfig struct {
 	CooldownLossMinutes      int
 	CooldownProfitMinutes    int
 	VWAPSessionWarmupMinutes int
+
+	// Random Entry Benchmark (Case C)
+	RandomEntrySeed int64
+	RandomEntryProb float64
 
 	Sizing SizingConfig
 }
@@ -179,6 +184,41 @@ func EvaluateSignal(
 		return model.OrderIntent{}, false, "INVALID_VWAP", ""
 	}
 
+	// Case C: Random Entry Benchmark Mode
+	if cfg.RandomEntrySeed > 0 {
+		prob := cfg.RandomEntryProb
+		if prob <= 0 {
+			prob = 0.0004
+		}
+		// Hash deterministik berbasis seed, symbol, dan timestamp bar
+		h := fnv.New64a()
+		_, _ = fmt.Fprintf(h, "%d:%s:%d", cfg.RandomEntrySeed, snap.Symbol, latest.CloseTime.Unix())
+		hashVal := h.Sum64()
+		normalized := float64(hashVal%1000000) / 1000000.0
+		if normalized >= prob {
+			return model.OrderIntent{}, false, "RANDOM_ENTRY_NOT_TRIGGERED", ""
+		}
+
+		targetSide := model.SideShort
+		if cfg.AllowedSide == "LONG_ONLY" {
+			targetSide = model.SideLong
+		} else if cfg.AllowedSide == "BOTH" {
+			if (hashVal>>32)%2 == 0 {
+				targetSide = model.SideLong
+			}
+		}
+
+		sizingCfg := cfg.Sizing
+		if sizingCfg.EntryOrderType == "" {
+			sizingCfg.EntryOrderType = cfg.EntryOrderType
+		}
+		intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, latest.Close, atr14, sizingCfg)
+		if !ok {
+			return model.OrderIntent{}, false, "SIZING_FAILED", ""
+		}
+		return intent, true, "SIGNAL_APPROVED", "RANDOM_ENTRY_BENCHMARK"
+	}
+
 	// Warmup Guard Pasca-Reset Session VWAP (00:00 - 00:30 UTC): hindari sinyal false pada awal sesi
 	warmupMins := cfg.VWAPSessionWarmupMinutes
 	if warmupMins <= 0 {
@@ -216,15 +256,15 @@ func EvaluateSignal(
 		pullbackTol = 0.35
 	}
 	minBounceZ := cfg.MinBounceZScore
-	if minBounceZ <= 0 {
+	if minBounceZ == 0 {
 		minBounceZ = 1.20
 	}
 	minBounceZLong := cfg.MinBounceZScoreLong
-	if minBounceZLong <= 0 {
+	if minBounceZLong == 0 {
 		minBounceZLong = minBounceZ
 	}
 	minBounceZShort := cfg.MinBounceZScoreShort
-	if minBounceZShort <= 0 {
+	if minBounceZShort == 0 {
 		minBounceZShort = minBounceZ
 	}
 	lookback := cfg.LookbackImpulseBars

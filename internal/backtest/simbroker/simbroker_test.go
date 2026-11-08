@@ -229,6 +229,110 @@ func TestSimBroker_PartialTP1AndTrailing(t *testing.T) {
 	}
 }
 
+func TestSimBroker_Tier2ProfitLock(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT:        decimal.NewFromFloat(1000.0),
+		MakerFeeRate:             decimal.NewFromFloat(0.0002),
+		TakerFeeRate:             decimal.NewFromFloat(0.0005),
+		SlippageRate:             decimal.NewFromFloat(0.0002),
+		SignalDelayBars:          1,
+		LimitTimeoutBars:         1,
+		PenetrationTicks:         1,
+		PartialTPEnabled:         false, // runner lock tanpa TP1
+		Tier2ProfitLockEnabled:   true,
+		Tier2ProfitLockATR:       1.80,
+		Tier2ProfitLockOffsetATR: 0.90,
+		TrailingEnabled:          false,
+	}
+
+	broker := NewSimBroker(cfg)
+	broker.ExchangeFilters["SOLUSDT"] = model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+		MinQty:      decimal.NewFromFloat(0.1),
+	}
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "SOL_TEST_T2",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(120.0),
+		ATRAtEntry:    decimal.NewFromFloat(5.0), // 1 ATR = 5.0 -> 1.8 ATR = 9.0 (target 109.0)
+		CreatedAt:     now,
+	}
+	broker.SubmitLimitEntry(intent)
+
+	// Bar 0: Fill order
+	c0 := data.HistoricalCandle{
+		OpenTime:  now,
+		CloseTime: now.Add(5*time.Minute - time.Millisecond),
+		Symbol:    "SOLUSDT",
+		Open:      100.2,
+		High:      100.3,
+		Low:       99.98,
+		Close:     100.0,
+	}
+	broker.ProcessCandle(c0, 0)
+
+	// Bar 1: Price climbs to 109.5 (current >= 100 + 1.8 * 5 = 109.0). Tier 2 activates!
+	// Target SL = 100 + 0.9 * 5 = 104.50
+	c1 := data.HistoricalCandle{
+		OpenTime:  now.Add(5 * time.Minute),
+		CloseTime: now.Add(10*time.Minute - time.Millisecond),
+		Symbol:    "SOLUSDT",
+		Open:      100.0,
+		High:      109.5,
+		Low:       100.0,
+		Close:     109.2,
+	}
+	broker.ProcessCandle(c1, 1)
+
+	broker.Mu.Lock()
+	pos := broker.OpenPositions["SOLUSDT"]
+	broker.Mu.Unlock()
+
+	if pos == nil {
+		t.Fatalf("expected open position, got nil")
+	}
+	if pos.ProtectionTier != 2 {
+		t.Errorf("expected ProtectionTier = 2, got %d", pos.ProtectionTier)
+	}
+	if !pos.CurrentSLPrice.Equal(decimal.NewFromFloat(104.50)) {
+		t.Errorf("expected SL at 104.50, got %s", pos.CurrentSLPrice)
+	}
+
+	// Bar 2: Price drops to 104.0, hitting the Tier 2 locked SL
+	c2 := data.HistoricalCandle{
+		OpenTime:  now.Add(10 * time.Minute),
+		CloseTime: now.Add(15*time.Minute - time.Millisecond),
+		Symbol:    "SOLUSDT",
+		Open:      109.0,
+		High:      109.0,
+		Low:       104.0,
+		Close:     104.2,
+	}
+	broker.ProcessCandle(c2, 2)
+
+	broker.Mu.Lock()
+	closed := broker.ClosedTrades
+	broker.Mu.Unlock()
+
+	if len(closed) != 1 {
+		t.Fatalf("expected 1 closed trade, got %d", len(closed))
+	}
+	if closed[0].ExitReason != "PROFIT_LOCK" {
+		t.Errorf("expected exit reason PROFIT_LOCK, got %s", closed[0].ExitReason)
+	}
+	if closed[0].NetPnL.LessThanOrEqual(decimal.Zero) {
+		t.Errorf("expected positive NetPnL for profit lock, got %s", closed[0].NetPnL)
+	}
+}
+
 func TestSimBroker_FundingSettlement(t *testing.T) {
 	cfg := SimBrokerConfig{
 		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
@@ -438,6 +542,168 @@ func TestSimBroker_CircuitBreakerDrawdownParity(t *testing.T) {
 
 	if broker.IsCircuitBreakerTripped() {
 		t.Fatalf("expected breaker to reset on new UTC day rollover")
+	}
+}
+
+func TestSimBroker_GapOpenStopLoss(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		MakerFeeRate:      decimal.Zero,
+		TakerFeeRate:      decimal.Zero,
+		SlippageRate:      decimal.Zero,
+		SignalDelayBars:   1,
+		LimitTimeoutBars:  1,
+		PenetrationTicks:  1,
+	}
+	broker := NewSimBroker(cfg)
+	broker.ExchangeFilters["BTCUSDT"] = model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.1),
+		StepSize: decimal.NewFromFloat(0.001),
+	}
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "GAP_TEST",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(120.0),
+		CreatedAt:     now,
+	}
+	broker.SubmitLimitEntry(intent)
+
+	// Bar 0: Fill order at 100.0
+	c0 := data.HistoricalCandle{
+		OpenTime:  now,
+		CloseTime: now.Add(5 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      100.0,
+		High:      100.5,
+		Low:       99.0, // Tembus 1 tick
+		Close:     99.5,
+	}
+	broker.ProcessCandle(c0, 0)
+
+	// Bar 1: Flash crash gap down. Candle opens at 90.0 (below SL 95.0)!
+	c1 := data.HistoricalCandle{
+		OpenTime:  now.Add(5 * time.Minute),
+		CloseTime: now.Add(10 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      90.0, // Gap down melompati SL 95.0
+		High:      91.0,
+		Low:       88.0,
+		Close:     89.0,
+	}
+	broker.ProcessCandle(c1, 1)
+
+	if len(broker.ClosedTrades) != 1 {
+		t.Fatalf("expected 1 closed trade, got %d", len(broker.ClosedTrades))
+	}
+	tr := broker.ClosedTrades[0]
+	// Exit price harus terisi pada Open bar yang gap (90.0) dengan penalti slippage, bukan 95.0
+	expectedExit := decimal.NewFromFloat(90.0).Mul(decimal.NewFromFloat(1.0).Sub(broker.Cfg.SlippageRate))
+	if !tr.ExitPrice.Equal(expectedExit) {
+		t.Fatalf("expected gap-down fill with slippage %s, got %s", expectedExit, tr.ExitPrice)
+	}
+}
+
+func TestSimBroker_MultiLegFundingAccounting(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		MakerFeeRate:      decimal.Zero,
+		TakerFeeRate:      decimal.Zero,
+		SlippageRate:      decimal.Zero,
+		PartialTPEnabled:  true,
+		PartialTP1Ratio:   0.50,
+		PartialTP1ATRMult: 1.0,
+	}
+	broker := NewSimBroker(cfg)
+	broker.ExchangeFilters["BTCUSDT"] = model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.1),
+		StepSize: decimal.NewFromFloat(0.001),
+	}
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "FUNDING_TEST",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0), // 2.0 BTC
+		SLPrice:       decimal.NewFromFloat(90.0),
+		TPPrice:       decimal.NewFromFloat(130.0),
+		TP1Price:      decimal.NewFromFloat(110.0),
+		ATRAtEntry:    decimal.NewFromFloat(10.0),
+		CreatedAt:     now,
+	}
+	broker.SubmitLimitEntry(intent)
+
+	// Fill order at 100.0
+	c0 := data.HistoricalCandle{
+		OpenTime:  now,
+		CloseTime: now.Add(5 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      100.0,
+		High:      100.5,
+		Low:       99.0,
+		Close:     100.0,
+	}
+	broker.ProcessCandle(c0, 0)
+
+	// Simulasikan funding payment pra-TP1 ($10.0 funding fee dibayar)
+	pos := broker.OpenPositions["BTCUSDT"]
+	pos.FundingPaid = decimal.NewFromFloat(10.0)
+
+	// Bar 1: Sentuh TP1 (110.0), scale out 50% = 1.0 BTC
+	c1 := data.HistoricalCandle{
+		OpenTime:  now.Add(5 * time.Minute),
+		CloseTime: now.Add(10 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      105.0,
+		High:      111.0,
+		Low:       104.0,
+		Close:     110.0,
+	}
+	broker.ProcessCandle(c1, 1)
+
+	if len(broker.ClosedTrades) != 1 {
+		t.Fatalf("expected 1 trade for TP1 leg, got %d", len(broker.ClosedTrades))
+	}
+	tp1Trade := broker.ClosedTrades[0]
+	// Separuh funding ($5.0) harus diatribusikan ke TP1
+	if !tp1Trade.FundingTotal.Equal(decimal.NewFromFloat(5.0)) {
+		t.Fatalf("expected TP1 funding fee 5.0, got %s", tp1Trade.FundingTotal)
+	}
+
+	// Sisa funding di posisi harus tinggal $5.0 dan InitialQty disesuaikan menjadi 1.0
+	if !pos.FundingPaid.Equal(decimal.NewFromFloat(5.0)) {
+		t.Fatalf("expected remaining FundingPaid 5.0, got %s", pos.FundingPaid)
+	}
+	if !pos.InitialQty.Equal(decimal.NewFromFloat(1.0)) {
+		t.Fatalf("expected remaining InitialQty 1.0, got %s", pos.InitialQty)
+	}
+
+	// Bar 2: Runner kena full TP at 130.0
+	c2 := data.HistoricalCandle{
+		OpenTime:  now.Add(10 * time.Minute),
+		CloseTime: now.Add(15 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      115.0,
+		High:      131.0,
+		Low:       114.0,
+		Close:     130.0,
+	}
+	broker.ProcessCandle(c2, 2)
+
+	if len(broker.ClosedTrades) != 2 {
+		t.Fatalf("expected 2 closed trades total, got %d", len(broker.ClosedTrades))
+	}
+	runnerTrade := broker.ClosedTrades[1]
+	// Sisa funding ($5.0) harus diatribusikan 100% ke runner trade
+	if !runnerTrade.FundingTotal.Equal(decimal.NewFromFloat(5.0)) {
+		t.Fatalf("expected runner funding fee 5.0, got %s", runnerTrade.FundingTotal)
 	}
 }
 

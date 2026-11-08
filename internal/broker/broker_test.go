@@ -1144,6 +1144,7 @@ func TestDryRunBroker_TieredDynamicBreakEvenAndProfitLock(t *testing.T) {
 		Tier1BEEnabled:           true,
 		Tier1BETriggerLongATR:    0.70,
 		Tier1BETriggerShortATR:   0.90,
+		Tier2ProfitLockEnabled:   true,
 		Tier2ProfitLockATR:       1.40,
 		Tier2ProfitLockOffsetATR: 0.70,
 		MinBreakEvenOffsetPct:    0.0010,

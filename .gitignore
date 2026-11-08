@@ -20,3 +20,6 @@ bin/
 .DS_Store
 .idea/
 .vscode/
+
+# Backtest Archives & Artifacts
+backtest_archive/

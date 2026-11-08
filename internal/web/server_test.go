@@ -29,6 +29,7 @@ func (m *mockBroker) GetDailyTotalDrawdownPct() float64           { return -0.01
 func (m *mockBroker) IsCircuitBreakerTripped() bool               { return false }
 func (m *mockBroker) GetActiveSlotCount() int                     { return 1 }
 func (m *mockBroker) HasActiveOrderOrPosition(symbol string) bool { return symbol == "BTCUSDT" }
+func (m *mockBroker) GetMonitoredSymbols() []string                 { return []string{"BTCUSDT"} }
 func (m *mockBroker) CheckTimeouts(now time.Time)                 {}
 func (m *mockBroker) GetActivePositions() []broker.ActivePositionDTO {
 	return []broker.ActivePositionDTO{

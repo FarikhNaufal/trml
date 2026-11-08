@@ -180,7 +180,7 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 			res.WinsCount++
 			sumWin += pnl
 			currentLosingStreak = 0
-			if hasTP1 && (finalReason == "TAKE_PROFIT" || finalReason == "TRAILING_STOP") {
+			if hasTP1 && (finalReason == "TAKE_PROFIT" || finalReason == "TRAILING_STOP" || finalReason == "PROFIT_LOCK") {
 				res.FullWinsCount++
 			} else {
 				res.PartialWinsCount++

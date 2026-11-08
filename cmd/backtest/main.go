@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -167,14 +170,35 @@ func handleRunCommand(args []string) {
 	scannerFlag := fs.Bool("scanner", true, "Enable dynamic rolling market scanner (default: true, use --scanner=false to disable)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	outFlag := fs.String("out", "", "Output report markdown file path")
-	equityFlag := fs.Float64("equity", 125.0, "Initial Equity USDT (default 125.0)")
+	csvOutFlag := fs.String("csv-out", "", "Output trades CSV file path")
+	jsonOutFlag := fs.String("json-out", "", "Output raw metrics and trades JSON file path")
+	equityFlag := fs.Float64("equity", 0.0, "Initial Equity USDT (default from INITIAL_EQUITY in backtest.env, or 125.0)")
 	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
 	unconstrainedFlag := fs.Bool("unconstrained", false, "Mode evaluasi sinyal murni (unconstrained 1 R per setup, abaikan slot portofolio & cooldown)")
 	compoundingFlag := fs.Bool("compounding", false, "Aktifkan mode compounding equity (position sizing dinamis mengikuti pertumbuhan saldo)")
+	randomSeedFlag := fs.Int64("random-seed", 0, "Pseudo-random seed for random entry mode (Case C benchmark)")
+	randomProbFlag := fs.Float64("random-prob", 0.0, "Probability per scanner coin per bar for random entry mode")
+	knockoutDeltaFlag := fs.Bool("knockout-delta", false, "Disable delta z-score filter for ablation study")
+	knockoutBTCFlag := fs.Bool("knockout-btc", false, "Disable BTC gate for ablation study")
+	knockoutRVOLFlag := fs.Bool("knockout-rvol", false, "Disable RVOL filter for ablation study")
+	knockoutNATRFlag := fs.Bool("knockout-natr", false, "Disable NATR filter for ablation study")
 	_ = fs.Parse(args)
 
+	cfg, err := loadConfigForBacktest(*envFlag)
+	if err != nil {
+		slog.Error("Gagal memuat konfigurasi backtest", "env", *envFlag, "err", err)
+		os.Exit(1)
+	}
+
+	initialEquity := 125.0
+	if cfg != nil && cfg.InitialEquity.GreaterThan(decimal.Zero) {
+		initialEquity = cfg.InitialEquity.InexactFloat64()
+	}
+	if *equityFlag > 0 {
+		initialEquity = *equityFlag
+	}
+
 	var from, to time.Time
-	var err error
 	if *todayFlag {
 		from, to = getTodayRange()
 	} else if *pastWeekFlag {
@@ -242,6 +266,26 @@ func handleRunCommand(args []string) {
 
 	// Evaluator Config dari konfigurasi backtest
 	evaluatorCfg := buildDefaultEvaluatorConfig(*envFlag)
+	if *randomSeedFlag != 0 || *randomProbFlag > 0 {
+		evaluatorCfg.RandomEntrySeed = *randomSeedFlag
+		evaluatorCfg.RandomEntryProb = *randomProbFlag
+	}
+	if *knockoutDeltaFlag {
+		evaluatorCfg.MinBounceZScore = -999.0
+		evaluatorCfg.MinBounceZScoreLong = -999.0
+		evaluatorCfg.MinBounceZScoreShort = -999.0
+	}
+	if *knockoutBTCFlag {
+		evaluatorCfg.BTCGateEnabled = false
+	}
+	if *knockoutRVOLFlag {
+		evaluatorCfg.MinSignalRVOL = 0.0
+		evaluatorCfg.MaxFrenzyRVOL = 999.0
+	}
+	if *knockoutNATRFlag {
+		evaluatorCfg.MinNATRPct = 0.0
+		evaluatorCfg.MaxNATRPct = 999.0
+	}
 
 	// Muat data tingkat pendanaan (funding rate) historis resmi Binance
 	fundingMgr := data.NewFundingManager(*cacheDirFlag)
@@ -249,10 +293,12 @@ func handleRunCommand(args []string) {
 	_ = fundingMgr.LoadFundingRates(ctx, symbols, from, to)
 
 	// Inisialisasi SimBroker pesimistis dengan fee & leverage dinamis dari environment
-	brokerCfg := buildSimBrokerConfig(*envFlag, *equityFlag)
-	if *compoundingFlag || isCompoundingConfigured(*envFlag) {
+	brokerCfg := buildSimBrokerConfig(*envFlag, initialEquity)
+	if *compoundingFlag || cfg.EquityModeCompounding {
 		brokerCfg.EquityModeCompounding = true
 		fmt.Printf("Mode Compounding AKTIF: Ukuran posisi dinamis mengikuti equity berjalan.\n")
+	} else {
+		fmt.Printf("Mode Compounding NON-AKTIF: Ukuran posisi flat berdasarkan modal awal $%.2f.\n", initialEquity)
 	}
 	if *unconstrainedFlag {
 		brokerCfg.MaxSlots = 1000
@@ -268,6 +314,10 @@ func handleRunCommand(args []string) {
 	if *todayFlag {
 		warmupBars = 288 // Seluruh 288 bar kemarin digunakan murni untuk warmup indikator
 	}
+	scannerInterval := 15 * time.Minute
+	if cfg.ScannerInterval > 0 {
+		scannerInterval = cfg.ScannerInterval
+	}
 	replayCfg := replay.ReplayConfig{
 		WarmupBars:            warmupBars,
 		SpreadPct:             evaluatorCfg.MaxSpreadPct,
@@ -275,7 +325,7 @@ func handleRunCommand(args []string) {
 		FundingMgr:            fundingMgr,
 		BenchmarkSym:          "BTCUSDT",
 		DynamicScannerEnabled: *scannerFlag,
-		ScannerInterval:       15 * time.Minute,
+		ScannerInterval:       scannerInterval,
 		ScannerCfg:            buildDefaultScannerConfig(*envFlag),
 		UnconstrainedMode:     *unconstrainedFlag,
 	}
@@ -291,7 +341,7 @@ func handleRunCommand(args []string) {
 	fmt.Printf("Simulasi selesai dalam %v!\n\n", elapsed)
 
 	// Hitung metrik performa statistik
-	summary := metrics.CalculateMetrics(sim.ClosedTrades, *equityFlag)
+	summary := metrics.CalculateMetrics(sim.ClosedTrades, initialEquity)
 
 	// Buat metadata laporan
 	metaFrom := from.Format("2006-01-02")
@@ -334,6 +384,71 @@ func handleRunCommand(args []string) {
 			fmt.Printf("Laporan berhasil disimpan ke: %s\n", *outFlag)
 		}
 	}
+
+	if *csvOutFlag != "" {
+		outDir := filepath.Dir(*csvOutFlag)
+		_ = os.MkdirAll(outDir, 0755)
+		f, err := os.Create(*csvOutFlag)
+		if err != nil {
+			slog.Error("Gagal membuat file output CSV", "path", *csvOutFlag, "err", err)
+		} else {
+			defer f.Close()
+			w := csv.NewWriter(f)
+			_ = w.Write([]string{
+				"ID", "Symbol", "Side", "EntryTime", "ExitTime", "EntryPrice", "ExitPrice",
+				"Qty", "InitialQty", "SLPrice", "TPPrice", "TP1Price", "GrossPnL", "NetPnL",
+				"FeeTotal", "FundingTotal", "ExitReason", "MAE", "MFE", "HoldingBars", "ATRAtEntry",
+			})
+			for _, tr := range sim.ClosedTrades {
+				_ = w.Write([]string{
+					tr.ID,
+					tr.Symbol,
+					string(tr.Side),
+					tr.EntryTime.Format("2006-01-02 15:04:05"),
+					tr.ExitTime.Format("2006-01-02 15:04:05"),
+					tr.EntryPrice.String(),
+					tr.ExitPrice.String(),
+					tr.Qty.String(),
+					tr.InitialQty.String(),
+					tr.SLPrice.String(),
+					tr.TPPrice.String(),
+					tr.TP1Price.String(),
+					tr.GrossPnL.String(),
+					tr.NetPnL.String(),
+					tr.FeeTotal.String(),
+					tr.FundingTotal.String(),
+					tr.ExitReason,
+					fmt.Sprintf("%.4f", tr.MAE),
+					fmt.Sprintf("%.4f", tr.MFE),
+					strconv.Itoa(tr.HoldingBars),
+					tr.ATRAtEntry.String(),
+				})
+			}
+			w.Flush()
+			fmt.Printf("Daftar trade berhasil disimpan ke: %s\n", *csvOutFlag)
+		}
+	}
+
+	if *jsonOutFlag != "" {
+		outDir := filepath.Dir(*jsonOutFlag)
+		_ = os.MkdirAll(outDir, 0755)
+		type jsonReport struct {
+			Summary       metrics.BacktestSummary     `json:"summary"`
+			RejectReasons map[string]int64            `json:"reject_reasons"`
+			Trades        []simbroker.SimTradeRecord `json:"trades"`
+		}
+		data, err := json.MarshalIndent(jsonReport{
+			Summary:       summary,
+			RejectReasons: engine.RejectReasons,
+			Trades:        sim.ClosedTrades,
+		}, "", "  ")
+		if err != nil {
+			slog.Error("Gagal serialize json report", "err", err)
+		} else {
+			_ = os.WriteFile(*jsonOutFlag, data, 0644)
+			fmt.Printf("Data JSON berhasil disimpan ke: %s\n", *jsonOutFlag)
+		}
+	}
 }
 
 func handleAblateCommand(args []string) {
@@ -345,9 +460,24 @@ func handleAblateCommand(args []string) {
 	scannerFlag := fs.Bool("scanner", true, "Enable dynamic rolling market scanner (default: true, use --scanner=false to disable)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
-	equityFlag := fs.Float64("equity", 125.0, "Initial Equity USDT (default 125.0)")
+	equityFlag := fs.Float64("equity", 0.0, "Initial Equity USDT (default from INITIAL_EQUITY in backtest.env, or 125.0)")
 	compoundingFlag := fs.Bool("compounding", false, "Aktifkan mode compounding equity")
+	unconstrainedFlag := fs.Bool("unconstrained", true, "Mode sinyal independen unconstrained (default: true)")
 	_ = fs.Parse(args)
+
+	cfg, err := loadConfigForBacktest(*envFlag)
+	if err != nil {
+		slog.Error("Gagal memuat konfigurasi backtest", "env", *envFlag, "err", err)
+		os.Exit(1)
+	}
+
+	initialEquity := 125.0
+	if cfg != nil && cfg.InitialEquity.GreaterThan(decimal.Zero) {
+		initialEquity = cfg.InitialEquity.InexactFloat64()
+	}
+	if *equityFlag > 0 {
+		initialEquity = *equityFlag
+	}
 
 	var from, to time.Time
 	if *pastMonthFlag {
@@ -361,11 +491,12 @@ func handleAblateCommand(args []string) {
 	downloader := data.NewDownloader(*cacheDirFlag)
 	ctx := context.Background()
 
+	scannerCfg := buildDefaultScannerConfig(*envFlag)
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
 	} else if *scannerFlag {
-		symbols, _ = data.DiscoverMarketSymbols(ctx, *cacheDirFlag, 25000000.0)
+		symbols, _ = data.DiscoverMarketSymbols(ctx, *cacheDirFlag, scannerCfg.MinVolume24hUSDT)
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
@@ -418,12 +549,21 @@ func handleAblateCommand(args []string) {
 	fmt.Printf("| %-38s | %-10s | %-12s | %-12s | %-14s |\n", "Eksperimen Filter", "Trades", "Win Rate", "Net PnL", "Expectancy/Tr")
 	fmt.Println("|:---------------------------------------|:-----------|:-------------|:-------------|:---------------|")
 
+	scannerInterval := 15 * time.Minute
+	if cfg != nil && cfg.ScannerInterval > 0 {
+		scannerInterval = cfg.ScannerInterval
+	}
+
 	for _, exp := range experiments {
 		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
 		exp.modifierFn(&evalCfg)
 
-		brokerCfg := buildSimBrokerConfig(*envFlag, *equityFlag)
-		if *compoundingFlag || isCompoundingConfigured(*envFlag) {
+		brokerCfg := buildSimBrokerConfig(*envFlag, initialEquity)
+		if *unconstrainedFlag {
+			brokerCfg.MaxSlots = 1000
+			brokerCfg.MaxDailyDrawdownPct = -1.0
+		}
+		if *compoundingFlag || (cfg != nil && cfg.EquityModeCompounding) {
 			brokerCfg.EquityModeCompounding = true
 		}
 		sim := simbroker.NewSimBroker(brokerCfg)
@@ -435,13 +575,14 @@ func handleAblateCommand(args []string) {
 			FundingMgr:            fundingMgr,
 			BenchmarkSym:          "BTCUSDT",
 			DynamicScannerEnabled: *scannerFlag,
-			ScannerInterval:       15 * time.Minute,
-			ScannerCfg:            buildDefaultScannerConfig(*envFlag),
+			ScannerInterval:       scannerInterval,
+			ScannerCfg:            scannerCfg,
+			UnconstrainedMode:     *unconstrainedFlag,
 		}
 		eng := replay.NewReplayEngine(replayCfg, evalCfg, sim, candleMap, filters)
 		_ = eng.Run(ctx)
 
-		summary := metrics.CalculateMetrics(sim.ClosedTrades, *equityFlag)
+		summary := metrics.CalculateMetrics(sim.ClosedTrades, initialEquity)
 		fmt.Printf("| %-38s | %-10d | %-10.2f%%  | $%-10.2f | $%-12.2f |\n",
 			exp.name, summary.TotalTrades, summary.WinRatePct, summary.TotalNetPnL, summary.ExpectancyUSDT)
 	}
@@ -544,9 +685,16 @@ func loadCandlesParallel(
 }
 
 func splitSymbols(s string) []string {
-	parts := strings.Split(s, ",")
-	res := make([]string, 0, len(parts))
-	for _, p := range parts {
+	if strings.HasSuffix(s, ".txt") || strings.HasSuffix(s, ".csv") {
+		if content, err := os.ReadFile(s); err == nil {
+			s = string(content)
+		}
+	}
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	res := make([]string, 0, len(fields))
+	for _, p := range fields {
 		c := strings.TrimSpace(p)
 		if c != "" {
 			res = append(res, c)
@@ -570,8 +718,12 @@ func loadConfigForBacktest(envPath string) (*config.Config, error) {
 func buildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerConfig {
 	cfg, err := loadConfigForBacktest(envPath)
 	if err != nil || cfg == nil {
+		eqDec := decimal.NewFromFloat(125.0)
+		if equity > 0 {
+			eqDec = decimal.NewFromFloat(equity)
+		}
 		return simbroker.SimBrokerConfig{
-			InitialEquityUSDT:       decimal.NewFromFloat(equity),
+			InitialEquityUSDT:       eqDec,
 			MaxSlots:                3,
 			MaxDailyDrawdownPct:     -0.05,
 			AccountLeverage:         8.0,
@@ -585,12 +737,22 @@ func buildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 			PartialTPEnabled:        true,
 			PartialTP1Ratio:         0.50,
 			PartialTP1ATRMult:       1.00,
+			Tier1BEEnabled:          true,
+			Tier2ProfitLockATR:      1.55,
+			Tier2ProfitLockOffsetATR: 0.75,
 			TrailingEnabled:         true,
 			TrailingActivateATR:     1.10,
 			TrailingDistanceATR:     0.55,
 			MaxHoldingDuration:      4 * time.Hour,
 			EquityModeCompounding:   false,
 		}
+	}
+
+	eqDec := decimal.NewFromFloat(125.0)
+	if equity > 0 {
+		eqDec = decimal.NewFromFloat(equity)
+	} else if cfg.InitialEquity.GreaterThan(decimal.Zero) {
+		eqDec = cfg.InitialEquity
 	}
 
 	maxDD := cfg.MaxDailyDrawdown
@@ -619,27 +781,44 @@ func buildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 		maxHold = cfg.MaxHoldingDuration
 	}
 
+	sigDelay := 1
+	if s := os.Getenv("SIGNAL_DELAY_BARS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+			sigDelay = v
+		}
+	}
+	penTicks := 1
+	if s := os.Getenv("PENETRATION_TICKS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
+			penTicks = v
+		}
+	}
+
 	return simbroker.SimBrokerConfig{
-		InitialEquityUSDT:       decimal.NewFromFloat(equity),
+		InitialEquityUSDT:       eqDec,
 		MaxSlots:                cfg.MaxSlots,
 		MaxDailyDrawdownPct:     maxDD,
 		AccountLeverage:         cfg.Leverage,
 		MakerFeeRate:            cfg.MakerFeeRate,
 		TakerFeeRate:            cfg.TakerFeeRate,
 		SlippageRate:            cfg.SlippageRate,
-		SignalDelayBars:         1,
+		SignalDelayBars:         sigDelay,
 		LimitTimeoutBars:        1,
-		PenetrationTicks:        1,
+		PenetrationTicks:        penTicks,
 		IntrabarConflictSLFirst: true,
 		PartialTPEnabled:        cfg.PartialTPEnabled,
 		PartialTP1Ratio:         pRatio,
 		PartialTP1ATRMult:       tp1Mult,
+		Tier1BEEnabled:          cfg.Tier1BEEnabled,
+		Tier2ProfitLockEnabled:  cfg.Tier2ProfitLockEnabled,
+		Tier2ProfitLockATR:      cfg.Tier2ProfitLockATR,
+		Tier2ProfitLockOffsetATR: cfg.Tier2ProfitLockOffsetATR,
 		RunnerBECushionATR:      cfg.RunnerBECushionATR,
 		TrailingEnabled:         cfg.TrailingEnabled,
 		TrailingActivateATR:     trailAct,
 		TrailingDistanceATR:     trailDist,
 		MaxHoldingDuration:      maxHold,
-		EquityModeCompounding:   false,
+		EquityModeCompounding:   cfg.EquityModeCompounding,
 	}
 }
 
@@ -702,7 +881,22 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 		maxDD = -0.05
 	}
 
+	var randomSeed int64
+	if seedStr := os.Getenv("RANDOM_ENTRY_SEED"); seedStr != "" {
+		if s, err := strconv.ParseInt(seedStr, 10, 64); err == nil {
+			randomSeed = s
+		}
+	}
+	var randomProb float64
+	if probStr := os.Getenv("RANDOM_ENTRY_PROB"); probStr != "" {
+		if p, err := strconv.ParseFloat(probStr, 64); err == nil {
+			randomProb = p
+		}
+	}
+
 	return strategy.EvaluatorConfig{
+		RandomEntrySeed:          randomSeed,
+		RandomEntryProb:          randomProb,
 		MaxDailyDrawdownPct:      maxDD,
 		MaxSlots:                 cfg.MaxSlots,
 		MaxBookStaleness:         cfg.MaxBookStaleness,
@@ -767,10 +961,17 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 func buildDefaultScannerConfig(envPath string) scanner.ScannerConfig {
 	cfg, err := loadConfigForBacktest(envPath)
 	if err == nil && cfg != nil {
+		minRVOL := cfg.MinRVOL
+		if minRVOL <= 0 {
+			minRVOL = cfg.MinSignalRVOL
+		}
+		if minRVOL <= 0 {
+			minRVOL = 1.80
+		}
 		return scanner.ScannerConfig{
 			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
 			MaxSpreadPct:          cfg.MaxSpreadPct,
-			MinRVOL:               1.80,
+			MinRVOL:               minRVOL,
 			MinFallbackRVOL:       cfg.MinFallbackRVOL,
 			RVOLLookback:          20,
 			MinNATRPct:            cfg.MinNATRPct,

@@ -258,6 +258,7 @@ func main() {
 			Tier1BEEnabled:           cfg.Tier1BEEnabled,
 			Tier1BETriggerLongATR:    cfg.Tier1BETriggerLongATR,
 			Tier1BETriggerShortATR:   cfg.Tier1BETriggerShortATR,
+			Tier2ProfitLockEnabled:   cfg.Tier2ProfitLockEnabled,
 			Tier2ProfitLockATR:       cfg.Tier2ProfitLockATR,
 			Tier2ProfitLockOffsetATR: cfg.Tier2ProfitLockOffsetATR,
 			PartialTPEnabled:         cfg.PartialTPEnabled,
@@ -390,6 +391,7 @@ func main() {
 			Tier1BEEnabled:           cfg.Tier1BEEnabled,
 			Tier1BETriggerLongATR:    cfg.Tier1BETriggerLongATR,
 			Tier1BETriggerShortATR:   cfg.Tier1BETriggerShortATR,
+			Tier2ProfitLockEnabled:   cfg.Tier2ProfitLockEnabled,
 			Tier2ProfitLockATR:       cfg.Tier2ProfitLockATR,
 			Tier2ProfitLockOffsetATR: cfg.Tier2ProfitLockOffsetATR,
 			PartialTPEnabled:         cfg.PartialTPEnabled,
@@ -1138,32 +1140,12 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	// Pertahankan simbol yang sedang memiliki posisi terbuka atau order aktif agar stream feed tidak putus
 	finalWatched := make([]string, 0, len(selected)+3)
 	finalWatched = append(finalWatched, selected...)
-	if e.dryRunBroker != nil {
-		e.dryRunBroker.Mu.Lock()
-		for sym := range e.dryRunBroker.OpenPositions {
+	if e.broker != nil {
+		for _, sym := range e.broker.GetMonitoredSymbols() {
 			if !slices.Contains(finalWatched, sym) {
 				finalWatched = append(finalWatched, sym)
 			}
 		}
-		for sym := range e.dryRunBroker.PendingOrders {
-			if !slices.Contains(finalWatched, sym) {
-				finalWatched = append(finalWatched, sym)
-			}
-		}
-		e.dryRunBroker.Mu.Unlock()
-	} else if e.liveBroker != nil {
-		e.liveBroker.Mu.Lock()
-		for sym := range e.liveBroker.ActivePositions {
-			if !slices.Contains(finalWatched, sym) {
-				finalWatched = append(finalWatched, sym)
-			}
-		}
-		for _, ord := range e.liveBroker.OrdersByClient {
-			if ord.IsEntry && (ord.Status == model.StatusNew || ord.Status == model.StatusPendingNew) && !slices.Contains(finalWatched, ord.Symbol) {
-				finalWatched = append(finalWatched, ord.Symbol)
-			}
-		}
-		e.liveBroker.Mu.Unlock()
 	}
 
 	if len(finalWatched) > 0 {

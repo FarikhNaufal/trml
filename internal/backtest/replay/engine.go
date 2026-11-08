@@ -116,6 +116,13 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 	rollingCandles := make(map[string][]model.Candle)
 	rollingDeltas := make(map[string][]float64)
 
+	// Urutkan simbol secara leksikografis untuk determinisme 100%
+	sortedSymbols := make([]string, 0, len(r.candleMap))
+	for sym := range r.candleMap {
+		sortedSymbols = append(sortedSymbols, sym)
+	}
+	sort.Strings(sortedSymbols)
+
 	var lastScanTime time.Time
 	watchedSymbols := make(map[string]bool)
 
@@ -134,7 +141,8 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 		// A. Update SimBroker pada setiap candle aktif di timestamp ini
 		// dan tambahkan ke rolling buffers
-		for sym, candles := range r.candleMap {
+		for _, sym := range sortedSymbols {
+			candles := r.candleMap[sym]
 			idx := candleIndices[sym]
 			if idx < len(candles) && candles[idx].CloseTime.Equal(simTime) {
 				c := candles[idx]
@@ -214,8 +222,9 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			bookMap := make(map[string]model.BookQuote, len(rollingCandles))
 			activeStates := make(map[string]*model.SymbolState)
 
-			for sym, cList := range rollingCandles {
-				if len(cList) == 0 {
+			for _, sym := range sortedSymbols {
+				cList, ok := rollingCandles[sym]
+				if !ok || len(cList) == 0 {
 					continue
 				}
 				startIdx := len(cList) - 288
@@ -276,7 +285,11 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			availBal = decimal.NewFromFloat(1000000.0)
 		}
 
-		for sym, cList := range rollingCandles {
+		for _, sym := range sortedSymbols {
+			cList, ok := rollingCandles[sym]
+			if !ok {
+				continue
+			}
 			// Lewati benchmark symbol jika bukan target trading
 			if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
 				continue
@@ -353,8 +366,9 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			if approved {
 				r.SignalsApproved++
 				_, _ = r.broker.SubmitLimitEntry(intent)
-				// Perbarui active slot count seketika agar tidak overflow
+				// Perbarui active slot count dan available balance seketika agar tidak overflow
 				activeSlots = r.broker.GetActiveSlotCount()
+				availBal = r.broker.GetAvailableBalanceUSDT()
 			} else {
 				r.SignalsRejected++
 				r.RejectReasons[reason]++

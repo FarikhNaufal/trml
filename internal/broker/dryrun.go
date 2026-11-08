@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -51,6 +53,7 @@ type DryRunConfig struct {
 	Tier1BEEnabled           bool
 	Tier1BETriggerLongATR    float64
 	Tier1BETriggerShortATR   float64
+	Tier2ProfitLockEnabled   bool
 	Tier2ProfitLockATR       float64
 	Tier2ProfitLockOffsetATR float64
 	PartialTPEnabled         bool
@@ -571,60 +574,6 @@ func (d *DryRunBroker) OnRealtimeTick(
 					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.TakerFeeRate, beOffsetRate)
 				}
 			}
-
-			trailActivateDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailActivateATR))
-			trailDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailDistATR))
-			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1LongTriggerATR))
-			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
-			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
-
-			// Tier 3: Trailing Stop untuk Runner (aktif jika TP1 tercapai saat PartialTPEnabled, atau langsung jika PartialTP disabled)
-			canTrail := d.Cfg.TrailingEnabled && pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(trailActivateDist)
-			if d.Cfg.PartialTPEnabled {
-				canTrail = canTrail && pos.IsTP1Hit
-			}
-			if canTrail {
-				newSL := pos.PeakPrice.Sub(trailDist)
-				if newSL.GreaterThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.IsBreakEvenMoved = true
-					pos.ProtectionTier = 3
-					d.enqueuePositionEvent(PositionEvent{
-						Type: PositionEventSave,
-						Pos:  *pos,
-					})
-					slog.Info("dryrun: Trailing Stop updated for runner",
-						"symbol", symbol, "peakPrice", pos.PeakPrice, "newSL", newSL, "triggerPrice", triggerRefPrice)
-				}
-			} else if pos.ProtectionTier < 2 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t2TriggerDist) {
-				// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry + 0.90x ATR)
-				newSL := pos.EntryPrice.Add(t2OffsetDist)
-				if newSL.GreaterThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.IsBreakEvenMoved = true
-					pos.ProtectionTier = 2
-					d.enqueuePositionEvent(PositionEvent{
-						Type: PositionEventSave,
-						Pos:  *pos,
-					})
-					slog.Info("dryrun: Tier 2 Profit Lock activated",
-						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
-				}
-			} else if d.Cfg.Tier1BEEnabled && pos.ProtectionTier < 1 && triggerRefPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(t1TriggerDist) {
-				// Tier 1: Rem Dini / Early BE Shield (+0.70x ATR MFE -> Pindahkan SL ke Entry + Fee Buffer)
-				newSL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
-				if newSL.GreaterThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.IsBreakEvenMoved = true
-					pos.ProtectionTier = 1
-					d.enqueuePositionEvent(PositionEvent{
-						Type: PositionEventSave,
-						Pos:  *pos,
-					})
-					slog.Info("dryrun: Tier 1 Break-Even activated",
-						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
-				}
-			}
 		} else {
 			isTPHit := triggerRefPrice.LessThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
@@ -657,60 +606,27 @@ func (d *DryRunBroker) OnRealtimeTick(
 					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.TakerFeeRate, beOffsetRate)
 				}
 			}
+		}
 
-			trailActivateDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailActivateATR))
-			trailDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(trailDistATR))
-			t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1ShortTriggerATR))
-			t2TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2TriggerATR))
-			t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2OffsetATR))
-
-			// Tier 3: Trailing Stop untuk Runner (aktif jika TP1 tercapai saat PartialTPEnabled, atau langsung jika PartialTP disabled)
-			canTrail := d.Cfg.TrailingEnabled && pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(trailActivateDist)
-			if d.Cfg.PartialTPEnabled {
-				canTrail = canTrail && pos.IsTP1Hit
+		// Unified Position Protection Engine (Tier 1 Early BE, Tier 2 Profit Lock, Tier 3 Trailing Ratchet)
+		var tickSize decimal.Decimal
+		if d.GetExchangeFilterFn != nil {
+			if f, ok := d.GetExchangeFilterFn(symbol); ok {
+				tickSize = f.TickSize
 			}
-			if canTrail {
-				newSL := pos.PeakPrice.Add(trailDist)
-				if newSL.LessThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.IsBreakEvenMoved = true
-					pos.ProtectionTier = 3
-					d.enqueuePositionEvent(PositionEvent{
-						Type: PositionEventSave,
-						Pos:  *pos,
-					})
-					slog.Info("dryrun: Trailing Stop updated for runner",
-						"symbol", symbol, "peakPrice", pos.PeakPrice, "newSL", newSL, "triggerPrice", triggerRefPrice)
-				}
-			} else if pos.ProtectionTier < 2 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t2TriggerDist) {
-				// Tier 2: Runner Profit Lock (+1.80x ATR MFE -> Kunci SL ke Entry - 0.90x ATR)
-				newSL := pos.EntryPrice.Sub(t2OffsetDist)
-				if newSL.LessThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.IsBreakEvenMoved = true
-					pos.ProtectionTier = 2
-					d.enqueuePositionEvent(PositionEvent{
-						Type: PositionEventSave,
-						Pos:  *pos,
-					})
-					slog.Info("dryrun: Tier 2 Profit Lock activated",
-						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
-				}
-			} else if d.Cfg.Tier1BEEnabled && pos.ProtectionTier < 1 && pos.EntryPrice.Sub(triggerRefPrice).GreaterThanOrEqual(t1TriggerDist) {
-				// Tier 1: Rem Dini / Early BE Shield (+0.90x ATR MFE -> Pindahkan SL ke Entry - Fee Buffer)
-				newSL := pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
-				if newSL.LessThan(pos.CurrentSLPrice) {
-					pos.CurrentSLPrice = newSL
-					pos.IsBreakEvenMoved = true
-					pos.ProtectionTier = 1
-					d.enqueuePositionEvent(PositionEvent{
-						Type: PositionEventSave,
-						Pos:  *pos,
-					})
-					slog.Info("dryrun: Tier 1 Break-Even activated",
-						"symbol", symbol, "newSL", newSL, "triggerPrice", triggerRefPrice, "entryPrice", pos.EntryPrice)
-				}
-			}
+		}
+		protDec := protection.EvaluatePositionProtection(pos.toSnapshot(tickSize), triggerRefPrice, d.toProtectionConfig())
+		if protDec.ShouldUpdate {
+			pos.CurrentSLPrice = protDec.NewSLPrice
+			pos.IsBreakEvenMoved = true
+			pos.ProtectionTier = int(protDec.NewTier)
+			d.enqueuePositionEvent(PositionEvent{
+				Type: PositionEventSave,
+				Pos:  *pos,
+			})
+			slog.Info("dryrun: protection updated",
+				"symbol", symbol, "tier", protDec.NewTier, "reason", protDec.TriggerReason,
+				"newSL", protDec.NewSLPrice, "peakPrice", pos.PeakPrice, "triggerPrice", triggerRefPrice)
 		}
 	}
 }
@@ -808,15 +724,18 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		// Ukuran posisi terlalu kecil untuk dipecah (atau MinNotional < 5 USDT).
 		// Anggap TP1 milestone tercapai: tandai IsTP1Hit, geser SL ke BE, biarkan 100% posisi berjalan sebagai runner.
 		pos.IsTP1Hit = true
-
-		var newSL decimal.Decimal
+		var tickSize decimal.Decimal
+		if d.GetExchangeFilterFn != nil {
+			if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok {
+				tickSize = f.TickSize
+			}
+		}
+		newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(tickSize), d.toProtectionConfig())
 		if pos.Side == model.SideLong {
-			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
 			if newSL.GreaterThan(pos.CurrentSLPrice) {
 				pos.CurrentSLPrice = newSL
 			}
 		} else {
-			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
 			if newSL.LessThan(pos.CurrentSLPrice) {
 				pos.CurrentSLPrice = newSL
 			}
@@ -854,38 +773,21 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 	pos.Qty = pos.Qty.Sub(closeQty)
 	pos.IsTP1Hit = true
 
-	// Pindahkan SL ke Break-Even (dengan Runner Cushion jika dikonfigurasi)
-	var newSL decimal.Decimal
-	if d.Cfg.RunnerBECushionATR > 0 && pos.ATRAtEntry.GreaterThan(decimal.Zero) {
-		cushionDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(d.Cfg.RunnerBECushionATR))
-		if pos.Side == model.SideLong {
-			newSL = pos.EntryPrice.Sub(cushionDist)
-			if pos.InitialSLPrice.GreaterThan(decimal.Zero) && newSL.LessThan(pos.InitialSLPrice) {
-				newSL = pos.InitialSLPrice
-			}
-			if newSL.GreaterThan(pos.CurrentSLPrice) {
-				pos.CurrentSLPrice = newSL
-			}
-		} else {
-			newSL = pos.EntryPrice.Add(cushionDist)
-			if pos.InitialSLPrice.GreaterThan(decimal.Zero) && newSL.GreaterThan(pos.InitialSLPrice) {
-				newSL = pos.InitialSLPrice
-			}
-			if newSL.LessThan(pos.CurrentSLPrice) {
-				pos.CurrentSLPrice = newSL
-			}
+	// Pindahkan SL ke Break-Even via Unified Protection Engine
+	var tickSize decimal.Decimal
+	if d.GetExchangeFilterFn != nil {
+		if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok {
+			tickSize = f.TickSize
+		}
+	}
+	newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(tickSize), d.toProtectionConfig())
+	if pos.Side == model.SideLong {
+		if newSL.GreaterThan(pos.CurrentSLPrice) {
+			pos.CurrentSLPrice = newSL
 		}
 	} else {
-		if pos.Side == model.SideLong {
-			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
-			if newSL.GreaterThan(pos.CurrentSLPrice) {
-				pos.CurrentSLPrice = newSL
-			}
-		} else {
-			newSL = pos.EntryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
-			if newSL.LessThan(pos.CurrentSLPrice) {
-				pos.CurrentSLPrice = newSL
-			}
+		if newSL.LessThan(pos.CurrentSLPrice) {
+			pos.CurrentSLPrice = newSL
 		}
 	}
 	pos.IsBreakEvenMoved = true
@@ -1100,6 +1002,21 @@ func (d *DryRunBroker) HasActiveOrderOrPosition(symbol string) bool {
 	return hasOrd || hasPos
 }
 
+func (d *DryRunBroker) GetMonitoredSymbols() []string {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	syms := make([]string, 0, len(d.OpenPositions)+len(d.PendingOrders))
+	for sym := range d.OpenPositions {
+		syms = append(syms, sym)
+	}
+	for sym := range d.PendingOrders {
+		if !slices.Contains(syms, sym) {
+			syms = append(syms, sym)
+		}
+	}
+	return syms
+}
+
 func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
@@ -1201,4 +1118,46 @@ func (d *DryRunBroker) GetActivePositions() []ActivePositionDTO {
 		return result[i].Symbol < result[j].Symbol
 	})
 	return result
+}
+
+func (d *DryRunBroker) toProtectionConfig() protection.ProtectionConfig {
+	t1Long := d.Cfg.Tier1BETriggerLongATR
+	if t1Long <= 0 {
+		t1Long = d.Cfg.BreakEvenTriggerATR
+	}
+	t1Short := d.Cfg.Tier1BETriggerShortATR
+	if t1Short <= 0 {
+		t1Short = d.Cfg.BreakEvenTriggerATR
+	}
+	return protection.ProtectionConfig{
+		Tier1BEEnabled:           d.Cfg.Tier1BEEnabled,
+		Tier1BETriggerLongATR:    t1Long,
+		Tier1BETriggerShortATR:   t1Short,
+		Tier2ProfitLockEnabled:   d.Cfg.Tier2ProfitLockEnabled,
+		Tier2ProfitLockATR:       d.Cfg.Tier2ProfitLockATR,
+		Tier2ProfitLockOffsetATR: d.Cfg.Tier2ProfitLockOffsetATR,
+		TrailingEnabled:          d.Cfg.TrailingEnabled,
+		TrailingActivateATR:      d.Cfg.TrailingActivateATR,
+		TrailingDistanceATR:      d.Cfg.TrailingDistanceATR,
+		PartialTPEnabled:         d.Cfg.PartialTPEnabled,
+		MinBreakEvenOffsetPct:    d.Cfg.MinBreakEvenOffsetPct,
+		RunnerBECushionATR:       d.Cfg.RunnerBECushionATR,
+		TakerFeeRate:             decimal.NewFromFloat(d.Cfg.TakerFeeRate),
+		SlippageRate:             decimal.NewFromFloat(d.Cfg.SlippageRate),
+	}
+}
+
+func (pos *VirtualOpenPosition) toSnapshot(tickSize decimal.Decimal) protection.PositionSnapshot {
+	return protection.PositionSnapshot{
+		Symbol:         pos.Symbol,
+		Side:           pos.Side,
+		EntryPrice:     pos.EntryPrice,
+		CurrentSLPrice: pos.CurrentSLPrice,
+		InitialSLPrice: pos.InitialSLPrice,
+		PeakPrice:      pos.PeakPrice,
+		ATRAtEntry:     pos.ATRAtEntry,
+		ProtectionTier: protection.ProtectionTier(pos.ProtectionTier),
+		IsTP1Hit:       pos.IsTP1Hit,
+		TickSize:       tickSize,
+	}
 }

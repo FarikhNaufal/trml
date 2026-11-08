@@ -45,13 +45,14 @@ type Config struct {
 	SlippageRate decimal.Decimal
 
 	// Parameter Risiko Terkunci
-	InitialEquity      decimal.Decimal
-	RiskPerTradePct    decimal.Decimal
-	MaxDailyDrawdown   float64
-	MaxSlots           int
-	MaxSlotMarginFrac  decimal.Decimal
-	MaxMarginAvailFrac decimal.Decimal
-	Leverage           float64
+	InitialEquity         decimal.Decimal
+	RiskPerTradePct       decimal.Decimal
+	MaxDailyDrawdown      float64
+	MaxSlots              int
+	MaxSlotMarginFrac     decimal.Decimal
+	MaxMarginAvailFrac    decimal.Decimal
+	Leverage              float64
+	EquityModeCompounding bool
 
 	// Parameter Scanner
 	MinVolume24hUSDT      float64
@@ -61,6 +62,7 @@ type Config struct {
 	MaxNATRPct            float64
 	MaxScannerVWAPDistATR float64
 	MaxWatchedCoins       int
+	MinRVOL               float64
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
 	PullbackToleranceATR     float64
@@ -80,6 +82,7 @@ type Config struct {
 	Tier1BEEnabled           bool
 	Tier1BETriggerLongATR    float64
 	Tier1BETriggerShortATR   float64
+	Tier2ProfitLockEnabled   bool
 	Tier2ProfitLockATR       float64
 	Tier2ProfitLockOffsetATR float64
 	MinBounceZScoreLong      float64
@@ -128,8 +131,8 @@ type Config struct {
 	AIRateLimitRPM   int
 }
 
-// loadDotEnv membaca file .env secara otomatis ke environment variable proses
-func loadDotEnv(filepath string) {
+// loadDotEnvWithOverwrite membaca file .env secara otomatis ke environment variable proses.
+func loadDotEnvWithOverwrite(filepath string, overwrite bool) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return
@@ -160,10 +163,14 @@ func loadDotEnv(filepath string) {
 			val = strings.Trim(val, `"'`+"`")
 		}
 
-		if os.Getenv(key) == "" {
+		if overwrite || os.Getenv(key) == "" {
 			_ = os.Setenv(key, val)
 		}
 	}
+}
+
+func loadDotEnv(filepath string) {
+	loadDotEnvWithOverwrite(filepath, false)
 }
 
 func LoadConfig() (*Config, error) {
@@ -172,7 +179,11 @@ func LoadConfig() (*Config, error) {
 
 func LoadConfigFile(envPath string) (*Config, error) {
 	if envPath != "" {
-		loadDotEnv(envPath)
+		if envPath == ".env" {
+			loadDotEnv(envPath)
+		} else {
+			loadDotEnvWithOverwrite(envPath, true)
+		}
 	}
 
 	envStr := strings.ToLower(getEnv("BINANCE_ENV", "testnet"))
@@ -234,11 +245,13 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid SLIPPAGE_RATE '%s' (must be between 0.0 and 0.05)", getEnv("SLIPPAGE_RATE", "0.0002"))
 	}
 
-	initEqStr := getEnv("INITIAL_EQUITY", "1000.0")
+	initEqStr := getEnv("INITIAL_EQUITY", "125.0")
 	initEq, err := decimal.NewFromString(initEqStr)
 	if err != nil || initEq.LessThanOrEqual(decimal.Zero) {
-		initEq = decimal.NewFromFloat(1000.0)
+		initEq = decimal.NewFromFloat(125.0)
 	}
+
+	compounding := parseBoolEnv(getEnv("EQUITY_MODE_COMPOUNDING", "false"))
 
 	riskPct, err := decimal.NewFromString(getEnv("RISK_PER_TRADE_PCT", "0.01"))
 	if err != nil || riskPct.LessThanOrEqual(decimal.Zero) || riskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
@@ -459,6 +472,8 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		t1BETriggerShort = beTrigger
 	}
 
+	tier2ProfitLockEnabled := parseBoolEnv(getEnv("TIER2_PROFIT_LOCK_ENABLED", "false"))
+
 	t2ProfitLockStr := getEnv("TIER2_PROFIT_LOCK_ATR", "1.80")
 	t2ProfitLock, err := parseFloatEnv(t2ProfitLockStr)
 	if err != nil || t2ProfitLock <= 0.1 || t2ProfitLock > 10.0 {
@@ -613,6 +628,21 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		vwapWarmupMins = 30
 	}
 
+	minRVOLStr := getEnv("MIN_RVOL", getEnv("SCANNER_MIN_RVOL", "1.80"))
+	minRVOL, err := parseFloatEnv(minRVOLStr)
+	if err != nil || minRVOL <= 0 {
+		minRVOL = 1.80
+	}
+
+	scannerInterval := 15 * time.Minute
+	if sIntStr := getEnv("SCANNER_INTERVAL_MINUTES", getEnv("SCANNER_INTERVAL", "")); sIntStr != "" {
+		if sIntMins, err := strconv.Atoi(sIntStr); err == nil && sIntMins > 0 {
+			scannerInterval = time.Duration(sIntMins) * time.Minute
+		} else if dur, err := time.ParseDuration(sIntStr); err == nil && dur > 0 {
+			scannerInterval = dur
+		}
+	}
+
 	return &Config{
 		Env:                      env,
 		APIKey:                   apiKey,
@@ -637,8 +667,10 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MaxSlotMarginFrac:        marginFrac,
 		MaxMarginAvailFrac:       availMarginFrac,
 		Leverage:                 lev,
+		EquityModeCompounding:    compounding,
 		MinVolume24hUSDT:         minVol,
 		MinFallbackRVOL:          minFallbackRVOL,
+		MinRVOL:                  minRVOL,
 		MaxSpreadPct:             maxSpread,
 		MinNATRPct:               minNATR,
 		MaxNATRPct:               maxNATR,
@@ -663,6 +695,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		Tier1BEEnabled:           tier1BEEnabled,
 		Tier1BETriggerLongATR:    t1BETriggerLong,
 		Tier1BETriggerShortATR:   t1BETriggerShort,
+		Tier2ProfitLockEnabled:   tier2ProfitLockEnabled,
 		Tier2ProfitLockATR:       t2ProfitLock,
 		Tier2ProfitLockOffsetATR: t2Offset,
 		MinSLDistancePct:         minSLDistPct,
@@ -687,7 +720,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		CooldownProfitMinutes:    cooldownProfitMins,
 		VWAPSessionWarmupMinutes: vwapWarmupMins,
 
-		ScannerInterval:      15 * time.Minute,
+		ScannerInterval:      scannerInterval,
 		MaxBookStaleness:     5 * time.Second,
 		MaxMarkStaleness:     15 * time.Second,
 		MaxDataStaleness:     330 * time.Second,

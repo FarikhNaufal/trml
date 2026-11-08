@@ -25,6 +25,9 @@ type SimBrokerConfig struct {
 	Tier1BEEnabled          bool            // default true
 	MinBreakEvenOffsetPct   float64         // default 0.0010
 	RunnerBECushionATR      float64         // default 0.0
+	Tier2ProfitLockEnabled  bool            // default false
+	Tier2ProfitLockATR      float64         // default 1.55 (atau 1.80)
+	Tier2ProfitLockOffsetATR float64        // default 0.75 (atau 0.90)
 	TrailingEnabled         bool            // default true
 	TrailingActivateATR     float64         // default 1.10
 	TrailingDistanceATR     float64         // default 0.55

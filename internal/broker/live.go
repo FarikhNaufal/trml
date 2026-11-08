@@ -4,13 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -24,6 +25,7 @@ type LiveBrokerConfig struct {
 	Tier1BEEnabled           bool
 	Tier1BETriggerLongATR    float64
 	Tier1BETriggerShortATR   float64
+	Tier2ProfitLockEnabled   bool
 	Tier2ProfitLockATR       float64
 	Tier2ProfitLockOffsetATR float64
 	PartialTPEnabled         bool
@@ -1677,23 +1679,29 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				slog.Info("live: position notional too small for partial TP1 split (< 5 USDT); moving SL to BE and letting 100% position run as runner",
 					"symbol", symbol, "qty", qty, "tp1Price", tp1Price)
 
-				// Pindahkan SL ke Break-Even (Tier 1) untuk 100% posisi
-				beOffset := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))
-				var beSL decimal.Decimal
-				if side == model.SideLong {
-					beSL = entryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffset))
-				} else {
-					beSL = entryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffset))
-				}
+				// Pindahkan SL ke Break-Even (Tier 1) untuk 100% posisi via Unified Protection Engine
+				var tickSize decimal.Decimal
 				if b.GetExchangeFilterFn != nil {
 					if f, ok := b.GetExchangeFilterFn(symbol); ok && f.TickSize.GreaterThan(decimal.Zero) {
-						if qSL, err := model.QuantizePrice(beSL, f.TickSize, side == model.SideShort); err == nil {
-							beSL = qSL
-						}
+						tickSize = f.TickSize
 					}
 				}
-
 				prot, ok := b.Protections[symbol]
+				var currentSL decimal.Decimal
+				if ok {
+					currentSL = prot.SLPrice
+				}
+				snap := protection.PositionSnapshot{
+					Symbol:         symbol,
+					Side:           side,
+					EntryPrice:     entryPrice,
+					CurrentSLPrice: currentSL,
+					InitialSLPrice: b.InitialSLPrices[symbol],
+					ATRAtEntry:     b.ATRAtEntry[symbol],
+					TickSize:       tickSize,
+				}
+				beSL := protection.CalculateBreakEvenSL(snap, b.toProtectionConfig())
+
 				var oldSLID int64
 				var oldClientSLID string
 				var gen uint64 = 1
@@ -1865,49 +1873,27 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 					}
 					b.ActivePositions[sym] = remQty
 
-					// Pindahkan SL ke Break-Even (dengan Runner Cushion jika dikonfigurasi)
-					beOffset := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))
-					var beSL decimal.Decimal
-					atr := b.ATRAtEntry[sym]
-					if b.Cfg.RunnerBECushionATR > 0 && atr.GreaterThan(decimal.Zero) {
-						cushionDist := atr.Mul(decimal.NewFromFloat(b.Cfg.RunnerBECushionATR))
-						initSL := b.InitialSLPrices[sym]
-						if pSide == model.SideLong {
-							beSL = ePrice.Sub(cushionDist)
-							if initSL.GreaterThan(decimal.Zero) && beSL.LessThan(initSL) {
-								beSL = initSL
-							}
-						} else {
-							beSL = ePrice.Add(cushionDist)
-							if initSL.GreaterThan(decimal.Zero) && beSL.GreaterThan(initSL) {
-								beSL = initSL
-							}
-						}
-					} else {
-						if pSide == model.SideLong {
-							beSL = ePrice.Mul(decimal.NewFromFloat(1.0).Add(beOffset))
-						} else {
-							beSL = ePrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffset))
-						}
-					}
-
-					// Defensive Ratchet Guard: Pastikan beSL tidak pernah melompat mundur dibandingkan SL aktif saat ini
-					if prot, ok := b.Protections[sym]; ok && prot.SLPrice.GreaterThan(decimal.Zero) {
-						if pSide == model.SideLong && beSL.LessThan(prot.SLPrice) {
-							beSL = prot.SLPrice
-						} else if pSide == model.SideShort && beSL.GreaterThan(prot.SLPrice) {
-							beSL = prot.SLPrice
-						}
-					}
-
-					// Kuantisasi beSL
+					// Pindahkan SL ke Break-Even via Unified Protection Engine
+					var tickSize decimal.Decimal
 					if b.GetExchangeFilterFn != nil {
 						if f, ok := b.GetExchangeFilterFn(sym); ok && f.TickSize.GreaterThan(decimal.Zero) {
-							if qSL, err := model.QuantizePrice(beSL, f.TickSize, pSide == model.SideShort); err == nil {
-								beSL = qSL
-							}
+							tickSize = f.TickSize
 						}
 					}
+					var currentSL decimal.Decimal
+					if prot, ok := b.Protections[sym]; ok {
+						currentSL = prot.SLPrice
+					}
+					snap := protection.PositionSnapshot{
+						Symbol:         sym,
+						Side:           pSide,
+						EntryPrice:     ePrice,
+						CurrentSLPrice: currentSL,
+						InitialSLPrice: b.InitialSLPrices[sym],
+						ATRAtEntry:     b.ATRAtEntry[sym],
+						TickSize:       tickSize,
+					}
+					beSL := protection.CalculateBreakEvenSL(snap, b.toProtectionConfig())
 
 					prot, ok := b.Protections[sym]
 					var oldSLID int64
@@ -2040,33 +2026,6 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 	// Proteksi Dinamis Tier 1, Tier 2, & Tier 3 Trailing Stop untuk Live Trading
 	atr := b.ATRAtEntry[symbol]
 	if atr.GreaterThan(decimal.Zero) {
-		t1LongTriggerATR := b.Cfg.Tier1BETriggerLongATR
-		if t1LongTriggerATR <= 0 {
-			t1LongTriggerATR = b.Cfg.BreakEvenTriggerATR
-		}
-		if t1LongTriggerATR <= 0 {
-			t1LongTriggerATR = 0.70
-		}
-
-		t1ShortTriggerATR := b.Cfg.Tier1BETriggerShortATR
-		if t1ShortTriggerATR <= 0 {
-			t1ShortTriggerATR = b.Cfg.BreakEvenTriggerATR
-		}
-		if t1ShortTriggerATR <= 0 {
-			t1ShortTriggerATR = 0.90
-		}
-
-		t2TriggerATR := b.Cfg.Tier2ProfitLockATR
-		if t2TriggerATR <= 0 {
-			t2TriggerATR = 1.80
-		}
-
-		t2OffsetATR := b.Cfg.Tier2ProfitLockOffsetATR
-		if t2OffsetATR <= 0 {
-			t2OffsetATR = 0.90
-		}
-
-		beOffsetRate := decimal.NewFromFloat(math.Max(b.Cfg.MinBreakEvenOffsetPct, 0.0010))
 		markPriceDec := decimal.NewFromFloat(markPrice)
 		prot, hasProt := b.Protections[symbol]
 		currentTier := b.ProtectionTiers[symbol]
@@ -2087,96 +2046,35 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 			}
 		}
 
-		trailActivateATR := b.Cfg.TrailingActivateATR
-		if trailActivateATR <= 0 {
-			trailActivateATR = 2.00
-		}
-		trailDistATR := b.Cfg.TrailingDistanceATR
-		if trailDistATR <= 0 {
-			trailDistATR = 0.80
-		}
-		trailActivateDist := atr.Mul(decimal.NewFromFloat(trailActivateATR))
-		trailDist := atr.Mul(decimal.NewFromFloat(trailDistATR))
-
 		if hasProt && prot.SLStatus == model.ProtectionAcked && b.PlaceAlgoOrderFn != nil {
-			var newTargetTier int
-			var newSL decimal.Decimal
-
-			if side == model.SideLong {
-				t1TriggerDist := atr.Mul(decimal.NewFromFloat(t1LongTriggerATR))
-				t2TriggerDist := atr.Mul(decimal.NewFromFloat(t2TriggerATR))
-				t2OffsetDist := atr.Mul(decimal.NewFromFloat(t2OffsetATR))
-
-				// Tier 3 Trailing Stop untuk Runner (aktif jika TP1 tercapai dan Peak >= Entry + trailActivateDist)
-				canTrail := b.Cfg.TrailingEnabled && peakPrice.Sub(entryPrice).GreaterThanOrEqual(trailActivateDist)
-				if b.Cfg.PartialTPEnabled {
-					canTrail = canTrail && b.IsTP1Hits[symbol]
-				}
-
-				if canTrail {
-					calculatedSL := peakPrice.Sub(trailDist)
-					if calculatedSL.GreaterThan(prot.SLPrice) {
-						newTargetTier = 3
-						newSL = calculatedSL
-					}
-				} else if currentTier < 2 && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t2TriggerDist) {
-					calculatedSL := entryPrice.Add(t2OffsetDist)
-					if calculatedSL.GreaterThan(prot.SLPrice) {
-						newTargetTier = 2
-						newSL = calculatedSL
-					}
-				} else if b.Cfg.Tier1BEEnabled && currentTier < 1 && !b.IsTP1Hits[symbol] && markPriceDec.Sub(entryPrice).GreaterThanOrEqual(t1TriggerDist) {
-					calculatedSL := entryPrice.Mul(decimal.NewFromFloat(1.0).Add(beOffsetRate))
-					if calculatedSL.GreaterThan(prot.SLPrice) {
-						newTargetTier = 1
-						newSL = calculatedSL
-					}
-				}
-			} else {
-				t1TriggerDist := atr.Mul(decimal.NewFromFloat(t1ShortTriggerATR))
-				t2TriggerDist := atr.Mul(decimal.NewFromFloat(t2TriggerATR))
-				t2OffsetDist := atr.Mul(decimal.NewFromFloat(t2OffsetATR))
-
-				canTrail := b.Cfg.TrailingEnabled && entryPrice.Sub(peakPrice).GreaterThanOrEqual(trailActivateDist)
-				if b.Cfg.PartialTPEnabled {
-					canTrail = canTrail && b.IsTP1Hits[symbol]
-				}
-
-				if canTrail {
-					calculatedSL := peakPrice.Add(trailDist)
-					if calculatedSL.LessThan(prot.SLPrice) {
-						newTargetTier = 3
-						newSL = calculatedSL
-					}
-				} else if currentTier < 2 && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t2TriggerDist) {
-					calculatedSL := entryPrice.Sub(t2OffsetDist)
-					if calculatedSL.LessThan(prot.SLPrice) {
-						newTargetTier = 2
-						newSL = calculatedSL
-					}
-				} else if b.Cfg.Tier1BEEnabled && currentTier < 1 && !b.IsTP1Hits[symbol] && entryPrice.Sub(markPriceDec).GreaterThanOrEqual(t1TriggerDist) {
-					calculatedSL := entryPrice.Mul(decimal.NewFromFloat(1.0).Sub(beOffsetRate))
-					if calculatedSL.LessThan(prot.SLPrice) {
-						newTargetTier = 1
-						newSL = calculatedSL
-					}
+			var tickSize decimal.Decimal
+			if b.GetExchangeFilterFn != nil {
+				if f, ok := b.GetExchangeFilterFn(symbol); ok && f.TickSize.GreaterThan(decimal.Zero) {
+					tickSize = f.TickSize
 				}
 			}
 
+			snap := protection.PositionSnapshot{
+				Symbol:         symbol,
+				Side:           side,
+				EntryPrice:     entryPrice,
+				CurrentSLPrice: prot.SLPrice,
+				PeakPrice:      peakPrice,
+				ATRAtEntry:     atr,
+				ProtectionTier: protection.ProtectionTier(currentTier),
+				IsTP1Hit:       b.IsTP1Hits[symbol],
+				TickSize:       tickSize,
+			}
+			protDec := protection.EvaluatePositionProtection(snap, markPriceDec, b.toProtectionConfig())
+
+			var newTargetTier int
+			var newSL decimal.Decimal
+			if protDec.ShouldUpdate {
+				newTargetTier = int(protDec.NewTier)
+				newSL = protDec.NewSLPrice
+			}
+
 			if newTargetTier > 0 && !newSL.IsZero() {
-				// Kuantisasi newSL sesuai TickSize simbol
-				var tickSize decimal.Decimal
-				if b.GetExchangeFilterFn != nil {
-					if f, ok := b.GetExchangeFilterFn(symbol); ok && f.TickSize.GreaterThan(decimal.Zero) {
-						tickSize = f.TickSize
-					}
-				}
-				if tickSize.GreaterThan(decimal.Zero) {
-					roundUp := (side == model.SideShort)
-					if qSL, err := model.QuantizePrice(newSL, tickSize, roundUp); err == nil {
-						newSL = qSL
-					}
-				}
 
 				// Throttling & Debounce Guard untuk update order SL
 				if b.AlgoUpdateInFlight[symbol] {
@@ -2341,6 +2239,26 @@ func (b *BinanceLiveBroker) HasActiveOrderOrPosition(symbol string) bool {
 	return false
 }
 
+func (b *BinanceLiveBroker) GetMonitoredSymbols() []string {
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+
+	syms := make([]string, 0, len(b.ActivePositions)+len(b.OrdersByClient))
+	for sym, posQty := range b.ActivePositions {
+		if posQty.GreaterThan(decimal.Zero) && !slices.Contains(syms, sym) {
+			syms = append(syms, sym)
+		}
+	}
+	for _, ord := range b.OrdersByClient {
+		if ord.IsEntry && (ord.Status == model.StatusNew || ord.Status == model.StatusPendingNew || ord.Status == model.StatusPartiallyFilled) {
+			if !slices.Contains(syms, ord.Symbol) {
+				syms = append(syms, ord.Symbol)
+			}
+		}
+	}
+	return syms
+}
+
 func (b *BinanceLiveBroker) CheckTimeouts(now time.Time) {
 	b.CheckPendingEntryTimeouts(now)
 	b.CheckMaxHoldingTimeouts(now)
@@ -2394,4 +2312,31 @@ func (b *BinanceLiveBroker) GetActivePositions() []ActivePositionDTO {
 		return result[i].Symbol < result[j].Symbol
 	})
 	return result
+}
+
+func (b *BinanceLiveBroker) toProtectionConfig() protection.ProtectionConfig {
+	t1Long := b.Cfg.Tier1BETriggerLongATR
+	if t1Long <= 0 {
+		t1Long = b.Cfg.BreakEvenTriggerATR
+	}
+	t1Short := b.Cfg.Tier1BETriggerShortATR
+	if t1Short <= 0 {
+		t1Short = b.Cfg.BreakEvenTriggerATR
+	}
+	return protection.ProtectionConfig{
+		Tier1BEEnabled:           b.Cfg.Tier1BEEnabled,
+		Tier1BETriggerLongATR:    t1Long,
+		Tier1BETriggerShortATR:   t1Short,
+		Tier2ProfitLockEnabled:   b.Cfg.Tier2ProfitLockEnabled,
+		Tier2ProfitLockATR:       b.Cfg.Tier2ProfitLockATR,
+		Tier2ProfitLockOffsetATR: b.Cfg.Tier2ProfitLockOffsetATR,
+		TrailingEnabled:          b.Cfg.TrailingEnabled,
+		TrailingActivateATR:      b.Cfg.TrailingActivateATR,
+		TrailingDistanceATR:      b.Cfg.TrailingDistanceATR,
+		PartialTPEnabled:         b.Cfg.PartialTPEnabled,
+		MinBreakEvenOffsetPct:    b.Cfg.MinBreakEvenOffsetPct,
+		RunnerBECushionATR:       b.Cfg.RunnerBECushionATR,
+		TakerFeeRate:             decimal.NewFromFloat(0.0005),
+		SlippageRate:             decimal.NewFromFloat(0.0002),
+	}
 }

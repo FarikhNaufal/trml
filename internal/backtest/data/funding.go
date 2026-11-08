@@ -206,8 +206,14 @@ func (fm *FundingManager) fetchMonthlyFunding(
 	cacheFile := filepath.Join(fundingDir, fmt.Sprintf("%s-fundingRate-%04d-%02d.csv", symbol, year, month))
 
 	// 1. Cek disk cache
-	if fileBytes, err := os.ReadFile(cacheFile); err == nil && len(fileBytes) > 0 {
-		return parseFundingCSV(bytes.NewReader(fileBytes))
+	if fileInfo, err := os.Stat(cacheFile); err == nil && fileInfo.Size() > 0 {
+		isCurrentMonth := year == time.Now().UTC().Year() && time.Month(month) == time.Now().UTC().Month()
+		// Jika bulan lampau, cache permanen berlaku. Jika bulan berjalan, gunakan cache jika masih fresh (< 4 jam).
+		if !isCurrentMonth || time.Since(fileInfo.ModTime()) < 4*time.Hour {
+			if fileBytes, err := os.ReadFile(cacheFile); err == nil && len(fileBytes) > 0 {
+				return parseFundingCSV(bytes.NewReader(fileBytes))
+			}
+		}
 	}
 
 	// 2. Unduh zip dari Binance Vision
@@ -280,10 +286,8 @@ func (fm *FundingManager) fetchLiveAPIFunding(
 	}
 
 	if len(rates) > 0 {
-		// Simpan cache jika bulan sudah selesai
-		if monthTime.Month() != time.Now().UTC().Month() || monthTime.Year() != time.Now().UTC().Year() {
-			fm.saveRatesToCSV(rates, cacheFile)
-		}
+		// Simpan cache ke disk agar tidak menembak REST API berulang-ulang
+		fm.saveRatesToCSV(rates, cacheFile)
 	}
 
 	return rates, nil
