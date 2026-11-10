@@ -65,6 +65,7 @@ type Config struct {
 	MinRVOL               float64
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
+	EMAPeriod                int
 	PullbackToleranceATR     float64
 	MinBounceZScore          float64
 	MinEMA200DistanceATR     float64
@@ -109,6 +110,19 @@ type Config struct {
 	CooldownProfitMinutes    int
 	VWAPSessionWarmupMinutes int
 
+	// Option C: Optimasi Seleksi Entry & Eksit Sisi LONG
+	MinCandleBodyRatioLong   float64
+	MaxPullbackRVOLLong      float64
+	MinImpulseATRLong        float64
+	MinEMASlopeLong          float64
+	RequireCleanPullbackLong bool
+	PartialTP1ATRMultLong    float64
+	SLATRMultiplierLong      float64
+
+	// Timeframe Operasional
+	Timeframe      string
+	CandleDuration time.Duration
+
 	// Batas Waktu & Staleness
 	ScannerInterval      time.Duration
 	MaxBookStaleness     time.Duration
@@ -129,6 +143,11 @@ type Config struct {
 	GeminiModel      string
 	GeminiTimeoutSec int
 	AIRateLimitRPM   int
+
+	// Flag Isolasi Perubahan Engine Commit a7f3eda (default: false = perilaku 9815362)
+	BTCGateShortOnly    bool
+	SLGapFillEnabled    bool
+	DeductPendingMargin bool
 }
 
 // loadDotEnvWithOverwrite membaca file .env secara otomatis ke environment variable proses.
@@ -322,6 +341,12 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE '%s' (must be positive float)", minBounceZStr)
 	}
 
+	emaPeriodStr := getEnv("EMA_PERIOD", "200")
+	emaPeriod, err := strconv.Atoi(emaPeriodStr)
+	if err != nil || emaPeriod < 10 || emaPeriod > 1000 {
+		return nil, fmt.Errorf("config: invalid EMA_PERIOD '%s' (must be integer between 10 and 1000)", emaPeriodStr)
+	}
+
 	minEMA200DistStr := getEnv("MIN_EMA200_DISTANCE_ATR", "0.15")
 	minEMA200Dist, err := parseFloatEnv(minEMA200DistStr)
 	if err != nil || minEMA200Dist < 0 || minEMA200Dist > 5.0 {
@@ -447,7 +472,11 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BREAK_EVEN_TRIGGER_ATR '%s' (must be float between 0.1 and 10.0)", beTriggerStr)
 	}
 
-	tier1BEEnabled := parseBoolEnv(getEnv("TIER1_BE_ENABLED", "false"))
+	tier1BEStr := getEnv("FLAG_TIER1_EARLY_BE", getEnv("TIER1_BE_ENABLED", "false"))
+	tier1BEEnabled := parseBoolEnv(tier1BEStr)
+	btcGateShortOnly := parseBoolEnv(getEnv("FLAG_BTC_GATE_SHORT_ONLY", "true")) // default true (best practice)
+	slGapFillEnabled := parseBoolEnv(getEnv("FLAG_SL_GAP_FILL", "false"))
+	deductPendingMargin := parseBoolEnv(getEnv("FLAG_DEDUCT_PENDING_MARGIN", "false"))
 	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "")
 	var t1BETriggerLong float64
 	if t1BETriggerLongStr != "" {
@@ -628,6 +657,44 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		vwapWarmupMins = 30
 	}
 
+	minCandleBodyRatioLongStr := getEnv("MIN_CANDLE_BODY_RATIO_LONG", "0.0")
+	minCandleBodyRatioLong, err := parseFloatEnv(minCandleBodyRatioLongStr)
+	if err != nil || minCandleBodyRatioLong < 0.0 || minCandleBodyRatioLong > 1.0 {
+		minCandleBodyRatioLong = 0.0
+	}
+
+	maxPullbackRVOLLongStr := getEnv("MAX_PULLBACK_RVOL_LONG", "0.0")
+	maxPullbackRVOLLong, err := parseFloatEnv(maxPullbackRVOLLongStr)
+	if err != nil || maxPullbackRVOLLong < 0.0 || maxPullbackRVOLLong > 10.0 {
+		maxPullbackRVOLLong = 0.0
+	}
+
+	minImpulseATRLongStr := getEnv("MIN_IMPULSE_ATR_LONG", "0.0")
+	minImpulseATRLong, err := parseFloatEnv(minImpulseATRLongStr)
+	if err != nil || minImpulseATRLong < 0.0 || minImpulseATRLong > 10.0 {
+		minImpulseATRLong = 0.0
+	}
+
+	minEMASlopeLongStr := getEnv("MIN_EMA_SLOPE_LONG", "0.0")
+	minEMASlopeLong, err := parseFloatEnv(minEMASlopeLongStr)
+	if err != nil || minEMASlopeLong < -1.0 || minEMASlopeLong > 10.0 {
+		minEMASlopeLong = 0.0
+	}
+
+	requireCleanPullbackLong := parseBoolEnv(getEnv("REQUIRE_CLEAN_PULLBACK_LONG", "false"))
+
+	partialTP1ATRMultLongStr := getEnv("PARTIAL_TP1_ATR_MULT_LONG", "0.0")
+	partialTP1ATRMultLong, err := parseFloatEnv(partialTP1ATRMultLongStr)
+	if err != nil || partialTP1ATRMultLong < 0.0 || partialTP1ATRMultLong > 10.0 {
+		partialTP1ATRMultLong = 0.0
+	}
+
+	slMultLongStr := getEnv("SL_ATR_MULTIPLIER_LONG", "0.0")
+	slMultLong, err := parseFloatEnv(slMultLongStr)
+	if err != nil || slMultLong < 0.0 || slMultLong > 10.0 {
+		slMultLong = 0.0
+	}
+
 	minRVOLStr := getEnv("MIN_RVOL", getEnv("SCANNER_MIN_RVOL", "1.80"))
 	minRVOL, err := parseFloatEnv(minRVOLStr)
 	if err != nil || minRVOL <= 0 {
@@ -641,6 +708,22 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		} else if dur, err := time.ParseDuration(sIntStr); err == nil && dur > 0 {
 			scannerInterval = dur
 		}
+	}
+
+	timeframeStr := strings.ToLower(strings.TrimSpace(getEnv("TIMEFRAME", getEnv("KLINE_INTERVAL", "5m"))))
+	if timeframeStr == "" {
+		timeframeStr = "5m"
+	}
+	candleDur, err := ParseTimeframeToDuration(timeframeStr)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+
+	maxDataStaleness := candleDur + 30*time.Second
+	maxOIStaleness := candleDur + 30*time.Second
+	maxOIInterval := candleDur * 2
+	if maxOIInterval < 8*time.Minute {
+		maxOIInterval = 8 * time.Minute
 	}
 
 	return &Config{
@@ -676,6 +759,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MaxNATRPct:               maxNATR,
 		MaxScannerVWAPDistATR:    maxScannerVWAPDist,
 		MaxWatchedCoins:          maxWatched,
+		EMAPeriod:                emaPeriod,
 		PullbackToleranceATR:     pullbackTol,
 		MinBounceZScore:          minBounceZ,
 		MinEMA200DistanceATR:     minEMA200Dist,
@@ -720,14 +804,25 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		CooldownProfitMinutes:    cooldownProfitMins,
 		VWAPSessionWarmupMinutes: vwapWarmupMins,
 
+		MinCandleBodyRatioLong:   minCandleBodyRatioLong,
+		MaxPullbackRVOLLong:      maxPullbackRVOLLong,
+		MinImpulseATRLong:        minImpulseATRLong,
+		MinEMASlopeLong:          minEMASlopeLong,
+		RequireCleanPullbackLong: requireCleanPullbackLong,
+		PartialTP1ATRMultLong:    partialTP1ATRMultLong,
+		SLATRMultiplierLong:      slMultLong,
+
+		Timeframe:            timeframeStr,
+		CandleDuration:       candleDur,
+
 		ScannerInterval:      scannerInterval,
 		MaxBookStaleness:     5 * time.Second,
 		MaxMarkStaleness:     15 * time.Second,
-		MaxDataStaleness:     330 * time.Second,
+		MaxDataStaleness:     maxDataStaleness,
 		MaxAccountStale:      60 * time.Second,
 		MinOIInterval:        1 * time.Minute,
-		MaxOIInterval:        8 * time.Minute,
-		MaxOIStaleness:       330 * time.Second,
+		MaxOIInterval:        maxOIInterval,
+		MaxOIStaleness:       maxOIStaleness,
 		LimitOrderTimeout:    45 * time.Second,
 		MaxHoldingDuration:   maxHoldingDuration,
 		OrphanPositionPolicy: orphanPolicy,
@@ -738,6 +833,10 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		GeminiModel:      geminiModel,
 		GeminiTimeoutSec: geminiTimeout,
 		AIRateLimitRPM:   aiRateLimit,
+
+		BTCGateShortOnly:    btcGateShortOnly,
+		SLGapFillEnabled:    slGapFillEnabled,
+		DeductPendingMargin: deductPendingMargin,
 	}, nil
 }
 
@@ -768,4 +867,32 @@ func parseFloatEnv(val string) (float64, error) {
 		return 0, fmt.Errorf("value cannot be NaN or Inf")
 	}
 	return v, nil
+}
+
+// ParseTimeframeToDuration mengonversi string timeframe Binance (e.g. "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d")
+// menjadi time.Duration yang ekuivalen.
+func ParseTimeframeToDuration(tf string) (time.Duration, error) {
+	tf = strings.ToLower(strings.TrimSpace(tf))
+	switch tf {
+	case "1m":
+		return 1 * time.Minute, nil
+	case "3m":
+		return 3 * time.Minute, nil
+	case "5m":
+		return 5 * time.Minute, nil
+	case "15m":
+		return 15 * time.Minute, nil
+	case "30m":
+		return 30 * time.Minute, nil
+	case "1h":
+		return 1 * time.Hour, nil
+	case "2h":
+		return 2 * time.Hour, nil
+	case "4h":
+		return 4 * time.Hour, nil
+	case "1d":
+		return 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("invalid TIMEFRAME '%s' (allowed: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 1d)", tf)
+	}
 }

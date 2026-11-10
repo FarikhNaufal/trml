@@ -27,6 +27,7 @@ type SymbolState struct {
 	PrevOIUpdatedAt  time.Time
 	CurrOIUpdatedAt  time.Time
 	IsOIBootstrapped bool
+	TargetOIInterval time.Duration
 	OISamples        []OISample
 
 	SessionEpochDayUTC      int64
@@ -57,14 +58,19 @@ func NewSymbolState(symbol string, filter ExchangeFilter, bootstrapCap, deltaCap
 	}
 }
 
-// RecordOpenInterestLocked mencatat sampel Open Interest dan menyinkronkan selisih 5 menit
+// RecordOpenInterestLocked mencatat sampel Open Interest dan menyinkronkan selisih interval candle
 func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
 	if oi <= 0 {
 		return
 	}
 
-	// 1. Bersihkan sampel basi (> 15 menit) agar simbol yang sempat keluar scanner tidak menyimpan sampel purba
-	cutoff := now.Add(-15 * time.Minute)
+	interval := s.TargetOIInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+
+	// 1. Bersihkan sampel basi (> 3x interval) agar simbol yang sempat keluar scanner tidak menyimpan sampel purba
+	cutoff := now.Add(-interval * 3)
 	validCount := 0
 	for _, sample := range s.OISamples {
 		if sample.Timestamp.After(cutoff) {
@@ -91,15 +97,17 @@ func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
 		return
 	}
 
-	// 3. Cari sampel terdekat dengan target 5 menit lalu (antara 3m50s dan 6m50s)
-	targetTime := now.Add(-5 * time.Minute)
+	// 3. Cari sampel terdekat dengan target interval lalu
+	targetTime := now.Add(-interval)
 	var bestSample *OISample
 	bestDiff := 100 * time.Hour
+	minAge := time.Duration(float64(interval) * 0.75)
+	maxAge := time.Duration(float64(interval) * 1.35)
 
 	for i := range s.OISamples {
 		sample := &s.OISamples[i]
 		age := now.Sub(sample.Timestamp)
-		if age < 3*time.Minute+50*time.Second || age > 6*time.Minute+50*time.Second {
+		if age < minAge || age > maxAge {
 			continue
 		}
 		diff := sample.Timestamp.Sub(targetTime)
@@ -117,15 +125,15 @@ func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
 		s.PrevOIUpdatedAt = bestSample.Timestamp
 		s.IsOIBootstrapped = bestSample.Bootstrapped
 	} else {
-		// 4. Fase transisi (< 4m): gunakan sampel tertua jika umurnya sudah minimal 1 menit dan maksimal 6.5 menit (Pengawal 2)
+		// 4. Fase transisi (< interval): gunakan sampel tertua jika umurnya sudah minimal 1 menit dan maksimal 1.35x interval
 		oldest := s.OISamples[0]
 		age := now.Sub(oldest.Timestamp)
-		if age >= 1*time.Minute && age <= 6*time.Minute+30*time.Second {
+		if age >= 1*time.Minute && age <= maxAge {
 			s.PrevOpenInterest = oldest.Value
 			s.PrevOIUpdatedAt = oldest.Timestamp
 			s.IsOIBootstrapped = oldest.Bootstrapped
 		} else {
-			// Sampel tertua masih < 1 menit atau sudah melebihi 6.5 menit (degrade ke warming up)
+			// Sampel tertua masih < 1 menit atau sudah melebihi batas (degrade ke warming up)
 			s.PrevOpenInterest = 0
 			s.PrevOIUpdatedAt = time.Time{}
 			s.IsOIBootstrapped = false
@@ -177,15 +185,21 @@ func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now ti
 	s.CurrOpenInterest = latest.Value
 	s.CurrOIUpdatedAt = latest.Timestamp
 
-	// Resolusi PrevOpenInterest (Pengawal 4: cari sampel ~5m lalu)
-	targetTime := now.Add(-5 * time.Minute)
+	// Resolusi PrevOpenInterest (Pengawal 4: cari sampel ~interval lalu)
+	interval := s.TargetOIInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	targetTime := now.Add(-interval)
 	var bestSample *OISample
 	bestDiff := 100 * time.Hour
+	minAge := time.Duration(float64(interval) * 0.75)
+	maxAge := time.Duration(float64(interval) * 1.35)
 
 	for i := range s.OISamples {
 		sample := &s.OISamples[i]
 		age := now.Sub(sample.Timestamp)
-		if age < 3*time.Minute+50*time.Second || age > 6*time.Minute+50*time.Second {
+		if age < minAge || age > maxAge {
 			continue
 		}
 		diff := sample.Timestamp.Sub(targetTime)
@@ -205,7 +219,7 @@ func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now ti
 	} else if len(s.OISamples) >= 2 {
 		oldest := s.OISamples[0]
 		age := now.Sub(oldest.Timestamp)
-		if age >= 1*time.Minute && age <= 6*time.Minute+30*time.Second {
+		if age >= 1*time.Minute && age <= maxAge {
 			s.PrevOpenInterest = oldest.Value
 			s.PrevOIUpdatedAt = oldest.Timestamp
 			s.IsOIBootstrapped = oldest.Bootstrapped

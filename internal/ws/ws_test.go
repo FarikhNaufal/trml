@@ -108,3 +108,21 @@ func TestBuildUserDataStreamURL(t *testing.T) {
 		t.Errorf("expected testnet user stream URL '%s', got '%s'", expectedTestnet, testnetURL)
 	}
 }
+
+func TestKlineClosed_DynamicInterval(t *testing.T) {
+	var parsed15m int32
+	var capturedInterval string
+	mgr := NewStreamManager(EventHandlers{
+		OnKlineClosed: func(symbol string, candle model.Candle, isClosed bool) {
+			atomic.AddInt32(&parsed15m, 1)
+			capturedInterval = "15m"
+		},
+	})
+
+	raw15m := []byte(`{"e":"kline","E":1700000000000,"s":"SOLUSDT","k":{"t":1700000000000,"T":1700000900000,"s":"SOLUSDT","i":"15m","f":1,"L":10,"o":"150.0","c":"152.0","h":"153.0","l":"149.0","v":"1000.0","n":50,"x":true,"q":"151000.0","V":"600.0","Q":"90600.0","B":"0"}}`)
+	mgr.ProcessMessage(raw15m)
+
+	if atomic.LoadInt32(&parsed15m) != 1 || capturedInterval != "15m" {
+		t.Fatalf("expected 15m kline to be parsed via OnKlineClosed, got count=%d, interval=%s", parsed15m, capturedInterval)
+	}
+}

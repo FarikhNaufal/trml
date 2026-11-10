@@ -15,6 +15,7 @@ type SimBrokerConfig struct {
 	MakerFeeRate            decimal.Decimal // default 0.0002 (2.0 bps)
 	TakerFeeRate            decimal.Decimal // default 0.0005 (5.0 bps)
 	SlippageRate            decimal.Decimal // default 0.0005 (5.0 bps pada market SL/exit)
+	SLGapFillEnabled        bool            // default false (9815362: nominal SL, true: candle open gap fill)
 	SignalDelayBars         int             // delay bar sebelum limit entry aktif (default 1)
 	LimitTimeoutBars        int             // batas bar sebelum limit order expired (default 1)
 	PenetrationTicks        int             // syarat tembus tick agar limit order terisi (default 1)

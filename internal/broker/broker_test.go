@@ -2773,8 +2773,9 @@ func TestLiveBrokerTimeStopEmergencyClose_GhostOrderAndExitReason(t *testing.T) 
 	for time.Now().Before(deadlinePlace) {
 		broker.Mu.Lock()
 		prot, hasProt := broker.Protections["ADAUSDT"]
+		placed := hasProt && prot != nil && prot.SLOrderID > 0 && prot.TPOrderID > 0
 		broker.Mu.Unlock()
-		if hasProt && prot != nil && prot.SLOrderID > 0 && prot.TPOrderID > 0 {
+		if placed {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)

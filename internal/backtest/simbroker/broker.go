@@ -325,20 +325,31 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	// A. Eksekusi Stop Loss
 	if slTouched {
 		exitPrice := pos.CurrentSLPrice
-		openDec := decimal.NewFromFloat(c.Open)
-		if pos.Side == model.SideLong {
-			if openDec.LessThan(exitPrice) {
-				exitPrice = openDec // Gap down: terisi di harga pembukaan bar
-			}
-			if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
-				exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Sub(s.Cfg.SlippageRate))
+		if s.Cfg.SLGapFillEnabled {
+			openDec := decimal.NewFromFloat(c.Open)
+			if pos.Side == model.SideLong {
+				if openDec.LessThan(exitPrice) {
+					exitPrice = openDec // Gap down: terisi di harga pembukaan bar
+				}
+				if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
+					exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Sub(s.Cfg.SlippageRate))
+				}
+			} else {
+				if openDec.GreaterThan(exitPrice) {
+					exitPrice = openDec // Gap up: terisi di harga pembukaan bar
+				}
+				if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
+					exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Add(s.Cfg.SlippageRate))
+				}
 			}
 		} else {
-			if openDec.GreaterThan(exitPrice) {
-				exitPrice = openDec // Gap up: terisi di harga pembukaan bar
-			}
+			// Perilaku commit 9815362: terisi tepat di nominal SL price (+ slippage)
 			if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
-				exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Add(s.Cfg.SlippageRate))
+				if pos.Side == model.SideLong {
+					exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Sub(s.Cfg.SlippageRate))
+				} else {
+					exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Add(s.Cfg.SlippageRate))
+				}
 			}
 		}
 
@@ -540,7 +551,7 @@ func (s *SimBroker) GetAvailableBalanceUSDT() decimal.Decimal {
 		usedMargin = usedMargin.Add(notional.Div(lev))
 	}
 
-	eff := s.calculateRealEffectiveEquityLocked()
+	eff := s.calculateEffectiveEquityLocked()
 	avail := eff.Sub(usedMargin)
 	if avail.LessThan(decimal.Zero) {
 		return decimal.Zero

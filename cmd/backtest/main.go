@@ -63,6 +63,7 @@ func printHelp() {
 	fmt.Println("  --from/--to     Rentang tanggal kustom (format: YYYY-MM-DD)")
 	fmt.Println("\nParameter Tambahan:")
 	fmt.Println("  --equity        Modal awal simulasi USDT (default: 125.0)")
+	fmt.Println("  --interval      Candlestick interval (e.g. 5m, 15m, 1h, default dari env atau 5m)")
 	fmt.Println("  --symbols       Daftar koin spesifik (jika kosong, auto-scan semua koin pasar dari cache)")
 	fmt.Println("  --scanner       Dynamic rolling market scanner (default: true, gunakan --scanner=false untuk matikan)")
 	fmt.Println("  --out           Simpan laporan hasil ke file markdown")
@@ -84,11 +85,25 @@ func handleDataCommand(args []string) {
 	sub := args[0]
 	fs := flag.NewFlagSet("data "+sub, flag.ExitOnError)
 	symbolsFlag := fs.String("symbols", "", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT). If omitted with --scanner, automatically scans all available market coins")
+	intervalFlag := fs.String("interval", "", "Candle interval (e.g. 5m, 15m, 1h). Default from env or 5m")
+	envFlag := fs.String("env", "backtest.env", "Environment config file path (default: backtest.env)")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Use past completed 1 month range (e.g. 2026-10-01 to 2026-10-31)")
 	cacheDirFlag := fs.String("cache-dir", filepath.Join("data", "backtest", "cache"), "Cache directory")
 	_ = fs.Parse(args[1:])
+
+	interval := "5m"
+	if cfg, _ := loadConfigForBacktest(*envFlag); cfg != nil && cfg.Timeframe != "" {
+		interval = cfg.Timeframe
+	}
+	if *intervalFlag != "" {
+		interval = *intervalFlag
+	}
+	candleDur, tfErr := config.ParseTimeframeToDuration(interval)
+	if tfErr != nil {
+		candleDur = 5 * time.Minute
+	}
 
 	var from, to time.Time
 	var err error
@@ -118,32 +133,32 @@ func handleDataCommand(args []string) {
 
 	switch sub {
 	case "fetch":
-		fmt.Printf("Mengunduh candlestick 5m resmi dari data.binance.vision untuk %d simbol [%s s/d %s]...\n",
-			len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
+		fmt.Printf("Mengunduh candlestick %s resmi dari data.binance.vision untuk %d simbol [%s s/d %s]...\n",
+			interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
 		ctx := context.Background()
 		for _, sym := range symbols {
 			fmt.Printf("--> Fetching %s...\n", sym)
-			candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
+			candles, err := downloader.FetchCandleRange(ctx, sym, interval, from, to)
 			if err != nil {
 				slog.Error("Gagal fetch simbol", "symbol", sym, "err", err)
 				continue
 			}
-			report := data.ValidateCandles(sym, candles, 5*time.Minute)
+			report := data.ValidateCandles(sym, candles, candleDur)
 			fmt.Printf("    Sukses: %d bars dimuat (Gaps: %d, ZeroVol: %d)\n", report.TotalBars, report.GapsCount, report.ZeroVolCount)
 		}
 		fmt.Println("Selesai mengunduh data.")
 
 	case "verify":
-		fmt.Printf("Memverifikasi integritas data cache untuk %d simbol [%s s/d %s]...\n",
-			len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
+		fmt.Printf("Memverifikasi integritas data cache (%s) untuk %d simbol [%s s/d %s]...\n",
+			interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
 		ctx := context.Background()
 		for _, sym := range symbols {
-			candles, err := downloader.FetchCandleRange(ctx, sym, "5m", from, to)
+			candles, err := downloader.FetchCandleRange(ctx, sym, interval, from, to)
 			if err != nil {
 				fmt.Printf("[GAGAL] %s: %v\n", sym, err)
 				continue
 			}
-			report := data.ValidateCandles(sym, candles, 5*time.Minute)
+			report := data.ValidateCandles(sym, candles, candleDur)
 			fmt.Printf("[OK] %s: %d bars (%s s/d %s) | Gaps: %d | Duplikat: %d | ZeroVol: %d\n",
 				sym, report.TotalBars, report.StartTime.Format("2006-01-02"), report.EndTime.Format("2006-01-02"),
 				report.GapsCount, report.Duplicates, report.ZeroVolCount)
@@ -162,6 +177,7 @@ func handleDataCommand(args []string) {
 func handleRunCommand(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	symbolsFlag := fs.String("symbols", "", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT). If omitted with --scanner, automatically scans all available market coins")
+	intervalFlag := fs.String("interval", "", "Candle interval (e.g. 5m, 15m, 1h). Default from env or 5m")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
@@ -182,6 +198,10 @@ func handleRunCommand(args []string) {
 	knockoutBTCFlag := fs.Bool("knockout-btc", false, "Disable BTC gate for ablation study")
 	knockoutRVOLFlag := fs.Bool("knockout-rvol", false, "Disable RVOL filter for ablation study")
 	knockoutNATRFlag := fs.Bool("knockout-natr", false, "Disable NATR filter for ablation study")
+	flagBTCGateShortOnly := fs.Bool("flag-btc-gate-short-only", true, "Flag 1: Enable Tier 2 BTC Gate for SHORT_ONLY (default: true = best practice)")
+	flagTier1EarlyBE := fs.Bool("flag-tier1-early-be", false, "Flag 2: Enable Tier 1 Early BE before TP1 (default: false = behavior 9815362)")
+	flagSLGapFill := fs.Bool("flag-sl-gap-fill", false, "Flag 3: Enable SL gap fill at candle open + slippage (default: false = behavior 9815362)")
+	flagDeductPendingMargin := fs.Bool("flag-deduct-pending-margin", false, "Flag 4: Deduct available margin intra-bar upon limit submit (default: false = behavior 9815362)")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfigForBacktest(*envFlag)
@@ -220,7 +240,21 @@ func handleRunCommand(args []string) {
 	}
 
 	ctx := context.Background()
+	interval := "5m"
+	if cfg != nil && cfg.Timeframe != "" {
+		interval = cfg.Timeframe
+	}
+	if *intervalFlag != "" {
+		interval = *intervalFlag
+	}
+	candleDur, tfErr := config.ParseTimeframeToDuration(interval)
+	if tfErr != nil {
+		candleDur = 5 * time.Minute
+	}
+
 	scannerCfg := buildDefaultScannerConfig(*envFlag)
+	scannerCfg.Timeframe = interval
+	scannerCfg.CandleDuration = candleDur
 
 	var symbols []string
 	if *symbolsFlag != "" {
@@ -255,9 +289,9 @@ func handleRunCommand(args []string) {
 		slog.Warn("Gagal memuat exchange filters resmi dari Binance API, menggunakan fail-safe", "err", err)
 	}
 
-	fmt.Printf("Memuat data candlestick 5m untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
-		len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
-	candleMap, filters := loadCandlesParallel(ctx, downloader, symbols, "5m", from, to, exchangeFilters)
+	fmt.Printf("Memuat data candlestick %s untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
+		interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
+	candleMap, filters := loadCandlesParallel(ctx, downloader, symbols, interval, from, to, exchangeFilters)
 
 	if len(candleMap) == 0 {
 		slog.Error("Tidak ada data candle yang tersedia untuk backtest. Jalankan 'backtest data fetch' terlebih dahulu.")
@@ -266,6 +300,7 @@ func handleRunCommand(args []string) {
 
 	// Evaluator Config dari konfigurasi backtest
 	evaluatorCfg := buildDefaultEvaluatorConfig(*envFlag)
+	evaluatorCfg.CandleDuration = candleDur
 	if *randomSeedFlag != 0 || *randomProbFlag > 0 {
 		evaluatorCfg.RandomEntrySeed = *randomSeedFlag
 		evaluatorCfg.RandomEntryProb = *randomProbFlag
@@ -300,6 +335,16 @@ func handleRunCommand(args []string) {
 	} else {
 		fmt.Printf("Mode Compounding NON-AKTIF: Ukuran posisi flat berdasarkan modal awal $%.2f.\n", initialEquity)
 	}
+
+	// Terapkan isolasi 4 flag engine (CLI override env)
+	evaluatorCfg.BTCGateShortOnly = *flagBTCGateShortOnly
+	if *flagTier1EarlyBE {
+		brokerCfg.Tier1BEEnabled = true
+	}
+	if *flagSLGapFill {
+		brokerCfg.SLGapFillEnabled = true
+	}
+
 	if *unconstrainedFlag {
 		brokerCfg.MaxSlots = 1000
 		evaluatorCfg.MaxSlots = 1000
@@ -326,8 +371,10 @@ func handleRunCommand(args []string) {
 		BenchmarkSym:          "BTCUSDT",
 		DynamicScannerEnabled: *scannerFlag,
 		ScannerInterval:       scannerInterval,
-		ScannerCfg:            buildDefaultScannerConfig(*envFlag),
+		ScannerCfg:            scannerCfg,
 		UnconstrainedMode:     *unconstrainedFlag,
+		DeductPendingMargin:   *flagDeductPendingMargin || (cfg != nil && cfg.DeductPendingMargin),
+		EquityModeCompounding: brokerCfg.EquityModeCompounding,
 	}
 	engine := replay.NewReplayEngine(replayCfg, evaluatorCfg, sim, candleMap, filters)
 
@@ -454,6 +501,7 @@ func handleRunCommand(args []string) {
 func handleAblateCommand(args []string) {
 	fs := flag.NewFlagSet("ablate", flag.ExitOnError)
 	symbolsFlag := fs.String("symbols", "", "Comma-separated symbols (e.g. SOLUSDT,DOGEUSDT). If omitted with --scanner, automatically scans all available market coins")
+	intervalFlag := fs.String("interval", "", "Candle interval (e.g. 5m, 15m, 1h). Default from env or 5m")
 	fromFlag := fs.String("from", "2026-10-01", "Start date (YYYY-MM-DD)")
 	toFlag := fs.String("to", "2026-10-31", "End date (YYYY-MM-DD)")
 	pastMonthFlag := fs.Bool("past-month", false, "Simulate 1 month backwards (last full calendar month)")
@@ -491,7 +539,21 @@ func handleAblateCommand(args []string) {
 	downloader := data.NewDownloader(*cacheDirFlag)
 	ctx := context.Background()
 
+	interval := "5m"
+	if cfg != nil && cfg.Timeframe != "" {
+		interval = cfg.Timeframe
+	}
+	if *intervalFlag != "" {
+		interval = *intervalFlag
+	}
+	candleDur, tfErr := config.ParseTimeframeToDuration(interval)
+	if tfErr != nil {
+		candleDur = 5 * time.Minute
+	}
+
 	scannerCfg := buildDefaultScannerConfig(*envFlag)
+	scannerCfg.Timeframe = interval
+	scannerCfg.CandleDuration = candleDur
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
@@ -503,9 +565,9 @@ func handleAblateCommand(args []string) {
 
 	exchangeFilters, _ := data.LoadExchangeFilters(ctx, *cacheDirFlag)
 
-	fmt.Printf("Memuat data candlestick 5m untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
-		len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
-	candleMap, filters := loadCandlesParallel(ctx, downloader, symbols, "5m", from, to, exchangeFilters)
+	fmt.Printf("Memuat data candlestick %s untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
+		interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
+	candleMap, filters := loadCandlesParallel(ctx, downloader, symbols, interval, from, to, exchangeFilters)
 
 	if len(candleMap) == 0 {
 		fmt.Println("Tidak ada data candle lokal. Jalankan 'backtest data fetch' terlebih dahulu.")
@@ -556,6 +618,7 @@ func handleAblateCommand(args []string) {
 
 	for _, exp := range experiments {
 		evalCfg := buildDefaultEvaluatorConfig(*envFlag)
+		evalCfg.CandleDuration = candleDur
 		exp.modifierFn(&evalCfg)
 
 		brokerCfg := buildSimBrokerConfig(*envFlag, initialEquity)
@@ -802,6 +865,7 @@ func buildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 		MakerFeeRate:            cfg.MakerFeeRate,
 		TakerFeeRate:            cfg.TakerFeeRate,
 		SlippageRate:            cfg.SlippageRate,
+		SLGapFillEnabled:        cfg.SLGapFillEnabled,
 		SignalDelayBars:         sigDelay,
 		LimitTimeoutBars:        1,
 		PenetrationTicks:        penTicks,
@@ -827,6 +891,7 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 	if err != nil {
 		// Fallback default Revisi v6
 		return strategy.EvaluatorConfig{
+			CandleDuration:           5 * time.Minute,
 			MaxDailyDrawdownPct:      -0.05,
 			MaxSlots:                 3,
 			MaxSpreadPct:             0.0006,
@@ -895,6 +960,7 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 	}
 
 	return strategy.EvaluatorConfig{
+		CandleDuration:           cfg.CandleDuration,
 		RandomEntrySeed:          randomSeed,
 		RandomEntryProb:          randomProb,
 		MaxDailyDrawdownPct:      maxDD,
@@ -908,7 +974,7 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 		MaxSpreadPct:             cfg.MaxSpreadPct,
 		MinNATRPct:               cfg.MinNATRPct,
 		MaxNATRPct:               cfg.MaxNATRPct,
-		EMAPeriod:                200,
+		EMAPeriod:                cfg.EMAPeriod,
 		ATRPeriod:                14,
 		DeltaZScoreWindow:        50,
 		MinBarDeltaZScore:        cfg.MinBounceZScore,
@@ -928,7 +994,13 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 		MinImpulseATR:            cfg.MinImpulseATR,
 		MaxEntryDistanceATR:      cfg.MaxEntryDistanceATR,
 		EntryOrderType:           cfg.EntryOrderType,
+		MinCandleBodyRatioLong:   cfg.MinCandleBodyRatioLong,
+		MaxPullbackRVOLLong:      cfg.MaxPullbackRVOLLong,
+		MinImpulseATRLong:        cfg.MinImpulseATRLong,
+		MinEMASlopeLong:          cfg.MinEMASlopeLong,
+		RequireCleanPullbackLong: cfg.RequireCleanPullbackLong,
 		BTCGateEnabled:           cfg.BTCGateEnabled,
+		BTCGateShortOnly:         cfg.BTCGateShortOnly,
 		BTCMax5mDumpPct:          cfg.BTCMax5mDumpPct,
 		BTCMax5mPumpPct:          cfg.BTCMax5mPumpPct,
 		BTCGatePersistenceBars:   cfg.BTCGatePersistenceBars,
@@ -947,8 +1019,10 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 			AvailableBalanceBufferFraction: cfg.MaxMarginAvailFrac,
 			AccountLeverage:                cfg.Leverage,
 			SLMultiplier:                   cfg.SLATRMultiplier,
+			SLMultiplierLong:               cfg.SLATRMultiplierLong,
 			TPMultiplier:                   cfg.TPATRMultiplier,
 			TP1Multiplier:                  cfg.PartialTP1ATRMult,
+			TP1MultiplierLong:              cfg.PartialTP1ATRMultLong,
 			MinSLDistancePct:               cfg.MinSLDistancePct,
 			MakerFeeRate:                   cfg.MakerFeeRate,
 			TakerFeeRate:                   cfg.TakerFeeRate,
@@ -969,6 +1043,8 @@ func buildDefaultScannerConfig(envPath string) scanner.ScannerConfig {
 			minRVOL = 1.80
 		}
 		return scanner.ScannerConfig{
+			Timeframe:             cfg.Timeframe,
+			CandleDuration:        cfg.CandleDuration,
 			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
 			MaxSpreadPct:          cfg.MaxSpreadPct,
 			MinRVOL:               minRVOL,
@@ -984,6 +1060,8 @@ func buildDefaultScannerConfig(envPath string) scanner.ScannerConfig {
 		}
 	}
 	return scanner.ScannerConfig{
+		Timeframe:             "5m",
+		CandleDuration:        5 * time.Minute,
 		MinVolume24hUSDT:      25000000.0,
 		MaxSpreadPct:          0.0006,
 		MinRVOL:               1.80,

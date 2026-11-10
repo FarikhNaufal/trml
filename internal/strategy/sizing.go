@@ -12,8 +12,10 @@ type SizingConfig struct {
 	MaxSlotMarginFraction          decimal.Decimal
 	AccountLeverage                float64
 	SLMultiplier                   float64
+	SLMultiplierLong               float64
 	TPMultiplier                   float64
 	TP1Multiplier                  float64
+	TP1MultiplierLong              float64
 	MinSLDistancePct               decimal.Decimal
 	MakerFeeRate                   decimal.Decimal
 	TakerFeeRate                   decimal.Decimal
@@ -42,7 +44,11 @@ func BuildSafeDecimalOrderIntent(
 	}
 
 	atrDec := decimal.NewFromFloat(atr14)
-	slDist := atrDec.Mul(decimal.NewFromFloat(cfg.SLMultiplier))
+	slMult := cfg.SLMultiplier
+	if side == model.SideLong && cfg.SLMultiplierLong > 0 {
+		slMult = cfg.SLMultiplierLong
+	}
+	slDist := atrDec.Mul(decimal.NewFromFloat(slMult))
 
 	// Stop Distance Floor: Lindungi SL agar tidak diletakkan di dalam zona noise (< MinSLDistancePct)
 	if cfg.MinSLDistancePct.GreaterThan(decimal.Zero) {
@@ -54,15 +60,17 @@ func BuildSafeDecimalOrderIntent(
 
 	tpDist := atrDec.Mul(decimal.NewFromFloat(cfg.TPMultiplier))
 	// Jaga rasio Risk-to-Reward: pastikan tpDist tidak lebih kecil dari slDist * (TPMultiplier / SLMultiplier)
-	if cfg.SLMultiplier > 0 && cfg.TPMultiplier > 0 {
-		minTPDist := slDist.Mul(decimal.NewFromFloat(cfg.TPMultiplier / cfg.SLMultiplier))
+	if slMult > 0 && cfg.TPMultiplier > 0 {
+		minTPDist := slDist.Mul(decimal.NewFromFloat(cfg.TPMultiplier / slMult))
 		if tpDist.LessThan(minTPDist) {
 			tpDist = minTPDist
 		}
 	}
 
 	tp1Mult := cfg.TP1Multiplier
-	if tp1Mult <= 0 {
+	if side == model.SideLong && cfg.TP1MultiplierLong > 0 {
+		tp1Mult = cfg.TP1MultiplierLong
+	} else if tp1Mult <= 0 {
 		tp1Mult = 1.20
 	}
 	// TP1 adalah mekanisme de-risking cepat (Scale-Out 50% + Geser SL ke BE).

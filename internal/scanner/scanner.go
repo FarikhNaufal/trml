@@ -26,6 +26,8 @@ type ScannerConfig struct {
 	MaxWatchedCoins       int
 	BootstrapCount        int
 	DeltaWindow           int
+	Timeframe             string
+	CandleDuration        time.Duration
 }
 
 func RunBulkMarketScanner(
@@ -105,7 +107,7 @@ func RunBulkMarketScanner(
 			defer func() { <-sem }()
 
 			rawKlines := fetchKlinesFn(symbol, klineLimit)
-			validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime)
+			validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime, cfg.CandleDuration)
 			if err != nil || len(validKlines) < cfg.EMAPeriod+1 {
 				return
 			}
@@ -194,9 +196,10 @@ func RunBulkMarketScanner(
 		st, exists := activeStates[cand.Symbol]
 		if !exists {
 			st = model.NewSymbolState(cand.Symbol, perpetualFilters[cand.Symbol], cfg.BootstrapCount, cfg.DeltaWindow+1)
+			st.TargetOIInterval = cfg.CandleDuration
 			activeStates[cand.Symbol] = st
 		}
-		if err := BootstrapSymbolState(st, cand.Candles, serverTime, cfg.BootstrapCount, cfg.DeltaWindow+1); err != nil {
+		if err := BootstrapSymbolState(st, cand.Candles, serverTime, cfg.BootstrapCount, cfg.DeltaWindow+1, cfg.CandleDuration); err != nil {
 			slog.Warn("scanner: failed to bootstrap symbol state, skipping symbol", "symbol", cand.Symbol, "err", err)
 			continue
 		}

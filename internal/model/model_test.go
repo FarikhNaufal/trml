@@ -271,3 +271,55 @@ func TestSeedOpenInterestBootstrap(t *testing.T) {
 		t.Fatalf("expected IsOIBootstrapped false after live polling aged into place")
 	}
 }
+
+func TestValidateAndFilterCandles_15m(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	step := 15 * time.Minute
+	c1 := Candle{
+		OpenTime:        now.Add(-2 * step),
+		CloseTime:       now.Add(-step).Add(-time.Millisecond),
+		Open:            100,
+		High:            105,
+		Low:             95,
+		Close:           102,
+		VolumeBase:      10,
+		QuoteVolumeUSDT: 1000,
+	}
+	c2 := Candle{
+		OpenTime:        now.Add(-step),
+		CloseTime:       now.Add(-time.Millisecond),
+		Open:            102,
+		High:            108,
+		Low:             101,
+		Close:           107,
+		VolumeBase:      15,
+		QuoteVolumeUSDT: 1500,
+	}
+
+	valid, err := ValidateAndFilterCandles([]Candle{c1, c2}, now, step)
+	if err != nil {
+		t.Fatalf("unexpected error validating 15m candles: %v", err)
+	}
+	if len(valid) != 2 {
+		t.Fatalf("expected 2 valid 15m candles, got %d", len(valid))
+	}
+}
+
+func TestRecordOpenInterest_15m(t *testing.T) {
+	baseTime := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	st := NewSymbolState("BTCUSDT", ExchangeFilter{}, 10, 10)
+	st.TargetOIInterval = 15 * time.Minute
+
+	st.RecordOpenInterestLocked(1000.0, baseTime)
+	st.RecordOpenInterestLocked(1050.0, baseTime.Add(15*time.Minute))
+
+	if st.CurrOpenInterest != 1050.0 {
+		t.Fatalf("expected curr OI 1050, got %f", st.CurrOpenInterest)
+	}
+	if st.PrevOpenInterest != 1000.0 {
+		t.Fatalf("expected prev OI 1000 at t=15m, got %f", st.PrevOpenInterest)
+	}
+	if diff := st.CurrOIUpdatedAt.Sub(st.PrevOIUpdatedAt); diff != 15*time.Minute {
+		t.Fatalf("expected 15m interval, got %v", diff)
+	}
+}

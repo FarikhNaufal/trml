@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"trml/internal/config"
 )
 
 type Downloader struct {
@@ -123,6 +125,15 @@ func (d *Downloader) FetchCandleRange(
 	return deduped, nil
 }
 
+func parseDurationWithFallback(interval string) time.Duration {
+	dur, err := config.ParseTimeframeToDuration(interval)
+	if err != nil || dur <= 0 {
+		slog.Warn("Unknown interval for duration calculation, defaulting to 5m", "interval", interval, "err", err)
+		return 5 * time.Minute
+	}
+	return dur
+}
+
 func (d *Downloader) fetchMonthly(
 	ctx context.Context,
 	symbol, interval string,
@@ -132,9 +143,11 @@ func (d *Downloader) fetchMonthly(
 	fileName := fmt.Sprintf("%s-%s-%04d-%02d.csv", symbol, interval, year, month)
 	cacheFile := filepath.Join(symDir, fileName)
 
+	dur := parseDurationWithFallback(interval)
+
 	// 1. Cek apakah CSV sudah ada di cache lokal
 	if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
-		return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol)
+		return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol, dur)
 	}
 
 	// 2. Download ZIP dari Binance Vision
@@ -188,7 +201,7 @@ func (d *Downloader) fetchMonthly(
 			_ = os.WriteFile(cacheFile, csvBytes, 0644)
 
 			// Parse ke data struct
-			return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
+			return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol, dur)
 		}
 	}
 
@@ -205,13 +218,15 @@ func (d *Downloader) fetchDaily(
 	fileName := fmt.Sprintf("%s-%s-%s.csv", symbol, interval, dateStr)
 	cacheFile := filepath.Join(symDir, fileName)
 
+	dur := parseDurationWithFallback(interval)
+
 	// 1. Cek apakah CSV sudah ada di cache lokal
 	nowUTC := time.Now().UTC()
 	isToday := date.Year() == nowUTC.Year() && date.Month() == nowUTC.Month() && date.Day() == nowUTC.Day()
 	if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
 		info, sErr := os.Stat(cacheFile)
 		if !isToday || (sErr == nil && time.Since(info.ModTime()) < 15*time.Minute) {
-			return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol)
+			return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol, dur)
 		}
 	}
 
@@ -262,7 +277,7 @@ func (d *Downloader) fetchDaily(
 			}
 
 			_ = os.WriteFile(cacheFile, csvBytes, 0644)
-			return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
+			return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol, dur)
 		}
 	}
 
@@ -320,5 +335,6 @@ func (d *Downloader) fetchFromLiveAPI(
 	csvBytes := []byte(sb.String())
 	_ = os.WriteFile(cacheFile, csvBytes, 0644)
 
-	return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol)
+	dur := parseDurationWithFallback(interval)
+	return ParseBinanceKlineCSV(bytes.NewReader(csvBytes), symbol, dur)
 }

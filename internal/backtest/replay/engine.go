@@ -26,6 +26,8 @@ type ReplayConfig struct {
 	ScannerInterval       time.Duration         // interval scanning ulang (default 15 menit)
 	ScannerCfg            scanner.ScannerConfig // konfigurasi scanner produksi
 	UnconstrainedMode     bool                  // mode evaluasi sinyal murni (tanpa batas slot portofolio & cooldown)
+	DeductPendingMargin   bool                  // kurangi available margin intra-bar saat order disubmit (default: false = behavior 9815362)
+	EquityModeCompounding bool                  // compounding vs modal tetap (default: false)
 }
 
 type lastExitInfo struct {
@@ -227,7 +229,14 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 				if !ok || len(cList) == 0 {
 					continue
 				}
-				startIdx := len(cList) - 288
+				bars24h := 288
+				if r.cfg.ScannerCfg.CandleDuration > 0 {
+					bars24h = int((24 * time.Hour) / r.cfg.ScannerCfg.CandleDuration)
+				}
+				if bars24h <= 0 {
+					bars24h = 288
+				}
+				startIdx := len(cList) - bars24h
 				if startIdx < 0 {
 					startIdx = 0
 				}
@@ -283,6 +292,9 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			activeSlots = 0
 			isDailyBreached = false
 			availBal = decimal.NewFromFloat(1000000.0)
+		} else if !r.cfg.EquityModeCompounding {
+			// Mode modal tetap: kapasitas slot dan ukuran posisi tidak boleh bergantung pada saldo berjalan (drawdown)
+			availBal = totEq
 		}
 
 		for _, sym := range sortedSymbols {
@@ -366,9 +378,11 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			if approved {
 				r.SignalsApproved++
 				_, _ = r.broker.SubmitLimitEntry(intent)
-				// Perbarui active slot count dan available balance seketika agar tidak overflow
+				// Perbarui active slot count seketika agar tidak overflow
 				activeSlots = r.broker.GetActiveSlotCount()
-				availBal = r.broker.GetAvailableBalanceUSDT()
+				if r.cfg.DeductPendingMargin {
+					availBal = r.broker.GetAvailableBalanceUSDT()
+				}
 			} else {
 				r.SignalsRejected++
 				r.RejectReasons[reason]++

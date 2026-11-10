@@ -4,6 +4,10 @@
 
 # Binaries & Executables
 bin/
+bot
+backtest
+*.test
+*.out
 *.exe
 *.exe~
 *.dll

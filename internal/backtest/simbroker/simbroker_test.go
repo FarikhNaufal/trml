@@ -554,6 +554,7 @@ func TestSimBroker_GapOpenStopLoss(t *testing.T) {
 		SignalDelayBars:   1,
 		LimitTimeoutBars:  1,
 		PenetrationTicks:  1,
+		SLGapFillEnabled:  true,
 	}
 	broker := NewSimBroker(cfg)
 	broker.ExchangeFilters["BTCUSDT"] = model.ExchangeFilter{

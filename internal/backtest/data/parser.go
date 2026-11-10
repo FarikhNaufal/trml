@@ -10,9 +10,14 @@ import (
 )
 
 // ParseBinanceKlineCSV membaca stream CSV Binance Vision dan mengonversinya menjadi slice HistoricalCandle.
-func ParseBinanceKlineCSV(r io.Reader, symbol string) ([]HistoricalCandle, error) {
+func ParseBinanceKlineCSV(r io.Reader, symbol string, expectedDuration ...time.Duration) ([]HistoricalCandle, error) {
 	reader := csv.NewReader(r)
 	reader.FieldsPerRecord = -1 // izinkan fleksibilitas jika ada trailing column
+
+	defaultStepMs := int64(5*60*1000 - 1)
+	if len(expectedDuration) > 0 && expectedDuration[0] > 0 {
+		defaultStepMs = expectedDuration[0].Milliseconds() - 1
+	}
 
 	var candles []HistoricalCandle
 	isFirstLine := true
@@ -66,7 +71,7 @@ func ParseBinanceKlineCSV(r io.Reader, symbol string) ([]HistoricalCandle, error
 
 		closeTimeMs, err := strconv.ParseInt(strings.TrimSpace(record[6]), 10, 64)
 		if err != nil {
-			closeTimeMs = openTimeMs + (5*60*1000 - 1)
+			closeTimeMs = openTimeMs + defaultStepMs
 		}
 
 		quoteVol, err := strconv.ParseFloat(strings.TrimSpace(record[7]), 64)

@@ -23,7 +23,11 @@ func isInvalidFloat(v float64) bool {
 }
 
 // ValidateAndFilterCandles memeriksa urutan strictly-monotonic, kline closed, dan harga valid (Solusi P1-5)
-func ValidateAndFilterCandles(raw []Candle, serverTime time.Time) ([]Candle, error) {
+func ValidateAndFilterCandles(raw []Candle, serverTime time.Time, expectedStep ...time.Duration) ([]Candle, error) {
+	targetStep := 5 * time.Minute
+	if len(expectedStep) > 0 && expectedStep[0] > 0 {
+		targetStep = expectedStep[0]
+	}
 	var valid []Candle
 	for i, c := range raw {
 		if !c.CloseTime.Before(serverTime) && !c.CloseTime.Equal(serverTime) {
@@ -50,8 +54,8 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time) ([]Candle, err
 				return nil, fmt.Errorf("candle non-monotonic timestamp at index %d", i)
 			}
 			step := c.OpenTime.Sub(prev.OpenTime)
-			if step != 5*time.Minute {
-				return nil, fmt.Errorf("candle gap detected: expected 5m, got %v", step)
+			if step != targetStep {
+				return nil, fmt.Errorf("candle gap detected: expected %v, got %v", targetStep, step)
 			}
 		}
 		valid = append(valid, c)

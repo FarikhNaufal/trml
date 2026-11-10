@@ -22,6 +22,7 @@ type EventHandlers struct {
 	OnAggTrade         func(symbol string, price, qty float64, isBuyerMaker bool, now time.Time)
 	OnMarkPrice        func(symbol string, markPrice, fundingRate float64, now time.Time)
 	OnKline5m          func(symbol string, candle model.Candle, isClosed bool)
+	OnKlineClosed      func(symbol string, candle model.Candle, isClosed bool)
 	OnOrderTradeUpdate func(clientOrderID string, exchangeOrderID int64, symbol string, status model.OrderLifecycleStatus, cumFilledQty, avgPrice, realizedProfit decimal.Decimal)
 	OnAccountUpdate    func(walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, eventTime time.Time)
 	OnListenKeyExpired func()
@@ -217,7 +218,8 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 				TakerBuyQuoteUSDT string `json:"Q"`
 			} `json:"k"`
 		}
-		if err := json.Unmarshal(payload, &ke); err == nil && ke.Kline.Interval == "5m" && m.Handlers.OnKline5m != nil {
+		hasKlineHandler := m.Handlers.OnKlineClosed != nil || m.Handlers.OnKline5m != nil
+		if err := json.Unmarshal(payload, &ke); err == nil && hasKlineHandler {
 			o, errO := strconv.ParseFloat(ke.Kline.Open, 64)
 			h, errH := strconv.ParseFloat(ke.Kline.High, 64)
 			l, errL := strconv.ParseFloat(ke.Kline.Low, 64)
@@ -239,7 +241,11 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 						QuoteVolumeUSDT:   qv,
 						TakerBuyQuoteUSDT: tbq,
 					}
-					m.Handlers.OnKline5m(ke.Symbol, candle, ke.Kline.IsClosed)
+					if m.Handlers.OnKlineClosed != nil {
+						m.Handlers.OnKlineClosed(ke.Symbol, candle, ke.Kline.IsClosed)
+					} else if m.Handlers.OnKline5m != nil && (ke.Kline.Interval == "5m" || ke.Kline.Interval == "") {
+						m.Handlers.OnKline5m(ke.Symbol, candle, ke.Kline.IsClosed)
+					}
 				}
 			}
 		}

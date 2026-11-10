@@ -13,6 +13,7 @@ import (
 )
 
 type EvaluatorConfig struct {
+	CandleDuration        time.Duration
 	MaxDailyDrawdownPct   float64
 	MaxSlots              int
 	MaxBookStaleness      time.Duration
@@ -47,8 +48,16 @@ type EvaluatorConfig struct {
 	MaxEntryDistanceATR  float64
 	EntryOrderType       string
 
+	// Option C: Optimasi Seleksi Entry Sisi LONG
+	MinCandleBodyRatioLong   float64
+	MaxPullbackRVOLLong      float64
+	MinImpulseATRLong        float64
+	MinEMASlopeLong          float64
+	RequireCleanPullbackLong bool
+
 	// Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
 	BTCGateEnabled         bool
+	BTCGateShortOnly       bool
 	BTCMax5mDumpPct        float64
 	BTCMax5mPumpPct        float64
 	BTCGatePersistenceBars int
@@ -288,7 +297,11 @@ func EvaluateSignal(
 	var hasPriorBearishImpulse bool
 	latestImpulseIdxLong := -1
 	latestImpulseIdxShort := -1
-	bullishImpulseThreshold := vwap + (minImpulseATR * atr14)
+	minImpulseATRLong := cfg.MinImpulseATRLong
+	if minImpulseATRLong <= 0 {
+		minImpulseATRLong = minImpulseATR
+	}
+	bullishImpulseThreshold := vwap + (minImpulseATRLong * atr14)
 	bearishImpulseThreshold := vwap - (minImpulseATR * atr14)
 
 	for i := startIdx; i < endIdx; i++ {
@@ -347,10 +360,28 @@ func EvaluateSignal(
 		cameFromBelow := (c.Open <= vwap) || (i > 0 && snap.ClosedCandles[i-1].Close <= vwap)
 
 		if cameFromAbove && c.Low <= vwap+tolDist && c.Low >= vwap-maxAdverseRetestDist && (latestImpulseIdxLong >= 0 && i >= latestImpulseIdxLong) {
-			longTestedVWAP = true
+			if cfg.RequireCleanPullbackLong && c.Low < vwap-0.20*atr14 {
+				// Pullback pierced below VWAP more than 0.20 ATR - not a clean bounce
+			} else {
+				longTestedVWAP = true
+			}
 		}
 		if cameFromBelow && c.High >= vwap-tolDist && c.High <= vwap+maxAdverseRetestDist && (latestImpulseIdxShort >= 0 && i >= latestImpulseIdxShort) {
 			shortTestedVWAP = true
+		}
+	}
+
+	// Option C: Filter volume jual agresif saat pullback sisi LONG
+	if longTestedVWAP && cfg.MaxPullbackRVOLLong > 0 && latestImpulseIdxLong >= 0 {
+		for k := latestImpulseIdxLong + 1; k < len(snap.ClosedCandles)-1; k++ {
+			c := snap.ClosedCandles[k]
+			if c.Close < c.Open {
+				rvolK := indicator.CalculateRVOL(snap.ClosedCandles[:k+1], 20)
+				if rvolK > cfg.MaxPullbackRVOLLong {
+					longTestedVWAP = false
+					break
+				}
+			}
 		}
 	}
 
@@ -367,6 +398,12 @@ func EvaluateSignal(
 	// Symmetrical Counter-Trend Wick Rejection:
 	// Long: Tolak jika upper wick >= 50% dari total range (rejection keras dari seller / Shooting Star).
 	isBullishShape := (latest.Close > latest.Open) && (latestRange <= 0 || upperWick < latestRange*0.50)
+	if isBullishShape && cfg.MinCandleBodyRatioLong > 0 && latestRange > 0 {
+		body := latest.Close - latest.Open
+		if (body / latestRange) < cfg.MinCandleBodyRatioLong {
+			isBullishShape = false
+		}
+	}
 
 	// Short: Tolak jika lower wick >= 50% dari total range (rejection keras dari buyer / Hammer).
 	isBearishShape := (latest.Close < latest.Open) && (latestRange <= 0 || lowerWick < latestRange*0.50)
@@ -377,6 +414,10 @@ func EvaluateSignal(
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
 	var oiDeltaPct float64
 	if !cfg.DisableOIFilter {
+		basisSec := 300.0
+		if cfg.CandleDuration > 0 {
+			basisSec = cfg.CandleDuration.Seconds()
+		}
 		rawOIDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
 		if math.IsNaN(rawOIDeltaPct) || math.IsInf(rawOIDeltaPct, 0) {
 			return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
@@ -384,9 +425,9 @@ func EvaluateSignal(
 		oiDeltaPct = rawOIDeltaPct
 		if !snap.PrevOIUpdatedAt.IsZero() && !snap.CurrOIUpdatedAt.IsZero() {
 			elapsedSec := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt).Seconds()
-			if elapsedSec >= 60.0 && elapsedSec <= 600.0 {
-				// Normalisasi laju perubahan Open Interest ke basis standar 300 detik (5 menit)
-				oiDeltaPct = rawOIDeltaPct * (300.0 / elapsedSec)
+			if elapsedSec >= 60.0 && elapsedSec <= (basisSec*2.0) {
+				// Normalisasi laju perubahan Open Interest ke basis standar interval
+				oiDeltaPct = rawOIDeltaPct * (basisSec / elapsedSec)
 				if math.IsNaN(oiDeltaPct) || math.IsInf(oiDeltaPct, 0) {
 					return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
 				}
@@ -420,6 +461,15 @@ func EvaluateSignal(
 	// untuk menghindari eksekusi sinyal palsu saat harga sedang bolak-balik menempel di kawat EMA200 yang mendatar.
 	minEMADist := cfg.MinEMA200DistanceATR * atr14
 	emaTrendLong := (latest.Close > ema200) && (minEMADist <= 0 || (latest.Close-ema200) >= minEMADist)
+	if emaTrendLong && cfg.MinEMASlopeLong > 0 && len(snap.ClosedCandles) >= cfg.EMAPeriod+20 {
+		emaPrev := indicator.CalculateEMA(snap.ClosedCandles[:len(snap.ClosedCandles)-20], cfg.EMAPeriod)
+		if !math.IsNaN(emaPrev) && !math.IsInf(emaPrev, 0) && emaPrev > 0 {
+			slope := (ema200 - emaPrev) / (20.0 * atr14)
+			if slope < cfg.MinEMASlopeLong {
+				emaTrendLong = false
+			}
+		}
+	}
 	emaTrendShort := (latest.Close < ema200) && (minEMADist <= 0 || (ema200-latest.Close) >= minEMADist)
 
 	longValid := emaTrendLong &&
@@ -610,11 +660,15 @@ func EvaluateSignal(
 			}
 		}
 
-		// TIER 2: Symmetric Directional Bias (Soft Veto)
-		// Aktif secara otomatis jika AllowedSide bernilai "AUTO" (default).
-		// Jika user secara manual mengatur AllowedSide="BOTH", maka Tier 2 di-bypass
-		// (Tier 1 Flash Crash Circuit Breaker tetap aktif menjaga keamanan).
-		if allowedSide == "AUTO" || allowedSide == "" {
+		// TIER 2: Symmetric Directional Bias (Soft Veto) - Best Practice
+		// Aktif secara default untuk semua arah (AUTO, SHORT_ONLY, LONG_ONLY).
+		// Hanya jika user secara manual mengatur AllowedSide="BOTH", maka Tier 2 di-bypass.
+		// Jika BTCGateShortOnly disetel false, kembali ke paritas lama 9815362 (SHORT_ONLY bypass Tier 2).
+		tier2Applies := (allowedSide != "BOTH")
+		if !cfg.BTCGateShortOnly {
+			tier2Applies = (allowedSide == "AUTO" || allowedSide == "")
+		}
+		if tier2Applies {
 			// 1. Posisi SHORT hanya diizinkan jika tren BTC memang tidak bullish kuat.
 			// Jika BTC berada di atas EMA dan di atas Session VWAP, veto posisi SHORT altcoin!
 			if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {

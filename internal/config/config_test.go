@@ -322,3 +322,39 @@ func TestNaNAndInfFloatValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestTimeframeConfig(t *testing.T) {
+	// 1. Default (5m)
+	_ = os.Unsetenv("TIMEFRAME")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Timeframe != "5m" || cfg.CandleDuration != 5*time.Minute {
+		t.Errorf("expected default 5m, got %s / %v", cfg.Timeframe, cfg.CandleDuration)
+	}
+	if cfg.MaxDataStaleness != 330*time.Second {
+		t.Errorf("expected 330s MaxDataStaleness for 5m, got %v", cfg.MaxDataStaleness)
+	}
+
+	// 2. 15m
+	_ = os.Setenv("TIMEFRAME", "15m")
+	cfg15, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg15.Timeframe != "15m" || cfg15.CandleDuration != 15*time.Minute {
+		t.Errorf("expected 15m, got %s / %v", cfg15.Timeframe, cfg15.CandleDuration)
+	}
+	if cfg15.MaxDataStaleness != (15*time.Minute + 30*time.Second) {
+		t.Errorf("expected 930s MaxDataStaleness for 15m, got %v", cfg15.MaxDataStaleness)
+	}
+
+	// 3. Invalid
+	_ = os.Setenv("TIMEFRAME", "7m")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Errorf("expected error for invalid timeframe 7m, got nil")
+	}
+	_ = os.Unsetenv("TIMEFRAME")
+}

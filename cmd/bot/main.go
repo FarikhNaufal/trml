@@ -132,6 +132,7 @@ func main() {
 		cooldownExits:   make(map[string]storage.RecentExitRecord),
 		verifiedSymbols: make(map[string]bool),
 		evaluatorCfg: strategy.EvaluatorConfig{
+			CandleDuration:           cfg.CandleDuration,
 			MaxSlots:                 cfg.MaxSlots,
 			MaxBookStaleness:         cfg.MaxBookStaleness,
 			MaxMarkStaleness:         cfg.MaxMarkStaleness,
@@ -142,7 +143,7 @@ func main() {
 			MaxSpreadPct:             cfg.MaxSpreadPct,
 			MinNATRPct:               cfg.MinNATRPct,
 			MaxNATRPct:               cfg.MaxNATRPct,
-			EMAPeriod:                200,
+			EMAPeriod:                cfg.EMAPeriod,
 			ATRPeriod:                14,
 			DeltaZScoreWindow:        50,
 			MinBarDeltaZScore:        cfg.MinBounceZScore,
@@ -161,7 +162,13 @@ func main() {
 			MinImpulseATR:            cfg.MinImpulseATR,
 			MaxEntryDistanceATR:      cfg.MaxEntryDistanceATR,
 			EntryOrderType:           cfg.EntryOrderType,
+			MinCandleBodyRatioLong:   cfg.MinCandleBodyRatioLong,
+			MaxPullbackRVOLLong:      cfg.MaxPullbackRVOLLong,
+			MinImpulseATRLong:        cfg.MinImpulseATRLong,
+			MinEMASlopeLong:          cfg.MinEMASlopeLong,
+			RequireCleanPullbackLong: cfg.RequireCleanPullbackLong,
 			BTCGateEnabled:           cfg.BTCGateEnabled,
+			BTCGateShortOnly:         cfg.BTCGateShortOnly,
 			BTCMax5mDumpPct:          cfg.BTCMax5mDumpPct,
 			BTCMax5mPumpPct:          cfg.BTCMax5mPumpPct,
 			BTCGatePersistenceBars:   cfg.BTCGatePersistenceBars,
@@ -180,8 +187,10 @@ func main() {
 				AvailableBalanceBufferFraction: cfg.MaxMarginAvailFrac,
 				AccountLeverage:                cfg.Leverage,
 				SLMultiplier:                   cfg.SLATRMultiplier,
+				SLMultiplierLong:               cfg.SLATRMultiplierLong,
 				TPMultiplier:                   cfg.TPATRMultiplier,
 				TP1Multiplier:                  cfg.PartialTP1ATRMult,
+				TP1MultiplierLong:              cfg.PartialTP1ATRMultLong,
 				MinSLDistancePct:               cfg.MinSLDistancePct,
 				MakerFeeRate:                   cfg.MakerFeeRate,
 				TakerFeeRate:                   cfg.TakerFeeRate,
@@ -203,6 +212,8 @@ func main() {
 			MaxWatchedCoins:       cfg.MaxWatchedCoins,
 			BootstrapCount:        1000,
 			DeltaWindow:           50,
+			Timeframe:             cfg.Timeframe,
+			CandleDuration:        cfg.CandleDuration,
 		},
 	}
 
@@ -1089,7 +1100,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	}
 
 	fetchKlinesFn := func(symbol string, limit int) []model.Candle {
-		k, err := e.client.FetchKlines(ctx, symbol, "5m", limit)
+		k, err := e.client.FetchKlines(ctx, symbol, e.cfg.Timeframe, limit)
 		if err != nil {
 			slog.Debug("failed to fetch klines for symbol", "symbol", symbol, "err", err)
 			return nil
@@ -1178,6 +1189,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 			}
 		}
 		btcSt = model.NewSymbolState(BenchmarkSymbol, filter, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
+		btcSt.TargetOIInterval = e.cfg.CandleDuration
 		btcSt.IsLeverageIsolatedVerified = true
 		e.activeStates[BenchmarkSymbol] = btcSt
 	}
@@ -1187,10 +1199,10 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	if !exists {
 		btcFetchCount = e.scannerCfg.BootstrapCount
 	}
-	klines, kErr := e.client.FetchKlines(ctx, BenchmarkSymbol, "5m", btcFetchCount)
+	klines, kErr := e.client.FetchKlines(ctx, BenchmarkSymbol, e.cfg.Timeframe, btcFetchCount)
 	if kErr == nil && len(klines) > 0 {
 		// [C-03] Filter candle yang belum tutup agar tidak merusak state makro BTC
-		filteredKlines, vErr := model.ValidateAndFilterCandles(klines, time.Now().UTC())
+		filteredKlines, vErr := model.ValidateAndFilterCandles(klines, time.Now().UTC(), e.cfg.CandleDuration)
 		if vErr == nil && len(filteredKlines) > 0 {
 			btcSt.Mu.Lock()
 			for _, k := range filteredKlines {
@@ -1371,7 +1383,7 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 		marketStreams = append(marketStreams,
 			fmt.Sprintf("%s@aggTrade", lower),
 			fmt.Sprintf("%s@markPrice@1s", lower),
-			fmt.Sprintf("%s@kline_5m", lower),
+			fmt.Sprintf("%s@kline_%s", lower, e.cfg.Timeframe),
 		)
 	}
 
@@ -1425,11 +1437,11 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 			}
 			e.broker.OnRealtimeTick(symbol, bestBid, bestAsk, markPrice, 0, 0, false, now)
 		},
-		OnKline5m: func(symbol string, candle model.Candle, isClosed bool) {
+		OnKlineClosed: func(symbol string, candle model.Candle, isClosed bool) {
 			if !isClosed {
 				return
 			}
-			slog.Info("5m candle closed received", "symbol", symbol, "close", candle.Close, "openTime", candle.OpenTime.Format(time.RFC3339))
+			slog.Info("candle closed received", "symbol", symbol, "close", candle.Close, "openTime", candle.OpenTime.Format(time.RFC3339), "timeframe", e.cfg.Timeframe)
 			e.statesMu.RLock()
 			st := e.activeStates[symbol]
 			e.statesMu.RUnlock()
@@ -1612,6 +1624,7 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 			}
 		},
 	}
+	handlers.OnKline5m = handlers.OnKlineClosed
 
 	publicMgr := ws.NewStreamManager(handlers)
 	go publicMgr.StartSupervisedStream(publicCtx, publicURL)
