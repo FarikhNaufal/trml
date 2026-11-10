@@ -251,6 +251,45 @@ func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model
 	return resp.OrderID, avgPrice, executedQty, nil
 }
 
+// PlaceLimitClose mengirimkan order LIMIT (Post-Only GTX atau fallback GTC reduceOnly) untuk penutupan parsial/TP (POST /fapi/v1/order)
+func (c *Client) PlaceLimitClose(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (int64, error) {
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	if side == model.SideLong {
+		params.Set("side", "BUY")
+	} else {
+		params.Set("side", "SELL")
+	}
+	params.Set("type", "LIMIT")
+	params.Set("timeInForce", "GTX") // Post-Only (Maker)
+	params.Set("reduceOnly", "true")
+	params.Set("quantity", qty.String())
+	params.Set("price", price.String())
+	if clientOrderID != "" {
+		params.Set("newClientOrderId", clientOrderID)
+	}
+
+	respBytes, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
+	if err != nil {
+		// Jika GTX ditolak karena harga sudah melintasi spread, fallback ke GTC reduceOnly
+		errStr := err.Error() + " " + string(respBytes)
+		if strings.Contains(errStr, "-2010") || strings.Contains(errStr, "-5022") || strings.Contains(errStr, "Post Only") {
+			params.Set("timeInForce", "GTC")
+			respBytes, err = c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
+		}
+		if err != nil {
+			return 0, fmt.Errorf("place limit close: %w (body: %s)", err, string(respBytes))
+		}
+	}
+
+	var resp OrderResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return 0, fmt.Errorf("place limit close: failed to decode response: %w", err)
+	}
+
+	return resp.OrderID, nil
+}
+
 // InitAndVerifySymbol memverifikasi One-Way mode, isolasi margin, dan leverage 5x (Solusi P0-5 & P0-7)
 func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverage int) (bool, error) {
 	// 1. Verifikasi One-Way Mode (GET /fapi/v1/positionSide/dual)

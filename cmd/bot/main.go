@@ -426,6 +426,7 @@ func main() {
 		}
 		engine.liveBroker.PlaceAlgoOrderFn = client.PlaceAlgoOrder
 		engine.liveBroker.MarketCloseFn = client.PlaceMarketClose
+		engine.liveBroker.PlaceLimitCloseFn = client.PlaceLimitClose
 		engine.liveBroker.CancelOrderFn = client.CancelOrder
 		engine.liveBroker.CancelAlgoOrderFn = client.CancelAlgoOrder
 		engine.liveBroker.VerifyAlgoOrderFn = func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (bool, bool, error) {

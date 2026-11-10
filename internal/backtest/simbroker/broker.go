@@ -434,7 +434,12 @@ func (s *SimBroker) recordClosedTradeLocked(
 		grossPnL = pos.EntryPrice.Sub(exitPrice).Mul(qty)
 	}
 
-	exitFee := exitPrice.Mul(qty).Mul(s.Cfg.TakerFeeRate)
+	var exitFee decimal.Decimal
+	if reason == "PARTIAL_TAKE_PROFIT" {
+		exitFee = exitPrice.Mul(qty).Mul(s.Cfg.MakerFeeRate)
+	} else {
+		exitFee = exitPrice.Mul(qty).Mul(s.Cfg.TakerFeeRate)
+	}
 	entryFeeLeg := pos.EntryPrice.Mul(qty).Mul(s.Cfg.MakerFeeRate)
 	totalFee := entryFeeLeg.Add(exitFee)
 

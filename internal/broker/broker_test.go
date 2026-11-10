@@ -3046,3 +3046,211 @@ func TestLiveBrokerTP1FormattingAndReaderStats(t *testing.T) {
 		t.Errorf("expected TP1 client order ID '%s', got '%s'", expectedTP1CID, tp1CID)
 	}
 }
+
+func TestLiveBrokerLimitMakerTP1AndGhostCancellation(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+		PartialTPEnabled:    true,
+		PartialTP1Ratio:     0.50,
+		MakerFeeRate:        0.0002,
+		TakerFeeRate:        0.0005,
+	})
+	defer b.Close()
+	now := time.Now().UTC()
+
+	var placedLimitCloseSymbol string
+	var placedLimitCloseSide model.Side
+	var placedLimitCloseQty decimal.Decimal
+	var placedLimitClosePrice decimal.Decimal
+	var placedLimitCloseCID string
+	var limitCloseMu sync.Mutex
+
+	b.PlaceLimitCloseFn = func(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (int64, error) {
+		limitCloseMu.Lock()
+		placedLimitCloseSymbol = symbol
+		placedLimitCloseSide = side
+		placedLimitCloseQty = qty
+		placedLimitClosePrice = price
+		placedLimitCloseCID = clientOrderID
+		limitCloseMu.Unlock()
+		return 888777, nil
+	}
+
+	var placedSLAlgoSide model.Side
+	var placedSLAlgoPrice decimal.Decimal
+	var placedSLAlgoQty decimal.Decimal
+	var slMu sync.Mutex
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		slMu.Lock()
+		placedSLAlgoSide = side
+		placedSLAlgoPrice = triggerPrice
+		placedSLAlgoQty = qty
+		slMu.Unlock()
+		return 112233, nil
+	}
+
+	var canceledExchangeOrderID int64
+	var canceledClientOrderID string
+	var cancelMu sync.Mutex
+	b.CancelOrderFn = func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error {
+		cancelMu.Lock()
+		canceledExchangeOrderID = exchangeOrderID
+		canceledClientOrderID = clientOrderID
+		cancelMu.Unlock()
+		return nil
+	}
+
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.1),
+			StepSize:    decimal.NewFromFloat(0.001),
+			MinNotional: decimal.NewFromFloat(5.0),
+		}, true
+	}
+
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000.0), decimal.Zero, decimal.NewFromFloat(10000.0), nil, now)
+
+	// Step 1: Entry SHORT 1.0 BTC @ 50,000, SL @ 51,000, TP1 @ 49,000
+	origCID := "BOT_SHORT_BTC_001"
+	intent := model.OrderIntent{
+		ClientOrderID: origCID,
+		Symbol:        "BTCUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(1.0),
+		LimitPrice:    decimal.NewFromFloat(50000.0),
+		SLPrice:       decimal.NewFromFloat(51000.0),
+		TPPrice:       decimal.NewFromFloat(48000.0),
+		TP1Price:      decimal.NewFromFloat(49000.0),
+		ATRAtEntry:    decimal.NewFromFloat(500.0),
+		CreatedAt:     now,
+	}
+	reserved, err := b.ReserveEntryIntent(intent)
+	if !reserved || err != nil {
+		t.Fatalf("failed to reserve intent: %v", err)
+	}
+
+	// Trigger Entry Fill
+	b.HandleUserDataOrderUpdate(origCID, 1001, "BTCUSDT", model.StatusFilled, decimal.NewFromFloat(1.0), decimal.NewFromFloat(50000.0), decimal.Zero)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verifikasi resting Limit Maker TP1 terpasang via PlaceLimitCloseFn
+	limitCloseMu.Lock()
+	if placedLimitCloseSymbol != "BTCUSDT" {
+		t.Errorf("expected placedLimitCloseSymbol BTCUSDT, got %s", placedLimitCloseSymbol)
+	}
+	if placedLimitCloseSide != model.SideLong {
+		t.Errorf("expected exit side LONG to close SHORT, got %s", placedLimitCloseSide)
+	}
+	if !placedLimitCloseQty.Equal(decimal.NewFromFloat(0.5)) {
+		t.Errorf("expected TP1 qty 0.5, got %s", placedLimitCloseQty)
+	}
+	if !placedLimitClosePrice.Equal(decimal.NewFromFloat(49000.0)) {
+		t.Errorf("expected TP1 price 49000.0, got %s", placedLimitClosePrice)
+	}
+	tp1CID := placedLimitCloseCID
+	limitCloseMu.Unlock()
+
+	b.Mu.Lock()
+	prot, hasProt := b.Protections["BTCUSDT"]
+	if !hasProt || prot.TP1OrderID != 888777 {
+		t.Fatalf("expected TP1OrderID 888777 stored in protection, got %v", prot)
+	}
+	b.Mu.Unlock()
+
+	// Step 2: Simulasikan fill resting Limit Maker TP1 di bursa via WebSocket ORDER_TRADE_UPDATE
+	var tradeRec TradeClosedRecord
+	var tradeClosedMu sync.Mutex
+	b.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		tradeClosedMu.Lock()
+		tradeRec = rec
+		tradeClosedMu.Unlock()
+	}
+
+	b.HandleUserDataOrderUpdate(tp1CID, 888777, "BTCUSDT", model.StatusFilled, decimal.NewFromFloat(0.5), decimal.NewFromFloat(49000.0), decimal.Zero)
+
+	time.Sleep(150 * time.Millisecond)
+
+	// Verifikasi record trade parsial
+	tradeClosedMu.Lock()
+	if tradeRec.ExitReason != "PARTIAL_TAKE_PROFIT" {
+		t.Errorf("expected exit reason PARTIAL_TAKE_PROFIT, got %s", tradeRec.ExitReason)
+	}
+	if !tradeRec.Qty.Equal(decimal.NewFromFloat(0.5)) {
+		t.Errorf("expected closed qty 0.5, got %s", tradeRec.Qty)
+	}
+	// Periksa PnL: Gross = (50000 - 49000) * 0.5 = 500. Entry fee = 50000*0.5*0.0005 = 12.5. Exit fee (Maker) = 49000*0.5*0.0002 = 4.9. Net PnL = 500 - 12.5 - 4.9 = 482.6
+	expectedNetPnL := decimal.NewFromFloat(482.6)
+	if !tradeRec.NetPnL.Equal(expectedNetPnL) {
+		t.Errorf("expected NetPnL %s with Maker fee, got %s", expectedNetPnL, tradeRec.NetPnL)
+	}
+	tradeClosedMu.Unlock()
+
+	// Verifikasi posisi berkurang menjadi 0.5 dan SL dipindahkan ke BE
+	b.Mu.Lock()
+	remQty := b.ActivePositions["BTCUSDT"]
+	if !remQty.Equal(decimal.NewFromFloat(0.5)) {
+		t.Errorf("expected active position remaining 0.5, got %s", remQty)
+	}
+	if !b.IsTP1Hits["BTCUSDT"] {
+		t.Errorf("expected IsTP1Hits true")
+	}
+	b.Mu.Unlock()
+
+	slMu.Lock()
+	if placedSLAlgoSide != model.SideLong {
+		t.Errorf("expected new SL exit side LONG, got %s", placedSLAlgoSide)
+	}
+	if !placedSLAlgoQty.Equal(decimal.NewFromFloat(0.5)) {
+		t.Errorf("expected new SL qty 0.5, got %s", placedSLAlgoQty)
+	}
+	if !placedSLAlgoPrice.LessThan(decimal.NewFromFloat(50000.0)) {
+		t.Errorf("expected new BE SL price < 50000.0, got %s", placedSLAlgoPrice)
+	}
+	slMu.Unlock()
+
+	// Step 3: Test skenario ghost order cancellation bila SL tersentuh sebelum TP1 terisi pada posisi lain
+	origCID2 := "BOT_SHORT_ETH_002"
+	intent2 := model.OrderIntent{
+		ClientOrderID: origCID2,
+		Symbol:        "ETHUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(10.0),
+		LimitPrice:    decimal.NewFromFloat(3000.0),
+		SLPrice:       decimal.NewFromFloat(3100.0),
+		TPPrice:       decimal.NewFromFloat(2800.0),
+		TP1Price:      decimal.NewFromFloat(2900.0),
+		ATRAtEntry:    decimal.NewFromFloat(50.0),
+		CreatedAt:     now,
+	}
+	_, _ = b.ReserveEntryIntent(intent2)
+	b.HandleUserDataOrderUpdate(origCID2, 2002, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(10.0), decimal.NewFromFloat(3000.0), decimal.Zero)
+	time.Sleep(100 * time.Millisecond)
+
+	b.Mu.Lock()
+	ethProt := b.Protections["ETHUSDT"]
+	if ethProt == nil || ethProt.TP1OrderID == 0 {
+		t.Fatalf("expected ETH TP1 order to be active")
+	}
+	ethTP1ID := ethProt.TP1OrderID
+	ethTP1CID := ethProt.TP1ClientOrderID
+	ethSLID := ethProt.SLOrderID
+	b.Mu.Unlock()
+
+	// Simulasikan SL terisi penuh sebelum TP1 tercapai
+	cancelMu.Lock()
+	canceledExchangeOrderID = 0
+	cancelMu.Unlock()
+
+	b.HandleUserDataOrderUpdate("ALGOSL_ETH", ethSLID, "ETHUSDT", model.StatusFilled, decimal.NewFromFloat(10.0), decimal.NewFromFloat(3100.0), decimal.NewFromFloat(-1000.0))
+	time.Sleep(100 * time.Millisecond)
+
+	// Verifikasi resting Limit Maker order di ETHUSDT dibatalkan via CancelOrderFn agar tidak jadi ghost order
+	cancelMu.Lock()
+	if canceledExchangeOrderID != ethTP1ID || canceledClientOrderID != ethTP1CID {
+		t.Errorf("expected resting TP1 order %d (%s) canceled on SL hit, got %d (%s)", ethTP1ID, ethTP1CID, canceledExchangeOrderID, canceledClientOrderID)
+	}
+	cancelMu.Unlock()
+}

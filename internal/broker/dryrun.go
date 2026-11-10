@@ -566,12 +566,12 @@ func (d *DryRunBroker) OnRealtimeTick(
 				return
 			}
 
-			// Partial Take Profit (Scale-Out Phase 2)
+			// Partial Take Profit (Scale-Out Phase 2) - Eksekusi Maker Limit
 			if d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
 				isTP1Hit := triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) ||
 					(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price))
 				if isTP1Hit {
-					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.TakerFeeRate, beOffsetRate)
+					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.MakerFeeRate, beOffsetRate)
 				}
 			}
 		} else {
@@ -598,12 +598,12 @@ func (d *DryRunBroker) OnRealtimeTick(
 				return
 			}
 
-			// Partial Take Profit (Scale-Out Phase 2)
+			// Partial Take Profit (Scale-Out Phase 2) - Eksekusi Maker Limit
 			if d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
 				isTP1Hit := triggerRefPrice.LessThanOrEqual(pos.TP1Price) ||
 					(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price))
 				if isTP1Hit {
-					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.TakerFeeRate, beOffsetRate)
+					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.MakerFeeRate, beOffsetRate)
 				}
 			}
 		}

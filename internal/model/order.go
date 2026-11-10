@@ -92,12 +92,14 @@ type LivePositionProtection struct {
 	SLStatus        ProtectionOrderStatus
 	SLPrice         decimal.Decimal
 	InitialSLPrice  decimal.Decimal
-	TPOrderID       int64
-	TPClientAlgoID  string
-	TPStatus        ProtectionOrderStatus
-	TPPrice         decimal.Decimal
-	TP1Price        decimal.Decimal
-	IsTP1Hit        bool
+	TPOrderID        int64
+	TPClientAlgoID   string
+	TPStatus         ProtectionOrderStatus
+	TPPrice          decimal.Decimal
+	TP1Price         decimal.Decimal
+	TP1OrderID       int64
+	TP1ClientOrderID string
+	IsTP1Hit         bool
 	LastAttemptTime time.Time
 	LastError       string
 	SLRetryCount    int
@@ -107,18 +109,24 @@ type LivePositionProtection struct {
 }
 
 type ProtectionPlanAction struct {
-	Symbol         string
-	Generation     uint64
-	CancelSLID     int64
-	CancelTPID     int64
-	NeedNewSL      bool
-	NeedNewTP      bool
-	ExitSide       Side
-	TargetQty      decimal.Decimal
-	SLPrice        decimal.Decimal
-	TPPrice        decimal.Decimal
-	ClientSLAlgoID string
-	ClientTPAlgoID string
+	Symbol            string
+	Generation        uint64
+	CancelSLID        int64
+	CancelTPID        int64
+	CancelTP1ID       int64
+	CancelTP1ClientID string
+	NeedNewSL         bool
+	NeedNewTP         bool
+	NeedNewTP1Limit   bool
+	ExitSide          Side
+	TargetQty         decimal.Decimal
+	SLPrice           decimal.Decimal
+	TPPrice           decimal.Decimal
+	TP1Price          decimal.Decimal
+	TP1Qty            decimal.Decimal
+	ClientSLAlgoID    string
+	ClientTPAlgoID    string
+	ClientTP1ID       string
 }
 
 type LivePosition struct {
