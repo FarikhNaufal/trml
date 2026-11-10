@@ -31,6 +31,7 @@ type FundingManager struct {
 	cacheDir string
 	client   *http.Client
 	rates    map[string][]HistoricalFundingRate // symbol -> sorted rates
+	offline  bool
 }
 
 func NewFundingManager(cacheDir string) *FundingManager {
@@ -44,6 +45,10 @@ func NewFundingManager(cacheDir string) *FundingManager {
 		},
 		rates: make(map[string][]HistoricalFundingRate),
 	}
+}
+
+func (fm *FundingManager) SetOffline(offline bool) {
+	fm.offline = offline
 }
 
 // LoadFundingRates memuat funding rates untuk sekumpulan simbol dalam rentang tanggal [from..to] secara paralel.
@@ -155,7 +160,7 @@ func (fm *FundingManager) fetchSymbolFunding(ctx context.Context, symbol string,
 		month := int(cur.Month())
 
 		rates, err := fm.fetchMonthlyFunding(ctx, symbol, year, month, fundingDir)
-		if err != nil {
+		if err != nil && !fm.offline {
 			// Fallback ke REST API jika arsip bulanan Binance Vision belum terbit (misal bulan berjalan / hari ini)
 			rates, err = fm.fetchLiveAPIFunding(ctx, symbol, cur, fundingDir)
 			if err != nil {
@@ -170,7 +175,7 @@ func (fm *FundingManager) fetchSymbolFunding(ctx context.Context, symbol string,
 		cur = cur.AddDate(0, 1, 0)
 	}
 
-	if len(allRates) == 0 {
+	if len(allRates) == 0 && !fm.offline {
 		// Percobaan terakhir: fetch langsung via live API untuk rentang tanggal
 		rates, err := fm.fetchLiveAPIFundingRange(ctx, symbol, from, to)
 		if err == nil && len(rates) > 0 {
@@ -209,11 +214,15 @@ func (fm *FundingManager) fetchMonthlyFunding(
 	if fileInfo, err := os.Stat(cacheFile); err == nil && fileInfo.Size() > 0 {
 		isCurrentMonth := year == time.Now().UTC().Year() && time.Month(month) == time.Now().UTC().Month()
 		// Jika bulan lampau, cache permanen berlaku. Jika bulan berjalan, gunakan cache jika masih fresh (< 4 jam).
-		if !isCurrentMonth || time.Since(fileInfo.ModTime()) < 4*time.Hour {
+		if !isCurrentMonth || time.Since(fileInfo.ModTime()) < 4*time.Hour || fm.offline {
 			if fileBytes, err := os.ReadFile(cacheFile); err == nil && len(fileBytes) > 0 {
 				return parseFundingCSV(bytes.NewReader(fileBytes))
 			}
 		}
+	}
+
+	if fm.offline {
+		return nil, fmt.Errorf("offline: funding rate %s-%04d-%02d tidak ada di cache", symbol, year, month)
 	}
 
 	// 2. Unduh zip dari Binance Vision

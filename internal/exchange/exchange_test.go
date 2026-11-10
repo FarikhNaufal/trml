@@ -2,10 +2,13 @@ package exchange
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
@@ -269,5 +272,51 @@ func TestMarketDataEndpoints(t *testing.T) {
 	}
 	if p, ok := pos["BTCUSDT"]; !ok || p.Side != model.SideLong || !p.Qty.Equal(decimal.RequireFromString("0.100")) {
 		t.Errorf("unexpected position map: %+v", pos)
+	}
+}
+
+func TestCircuitBreakerHTTP418(t *testing.T) {
+	reqCount := 0
+	futureBanMs := time.Now().Add(10 * time.Minute).UnixMilli()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(418)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":-1003,"msg":"IP: 202.154.12.9 is banned until %d. Please use the Binance UI or webhooks to perform this action."}`, futureBanMs)))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+
+	// Panggilan pertama: harus menerima HTTP 418 dan TIDAK melakukan retry
+	_, err := client.DoRequest(context.Background(), http.MethodGet, "/fapi/v1/openInterest", nil, false)
+	if err == nil {
+		t.Fatalf("expected error from 418, got nil")
+	}
+
+	if reqCount != 1 {
+		t.Errorf("expected exactly 1 request (no retry on 418), got %d", reqCount)
+	}
+
+	banned, until := client.IsIPBanned()
+	if !banned {
+		t.Fatalf("expected client to be flagged as IP banned")
+	}
+	if until.UnixMilli() != futureBanMs {
+		t.Errorf("expected ban until %d, got %d", futureBanMs, until.UnixMilli())
+	}
+
+	// Panggilan kedua: harus langsung ditolak oleh circuit breaker TANPA memanggil HTTP server
+	_, err2 := client.DoRequest(context.Background(), http.MethodGet, "/fapi/v1/openInterest", nil, false)
+	if err2 == nil {
+		t.Fatalf("expected circuit breaker error on second request, got nil")
+	}
+	if !strings.Contains(err2.Error(), "outgoing requests paused due to active Binance IP ban") {
+		t.Errorf("unexpected error message: %v", err2)
+	}
+
+	if reqCount != 1 {
+		t.Errorf("expected reqCount to remain 1 after second request, got %d", reqCount)
 	}
 }

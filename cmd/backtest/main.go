@@ -202,6 +202,7 @@ func handleRunCommand(args []string) {
 	flagTier1EarlyBE := fs.Bool("flag-tier1-early-be", false, "Flag 2: Enable Tier 1 Early BE before TP1 (default: false = behavior 9815362)")
 	flagSLGapFill := fs.Bool("flag-sl-gap-fill", false, "Flag 3: Enable SL gap fill at candle open + slippage (default: false = behavior 9815362)")
 	flagDeductPendingMargin := fs.Bool("flag-deduct-pending-margin", false, "Flag 4: Deduct available margin intra-bar upon limit submit (default: false = behavior 9815362)")
+	offlineFlag := fs.Bool("offline", false, "Strict 100% offline mode: rely solely on local disk cache with zero network calls")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfigForBacktest(*envFlag)
@@ -259,6 +260,13 @@ func handleRunCommand(args []string) {
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
+	} else if *offlineFlag {
+		var err error
+		symbols, err = data.DiscoverMarketSymbolsOffline(*cacheDirFlag)
+		if err != nil {
+			slog.Warn("Gagal discover simbol dari cache lokal, fallback koin utama", "err", err)
+			symbols = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+		}
 	} else if *scannerFlag {
 		var err error
 		symbols, err = data.DiscoverMarketSymbols(ctx, *cacheDirFlag, scannerCfg.MinVolume24hUSDT)
@@ -281,10 +289,18 @@ func handleRunCommand(args []string) {
 	}
 
 	downloader := data.NewDownloader(*cacheDirFlag)
+	if *offlineFlag {
+		downloader.SetOffline(true)
+	}
 
 	// Muat filter resmi bursa Binance Futures (tickSize, stepSize, minNotional)
 	fmt.Printf("Memuat filter bursa resmi Binance Futures (exchangeInfo)...\n")
-	exchangeFilters, err := data.LoadExchangeFilters(ctx, *cacheDirFlag)
+	var exchangeFilters map[string]model.ExchangeFilter
+	if *offlineFlag {
+		exchangeFilters, err = data.LoadExchangeFiltersOffline(*cacheDirFlag)
+	} else {
+		exchangeFilters, err = data.LoadExchangeFilters(ctx, *cacheDirFlag)
+	}
 	if err != nil {
 		slog.Warn("Gagal memuat exchange filters resmi dari Binance API, menggunakan fail-safe", "err", err)
 	}
@@ -324,6 +340,9 @@ func handleRunCommand(args []string) {
 
 	// Muat data tingkat pendanaan (funding rate) historis resmi Binance
 	fundingMgr := data.NewFundingManager(*cacheDirFlag)
+	if *offlineFlag {
+		fundingMgr.SetOffline(true)
+	}
 	fmt.Printf("Memuat data tingkat pendanaan (funding rate) historis Binance untuk %d simbol...\n", len(symbols))
 	_ = fundingMgr.LoadFundingRates(ctx, symbols, from, to)
 
@@ -511,6 +530,7 @@ func handleAblateCommand(args []string) {
 	equityFlag := fs.Float64("equity", 0.0, "Initial Equity USDT (default from INITIAL_EQUITY in backtest.env, or 125.0)")
 	compoundingFlag := fs.Bool("compounding", false, "Aktifkan mode compounding equity")
 	unconstrainedFlag := fs.Bool("unconstrained", true, "Mode sinyal independen unconstrained (default: true)")
+	offlineFlag := fs.Bool("offline", false, "Strict 100% offline mode: rely solely on local disk cache with zero network calls")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfigForBacktest(*envFlag)
@@ -537,6 +557,9 @@ func handleAblateCommand(args []string) {
 	}
 
 	downloader := data.NewDownloader(*cacheDirFlag)
+	if *offlineFlag {
+		downloader.SetOffline(true)
+	}
 	ctx := context.Background()
 
 	interval := "5m"
@@ -557,13 +580,20 @@ func handleAblateCommand(args []string) {
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
+	} else if *offlineFlag {
+		symbols, _ = data.DiscoverMarketSymbolsOffline(*cacheDirFlag)
 	} else if *scannerFlag {
 		symbols, _ = data.DiscoverMarketSymbols(ctx, *cacheDirFlag, scannerCfg.MinVolume24hUSDT)
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
 
-	exchangeFilters, _ := data.LoadExchangeFilters(ctx, *cacheDirFlag)
+	var exchangeFilters map[string]model.ExchangeFilter
+	if *offlineFlag {
+		exchangeFilters, _ = data.LoadExchangeFiltersOffline(*cacheDirFlag)
+	} else {
+		exchangeFilters, _ = data.LoadExchangeFilters(ctx, *cacheDirFlag)
+	}
 
 	fmt.Printf("Memuat data candlestick %s untuk %d simbol [%s s/d %s] (16 parallel workers)...\n",
 		interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
@@ -575,6 +605,9 @@ func handleAblateCommand(args []string) {
 	}
 
 	fundingMgr := data.NewFundingManager(*cacheDirFlag)
+	if *offlineFlag {
+		fundingMgr.SetOffline(true)
+	}
 	_ = fundingMgr.LoadFundingRates(ctx, symbols, from, to)
 
 	fmt.Println("========================================================================================")

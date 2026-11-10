@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,12 +28,57 @@ func (e *APIError) Error() string {
 }
 
 type Client struct {
-	BaseURL    string
-	APIKey     string
-	SecretKey  string
-	HTTPClient *http.Client
-	TimeOffset int64
-	RecvWindow int64
+	BaseURL     string
+	APIKey      string
+	SecretKey   string
+	HTTPClient  *http.Client
+	TimeOffset  int64
+	RecvWindow  int64
+	bannedUntil int64 // unix milli timestamp (circuit breaker untuk HTTP 418 / code -1003)
+}
+
+func (c *Client) IsIPBanned() (bool, time.Time) {
+	b := atomic.LoadInt64(&c.bannedUntil)
+	if b == 0 {
+		return false, time.Time{}
+	}
+	now := time.Now().UnixMilli()
+	if b > now {
+		return true, time.UnixMilli(b)
+	}
+	return false, time.Time{}
+}
+
+func (c *Client) SetBanUntil(untilMs int64) {
+	atomic.StoreInt64(&c.bannedUntil, untilMs)
+}
+
+func parseBanExpiry(header http.Header, msg string) int64 {
+	// 1. Cek header Retry-After
+	if retryHeader := header.Get("Retry-After"); retryHeader != "" {
+		if s, err := strconv.ParseInt(retryHeader, 10, 64); err == nil && s > 0 {
+			return time.Now().Add(time.Duration(s) * time.Second).UnixMilli()
+		}
+	}
+
+	// 2. Cek pesan body: "banned until 1794327217106"
+	idx := strings.Index(msg, "banned until ")
+	if idx != -1 {
+		sub := msg[idx+len("banned until "):]
+		endIdx := strings.IndexAny(sub, ". ,;\t\n")
+		var numStr string
+		if endIdx != -1 {
+			numStr = sub[:endIdx]
+		} else {
+			numStr = sub
+		}
+		if ts, err := strconv.ParseInt(numStr, 10, 64); err == nil && ts > 0 {
+			return ts
+		}
+	}
+
+	// 3. Fallback: proteksi freeze 5 menit
+	return time.Now().Add(5 * time.Minute).UnixMilli()
 }
 
 func NewClient(baseURL, apiKey, secretKey string) *Client {
@@ -74,6 +120,10 @@ func (c *Client) signQuery(params url.Values) string {
 }
 
 func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params url.Values, signed bool) ([]byte, error) {
+	if banned, until := c.IsIPBanned(); banned {
+		return nil, fmt.Errorf("exchange: outgoing requests paused due to active Binance IP ban until %s", until.Format(time.RFC3339))
+	}
+
 	if params == nil {
 		params = url.Values{}
 	}
@@ -168,8 +218,18 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 		}
 		lastBody = body
 
-		// Tangani Rate Limit (429/418) dan Server Error (5xx) dengan retry bounded
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 418 || (resp.StatusCode >= 500 && resp.StatusCode <= 504) {
+		// Circuit Breaker: Tangani HTTP 418 (IP Ban) tanpa retry agar tidak memperpanjang ban
+		if resp.StatusCode == 418 {
+			var apiErr APIError
+			_ = json.Unmarshal(body, &apiErr)
+			apiErr.HTTPStatusCode = 418
+			expiry := parseBanExpiry(resp.Header, apiErr.Msg)
+			c.SetBanUntil(expiry)
+			return body, &apiErr
+		}
+
+		// Tangani Rate Limit (429) dan Server Error (5xx) dengan retry bounded
+		if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode <= 504) {
 			if method == http.MethodPost && (strings.Contains(endpoint, "/order") || strings.Contains(endpoint, "/algoOrder")) {
 				clientOID := params.Get("newClientOrderId")
 				if clientOID == "" {
@@ -207,6 +267,10 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 			var apiErr APIError
 			if jsonErr := json.Unmarshal(body, &apiErr); jsonErr == nil && apiErr.Code != 0 {
 				apiErr.HTTPStatusCode = resp.StatusCode
+				if apiErr.Code == -1003 {
+					expiry := parseBanExpiry(resp.Header, apiErr.Msg)
+					c.SetBanUntil(expiry)
+				}
 				return body, &apiErr
 			}
 			return body, fmt.Errorf("exchange: API returned HTTP %d: %s", resp.StatusCode, string(body))

@@ -4,8 +4,8 @@
 
 # Binaries & Executables
 bin/
-bot
-backtest
+/bot
+/backtest
 *.test
 *.out
 *.exe

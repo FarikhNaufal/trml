@@ -62,6 +62,52 @@ func LoadExchangeFilters(ctx context.Context, cacheDir string) (map[string]model
 	return parseExchangeInfoJSON(rawBytes)
 }
 
+// LoadExchangeFiltersOffline memuat filter bursa resmi MURNI dari cache lokal tanpa menyentuh network.
+func LoadExchangeFiltersOffline(cacheDir string) (map[string]model.ExchangeFilter, error) {
+	if cacheDir == "" {
+		cacheDir = filepath.Join("data", "backtest", "cache")
+	}
+	cacheFile := filepath.Join(cacheDir, "exchange_info.json")
+	fileData, err := os.ReadFile(cacheFile)
+	if err != nil || len(fileData) == 0 {
+		return nil, fmt.Errorf("exchange_info.json tidak ditemukan di cache lokal %s: %w", cacheDir, err)
+	}
+	return parseExchangeInfoJSON(fileData)
+}
+
+// DiscoverMarketSymbolsOffline mengembalikan daftar koin murni dari direktori cache lokal.
+func DiscoverMarketSymbolsOffline(cacheDir string) ([]string, error) {
+	if cacheDir == "" {
+		cacheDir = filepath.Join("data", "backtest", "cache")
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membaca direktori cache: %w", err)
+	}
+
+	var cachedSyms []string
+	hasBTC := false
+	for _, e := range entries {
+		name := strings.ToUpper(e.Name())
+		if e.IsDir() && strings.HasSuffix(name, "USDT") {
+			cachedSyms = append(cachedSyms, name)
+			if name == "BTCUSDT" {
+				hasBTC = true
+			}
+		}
+	}
+
+	if len(cachedSyms) == 0 {
+		return nil, fmt.Errorf("tidak ada koin USDT di cache lokal %s", cacheDir)
+	}
+
+	if !hasBTC {
+		cachedSyms = append([]string{"BTCUSDT"}, cachedSyms...)
+	}
+	sort.Strings(cachedSyms)
+	return cachedSyms, nil
+}
+
 func parseExchangeInfoJSON(data []byte) (map[string]model.ExchangeFilter, error) {
 	var res struct {
 		Symbols []struct {

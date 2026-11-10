@@ -22,6 +22,7 @@ type Downloader struct {
 	client   *http.Client
 	cacheDir string
 	baseURL  string
+	offline  bool
 }
 
 func NewDownloader(cacheDir string) *Downloader {
@@ -35,6 +36,10 @@ func NewDownloader(cacheDir string) *Downloader {
 		cacheDir: cacheDir,
 		baseURL:  "https://data.binance.vision/data/futures/um",
 	}
+}
+
+func (d *Downloader) SetOffline(offline bool) {
+	d.offline = offline
 }
 
 // FetchCandleRange mengunduh dan memuat candlestick Binance Vision untuk rentang tanggal yang diminta.
@@ -150,6 +155,10 @@ func (d *Downloader) fetchMonthly(
 		return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol, dur)
 	}
 
+	if d.offline {
+		return nil, fmt.Errorf("offline mode: candle bulanan %s-%s-%04d-%02d tidak ada di cache", symbol, interval, year, month)
+	}
+
 	// 2. Download ZIP dari Binance Vision
 	zipName := fmt.Sprintf("%s-%s-%04d-%02d.zip", symbol, interval, year, month)
 	url := fmt.Sprintf("%s/monthly/klines/%s/%s/%s", d.baseURL, symbol, interval, zipName)
@@ -225,9 +234,13 @@ func (d *Downloader) fetchDaily(
 	isToday := date.Year() == nowUTC.Year() && date.Month() == nowUTC.Month() && date.Day() == nowUTC.Day()
 	if fileData, err := os.ReadFile(cacheFile); err == nil && len(fileData) > 0 {
 		info, sErr := os.Stat(cacheFile)
-		if !isToday || (sErr == nil && time.Since(info.ModTime()) < 15*time.Minute) {
+		if !isToday || (sErr == nil && time.Since(info.ModTime()) < 15*time.Minute) || d.offline {
 			return ParseBinanceKlineCSV(bytes.NewReader(fileData), symbol, dur)
 		}
+	}
+
+	if d.offline {
+		return nil, fmt.Errorf("offline mode: candle harian %s-%s-%s tidak ada di cache", symbol, interval, dateStr)
 	}
 
 	// 2. Download ZIP harian dari Binance Vision
