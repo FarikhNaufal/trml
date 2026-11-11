@@ -2,6 +2,7 @@ package model
 
 import (
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -58,38 +59,74 @@ func NewSymbolState(symbol string, filter ExchangeFilter, bootstrapCap, deltaCap
 	}
 }
 
-// RecordOpenInterestLocked mencatat sampel Open Interest dan menyinkronkan selisih interval candle
-func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
-	if oi <= 0 {
-		return
-	}
-
-	interval := s.TargetOIInterval
+func (s *SymbolState) oiIntervalConfig() (interval, maxInterval, minAge, maxAge time.Duration) {
+	interval = s.TargetOIInterval
 	if interval <= 0 {
 		interval = 5 * time.Minute
 	}
+	maxInterval = interval * 2
+	if maxInterval < 8*time.Minute {
+		maxInterval = 8 * time.Minute
+	}
+	minAge = time.Duration(float64(interval) * 0.75)
+	maxAge = time.Duration(float64(interval) * 1.35)
+	return interval, maxInterval, minAge, maxAge
+}
 
-	// 1. Bersihkan sampel basi (> 3x interval) agar simbol yang sempat keluar scanner tidak menyimpan sampel purba
-	cutoff := now.Add(-interval * 3)
-	validCount := 0
+// NeedsOIBootstrapLocked menentukan apakah state OI masih membutuhkan seeding data historis
+// (buffer belum punya 2 sampel usable, PrevOI kosong, atau PrevOI sudah melewati batas maxInterval).
+func (s *SymbolState) NeedsOIBootstrapLocked(now time.Time, maxInterval time.Duration) bool {
+	if maxInterval <= 0 {
+		_, maxInterval, _, _ = s.oiIntervalConfig()
+	}
+	if len(s.OISamples) < 2 || s.PrevOpenInterest <= 0 || s.PrevOIUpdatedAt.IsZero() {
+		return true
+	}
+	return now.Sub(s.PrevOIUpdatedAt) > maxInterval
+}
+
+func (s *SymbolState) pruneAndNormalizeOISamplesLocked(now time.Time, maxInterval time.Duration) {
+	cutoff := now.Add(-maxInterval)
+	byTS := make(map[int64]OISample, len(s.OISamples))
 	for _, sample := range s.OISamples {
-		if sample.Timestamp.After(cutoff) {
-			s.OISamples[validCount] = sample
-			validCount++
+		if sample.Value <= 0 || sample.Timestamp.Before(cutoff) {
+			continue
+		}
+		key := sample.Timestamp.UnixMilli()
+		if existing, exists := byTS[key]; !exists || (existing.Bootstrapped && !sample.Bootstrapped) {
+			byTS[key] = sample
 		}
 	}
-	s.OISamples = s.OISamples[:validCount]
 
-	s.OISamples = append(s.OISamples, OISample{Value: oi, Timestamp: now, Bootstrapped: false})
-	if len(s.OISamples) > 30 {
-		s.OISamples = s.OISamples[len(s.OISamples)-30:]
+	cleaned := make([]OISample, 0, len(byTS))
+	for _, sample := range byTS {
+		cleaned = append(cleaned, sample)
 	}
+	sort.Slice(cleaned, func(i, j int) bool {
+		return cleaned[i].Timestamp.Before(cleaned[j].Timestamp)
+	})
+	if len(cleaned) > 30 {
+		cleaned = cleaned[len(cleaned)-30:]
+	}
+	s.OISamples = cleaned
+}
 
-	s.CurrOpenInterest = oi
-	s.CurrOIUpdatedAt = now
+func isBetterOICandidate(best *OISample, bestDiff, bestAge time.Duration, cand *OISample, candDiff, candAge, minAge time.Duration) bool {
+	if best == nil {
+		return true
+	}
+	if candDiff != bestDiff {
+		return candDiff < bestDiff
+	}
+	candMature := candAge >= minAge
+	bestMature := bestAge >= minAge
+	if candMature != bestMature {
+		return candMature
+	}
+	return best.Bootstrapped && !cand.Bootstrapped
+}
 
-	// 2. Jika sampel baru 1 (warm-up startup/koin baru), biarkan PrevOI kosong
-	// agar evaluator menolak dengan MISSING_OI_DATA bukan melempar INTERVAL_0s
+func (s *SymbolState) resolvePrevOpenInterestLocked() {
 	if len(s.OISamples) < 2 {
 		s.PrevOpenInterest = 0
 		s.PrevOIUpdatedAt = time.Time{}
@@ -97,60 +134,92 @@ func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
 		return
 	}
 
-	// 3. Cari sampel terdekat dengan target interval lalu
-	targetTime := now.Add(-interval)
-	var bestSample *OISample
-	bestDiff := 100 * time.Hour
-	minAge := time.Duration(float64(interval) * 0.75)
-	maxAge := time.Duration(float64(interval) * 1.35)
+	interval, maxInterval, minAge, maxAge := s.oiIntervalConfig()
+	latest := s.OISamples[len(s.OISamples)-1]
+	refTime := s.CurrOIUpdatedAt
+	if refTime.IsZero() {
+		refTime = latest.Timestamp
+	}
+	targetTime := refTime.Add(-interval)
 
-	for i := range s.OISamples {
+	// Tier 1: Cari sampel terdekat dengan target interval dalam jendela utama [0.75*interval, 1.35*interval]
+	var tier1Best *OISample
+	var tier1Diff, tier1Age time.Duration
+
+	// Tier 2 (Transisi / Pemulihan): Cari sampel valid dalam [1m, maxInterval], mengutamakan yang terdekat ke interval
+	var tier2Best *OISample
+	var tier2Diff, tier2Age time.Duration
+
+	for i := 0; i < len(s.OISamples)-1; i++ {
 		sample := &s.OISamples[i]
-		age := now.Sub(sample.Timestamp)
-		if age < minAge || age > maxAge {
+		if !sample.Timestamp.Before(refTime) {
+			continue
+		}
+		age := refTime.Sub(sample.Timestamp)
+		if age > maxInterval {
 			continue
 		}
 		diff := sample.Timestamp.Sub(targetTime)
 		if diff < 0 {
 			diff = -diff
 		}
-		if diff < bestDiff {
-			bestDiff = diff
-			bestSample = sample
+		if age >= minAge && age <= maxAge {
+			if isBetterOICandidate(tier1Best, tier1Diff, tier1Age, sample, diff, age, minAge) {
+				tier1Best, tier1Diff, tier1Age = sample, diff, age
+			}
+			continue
+		}
+		if age >= 1*time.Minute && isBetterOICandidate(tier2Best, tier2Diff, tier2Age, sample, diff, age, minAge) {
+			tier2Best, tier2Diff, tier2Age = sample, diff, age
 		}
 	}
 
-	if bestSample != nil {
-		s.PrevOpenInterest = bestSample.Value
-		s.PrevOIUpdatedAt = bestSample.Timestamp
-		s.IsOIBootstrapped = bestSample.Bootstrapped
-	} else {
-		// 4. Fase transisi (< interval): gunakan sampel tertua jika umurnya sudah minimal 1 menit dan maksimal 1.35x interval
-		oldest := s.OISamples[0]
-		age := now.Sub(oldest.Timestamp)
-		if age >= 1*time.Minute && age <= maxAge {
-			s.PrevOpenInterest = oldest.Value
-			s.PrevOIUpdatedAt = oldest.Timestamp
-			s.IsOIBootstrapped = oldest.Bootstrapped
-		} else {
-			// Sampel tertua masih < 1 menit atau sudah melebihi batas (degrade ke warming up)
-			s.PrevOpenInterest = 0
-			s.PrevOIUpdatedAt = time.Time{}
-			s.IsOIBootstrapped = false
-		}
+	chosen := tier1Best
+	if chosen == nil {
+		chosen = tier2Best
 	}
+	if chosen != nil {
+		s.PrevOpenInterest = chosen.Value
+		s.PrevOIUpdatedAt = chosen.Timestamp
+		s.IsOIBootstrapped = chosen.Bootstrapped
+		return
+	}
+
+	s.PrevOpenInterest = 0
+	s.PrevOIUpdatedAt = time.Time{}
+	s.IsOIBootstrapped = false
 }
 
-// SeedOpenInterestBootstrapLocked menginjeksi sampel historis Open Interest jika buffer belum siap (len < 2)
-// Mengimplementasikan 5 Pengawal Ketat:
-// 1. Nilai menggunakan unit kontrak (sumOpenInterest).
-// 2. Filter data: hanya menerima bar yang berumur <= 6.5m dan bukan masa depan (Pengawal 2).
-// 3. Seed hanya jika buffer len(OISamples) < 2 (tidak menimpa data polling riil).
-// 4. Timestamp asli dari bursa dipertahankan.
-// 5. Tandai sampel sebagai Bootstrapped untuk audit trail.
-func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now time.Time) {
-	if len(s.OISamples) >= 2 {
-		return // Pengawal 3: buffer sudah terisi data polling riil
+// RecordOpenInterestLocked mencatat sampel Open Interest dan menyinkronkan selisih interval candle
+func (s *SymbolState) RecordOpenInterestLocked(oi float64, now time.Time) {
+	if oi <= 0 {
+		return
+	}
+
+	_, maxInterval, _, _ := s.oiIntervalConfig()
+	s.OISamples = append(s.OISamples, OISample{Value: oi, Timestamp: now, Bootstrapped: false})
+	s.pruneAndNormalizeOISamplesLocked(now, maxInterval)
+
+	if len(s.OISamples) > 0 {
+		latest := s.OISamples[len(s.OISamples)-1]
+		s.CurrOpenInterest = latest.Value
+		s.CurrOIUpdatedAt = latest.Timestamp
+	} else {
+		s.CurrOpenInterest = oi
+		s.CurrOIUpdatedAt = now
+	}
+
+	// Jika sampel baru 1 (warm-up startup/koin baru), biarkan PrevOI kosong
+	// agar evaluator menolak dengan MISSING_OI_DATA bukan melempar INTERVAL_0s
+	s.resolvePrevOpenInterestLocked()
+}
+
+// SeedOpenInterestBootstrapLocked menginjeksi sampel historis Open Interest jika buffer belum siap.
+// Mengembalikan jumlah sampel historis yang diterima setelah filter usia & validasi.
+func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now time.Time) int {
+	_, maxInterval, _, _ := s.oiIntervalConfig()
+	if !s.NeedsOIBootstrapLocked(now, maxInterval) {
+		return 0 // Pengawal 3: buffer sudah terisi pasangan valid
 	}
 
 	validSamples := make([]OISample, 0, len(samples))
@@ -159,8 +228,8 @@ func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now ti
 			continue
 		}
 		age := now.Sub(sample.Timestamp)
-		// Pengawal 2: Hanya ambil sampel valid (tidak purba > 6.5m dan tidak di masa depan > 1m)
-		if age < -1*time.Minute || age > 6*time.Minute+30*time.Second {
+		// Terima sampel dalam batas MaxOIInterval (dan toleransi clock skew -1m) agar bar 5m Binance tetap terserap
+		if age < -1*time.Minute || age > maxInterval {
 			continue
 		}
 		sample.Bootstrapped = true // Pengawal 5: Tandai sebagai Bootstrapped
@@ -168,63 +237,20 @@ func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now ti
 	}
 
 	if len(validSamples) == 0 {
-		return
+		return 0
 	}
 
-	// Jika ada sampel polling berjalan, pertahankan di belakang
-	merged := make([]OISample, 0, len(validSamples)+len(s.OISamples))
-	merged = append(merged, validSamples...)
-	merged = append(merged, s.OISamples...)
-	if len(merged) > 30 {
-		merged = merged[len(merged)-30:]
-	}
-	s.OISamples = merged
+	s.OISamples = append(s.OISamples, validSamples...)
+	s.pruneAndNormalizeOISamplesLocked(now, maxInterval)
 
-	// Set CurrOpenInterest ke sampel terbaru
-	latest := s.OISamples[len(s.OISamples)-1]
-	s.CurrOpenInterest = latest.Value
-	s.CurrOIUpdatedAt = latest.Timestamp
-
-	// Resolusi PrevOpenInterest (Pengawal 4: cari sampel ~interval lalu)
-	interval := s.TargetOIInterval
-	if interval <= 0 {
-		interval = 5 * time.Minute
-	}
-	targetTime := now.Add(-interval)
-	var bestSample *OISample
-	bestDiff := 100 * time.Hour
-	minAge := time.Duration(float64(interval) * 0.75)
-	maxAge := time.Duration(float64(interval) * 1.35)
-
-	for i := range s.OISamples {
-		sample := &s.OISamples[i]
-		age := now.Sub(sample.Timestamp)
-		if age < minAge || age > maxAge {
-			continue
-		}
-		diff := sample.Timestamp.Sub(targetTime)
-		if diff < 0 {
-			diff = -diff
-		}
-		if diff < bestDiff {
-			bestDiff = diff
-			bestSample = sample
-		}
+	if len(s.OISamples) > 0 {
+		latest := s.OISamples[len(s.OISamples)-1]
+		s.CurrOpenInterest = latest.Value
+		s.CurrOIUpdatedAt = latest.Timestamp
 	}
 
-	if bestSample != nil {
-		s.PrevOpenInterest = bestSample.Value
-		s.PrevOIUpdatedAt = bestSample.Timestamp
-		s.IsOIBootstrapped = bestSample.Bootstrapped
-	} else if len(s.OISamples) >= 2 {
-		oldest := s.OISamples[0]
-		age := now.Sub(oldest.Timestamp)
-		if age >= 1*time.Minute && age <= maxAge {
-			s.PrevOpenInterest = oldest.Value
-			s.PrevOIUpdatedAt = oldest.Timestamp
-			s.IsOIBootstrapped = oldest.Bootstrapped
-		}
-	}
+	s.resolvePrevOpenInterestLocked()
+	return len(validSamples)
 }
 
 func (s *SymbolState) ApplyClosedCandleLocked(candle Candle, bootstrapCap int, deltaCap int) bool {

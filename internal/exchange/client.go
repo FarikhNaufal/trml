@@ -202,10 +202,15 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 				}
 			}
 
-			// Network error sementara: tunggu sebelum retry
+			// Network error sementara: tunggu sebelum retry dengan menghormati pembatalan context
 			if attempt < maxRetries-1 {
-				time.Sleep(time.Duration(250*(1<<attempt)) * time.Millisecond)
-				continue
+				retryDelay := time.Duration(250*(1<<attempt)) * time.Millisecond
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(retryDelay):
+					continue
+				}
 			}
 			return nil, lastErr
 		}

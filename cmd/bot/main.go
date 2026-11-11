@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,6 +55,10 @@ type BotEngine struct {
 	verifiedSymbols map[string]bool
 	streamCancel    context.CancelFunc
 	streamMu        sync.Mutex
+
+	oiPollRunning   atomic.Bool
+	oiBootMu        sync.Mutex
+	oiBootAttemptAt map[string]time.Time
 }
 
 func main() {
@@ -131,6 +136,7 @@ func main() {
 		exchangeFilters: make(map[string]model.ExchangeFilter),
 		cooldownExits:   make(map[string]storage.RecentExitRecord),
 		verifiedSymbols: make(map[string]bool),
+		oiBootAttemptAt: make(map[string]time.Time),
 		evaluatorCfg: strategy.EvaluatorConfig{
 			CandleDuration:           cfg.CandleDuration,
 			MaxSlots:                 cfg.MaxSlots,
@@ -1160,6 +1166,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		}
 	}
 
+	var prunedSymbols []string
 	if len(finalWatched) > 0 {
 		e.watchedCoins = finalWatched
 		// M3 FIX: Pangkas simbol lama dari activeStates yang sudah tidak di-watch dan tidak memiliki posisi/order aktif
@@ -1171,10 +1178,19 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		for sym := range e.activeStates {
 			if !watchedSet[sym] {
 				delete(e.activeStates, sym)
+				prunedSymbols = append(prunedSymbols, sym)
 			}
 		}
 	}
 	e.statesMu.Unlock()
+
+	if len(prunedSymbols) > 0 {
+		e.oiBootMu.Lock()
+		for _, sym := range prunedSymbols {
+			delete(e.oiBootAttemptAt, sym)
+		}
+		e.oiBootMu.Unlock()
+	}
 
 	// Inisialisasi dan periodik re-sinkronisasi state BTCUSDT sebagai benchmark makro (P2-3)
 	e.statesMu.Lock()
@@ -1288,60 +1304,131 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	}
 }
 
+const (
+	oiPollWorkers       = 5
+	oiRequestTimeout    = 6 * time.Second
+	oiBootstrapCooldown = 2 * time.Minute
+)
+
 func (e *BotEngine) pollOpenInterest(ctx context.Context) {
+	if !e.oiPollRunning.CompareAndSwap(false, true) {
+		slog.Warn("previous open interest poll still running, skipping overlapping tick")
+		return
+	}
+	defer e.oiPollRunning.Store(false)
+
 	e.statesMu.RLock()
 	symbols := make([]string, len(e.watchedCoins))
 	copy(symbols, e.watchedCoins)
 	e.statesMu.RUnlock()
-
-	now := time.Now().UTC()
-	for _, sym := range symbols {
-		e.statesMu.RLock()
-		st := e.activeStates[sym]
-		e.statesMu.RUnlock()
-		if st == nil {
-			continue
-		}
-
-		// Pengawal 3: Bootstrap histori OI jika buffer masih kurang (< 2 sampel)
-		st.Mu.Lock()
-		needsBootstrap := len(st.OISamples) < 2
-		st.Mu.Unlock()
-
-		if needsBootstrap {
-			hist, hErr := e.client.FetchOpenInterestHist(ctx, sym, 3)
-			if hErr == nil && len(hist) > 0 {
-				samples := make([]model.OISample, 0, len(hist))
-				for _, item := range hist {
-					val, pErr := strconv.ParseFloat(item.SumOpenInterest, 64) // Pengawal 1: unit kontrak sumOpenInterest
-					if pErr == nil && val > 0 {
-						samples = append(samples, model.OISample{
-							Value:        val,
-							Timestamp:    time.UnixMilli(item.Timestamp).UTC(), // Pengawal 4: Timestamp asli bursa dipertahankan
-							Bootstrapped: true,                                 // Pengawal 5: Flag Bootstrapped
-						})
-					}
-				}
-				if len(samples) > 0 {
-					st.Mu.Lock()
-					st.SeedOpenInterestBootstrapLocked(samples, now)
-					st.Mu.Unlock()
-					slog.Info("bootstrapped historical open interest", "symbol", sym, "samplesCount", len(samples))
-				}
-			} else if hErr != nil {
-				// Pengawal 2: Graceful degradation ke polling riil jika 404 / kosong
-				slog.Debug("historical open interest unavailable, falling back to live poll", "symbol", sym, "err", hErr)
-			}
-		}
-
-		oi, err := e.client.FetchOpenInterest(ctx, sym)
-		if err != nil {
-			continue
-		}
-		st.Mu.Lock()
-		st.RecordOpenInterestLocked(oi, now)
-		st.Mu.Unlock()
+	if len(symbols) == 0 {
+		return
 	}
+
+	workerCount := oiPollWorkers
+	if len(symbols) < workerCount {
+		workerCount = len(symbols)
+	}
+
+	symCh := make(chan string, len(symbols))
+	for _, sym := range symbols {
+		symCh <- sym
+	}
+	close(symCh)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sym := range symCh {
+				if ctx.Err() != nil {
+					return
+				}
+				e.pollSymbolOpenInterest(ctx, sym)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (e *BotEngine) canAttemptOIBootstrap(sym string, now time.Time) bool {
+	e.oiBootMu.Lock()
+	defer e.oiBootMu.Unlock()
+	if e.oiBootAttemptAt == nil {
+		e.oiBootAttemptAt = make(map[string]time.Time)
+	}
+	last, exists := e.oiBootAttemptAt[sym]
+	if exists && now.Sub(last) < oiBootstrapCooldown {
+		return false
+	}
+	e.oiBootAttemptAt[sym] = now
+	return true
+}
+
+func (e *BotEngine) pollSymbolOpenInterest(ctx context.Context, sym string) {
+	e.statesMu.RLock()
+	st := e.activeStates[sym]
+	e.statesMu.RUnlock()
+	if st == nil {
+		return
+	}
+
+	nowCheck := time.Now().UTC()
+	var maxOIInterval time.Duration
+	if e.cfg != nil {
+		maxOIInterval = e.cfg.MaxOIInterval
+	}
+	st.Mu.Lock()
+	needsBootstrap := st.NeedsOIBootstrapLocked(nowCheck, maxOIInterval)
+	st.Mu.Unlock()
+
+	if needsBootstrap && e.canAttemptOIBootstrap(sym, nowCheck) {
+		histCtx, histCancel := context.WithTimeout(ctx, oiRequestTimeout)
+		hist, hErr := e.client.FetchOpenInterestHist(histCtx, sym, 3)
+		histCancel()
+
+		if hErr == nil && len(hist) > 0 {
+			samples := make([]model.OISample, 0, len(hist))
+			for _, item := range hist {
+				val, pErr := strconv.ParseFloat(item.SumOpenInterest, 64) // Pengawal 1: unit kontrak sumOpenInterest
+				if pErr == nil && val > 0 {
+					samples = append(samples, model.OISample{
+						Value:        val,
+						Timestamp:    time.UnixMilli(item.Timestamp).UTC(), // Pengawal 4: Timestamp asli bursa dipertahankan
+						Bootstrapped: true,                                 // Pengawal 5: Flag Bootstrapped
+					})
+				}
+			}
+			if len(samples) > 0 {
+				seedNow := time.Now().UTC()
+				st.Mu.Lock()
+				accepted := st.SeedOpenInterestBootstrapLocked(samples, seedNow)
+				st.Mu.Unlock()
+				if accepted > 0 {
+					slog.Info("bootstrapped historical open interest", "symbol", sym, "rawCount", len(samples), "acceptedCount", accepted)
+				} else {
+					slog.Warn("historical open interest samples rejected by age window", "symbol", sym, "rawCount", len(samples))
+				}
+			}
+		} else if hErr != nil {
+			// Pengawal 2: Graceful degradation ke polling riil jika gagal / kosong
+			slog.Warn("historical open interest bootstrap failed", "symbol", sym, "err", hErr)
+		}
+	}
+
+	liveCtx, liveCancel := context.WithTimeout(ctx, oiRequestTimeout)
+	oi, err := e.client.FetchOpenInterest(liveCtx, sym)
+	liveCancel()
+	if err != nil {
+		slog.Warn("open interest live poll failed", "symbol", sym, "err", err)
+		return
+	}
+
+	sampleNow := time.Now().UTC()
+	st.Mu.Lock()
+	st.RecordOpenInterestLocked(oi, sampleNow)
+	st.Mu.Unlock()
 }
 
 func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []string) {

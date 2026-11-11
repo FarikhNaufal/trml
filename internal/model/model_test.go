@@ -323,3 +323,95 @@ func TestRecordOpenInterest_15m(t *testing.T) {
 		t.Fatalf("expected 15m interval, got %v", diff)
 	}
 }
+
+func TestSeedOpenInterestBootstrap_DelayedBinanceBars(t *testing.T) {
+	// Simulasi kondisi produksi pukul 14:23:28 UTC:
+	// Binance openInterestHist (period=5m, limit=3) mengembalikan bar 14:10, 14:15, 14:20.
+	now := time.Date(2026, 11, 11, 14, 23, 28, 0, time.UTC)
+	st := NewSymbolState("ZECUSDT", ExchangeFilter{}, 10, 10)
+	st.TargetOIInterval = 5 * time.Minute
+
+	histSamples := []OISample{
+		{Value: 488000.0, Timestamp: time.Date(2026, 11, 11, 14, 10, 0, 0, time.UTC)}, // umur 13m28s (> 10m, dibuang)
+		{Value: 487600.0, Timestamp: time.Date(2026, 11, 11, 14, 15, 0, 0, time.UTC)}, // umur 8m28s (diterima)
+		{Value: 487000.0, Timestamp: time.Date(2026, 11, 11, 14, 20, 0, 0, time.UTC)}, // umur 3m28s (diterima)
+	}
+
+	accepted := st.SeedOpenInterestBootstrapLocked(histSamples, now)
+	if accepted != 2 {
+		t.Fatalf("expected 2 accepted bootstrap samples, got %d", accepted)
+	}
+	if st.PrevOpenInterest != 487600.0 || st.CurrOpenInterest != 487000.0 {
+		t.Fatalf("unexpected OI pair after bootstrap: prev=%.1f curr=%.1f", st.PrevOpenInterest, st.CurrOpenInterest)
+	}
+
+	// Diikuti live poll pada menit yang sama -> tidak boleh jatuh kembali ke OI_WARMING_UP
+	st.RecordOpenInterestLocked(487250.0, now)
+	if st.PrevOpenInterest <= 0 || st.PrevOIUpdatedAt.IsZero() {
+		t.Fatalf("expected valid PrevOpenInterest after bootstrap+live poll, got %f", st.PrevOpenInterest)
+	}
+	if interval := st.CurrOIUpdatedAt.Sub(st.PrevOIUpdatedAt); interval < 1*time.Minute || interval > 10*time.Minute {
+		t.Fatalf("expected OI interval within [1m, 10m], got %v", interval)
+	}
+	if st.NeedsOIBootstrapLocked(now, 10*time.Minute) {
+		t.Fatalf("expected NeedsOIBootstrapLocked false when valid pair exists")
+	}
+
+	// Kasus lebih ketat: bar 14:20 belum terbit di Binance, hanya 14:10 dan 14:15 yang ada,
+	// lalu live poll masuk di 14:23:28 -> tetap langsung membentuk pasangan 8m28s <= 10m.
+	stLag := NewSymbolState("ZROUSDT", ExchangeFilter{}, 10, 10)
+	stLag.TargetOIInterval = 5 * time.Minute
+	acceptedLag := stLag.SeedOpenInterestBootstrapLocked(histSamples[:2], now)
+	if acceptedLag != 1 {
+		t.Fatalf("expected 1 accepted lagging bar (14:15), got %d", acceptedLag)
+	}
+	stLag.RecordOpenInterestLocked(10250.0, now)
+	if stLag.PrevOpenInterest != 487600.0 {
+		t.Fatalf("expected lagging bar 487600.0 as PrevOI after live poll, got %f", stLag.PrevOpenInterest)
+	}
+}
+
+func TestRecordOpenInterest_RecoverAfterStall(t *testing.T) {
+	t0 := time.Date(2026, 11, 11, 13, 49, 0, 0, time.UTC)
+	st := NewSymbolState("AINUSDT", ExchangeFilter{}, 10, 10)
+	st.TargetOIInterval = 5 * time.Minute
+
+	st.RecordOpenInterestLocked(1000.0, t0)
+	// Simulasi jeda jaringan 10 menit -> pulih di 13:59 (13:49 berumur 10m, tepat di batas maxInterval)
+	tRecover1 := time.Date(2026, 11, 11, 13, 59, 0, 0, time.UTC)
+	st.RecordOpenInterestLocked(1020.0, tRecover1)
+	if st.PrevOpenInterest != 1000.0 {
+		t.Fatalf("expected 13:49 sample to remain usable at 10m edge, got %f", st.PrevOpenInterest)
+	}
+
+	// 1 menit kemudian di 14:00: 13:49 sekarang berumur 11m (> 10m), tetapi 13:59 berumur 1m ->
+	// PrevOpenInterest HARUS beralih ke 13:59 (1020.0), bukan direset ke 0 oleh elemen [0] basi.
+	tRecover2 := time.Date(2026, 11, 11, 14, 0, 0, 0, time.UTC)
+	st.RecordOpenInterestLocked(1030.0, tRecover2)
+	if st.PrevOpenInterest != 1020.0 {
+		t.Fatalf("expected transition recovery to use 13:59 (1020.0), got %f", st.PrevOpenInterest)
+	}
+	if !st.PrevOIUpdatedAt.Equal(tRecover1) {
+		t.Fatalf("expected PrevOIUpdatedAt %v, got %v", tRecover1, st.PrevOIUpdatedAt)
+	}
+}
+
+func TestSeedOpenInterestBootstrap_SingleSampleDoesNotSelfPair(t *testing.T) {
+	now := time.Date(2026, 11, 11, 14, 23, 0, 0, time.UTC)
+	st := NewSymbolState("LITUSDT", ExchangeFilter{}, 10, 10)
+	st.TargetOIInterval = 5 * time.Minute
+
+	hist := []OISample{
+		{Value: 25000.0, Timestamp: now.Add(-5 * time.Minute)},
+	}
+	accepted := st.SeedOpenInterestBootstrapLocked(hist, now)
+	if accepted != 1 {
+		t.Fatalf("expected 1 accepted sample, got %d", accepted)
+	}
+	if st.PrevOpenInterest != 0 || !st.PrevOIUpdatedAt.IsZero() {
+		t.Fatalf("expected PrevOpenInterest 0 when only 1 sample exists (avoid INTERVAL_0s), got %f at %v", st.PrevOpenInterest, st.PrevOIUpdatedAt)
+	}
+	if !st.NeedsOIBootstrapLocked(now, 10*time.Minute) {
+		t.Fatalf("expected NeedsOIBootstrapLocked true when only 1 sample exists")
+	}
+}
