@@ -203,6 +203,8 @@ func handleRunCommand(args []string) {
 	flagSLGapFill := fs.Bool("flag-sl-gap-fill", false, "Flag 3: Enable SL gap fill at candle open + slippage (default: false = behavior 9815362)")
 	flagDeductPendingMargin := fs.Bool("flag-deduct-pending-margin", false, "Flag 4: Deduct available margin intra-bar upon limit submit (default: false = behavior 9815362)")
 	offlineFlag := fs.Bool("offline", false, "Strict 100% offline mode: rely solely on local disk cache with zero network calls")
+	scannerRankFlag := fs.String("scanner-rank", "", "Scanner ranking mode (default from SCANNER_RANKING_MODE or 'pullback'; supports 'pullback', 'rvol')")
+	maxWatchedFlag := fs.Int("max-watched", 0, "Override MAX_WATCHED_COINS for scanner benchmarking")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfigForBacktest(*envFlag)
@@ -241,21 +243,13 @@ func handleRunCommand(args []string) {
 	}
 
 	ctx := context.Background()
-	interval := "5m"
-	if cfg != nil && cfg.Timeframe != "" {
-		interval = cfg.Timeframe
+	interval, candleDur, scannerCfg := resolveBacktestScannerConfig(cfg, *intervalFlag)
+	if *scannerRankFlag != "" {
+		scannerCfg.RankingMode = *scannerRankFlag
 	}
-	if *intervalFlag != "" {
-		interval = *intervalFlag
+	if *maxWatchedFlag > 0 {
+		scannerCfg.MaxWatchedCoins = *maxWatchedFlag
 	}
-	candleDur, tfErr := config.ParseTimeframeToDuration(interval)
-	if tfErr != nil {
-		candleDur = 5 * time.Minute
-	}
-
-	scannerCfg := buildDefaultScannerConfig(*envFlag)
-	scannerCfg.Timeframe = interval
-	scannerCfg.CandleDuration = candleDur
 
 	var symbols []string
 	if *symbolsFlag != "" {
@@ -561,22 +555,7 @@ func handleAblateCommand(args []string) {
 		downloader.SetOffline(true)
 	}
 	ctx := context.Background()
-
-	interval := "5m"
-	if cfg != nil && cfg.Timeframe != "" {
-		interval = cfg.Timeframe
-	}
-	if *intervalFlag != "" {
-		interval = *intervalFlag
-	}
-	candleDur, tfErr := config.ParseTimeframeToDuration(interval)
-	if tfErr != nil {
-		candleDur = 5 * time.Minute
-	}
-
-	scannerCfg := buildDefaultScannerConfig(*envFlag)
-	scannerCfg.Timeframe = interval
-	scannerCfg.CandleDuration = candleDur
+	interval, candleDur, scannerCfg := resolveBacktestScannerConfig(cfg, *intervalFlag)
 	var symbols []string
 	if *symbolsFlag != "" {
 		symbols = splitSymbols(*symbolsFlag)
@@ -1065,49 +1044,22 @@ func buildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 	}
 }
 
-func buildDefaultScannerConfig(envPath string) scanner.ScannerConfig {
-	cfg, err := loadConfigForBacktest(envPath)
-	if err == nil && cfg != nil {
-		minRVOL := cfg.MinRVOL
-		if minRVOL <= 0 {
-			minRVOL = cfg.MinSignalRVOL
-		}
-		if minRVOL <= 0 {
-			minRVOL = 1.80
-		}
-		return scanner.ScannerConfig{
-			Timeframe:             cfg.Timeframe,
-			CandleDuration:        cfg.CandleDuration,
-			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
-			MaxSpreadPct:          cfg.MaxSpreadPct,
-			MinRVOL:               minRVOL,
-			MinFallbackRVOL:       cfg.MinFallbackRVOL,
-			RVOLLookback:          20,
-			MinNATRPct:            cfg.MinNATRPct,
-			MaxNATRPct:            cfg.MaxNATRPct,
-			MaxScannerVWAPDistATR: cfg.MaxScannerVWAPDistATR,
-			ATRPeriod:             14,
-			EMAPeriod:             200,
-			MaxWatchedCoins:       cfg.MaxWatchedCoins,
-			BootstrapCount:        250,
-		}
+func resolveBacktestScannerConfig(cfg *config.Config, intervalOverride string) (string, time.Duration, scanner.ScannerConfig) {
+	interval := "5m"
+	if cfg != nil && cfg.Timeframe != "" {
+		interval = cfg.Timeframe
 	}
-	return scanner.ScannerConfig{
-		Timeframe:             "5m",
-		CandleDuration:        5 * time.Minute,
-		MinVolume24hUSDT:      25000000.0,
-		MaxSpreadPct:          0.0006,
-		MinRVOL:               1.80,
-		MinFallbackRVOL:       0.60,
-		RVOLLookback:          20,
-		MinNATRPct:            0.0050,
-		MaxNATRPct:            0.0180,
-		MaxScannerVWAPDistATR: 2.50,
-		ATRPeriod:             14,
-		EMAPeriod:             200,
-		MaxWatchedCoins:       20,
-		BootstrapCount:        250,
+	if intervalOverride != "" {
+		interval = intervalOverride
 	}
+	candleDur, tfErr := config.ParseTimeframeToDuration(interval)
+	if tfErr != nil {
+		candleDur = 5 * time.Minute
+	}
+	scannerCfg := scanner.FromAppConfig(cfg, 250)
+	scannerCfg.Timeframe = interval
+	scannerCfg.CandleDuration = candleDur
+	return interval, candleDur, scannerCfg
 }
 
 func getGitCommitHash() string {

@@ -66,6 +66,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MinNATRPct != 0.75 {
 		t.Errorf("expected default MinNATRPct 0.75, got %f", cfg.MinNATRPct)
 	}
+	if cfg.MaxNATRPct != 1.20 {
+		t.Errorf("expected default MaxNATRPct 1.20, got %f", cfg.MaxNATRPct)
+	}
 	if cfg.MaxScannerVWAPDistATR != 2.50 {
 		t.Errorf("expected default MaxScannerVWAPDistATR 2.50, got %f", cfg.MaxScannerVWAPDistATR)
 	}
@@ -75,8 +78,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MaxEMA200DistanceATR != 3.20 {
 		t.Errorf("expected default MaxEMA200DistanceATR 3.20, got %f", cfg.MaxEMA200DistanceATR)
 	}
-	if cfg.MinSignalRVOL != 0.75 {
-		t.Errorf("expected default MinSignalRVOL 0.75, got %f", cfg.MinSignalRVOL)
+	if cfg.MinSignalRVOL != 0.0 {
+		t.Errorf("expected default MinSignalRVOL 0.0, got %f", cfg.MinSignalRVOL)
 	}
 	if cfg.BTCCounterMomentumPct != 0.25 {
 		t.Errorf("expected default BTCCounterMomentumPct 0.25, got %f", cfg.BTCCounterMomentumPct)
@@ -357,4 +360,30 @@ func TestTimeframeConfig(t *testing.T) {
 		t.Errorf("expected error for invalid timeframe 7m, got nil")
 	}
 	_ = os.Unsetenv("TIMEFRAME")
+}
+
+func TestScannerRankingModeConfig(t *testing.T) {
+	_ = os.Unsetenv("SCANNER_RANKING_MODE")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ScannerRankingMode != "pullback" {
+		t.Fatalf("expected default ScannerRankingMode='pullback', got %q", cfg.ScannerRankingMode)
+	}
+
+	_ = os.Setenv("SCANNER_RANKING_MODE", "RVOL # override")
+	cfgRVOL, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error for rvol mode: %v", err)
+	}
+	if cfgRVOL.ScannerRankingMode != "rvol" {
+		t.Fatalf("expected normalized 'rvol', got %q", cfgRVOL.ScannerRankingMode)
+	}
+
+	_ = os.Setenv("SCANNER_RANKING_MODE", "unknown")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected error for invalid SCANNER_RANKING_MODE")
+	}
+	_ = os.Unsetenv("SCANNER_RANKING_MODE")
 }

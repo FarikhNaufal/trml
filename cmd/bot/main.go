@@ -204,23 +204,7 @@ func main() {
 				EntryOrderType:                 cfg.EntryOrderType,
 			},
 		},
-		scannerCfg: scanner.ScannerConfig{
-			MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
-			MaxSpreadPct:          cfg.MaxSpreadPct,
-			MinRVOL:               1.80,
-			MinFallbackRVOL:       cfg.MinFallbackRVOL,
-			RVOLLookback:          20,
-			MinNATRPct:            cfg.MinNATRPct,
-			MaxNATRPct:            cfg.MaxNATRPct,
-			MaxScannerVWAPDistATR: cfg.MaxScannerVWAPDistATR,
-			ATRPeriod:             14,
-			EMAPeriod:             200,
-			MaxWatchedCoins:       cfg.MaxWatchedCoins,
-			BootstrapCount:        1000,
-			DeltaWindow:           50,
-			Timeframe:             cfg.Timeframe,
-			CandleDuration:        cfg.CandleDuration,
-		},
+		scannerCfg: scanner.FromAppConfig(cfg, 1000),
 	}
 
 	// [COOLDOWN-PERSISTENCE] Hydrate cooldown state dari trade_ledger untuk mencegah amnesia saat restart
@@ -849,17 +833,22 @@ func main() {
 	// 6. Mulai Background Workers
 	var wg sync.WaitGroup
 
-	// Worker 1: Periodic 15-minute Scanner
+	// Worker 1: Periodic Scanner (menggunakan cfg.ScannerInterval, disinkronkan aman setelah candle close)
+	scannerInterval := cfg.ScannerInterval
+	if scannerInterval <= 0 {
+		scannerInterval = 15 * time.Minute
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(15 * time.Minute)
-		defer ticker.Stop()
 		for {
+			delay := nextSafeScanDelay(engine.exchangeNow(), scannerInterval, cfg.CandleDuration)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				slog.Info("running periodic market scan...")
 				engine.runMarketScan(ctx)
 			}
@@ -1084,8 +1073,43 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 	return result
 }
 
+const scanFetchTimeout = 2 * time.Minute
+
+func (e *BotEngine) exchangeNow() time.Time {
+	now := time.Now().UTC()
+	if e.client != nil && e.client.TimeOffset != 0 {
+		now = now.Add(time.Duration(e.client.TimeOffset) * time.Millisecond)
+	}
+	return now
+}
+
+// nextSafeScanDelay menjadwalkan scan setelah penutupan candle agar restart stream WS tidak menabrak event bar close.
+func nextSafeScanDelay(now time.Time, scanInterval, candleDur time.Duration) time.Duration {
+	if scanInterval <= 0 {
+		scanInterval = 15 * time.Minute
+	}
+	offset := 25 * time.Second
+	if candleDur > 0 && candleDur <= time.Minute {
+		offset = 10 * time.Second
+	} else if candleDur > 0 && offset >= candleDur/2 {
+		offset = candleDur / 4
+	}
+	if offset >= scanInterval {
+		offset = scanInterval / 3
+	}
+	utcNow := now.UTC()
+	target := utcNow.Truncate(scanInterval).Add(offset)
+	for !target.After(utcNow) {
+		target = target.Add(scanInterval)
+	}
+	return target.Sub(utcNow)
+}
+
 func (e *BotEngine) runMarketScan(ctx context.Context) {
-	filters, err := e.client.FetchExchangeInfo(ctx)
+	scanCtx, scanCancel := context.WithTimeout(ctx, scanFetchTimeout)
+	defer scanCancel()
+
+	filters, err := e.client.FetchExchangeInfo(scanCtx)
 	if err != nil {
 		slog.Error("failed to fetch exchange info", "err", err)
 		return
@@ -1094,20 +1118,20 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	e.exchangeFilters = filters
 	e.filtersMu.Unlock()
 
-	volMap, err := e.client.Fetch24hTickers(ctx)
+	volMap, err := e.client.Fetch24hTickers(scanCtx)
 	if err != nil {
 		slog.Error("failed to fetch 24h tickers", "err", err)
 		return
 	}
 
-	bookMap, err := e.client.FetchBookTickers(ctx)
+	bookMap, err := e.client.FetchBookTickers(scanCtx)
 	if err != nil {
 		slog.Error("failed to fetch book tickers", "err", err)
 		return
 	}
 
 	fetchKlinesFn := func(symbol string, limit int) []model.Candle {
-		k, err := e.client.FetchKlines(ctx, symbol, e.cfg.Timeframe, limit)
+		k, err := e.client.FetchKlines(scanCtx, symbol, e.cfg.Timeframe, limit)
 		if err != nil {
 			slog.Debug("failed to fetch klines for symbol", "symbol", symbol, "err", err)
 			return nil
@@ -1115,17 +1139,18 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		return k
 	}
 
-	serverTime := time.Now().UTC()
+	serverTime := e.exchangeNow()
 
 	// C6 FIX: Hindari menahan statesMu write-lock saat melakukan REST fetch klines serial
 	e.statesMu.RLock()
+	hadPriorWatchlist := len(e.watchedCoins) > 0
 	localStates := make(map[string]*model.SymbolState, len(e.activeStates))
 	for k, v := range e.activeStates {
 		localStates[k] = v
 	}
 	e.statesMu.RUnlock()
 
-	selected := scanner.RunBulkMarketScanner(
+	selected, scanStats := scanner.RunBulkMarketScannerWithStats(
 		e.scannerCfg,
 		localStates,
 		filters,
@@ -1134,6 +1159,28 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		fetchKlinesFn,
 		serverTime,
 	)
+
+	slog.Info("scanner diagnostics",
+		"totalPerpUSDT", scanStats.TotalPerpUSDT,
+		"volRejected", scanStats.VolRejected,
+		"spreadRejected", scanStats.SpreadRejected,
+		"preFilterPassed", scanStats.PreFilterPassed,
+		"klineShort", scanStats.KlineFetchOrShort,
+		"klineInvalidOrGap", scanStats.KlineGapOrInvalid,
+		"atrInvalid", scanStats.ATRInvalid,
+		"natrRejected", scanStats.NATRRejected,
+		"vwapDistRejected", scanStats.VWAPDistRejected,
+		"candidatesValid", scanStats.CandidatesValid,
+		"primaryPassed", scanStats.PrimaryPassed,
+		"fallbackUsed", scanStats.FallbackUsed,
+		"selectedCount", scanStats.SelectedCount,
+		"rankingMode", e.scannerCfg.RankingMode,
+	)
+
+	if scanCtx.Err() != nil && hadPriorWatchlist {
+		slog.Warn("market scan did not finish cleanly before context ended; retaining prior watchlist", "err", scanCtx.Err(), "partialSelected", len(selected))
+		return
+	}
 
 	e.statesMu.Lock()
 	oldWatched := make([]string, len(e.watchedCoins))
@@ -1216,10 +1263,10 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	if !exists {
 		btcFetchCount = e.scannerCfg.BootstrapCount
 	}
-	klines, kErr := e.client.FetchKlines(ctx, BenchmarkSymbol, e.cfg.Timeframe, btcFetchCount)
+	klines, kErr := e.client.FetchKlines(scanCtx, BenchmarkSymbol, e.cfg.Timeframe, btcFetchCount)
 	if kErr == nil && len(klines) > 0 {
 		// [C-03] Filter candle yang belum tutup agar tidak merusak state makro BTC
-		filteredKlines, vErr := model.ValidateAndFilterCandles(klines, time.Now().UTC(), e.cfg.CandleDuration)
+		filteredKlines, vErr := model.ValidateAndFilterCandles(klines, e.exchangeNow(), e.cfg.CandleDuration)
 		if vErr == nil && len(filteredKlines) > 0 {
 			btcSt.Mu.Lock()
 			for _, k := range filteredKlines {
@@ -1248,7 +1295,9 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 				e.statesMu.Unlock()
 				continue
 			}
-			ok, err := e.client.InitAndVerifySymbol(ctx, sym, int(e.cfg.Leverage))
+			verifyCtx, verifyCancel := context.WithTimeout(ctx, 15*time.Second)
+			ok, err := e.client.InitAndVerifySymbol(verifyCtx, sym, int(e.cfg.Leverage))
+			verifyCancel()
 			if err != nil || !ok {
 				slog.Warn("symbol setup failed; ignoring symbol", "symbol", sym, "err", err)
 			} else {
@@ -1431,6 +1480,33 @@ func (e *BotEngine) pollSymbolOpenInterest(ctx context.Context, sym string) {
 	st.Mu.Unlock()
 }
 
+func buildMarketStreamSubscriptions(symbols []string, timeframe string, includeAggTrade bool) (publicStreams, marketStreams []string) {
+	allStreamSymbols := make([]string, 0, len(symbols)+1)
+	hasBTC := false
+	for _, sym := range symbols {
+		if sym == BenchmarkSymbol {
+			hasBTC = true
+		}
+		allStreamSymbols = append(allStreamSymbols, sym)
+	}
+	if !hasBTC {
+		allStreamSymbols = append(allStreamSymbols, BenchmarkSymbol)
+	}
+
+	for _, sym := range allStreamSymbols {
+		lower := strings.ToLower(sym)
+		publicStreams = append(publicStreams, fmt.Sprintf("%s@bookTicker", lower))
+		if includeAggTrade {
+			marketStreams = append(marketStreams, fmt.Sprintf("%s@aggTrade", lower))
+		}
+		marketStreams = append(marketStreams,
+			fmt.Sprintf("%s@markPrice@1s", lower),
+			fmt.Sprintf("%s@kline_%s", lower, timeframe),
+		)
+	}
+	return publicStreams, marketStreams
+}
+
 func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []string) {
 	e.streamMu.Lock()
 	defer e.streamMu.Unlock()
@@ -1452,28 +1528,8 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 		cancel()
 	}
 
-	var publicStreams, marketStreams []string
-	allStreamSymbols := make([]string, 0, len(symbols)+1)
-	hasBTC := false
-	for _, sym := range symbols {
-		if sym == BenchmarkSymbol {
-			hasBTC = true
-		}
-		allStreamSymbols = append(allStreamSymbols, sym)
-	}
-	if !hasBTC {
-		allStreamSymbols = append(allStreamSymbols, BenchmarkSymbol)
-	}
-
-	for _, sym := range allStreamSymbols {
-		lower := strings.ToLower(sym)
-		publicStreams = append(publicStreams, fmt.Sprintf("%s@bookTicker", lower))
-		marketStreams = append(marketStreams,
-			fmt.Sprintf("%s@aggTrade", lower),
-			fmt.Sprintf("%s@markPrice@1s", lower),
-			fmt.Sprintf("%s@kline_%s", lower, e.cfg.Timeframe),
-		)
-	}
+	includeAggTrade := e.cfg == nil || e.cfg.DryRun
+	publicStreams, marketStreams := buildMarketStreamSubscriptions(symbols, e.cfg.Timeframe, includeAggTrade)
 
 	publicURL := ws.BuildCombinedStreamURL(e.cfg.WSPublicURL, publicStreams)
 	marketURL := ws.BuildCombinedStreamURL(e.cfg.WSMarketURL, marketStreams)

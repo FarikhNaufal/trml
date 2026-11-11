@@ -63,6 +63,7 @@ type Config struct {
 	MaxScannerVWAPDistATR float64
 	MaxWatchedCoins       int
 	MinRVOL               float64
+	ScannerRankingMode    string
 
 	// Parameter Strategi VWAP Pullback / Retest with Orderflow Bounce
 	EMAPeriod                int
@@ -418,7 +419,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_NATR_PCT '%s' (must be float between 0.01 and 10.0)", minNATRStr)
 	}
 
-	maxNATRStr := getEnv("MAX_NATR_PCT", "2.50")
+	maxNATRStr := getEnv("MAX_NATR_PCT", "1.20")
 	maxNATR, err := parseFloatEnv(maxNATRStr)
 	if err != nil || maxNATR < minNATR || maxNATR > 20.0 {
 		return nil, fmt.Errorf("config: invalid MAX_NATR_PCT '%s' (must be float >= MIN_NATR_PCT and <= 20.0)", maxNATRStr)
@@ -599,7 +600,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid BTC_COUNTER_MOMENTUM_PCT '%s' (must be float between 0.0 and 5.0)", btcCounterMomStr)
 	}
 
-	minSignalRVOLStr := getEnv("MIN_SIGNAL_RVOL", "0.75")
+	minSignalRVOLStr := getEnv("MIN_SIGNAL_RVOL", "0.0")
 	minSignalRVOL, err := parseFloatEnv(minSignalRVOLStr)
 	if err != nil || minSignalRVOL < 0.0 || minSignalRVOL > 5.0 {
 		return nil, fmt.Errorf("config: invalid MIN_SIGNAL_RVOL '%s' (must be float between 0.0 and 5.0)", minSignalRVOLStr)
@@ -701,6 +702,14 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		minRVOL = 1.80
 	}
 
+	scannerRankingMode := strings.ToLower(strings.TrimSpace(getEnv("SCANNER_RANKING_MODE", "pullback")))
+	if scannerRankingMode == "" {
+		scannerRankingMode = "pullback"
+	}
+	if scannerRankingMode != "pullback" && scannerRankingMode != "rvol" {
+		return nil, fmt.Errorf("config: invalid SCANNER_RANKING_MODE '%s' (must be 'pullback' or 'rvol')", scannerRankingMode)
+	}
+
 	scannerInterval := 15 * time.Minute
 	if sIntStr := getEnv("SCANNER_INTERVAL_MINUTES", getEnv("SCANNER_INTERVAL", "")); sIntStr != "" {
 		if sIntMins, err := strconv.Atoi(sIntStr); err == nil && sIntMins > 0 {
@@ -754,6 +763,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MinVolume24hUSDT:         minVol,
 		MinFallbackRVOL:          minFallbackRVOL,
 		MinRVOL:                  minRVOL,
+		ScannerRankingMode:       scannerRankingMode,
 		MaxSpreadPct:             maxSpread,
 		MinNATRPct:               minNATR,
 		MaxNATRPct:               maxNATR,
