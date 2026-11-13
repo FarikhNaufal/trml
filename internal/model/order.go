@@ -2,6 +2,8 @@ package model
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -139,15 +141,67 @@ type LivePosition struct {
 
 var clientOrderNonce uint64
 
+const MaxBinanceClientOrderIDLen = 36
+
+// SanitizeClientIDPart membersihkan string agar hanya berisi karakter ASCII yang diterima Binance ([A-Za-z0-9_-]).
+func SanitizeClientIDPart(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' {
+			b.WriteByte(c)
+		}
+	}
+	res := b.String()
+	if res == "" {
+		return "SYM"
+	}
+	return res
+}
+
+// FormatClientID membentuk clientOrderId / clientAlgoId unik yang selalu ASCII-safe dan <= 36 karakter.
+func FormatClientID(prefix, symbol string, now time.Time) string {
+	cleanPrefix := SanitizeClientIDPart(prefix)
+	cleanSym := SanitizeClientIDPart(symbol)
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	ts36 := strconv.FormatInt(now.UTC().UnixMilli(), 36)
+	if ts36 == "" {
+		ts36 = "0"
+	}
+	n := atomic.AddUint64(&clientOrderNonce, 1) % 1000
+	suffix := fmt.Sprintf("%s_%03d", ts36, n)
+
+	// Format utama: <prefix>_<sym>_<ts36>_<nonce3>
+	overhead := len(cleanPrefix) + 1 + 1 + len(suffix)
+	maxSymLen := MaxBinanceClientOrderIDLen - overhead
+	var id string
+	if maxSymLen >= 1 {
+		if len(cleanSym) > maxSymLen {
+			cleanSym = cleanSym[:maxSymLen]
+		}
+		id = fmt.Sprintf("%s_%s_%s", cleanPrefix, cleanSym, suffix)
+	} else {
+		id = fmt.Sprintf("%s_%s", cleanPrefix, suffix)
+	}
+	if len(id) > MaxBinanceClientOrderIDLen {
+		id = id[:MaxBinanceClientOrderIDLen]
+	}
+	return id
+}
+
 func GenerateDeterministicClientOrderID(symbol string, side Side, candleCloseTime time.Time) string {
 	n := atomic.AddUint64(&clientOrderNonce, 1) % 1000
-	id := fmt.Sprintf("BOT_%s_%s_%d_%03d", symbol, side, candleCloseTime.UTC().Unix(), n)
-	if len(id) > 36 {
+	cleanSym := SanitizeClientIDPart(symbol)
+	id := fmt.Sprintf("BOT_%s_%s_%d_%03d", cleanSym, side, candleCloseTime.UTC().Unix(), n)
+	if len(id) > MaxBinanceClientOrderIDLen {
 		s := "L"
 		if side == SideShort {
 			s = "S"
 		}
-		sym := symbol
+		sym := cleanSym
 		// Batasi panjang simbol agar total ClientOrderID maksimal 36 karakter (syarat Binance).
 		// Format: B_<sym>_<s:1>_<unix:10>_<nonce:3> -> Total selain sym adalah 19 karakter.
 		// Maka batas aman panjang sym adalah 36 - 19 = 17 karakter.
@@ -155,6 +209,9 @@ func GenerateDeterministicClientOrderID(symbol string, side Side, candleCloseTim
 			sym = sym[:17]
 		}
 		id = fmt.Sprintf("B_%s_%s_%d_%03d", sym, s, candleCloseTime.UTC().Unix(), n)
+		if len(id) > MaxBinanceClientOrderIDLen {
+			id = id[:MaxBinanceClientOrderIDLen]
+		}
 	}
 	return id
 }

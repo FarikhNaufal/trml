@@ -292,9 +292,6 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			activeSlots = 0
 			isDailyBreached = false
 			availBal = decimal.NewFromFloat(1000000.0)
-		} else if !r.cfg.EquityModeCompounding {
-			// Mode modal tetap: kapasitas slot dan ukuran posisi tidak boleh bergantung pada saldo berjalan (drawdown)
-			availBal = totEq
 		}
 
 		for _, sym := range sortedSymbols {

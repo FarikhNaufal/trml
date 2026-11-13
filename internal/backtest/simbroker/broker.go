@@ -443,14 +443,14 @@ func (s *SimBroker) recordClosedTradeLocked(
 	entryFeeLeg := pos.EntryPrice.Mul(qty).Mul(s.Cfg.MakerFeeRate)
 	totalFee := entryFeeLeg.Add(exitFee)
 
-	// Proporsi funding yang diatribusikan ke trade leg ini
+	// Proporsi funding yang diatribusikan ke trade leg ini menggunakan sisa lot sebelum penutupan (pos.Qty)
+	// agar pos.InitialQty tetap utuh sebagai referensi ukuran entry awal.
 	var fundingLeg decimal.Decimal
-	if pos.InitialQty.GreaterThan(decimal.Zero) {
-		ratio := qty.Div(pos.InitialQty)
+	if pos.Qty.GreaterThan(decimal.Zero) {
+		ratio := qty.Div(pos.Qty)
 		fundingLeg = pos.FundingPaid.Mul(ratio)
 	}
 	pos.FundingPaid = pos.FundingPaid.Sub(fundingLeg)
-	pos.InitialQty = pos.InitialQty.Sub(qty)
 
 	// Net PnL = Gross PnL - Trading Fees - Funding Paid (+ Funding Received jika negatif)
 	netPnL := grossPnL.Sub(totalFee).Sub(fundingLeg)

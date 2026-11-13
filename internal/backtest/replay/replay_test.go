@@ -157,3 +157,32 @@ func TestReplayEngine_EndToEndSyntheticSimulation(t *testing.T) {
 		engine.TotalSignalsEvaluated, engine.SignalsApproved, engine.SignalsRejected, len(sim.ClosedTrades))
 }
 
+func TestSimBrokerFixedEquityAvailableBalanceDeductsUsedMargin(t *testing.T) {
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT:     decimal.NewFromFloat(100.0),
+		MaxSlots:              5,
+		AccountLeverage:       10.0,
+		EquityModeCompounding: false, // Fixed-equity mode
+	})
+
+	// Simulasikan 1 pending limit entry menggunakan margin 20 USDT (notional 200 USDT / lev 10)
+	ok, err := sim.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "FIXED_EQ_1",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(0.1),
+		LimitPrice:    decimal.NewFromFloat(2000.0),
+		SLPrice:       decimal.NewFromFloat(2100.0),
+		TPPrice:       decimal.NewFromFloat(1800.0),
+		CreatedAt:     time.Now().UTC(),
+	})
+	if !ok || err != nil {
+		t.Fatalf("SubmitLimitEntry failed: %v", err)
+	}
+
+	avail := sim.GetAvailableBalanceUSDT()
+	if !avail.Equal(decimal.NewFromFloat(80.0)) {
+		t.Fatalf("expected available balance 80.0 USDT (100 - 20 usedMargin) in fixed-equity mode, got %s", avail)
+	}
+}
+

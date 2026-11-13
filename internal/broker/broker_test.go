@@ -2129,8 +2129,8 @@ func TestLiveBrokerHandleUserDataOrderUpdate_ALGO_TP1(t *testing.T) {
 	if !exists {
 		t.Fatalf("expected BTCUSDT active position to be preserved, but it was deleted!")
 	}
-	if !qty.Equal(decimal.NewFromFloat(2.0)) {
-		t.Errorf("expected active position qty 2.0, got %s", qty)
+	if !qty.Equal(decimal.NewFromFloat(1.0)) {
+		t.Errorf("expected remaining runner qty 1.0 after TP1 fill, got %s", qty)
 	}
 	if _, hasProt := b.Protections["BTCUSDT"]; !hasProt {
 		t.Fatalf("expected protections to be preserved for runner")
@@ -3253,4 +3253,185 @@ func TestLiveBrokerLimitMakerTP1AndGhostCancellation(t *testing.T) {
 		t.Errorf("expected resting TP1 order %d (%s) canceled on SL hit, got %d (%s)", ethTP1ID, ethTP1CID, canceledExchangeOrderID, canceledClientOrderID)
 	}
 	cancelMu.Unlock()
+}
+
+func TestLiveBrokerHandleUserDataOrderUpdate_EntryAfterTP1NoDeadlock(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{MaxSlots: 3})
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, now)
+
+	b.Mu.Lock()
+	b.OrdersByClient["ENTRY_LATE_1"] = &model.LiveOrderRecord{
+		ClientOrderID: "ENTRY_LATE_1",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideShort,
+		IsEntry:       true,
+		Status:        model.StatusNew,
+	}
+	b.ActivePositions["SOLUSDT"] = decimal.NewFromFloat(5.0)
+	b.PositionSides["SOLUSDT"] = model.SideShort
+	b.PositionEntryPrices["SOLUSDT"] = decimal.NewFromFloat(100.0)
+	b.IsTP1Hits["SOLUSDT"] = true
+	b.Mu.Unlock()
+
+	// Panggil update entry terlambat pasca-TP1: sebelumnya memicu return tanpa Unlock (deadlock)
+	b.HandleUserDataOrderUpdate("ENTRY_LATE_1", 999111, "SOLUSDT", model.StatusFilled, decimal.NewFromFloat(5.0), decimal.NewFromFloat(100.0), decimal.Zero)
+
+	done := make(chan struct{})
+	go func() {
+		b.OnRealtimeTick("SOLUSDT", 99.0, 99.1, 99.0, 99.0, 1.0, false, now)
+		_ = b.GetActiveSlotCount()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("deadlock detected after post-TP1 entry update")
+	}
+}
+
+func TestLiveBrokerHandleUserDataOrderUpdate_TP1_PartialFillsThenFilled(t *testing.T) {
+	var slMu sync.Mutex
+	var beSLQty decimal.Decimal
+	var closedTradesMu sync.Mutex
+	var closed []TradeClosedRecord
+
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:         3,
+		PartialTPEnabled: true,
+		PartialTP1Ratio:  0.50,
+		MakerFeeRate:     0.0002,
+		TakerFeeRate:     0.0005,
+	})
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if len(clientAlgoID) > model.MaxBinanceClientOrderIDLen {
+			return 0, fmt.Errorf("clientAlgoId too long: %d", len(clientAlgoID))
+		}
+		slMu.Lock()
+		beSLQty = qty
+		slMu.Unlock()
+		return 556677, nil
+	}
+	b.OnTradeClosedFn = func(rec TradeClosedRecord) {
+		closedTradesMu.Lock()
+		closed = append(closed, rec)
+		closedTradesMu.Unlock()
+	}
+
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, now)
+
+	b.Mu.Lock()
+	b.ActivePositions["1000PEPEUSDT"] = decimal.NewFromFloat(10.0)
+	b.InitialQtys["1000PEPEUSDT"] = decimal.NewFromFloat(10.0)
+	b.PositionSides["1000PEPEUSDT"] = model.SideShort
+	b.PositionEntryPrices["1000PEPEUSDT"] = decimal.NewFromFloat(1.0)
+	b.InitialSLPrices["1000PEPEUSDT"] = decimal.NewFromFloat(1.05)
+	b.TP1Prices["1000PEPEUSDT"] = decimal.NewFromFloat(0.95)
+	b.ATRAtEntry["1000PEPEUSDT"] = decimal.NewFromFloat(0.02)
+	b.Protections["1000PEPEUSDT"] = &model.LivePositionProtection{
+		Symbol:           "1000PEPEUSDT",
+		Side:             model.SideShort,
+		PlanGeneration:   1,
+		ProtectedQty:     decimal.NewFromFloat(10.0),
+		SLOrderID:        111,
+		SLPrice:          decimal.NewFromFloat(1.05),
+		SLStatus:         model.ProtectionAcked,
+		TP1OrderID:       222,
+		TP1ClientOrderID: "ALGO_TP1_1000PEPE_1",
+	}
+	b.Mu.Unlock()
+
+	// Chunk 1: PARTIALLY_FILLED 2.0 dari 5.0
+	b.HandleUserDataOrderUpdate("ALGO_TP1_1000PEPE_1", 222, "1000PEPEUSDT", model.StatusPartiallyFilled, decimal.NewFromFloat(2.0), decimal.NewFromFloat(0.95), decimal.Zero)
+
+	b.Mu.Lock()
+	if !b.ActivePositions["1000PEPEUSDT"].Equal(decimal.NewFromFloat(8.0)) {
+		t.Fatalf("expected active qty 8.0 after TP1 chunk 1, got %s", b.ActivePositions["1000PEPEUSDT"])
+	}
+	if b.IsTP1Hits["1000PEPEUSDT"] {
+		t.Fatalf("expected IsTP1Hits false before final StatusFilled")
+	}
+	b.Mu.Unlock()
+
+	// Chunk 2 (Final): FILLED kumulatif 5.0 -> sisa runner harus 5.0 (bukan 8.0 - 5.0 = 3.0!)
+	b.HandleUserDataOrderUpdate("ALGO_TP1_1000PEPE_1", 222, "1000PEPEUSDT", model.StatusFilled, decimal.NewFromFloat(5.0), decimal.NewFromFloat(0.95), decimal.Zero)
+
+	b.Mu.Lock()
+	if !b.ActivePositions["1000PEPEUSDT"].Equal(decimal.NewFromFloat(5.0)) {
+		t.Fatalf("expected final runner qty 5.0 after full TP1 fill, got %s", b.ActivePositions["1000PEPEUSDT"])
+	}
+	if !b.IsTP1Hits["1000PEPEUSDT"] {
+		t.Fatalf("expected IsTP1Hits true after StatusFilled")
+	}
+	b.Mu.Unlock()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		slMu.Lock()
+		gotSLQty := beSLQty
+		slMu.Unlock()
+		closedTradesMu.Lock()
+		nClosed := len(closed)
+		closedTradesMu.Unlock()
+		if nClosed == 1 && !gotSLQty.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closedTradesMu.Lock()
+	if len(closed) != 1 || !closed[0].Qty.Equal(decimal.NewFromFloat(5.0)) {
+		t.Fatalf("expected 1 TP1 TradeClosedRecord with Qty 5.0, got %+v", closed)
+	}
+	closedTradesMu.Unlock()
+
+	slMu.Lock()
+	if !beSLQty.Equal(decimal.NewFromFloat(5.0)) {
+		t.Fatalf("expected BE SL placed for remaining 5.0 qty, got %s", beSLQty)
+	}
+	slMu.Unlock()
+}
+
+func TestLiveBrokerRestoreOpenPosition_PartialTPEnabledSkipsTPRepair(t *testing.T) {
+	var tpRepairCalls atomic.Int32
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:         3,
+		PartialTPEnabled: true,
+		TrailingEnabled:  true,
+	})
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if orderType == "TAKE_PROFIT_MARKET" {
+			tpRepairCalls.Add(1)
+		}
+		return 99123, nil
+	}
+
+	pos := &LiveOpenPosition{
+		Symbol:         "1000SHIBUSDT",
+		Side:           model.SideShort,
+		Qty:            decimal.NewFromFloat(100.0),
+		InitialQty:     decimal.NewFromFloat(100.0),
+		EntryPrice:     decimal.NewFromFloat(0.020),
+		SLOrderID:      12345,
+		SLClientAlgoID: "ALGO_SL_1000SHIB_1",
+		SLPrice:        decimal.NewFromFloat(0.021),
+		TPOrderID:      0, // Sengaja 0 saat PartialTPEnabled=true
+		TPPrice:        decimal.NewFromFloat(0.018),
+		TP1Price:       decimal.NewFromFloat(0.019),
+	}
+	b.RestoreOpenPosition(pos)
+
+	b.Mu.Lock()
+	prot := b.Protections["1000SHIBUSDT"]
+	if prot == nil || prot.TPStatus != model.ProtectionAcked {
+		t.Fatalf("expected TPStatus ProtectionAcked under PartialTPEnabled=true, got %+v", prot)
+	}
+	b.Mu.Unlock()
+
+	b.RepairFailedProtections(time.Now().UTC())
+	if tpRepairCalls.Load() != 0 {
+		t.Fatalf("expected 0 TAKE_PROFIT_MARKET repair calls under PartialTPEnabled=true, got %d", tpRepairCalls.Load())
+	}
 }

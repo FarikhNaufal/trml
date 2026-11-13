@@ -228,6 +228,16 @@ func EvaluateSignal(
 		return intent, true, "SIGNAL_APPROVED", "RANDOM_ENTRY_BENCHMARK"
 	}
 
+	// Early Guard: Filter Arah Eksekusi (ALLOWED_SIDE) berdasarkan bias tren EMA200
+	// agar audit log tidak dipenuhi kegagalan indikator/NATR dari arah yang memang dinonaktifkan konfigurasi.
+	earlyAllowedSide := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
+	if earlyAllowedSide == "SHORT_ONLY" && latest.Close > ema200 {
+		return model.OrderIntent{}, false, "SIDE_DISABLED_SHORT_ONLY", "LONG_DISABLED_BY_CONFIG"
+	}
+	if earlyAllowedSide == "LONG_ONLY" && latest.Close < ema200 {
+		return model.OrderIntent{}, false, "SIDE_DISABLED_LONG_ONLY", "SHORT_DISABLED_BY_CONFIG"
+	}
+
 	// Warmup Guard Pasca-Reset Session VWAP (00:00 - 00:30 UTC): hindari sinyal false pada awal sesi
 	warmupMins := cfg.VWAPSessionWarmupMinutes
 	if warmupMins <= 0 {

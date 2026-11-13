@@ -54,7 +54,8 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 	fmt.Fprintf(&sb, "| **Adjusted Win Rate (Pure)** | `%.2f%%` | Win / (Win + Loss), mengabaikan BE |\n", summary.AdjustedWinRatePct)
 	fmt.Fprintf(&sb, "| **Payoff Ratio (Avg W/L)** | `%.2f` | Rata-rata Win ($%.2f) / Loss ($%.2f) |\n", summary.PayoffRatio, summary.AvgWinUSDT, summary.AvgLossUSDT)
 	fmt.Fprintf(&sb, "| **Break-Even Win Rate** | `%.2f%%` | Ambang batas minimum impas |\n", summary.BreakEvenWinRate)
-	fmt.Fprintf(&sb, "| **Profit Factor** | `%.2f` | Total Profit Kotor / Loss Kotor |\n", summary.ProfitFactor)
+	fmt.Fprintf(&sb, "| **Profit Factor (Gross)** | `%.2f` | Total Profit Kotor / Loss Kotor |\n", summary.ProfitFactor)
+	fmt.Fprintf(&sb, "| **Net Profit Factor** | `%.2f` | Total Profit Bersih / Loss Bersih (pasca fee & funding) |\n", summary.NetProfitFactor)
 	fmt.Fprintf(&sb, "| **Total Net PnL** | `%s USDT` | Setelah potongan fee & slippage |\n", formatSignedUSD(summary.TotalNetPnL))
 	fmt.Fprintf(&sb, "| **Net Expectancy per Trade** | `%s USDT` | Rata-rata keuntungan bersih per trade |\n", formatSignedUSD(summary.ExpectancyUSDT))
 	fmt.Fprintf(&sb, "| **95%% Bootstrap CI** | `[%s, %s]` | Interval kepercayaan 1.000 iterasi |\n", formatSignedUSD(summary.CI95LowerUSDT), formatSignedUSD(summary.CI95UpperUSDT))
@@ -178,7 +179,10 @@ func GenerateMarkdownReport(summary metrics.BacktestSummary, meta ReportMeta, re
 	if summary.ExpectancyUSDT > 0 && summary.CI95LowerUSDT > 0 && summary.ProfitFactor >= 1.30 {
 		sb.WriteString("> [!TIP] **KESIMPULAN: STRATEGI VALID DENGAN EXPECTANCY POSITIF.**\n")
 		sb.WriteString("> Strategi terbukti memiliki edge statistik yang melampaui seluruh potongan fee dan slippage bursa.\n")
-	} else if summary.ExpectancyUSDT > 0 && summary.CI95LowerUSDT <= 0 {
+	} else if summary.ExpectancyUSDT > 0 && summary.CI95LowerUSDT > 0 && summary.ProfitFactor >= 1.0 {
+		sb.WriteString("> [!NOTE] **KESIMPULAN: EXPECTANCY POSITIF TERKONFIRMASI (PF MODERAT < 1.30).**\n")
+		sb.WriteString("> Interval kepercayaan 95% sudah sepenuhnya positif di atas nol, namun Profit Factor masih di bawah ambang ideal 1.30.\n")
+	} else if summary.ExpectancyUSDT > 0 && summary.ProfitFactor >= 1.0 {
 		sb.WriteString("> [!IMPORTANT] **KESIMPULAN: EXPECTANCY POSITIF TIPIS (BORDERLINE).**\n")
 		sb.WriteString("> Interval 95% menyentuh wilayah negatif. Disarankan menjalankan `backtest ablate` untuk membuang filter yang menambah friction drag.\n")
 	} else {

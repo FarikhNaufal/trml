@@ -93,3 +93,37 @@ func TestBootstrapConfidenceInterval(t *testing.T) {
 	}
 }
 
+func TestCalculateMetrics_NetProfitFactor(t *testing.T) {
+	now := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	raw := []simbroker.SimTradeRecord{
+		{
+			ID:        "W1",
+			Symbol:    "SOLUSDT",
+			Side:      model.SideShort,
+			EntryTime: now,
+			ExitTime:  now.Add(5 * time.Minute),
+			GrossPnL:  decimal.NewFromFloat(10.0),
+			NetPnL:    decimal.NewFromFloat(8.0),
+			FeeTotal:  decimal.NewFromFloat(2.0),
+		},
+		{
+			ID:        "L1",
+			Symbol:    "ETHUSDT",
+			Side:      model.SideShort,
+			EntryTime: now.Add(10 * time.Minute),
+			ExitTime:  now.Add(15 * time.Minute),
+			GrossPnL:  decimal.NewFromFloat(-4.0),
+			NetPnL:    decimal.NewFromFloat(-5.0),
+			FeeTotal:  decimal.NewFromFloat(1.0),
+		},
+	}
+
+	summary := CalculateMetrics(raw, 100.0)
+	if summary.ProfitFactor != 2.5 {
+		t.Errorf("expected gross ProfitFactor 2.5, got %f", summary.ProfitFactor)
+	}
+	if summary.NetProfitFactor != 1.6 {
+		t.Errorf("expected NetProfitFactor 1.6 (8.0/5.0), got %f", summary.NetProfitFactor)
+	}
+}
+

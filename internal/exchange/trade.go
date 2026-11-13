@@ -147,7 +147,12 @@ func (c *Client) PlaceAlgoOrder(
 	}
 	params.Set("workingType", workingType)
 	params.Set("reduceOnly", "true")
-	params.Set("clientAlgoId", clientAlgoID)
+	if clientAlgoID != "" {
+		if len(clientAlgoID) > model.MaxBinanceClientOrderIDLen {
+			return 0, fmt.Errorf("place algo order: clientAlgoId exceeds %d chars (%d: %s)", model.MaxBinanceClientOrderIDLen, len(clientAlgoID), clientAlgoID)
+		}
+		params.Set("clientAlgoId", clientAlgoID)
+	}
 
 	respBytes, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/algoOrder", params, true)
 	if err != nil {
@@ -211,7 +216,7 @@ func (c *Client) EmergencyMarketClose(ctx context.Context, symbol string, positi
 	params.Set("type", "MARKET")
 	params.Set("reduceOnly", "true")
 	params.Set("quantity", qty.String())
-	params.Set("newClientOrderId", fmt.Sprintf("live_emg_%s_%d", symbol, time.Now().UnixNano()))
+	params.Set("newClientOrderId", model.FormatClientID("live_emg", symbol, time.Now().UTC()))
 
 	_, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
 	if err != nil {

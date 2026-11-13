@@ -23,7 +23,8 @@ type BacktestSummary struct {
 	AvgLossUSDT        float64        `json:"avg_loss_usdt"`
 	PayoffRatio        float64        `json:"payoff_ratio"` // AvgWin / AvgLoss
 	BreakEvenWinRate   float64        `json:"break_even_win_rate"`
-	ProfitFactor       float64        `json:"profit_factor"` // Gross Profit / Gross Loss
+	ProfitFactor       float64        `json:"profit_factor"`     // Gross Profit / Gross Loss
+	NetProfitFactor    float64        `json:"net_profit_factor"` // Net Profit / Net Loss (setelah fee & funding)
 	TotalNetPnL        float64        `json:"total_net_pnl"`
 	TotalGrossPnL      float64        `json:"total_gross_pnl"`
 	TotalFees          float64        `json:"total_fees"`
@@ -243,6 +244,12 @@ func CalculateMetrics(rawTrades []simbroker.SimTradeRecord, initialEquity float6
 		res.ProfitFactor = grossProfit / grossLoss
 	} else if grossProfit > 0 {
 		res.ProfitFactor = 99.0 // No loss
+	}
+
+	if sumLoss > 0 {
+		res.NetProfitFactor = sumWin / sumLoss
+	} else if sumWin > 0 {
+		res.NetProfitFactor = 99.0
 	}
 
 	if grossProfit > 0 {

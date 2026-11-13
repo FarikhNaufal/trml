@@ -184,21 +184,10 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 		if err != nil {
 			lastErr = fmt.Errorf("exchange: network error on %s %s: %w", method, endpoint, err)
 
-			// Pencegahan Order Ganda: Jika POST order mengalami network error, cek apakah order sebenarnya sudah diterima Binance
-			if method == http.MethodPost && (strings.Contains(endpoint, "/order") || strings.Contains(endpoint, "/algoOrder")) {
-				clientOID := params.Get("newClientOrderId")
-				if clientOID == "" {
-					clientOID = params.Get("clientAlgoId")
-				}
-				symbol := params.Get("symbol")
-				if clientOID != "" && symbol != "" {
-					qParams := url.Values{}
-					qParams.Set("symbol", symbol)
-					qParams.Set("origClientOrderId", clientOID)
-					checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/order", qParams, true)
-					if checkErr == nil && len(checkBody) > 0 {
-						return checkBody, nil
-					}
+			// Pencegahan Order Ganda: Jika POST order/algoOrder mengalami network error, cek apakah sudah diterima Binance
+			if method == http.MethodPost {
+				if existingBody, ok := c.verifyPostOrderIdempotency(ctx, endpoint, params); ok {
+					return existingBody, nil
 				}
 			}
 
@@ -235,20 +224,9 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 
 		// Tangani Rate Limit (429) dan Server Error (5xx) dengan retry bounded
 		if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode <= 504) {
-			if method == http.MethodPost && (strings.Contains(endpoint, "/order") || strings.Contains(endpoint, "/algoOrder")) {
-				clientOID := params.Get("newClientOrderId")
-				if clientOID == "" {
-					clientOID = params.Get("clientAlgoId")
-				}
-				symbol := params.Get("symbol")
-				if clientOID != "" && symbol != "" {
-					qParams := url.Values{}
-					qParams.Set("symbol", symbol)
-					qParams.Set("origClientOrderId", clientOID)
-					checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/order", qParams, true)
-					if checkErr == nil && len(checkBody) > 0 {
-						return checkBody, nil
-					}
+			if method == http.MethodPost {
+				if existingBody, ok := c.verifyPostOrderIdempotency(ctx, endpoint, params); ok {
+					return existingBody, nil
 				}
 			}
 
@@ -351,4 +329,61 @@ func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, par
 		return body, fmt.Errorf("exchange: API returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	return body, nil
+}
+
+// verifyPostOrderIdempotency memeriksa apakah POST /order atau POST /algoOrder sebenarnya sudah diterima bursa
+// sebelum melakukan retry setelah network error / rate-limit / 5xx.
+func (c *Client) verifyPostOrderIdempotency(ctx context.Context, endpoint string, params url.Values) ([]byte, bool) {
+	if params == nil {
+		return nil, false
+	}
+	symbol := params.Get("symbol")
+	if symbol == "" {
+		return nil, false
+	}
+
+	if strings.Contains(endpoint, "/algoOrder") {
+		clientAlgoID := params.Get("clientAlgoId")
+		if clientAlgoID == "" {
+			return nil, false
+		}
+		qParams := url.Values{}
+		qParams.Set("symbol", symbol)
+		checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/openAlgoOrders", qParams, true)
+		if checkErr != nil || len(checkBody) == 0 {
+			return nil, false
+		}
+		var openAlgos []QueryAlgoOrderResponse
+		if jsonErr := json.Unmarshal(checkBody, &openAlgos); jsonErr != nil {
+			return nil, false
+		}
+		for _, item := range openAlgos {
+			if item.ClientAlgoID == clientAlgoID && item.AlgoID != 0 {
+				synth, mErr := json.Marshal(AlgoOrderResponse{
+					AlgoID:       item.AlgoID,
+					ClientAlgoID: item.ClientAlgoID,
+				})
+				if mErr == nil {
+					return synth, true
+				}
+			}
+		}
+		return nil, false
+	}
+
+	if strings.Contains(endpoint, "/order") {
+		clientOID := params.Get("newClientOrderId")
+		if clientOID == "" {
+			return nil, false
+		}
+		qParams := url.Values{}
+		qParams.Set("symbol", symbol)
+		qParams.Set("origClientOrderId", clientOID)
+		checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/order", qParams, true)
+		if checkErr == nil && len(checkBody) > 0 {
+			return checkBody, true
+		}
+	}
+
+	return nil, false
 }

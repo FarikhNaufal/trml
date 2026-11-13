@@ -1,10 +1,16 @@
 package ws
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
 )
@@ -124,5 +130,75 @@ func TestKlineClosed_DynamicInterval(t *testing.T) {
 
 	if atomic.LoadInt32(&parsed15m) != 1 || capturedInterval != "15m" {
 		t.Fatalf("expected 15m kline to be parsed via OnKlineClosed, got count=%d, interval=%s", parsed15m, capturedInterval)
+	}
+}
+
+func TestDynamicStream_DifferentialSubscribeUnsubscribe(t *testing.T) {
+	var connCount atomic.Int32
+	ctrlCh := make(chan map[string]any, 4)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connCount.Add(1)
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+		for {
+			_, raw, err := c.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var msg map[string]any
+			if json.Unmarshal(raw, &msg) == nil {
+				ctrlCh <- msg
+			}
+		}
+	}))
+	defer ts.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream"
+	mgr := NewStreamManager(EventHandlers{})
+	ds := NewDynamicStream(mgr, wsBase, []string{"btcusdt@bookTicker", "solusdt@bookTicker"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ds.Start(ctx)
+
+	// Tunggu koneksi tersambung sebelum UpdateStreams
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ds.mu.Lock()
+		connected := ds.conn != nil
+		ds.mu.Unlock()
+		if connected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Update dengan delta: solusdt dihapus, ethusdt ditambahkan, btcusdt dipertahankan
+	if err := ds.UpdateStreams(ctx, []string{"btcusdt@bookTicker", "ethusdt@bookTicker"}); err != nil {
+		t.Fatalf("UpdateStreams failed: %v", err)
+	}
+
+	var methods []string
+	timeout := time.After(2 * time.Second)
+	for len(methods) < 2 {
+		select {
+		case msg := <-ctrlCh:
+			m, _ := msg["method"].(string)
+			methods = append(methods, m)
+		case <-timeout:
+			t.Fatalf("timeout waiting for control frames, got methods=%v", methods)
+		}
+	}
+
+	if connCount.Load() != 1 {
+		t.Fatalf("expected 1 persistent connection without teardown, got %d", connCount.Load())
+	}
+	if methods[0] != "UNSUBSCRIBE" || methods[1] != "SUBSCRIBE" {
+		t.Fatalf("expected [UNSUBSCRIBE SUBSCRIBE], got %v", methods)
 	}
 }

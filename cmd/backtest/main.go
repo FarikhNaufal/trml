@@ -725,17 +725,14 @@ func loadCandlesParallel(
 		go func() {
 			defer wg.Done()
 			for sym := range taskChan {
-				candles, err := downloader.FetchCandleRange(ctx, sym, interval, from, to)
-				curr := atomic.AddInt32(&completed, 1)
-
-				if err != nil || len(candles) == 0 {
-					slog.Debug("Gagal memuat candle simbol", "symbol", sym, "err", err)
-					continue
-				}
-
 				var ef model.ExchangeFilter
 				if f, ok := exchangeFilters[sym]; ok {
 					ef = f
+				} else if len(exchangeFilters) > 0 {
+					// Keep parity with live FetchExchangeInfo: skip TRADIFI_PERPETUAL or unlisted symbols
+					// rather than synthesizing fallback filters that never execute in live trading.
+					slog.Debug("Melewati simbol di luar exchangeInfo PERPETUAL", "symbol", sym)
+					continue
 				} else {
 					ef = model.ExchangeFilter{
 						TickSize:    decimal.NewFromFloat(0.01),
@@ -743,6 +740,14 @@ func loadCandlesParallel(
 						MinNotional: decimal.NewFromFloat(5.0),
 						MinQty:      decimal.NewFromFloat(0.1),
 					}
+				}
+
+				candles, err := downloader.FetchCandleRange(ctx, sym, interval, from, to)
+				curr := atomic.AddInt32(&completed, 1)
+
+				if err != nil || len(candles) == 0 {
+					slog.Debug("Gagal memuat candle simbol", "symbol", sym, "err", err)
+					continue
 				}
 
 				mu.Lock()

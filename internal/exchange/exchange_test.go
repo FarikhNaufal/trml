@@ -320,3 +320,54 @@ func TestCircuitBreakerHTTP418(t *testing.T) {
 		t.Errorf("expected reqCount to remain 1 after second request, got %d", reqCount)
 	}
 }
+
+func TestPlaceAlgoOrder_IdempotencyOpenAlgoOrders(t *testing.T) {
+	var postAlgoAttempts int
+	var openAlgoQueries int
+	var regularOrderQueries int
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/fapi/v1/algoOrder":
+			postAlgoAttempts++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"code":-1000,"msg":"internal error"}`))
+		case "/fapi/v1/openAlgoOrders":
+			openAlgoQueries++
+			_, _ = w.Write([]byte(`[
+				{"algoId":778899,"clientAlgoId":"ALGO_SL_BTC_1","symbol":"BTCUSDT","algoStatus":"NEW"}
+			]`))
+		case "/fapi/v1/order":
+			regularOrderQueries++
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	algoID, err := client.PlaceAlgoOrder(context.Background(), "BTCUSDT", model.SideShort, "STOP_MARKET", decimal.NewFromFloat(0.1), decimal.NewFromFloat(85000), "ALGO_SL_BTC_1")
+	if err != nil {
+		t.Fatalf("expected algo idempotency recovery without error, got: %v", err)
+	}
+	if algoID != 778899 {
+		t.Fatalf("expected recovered algoId 778899, got %d", algoID)
+	}
+	if postAlgoAttempts != 1 || openAlgoQueries != 1 {
+		t.Fatalf("expected 1 algo POST and 1 openAlgoOrders query, got post=%d openAlgo=%d", postAlgoAttempts, openAlgoQueries)
+	}
+	if regularOrderQueries != 0 {
+		t.Fatalf("expected 0 /fapi/v1/order queries for algo idempotency, got %d", regularOrderQueries)
+	}
+}
+
+func TestPlaceAlgoOrder_RejectsClientAlgoIDExceeding36Chars(t *testing.T) {
+	client := NewClient("http://127.0.0.1:0", "KEY", "SECRET")
+	tooLongID := strings.Repeat("A", 37)
+	_, err := client.PlaceAlgoOrder(context.Background(), "1000PEPEUSDT", model.SideShort, "STOP_MARKET", decimal.NewFromFloat(10), decimal.NewFromFloat(0.01), tooLongID)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 36 chars") {
+		t.Fatalf("expected error rejecting clientAlgoId > 36 chars, got: %v", err)
+	}
+}

@@ -415,3 +415,36 @@ func TestSeedOpenInterestBootstrap_SingleSampleDoesNotSelfPair(t *testing.T) {
 		t.Fatalf("expected NeedsOIBootstrapLocked true when only 1 sample exists")
 	}
 }
+
+func TestFormatClientID_MaxLengthAndASCII(t *testing.T) {
+	prefixes := []string{"ALGO_SL", "ALGO_TP", "ALGO_TP1", "ALGOSL_R", "ALGOTP_R", "live_sl_be", "live_sl", "live_emg"}
+	symbols := []string{"BTCUSDT", "1000PEPEUSDT", "FARTCOINUSDT", "1000000MOGUSDT", "牛来USDT", "币安人生USDT"}
+	now := time.Date(2026, 11, 14, 1, 0, 0, 0, time.UTC)
+
+	seen := make(map[string]bool)
+	for _, p := range prefixes {
+		for _, sym := range symbols {
+			id := FormatClientID(p, sym, now)
+			if len(id) == 0 || len(id) > MaxBinanceClientOrderIDLen {
+				t.Fatalf("expected length 1..36 for prefix=%s sym=%s, got len=%d (%q)", p, sym, len(id), id)
+			}
+			for i := 0; i < len(id); i++ {
+				c := id[i]
+				valid := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'
+				if !valid {
+					t.Fatalf("invalid non-ASCII/disallowed char %q in client ID %q", c, id)
+				}
+			}
+			if seen[id] {
+				t.Fatalf("duplicate client ID generated: %q", id)
+			}
+			seen[id] = true
+		}
+	}
+
+	// Non-ASCII deterministic entry order ID harus tetap ASCII & <= 36 char
+	entryID := GenerateDeterministicClientOrderID("牛来USDT", SideShort, now)
+	if len(entryID) == 0 || len(entryID) > MaxBinanceClientOrderIDLen {
+		t.Fatalf("expected deterministic entry ID <= 36 chars, got %d (%q)", len(entryID), entryID)
+	}
+}

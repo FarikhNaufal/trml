@@ -54,6 +54,8 @@ type BotEngine struct {
 	verifiedMu      sync.RWMutex
 	verifiedSymbols map[string]bool
 	streamCancel    context.CancelFunc
+	publicDynStream *ws.DynamicStream
+	marketDynStream *ws.DynamicStream
 	streamMu        sync.Mutex
 
 	oiPollRunning   atomic.Bool
@@ -1511,12 +1513,31 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 	e.streamMu.Lock()
 	defer e.streamMu.Unlock()
 
-	if e.streamCancel != nil {
-		e.streamCancel()
+	if len(symbols) == 0 {
+		if e.streamCancel != nil {
+			e.streamCancel()
+			e.streamCancel = nil
+		}
+		e.publicDynStream = nil
+		e.marketDynStream = nil
+		return
 	}
 
-	if len(symbols) == 0 {
-		return
+	includeAggTrade := e.cfg == nil || e.cfg.DryRun
+	publicStreams, marketStreams := buildMarketStreamSubscriptions(symbols, e.cfg.Timeframe, includeAggTrade)
+
+	// Differential Update: pertahankan koneksi WS tetap hidup bila sudah ada, hanya kirim UNSUBSCRIBE/SUBSCRIBE
+	if e.publicDynStream != nil && e.marketDynStream != nil && e.streamCancel != nil {
+		pubErr := e.publicDynStream.UpdateStreams(parentCtx, publicStreams)
+		mktErr := e.marketDynStream.UpdateStreams(parentCtx, marketStreams)
+		if pubErr == nil && mktErr == nil {
+			return
+		}
+		slog.Warn("differential WS update failed, falling back to clean stream restart", "pubErr", pubErr, "mktErr", mktErr)
+	}
+
+	if e.streamCancel != nil {
+		e.streamCancel()
 	}
 
 	streamCtx, cancel := context.WithCancel(parentCtx)
@@ -1527,12 +1548,6 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 		marketCancel()
 		cancel()
 	}
-
-	includeAggTrade := e.cfg == nil || e.cfg.DryRun
-	publicStreams, marketStreams := buildMarketStreamSubscriptions(symbols, e.cfg.Timeframe, includeAggTrade)
-
-	publicURL := ws.BuildCombinedStreamURL(e.cfg.WSPublicURL, publicStreams)
-	marketURL := ws.BuildCombinedStreamURL(e.cfg.WSMarketURL, marketStreams)
 
 	handlers := ws.EventHandlers{
 		OnBookTicker: func(symbol string, bestBid, bestAsk float64, now time.Time) {
@@ -1607,174 +1622,183 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 				return
 			}
 
-			now := time.Now().UTC()
-			snap := st.Snapshot(now)
-
-			// Evaluasi Sinyal
-			activeSlots := e.broker.GetActiveSlotCount()
-			availBal := e.broker.GetAvailableBalanceUSDT()
-			totEq := e.broker.GetEffectiveTotalEquityUSDT()
-
-			// C3 & M1 FIX: Evaluasi sinyal dengan equity, available balance, status drawdown, dan active symbol riil
-			isDailyBreached := e.broker.IsCircuitBreakerTripped() || (e.broker.GetDailyTotalDrawdownPct() <= e.cfg.MaxDailyDrawdown)
-			hasActiveSymbol := e.broker.HasActiveOrderOrPosition(snap.Symbol)
-
-			var btcSnap *model.MarketSnapshot
-			if e.cfg.BTCGateEnabled {
-				e.statesMu.RLock()
-				if btcSt := e.activeStates[BenchmarkSymbol]; btcSt != nil {
-					s := btcSt.Snapshot(now)
-					btcSnap = &s
-				}
-				e.statesMu.RUnlock()
-			}
-
-			intent, ok, reason, subReason := strategy.EvaluateSignal(
-				snap,
-				btcSnap,
-				activeSlots,
-				isDailyBreached,
-				hasActiveSymbol,
-				totEq,
-				availBal,
-				e.evaluatorCfg,
-			)
-
-			// Simpan audit log lengkap dengan metrik analitik riil
-			decision := "REJECT"
-			if ok {
-				decision = "APPROVE"
-			}
-			ema200 := indicator.CalculateEMA(snap.ClosedCandles, e.evaluatorCfg.EMAPeriod)
-			if math.IsNaN(ema200) || math.IsInf(ema200, 0) {
-				ema200 = 0.0
-			}
-			atr14 := indicator.CalculateATR(snap.ClosedCandles, e.evaluatorCfg.ATRPeriod)
-			if math.IsNaN(atr14) || math.IsInf(atr14, 0) {
-				atr14 = 0.0
-			}
-			zScore, _ := indicator.CalculateBarDeltaZScore(snap.ClosedBarDeltasUSDT, e.evaluatorCfg.DeltaZScoreWindow)
-			if math.IsNaN(zScore) || math.IsInf(zScore, 0) {
-				zScore = 0.0
-			}
-			var oiDelta float64
-			if snap.PrevOpenInterest > 0 {
-				oiDelta = ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
-				if math.IsNaN(oiDelta) || math.IsInf(oiDelta, 0) {
-					oiDelta = 0.0
-				}
-			}
-
-			spreadPct := 0.0
-			if snap.BestBid > 0 && snap.BestAsk > snap.BestBid {
-				spreadPct = ((snap.BestAsk - snap.BestBid) / snap.BestBid) * 100.0
-				if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) {
-					spreadPct = 0.0
-				}
-			}
-			rvol := indicator.CalculateRVOL(snap.ClosedCandles, 20)
-			if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
-				rvol = 0.0
-			}
-
-			lookback := e.evaluatorCfg.LookbackImpulseBars
-			if lookback <= 0 {
-				lookback = 18
-			}
-			startIdx := len(snap.ClosedCandles) - 1 - lookback
-			if startIdx < 0 {
-				startIdx = 0
-			}
-			endIdx := len(snap.ClosedCandles) - 1
-			impulseATRMult := 0.0
-			for i := startIdx; i < endIdx; i++ {
-				c := snap.ClosedCandles[i]
-				if atr14 > 0 {
-					var mult float64
-					if candle.Close >= ema200 {
-						mult = (c.High - snap.CurrentSessionVWAP) / atr14
-					} else {
-						mult = (snap.CurrentSessionVWAP - c.Low) / atr14
-					}
-					if mult > impulseATRMult {
-						impulseATRMult = mult
-					}
-				}
-			}
-
-			// Pengawal 5: Tandai subReason dengan OI_BOOTSTRAPPED jika sampel menggunakan data historis bursa
-			if snap.IsOIBootstrapped {
-				if subReason == "" {
-					subReason = "OI_BOOTSTRAPPED"
-				} else {
-					subReason += "|OI_BOOTSTRAPPED"
-				}
-			}
-
-			evaluatedSide := "NONE"
-			if ok {
-				evaluatedSide = string(intent.Side)
-			} else if candle.Close > ema200 {
-				evaluatedSide = "LONG"
-			} else if candle.Close < ema200 {
-				evaluatedSide = "SHORT"
-			}
-			slog.Info("signal evaluated", "symbol", snap.Symbol, "side", evaluatedSide, "decision", decision, "reason", reason, "subReason", subReason, "oiBootstrapped", snap.IsOIBootstrapped)
-
-			var limitPriceFloat, slPriceFloat, tpPriceFloat float64
-			if ok {
-				limitPriceFloat, _ = intent.LimitPrice.Float64()
-				slPriceFloat, _ = intent.SLPrice.Float64()
-				tpPriceFloat, _ = intent.TPPrice.Float64()
-			}
-
-			sigID, err := e.repo.LogSignalAudit(
-				context.Background(),
-				candle.OpenTime,
-				snap.Symbol,
-				evaluatedSide,
-				candle.Close,
-				ema200,
-				snap.CurrentSessionVWAP,
-				atr14,
-				zScore,
-				oiDelta,
-				snap.FundingRate,
-				spreadPct,
-				rvol,
-				impulseATRMult,
-				limitPriceFloat,
-				slPriceFloat,
-				tpPriceFloat,
-				decision,
-				reason,
-				subReason,
-			)
-			if err != nil {
-				slog.Error("failed to log signal audit", "symbol", snap.Symbol, "err", err)
-			}
-
-			if ok && reason == "SIGNAL_APPROVED" {
-				intent.SignalAuditID = sigID
-				slog.Info("SIGNAL APPROVED! Spawning async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "qty", intent.Qty, "price", intent.LimitPrice, "signalAuditID", sigID)
-				go func(targetIntent model.OrderIntent) {
-					reserved, err := e.broker.SubmitLimitEntry(targetIntent)
-					if reserved && err == nil {
-						slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", targetIntent.Symbol, "clientOrderID", targetIntent.ClientOrderID)
-					} else {
-						slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", targetIntent.Symbol, "err", err)
-					}
-				}(intent)
-			}
+			// Lepas evaluasi sinyal dan penulisan SQLite audit log dari read-loop WebSocket
+			go e.evaluateAndLogClosedCandle(candle, st)
 		},
 	}
 	handlers.OnKline5m = handlers.OnKlineClosed
 
 	publicMgr := ws.NewStreamManager(handlers)
-	go publicMgr.StartSupervisedStream(publicCtx, publicURL)
+	publicDyn := ws.NewDynamicStream(publicMgr, e.cfg.WSPublicURL, publicStreams)
+	e.publicDynStream = publicDyn
+	go publicDyn.Start(publicCtx)
 
 	marketMgr := ws.NewStreamManager(handlers)
-	go marketMgr.StartSupervisedStream(marketCtx, marketURL)
+	marketDyn := ws.NewDynamicStream(marketMgr, e.cfg.WSMarketURL, marketStreams)
+	e.marketDynStream = marketDyn
+	go marketDyn.Start(marketCtx)
+}
+
+func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.SymbolState) {
+	now := time.Now().UTC()
+	snap := st.Snapshot(now)
+
+	// Evaluasi Sinyal
+	activeSlots := e.broker.GetActiveSlotCount()
+	availBal := e.broker.GetAvailableBalanceUSDT()
+	totEq := e.broker.GetEffectiveTotalEquityUSDT()
+
+	// C3 & M1 FIX: Evaluasi sinyal dengan equity, available balance, status drawdown, dan active symbol riil
+	isDailyBreached := e.broker.IsCircuitBreakerTripped() || (e.broker.GetDailyTotalDrawdownPct() <= e.cfg.MaxDailyDrawdown)
+	hasActiveSymbol := e.broker.HasActiveOrderOrPosition(snap.Symbol)
+
+	var btcSnap *model.MarketSnapshot
+	if e.cfg.BTCGateEnabled {
+		e.statesMu.RLock()
+		if btcSt := e.activeStates[BenchmarkSymbol]; btcSt != nil {
+			s := btcSt.Snapshot(now)
+			btcSnap = &s
+		}
+		e.statesMu.RUnlock()
+	}
+
+	intent, ok, reason, subReason := strategy.EvaluateSignal(
+		snap,
+		btcSnap,
+		activeSlots,
+		isDailyBreached,
+		hasActiveSymbol,
+		totEq,
+		availBal,
+		e.evaluatorCfg,
+	)
+
+	// Simpan audit log lengkap dengan metrik analitik riil
+	decision := "REJECT"
+	if ok {
+		decision = "APPROVE"
+	}
+	ema200 := indicator.CalculateEMA(snap.ClosedCandles, e.evaluatorCfg.EMAPeriod)
+	if math.IsNaN(ema200) || math.IsInf(ema200, 0) {
+		ema200 = 0.0
+	}
+	atr14 := indicator.CalculateATR(snap.ClosedCandles, e.evaluatorCfg.ATRPeriod)
+	if math.IsNaN(atr14) || math.IsInf(atr14, 0) {
+		atr14 = 0.0
+	}
+	zScore, _ := indicator.CalculateBarDeltaZScore(snap.ClosedBarDeltasUSDT, e.evaluatorCfg.DeltaZScoreWindow)
+	if math.IsNaN(zScore) || math.IsInf(zScore, 0) {
+		zScore = 0.0
+	}
+	var oiDelta float64
+	if snap.PrevOpenInterest > 0 {
+		oiDelta = ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
+		if math.IsNaN(oiDelta) || math.IsInf(oiDelta, 0) {
+			oiDelta = 0.0
+		}
+	}
+
+	spreadPct := 0.0
+	if snap.BestBid > 0 && snap.BestAsk > snap.BestBid {
+		spreadPct = ((snap.BestAsk - snap.BestBid) / snap.BestBid) * 100.0
+		if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) {
+			spreadPct = 0.0
+		}
+	}
+	rvol := indicator.CalculateRVOL(snap.ClosedCandles, 20)
+	if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
+		rvol = 0.0
+	}
+
+	lookback := e.evaluatorCfg.LookbackImpulseBars
+	if lookback <= 0 {
+		lookback = 18
+	}
+	startIdx := len(snap.ClosedCandles) - 1 - lookback
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	endIdx := len(snap.ClosedCandles) - 1
+	impulseATRMult := 0.0
+	for i := startIdx; i < endIdx; i++ {
+		c := snap.ClosedCandles[i]
+		if atr14 > 0 {
+			var mult float64
+			if candle.Close >= ema200 {
+				mult = (c.High - snap.CurrentSessionVWAP) / atr14
+			} else {
+				mult = (snap.CurrentSessionVWAP - c.Low) / atr14
+			}
+			if mult > impulseATRMult {
+				impulseATRMult = mult
+			}
+		}
+	}
+
+	// Pengawal 5: Tandai subReason dengan OI_BOOTSTRAPPED jika sampel menggunakan data historis bursa
+	if snap.IsOIBootstrapped {
+		if subReason == "" {
+			subReason = "OI_BOOTSTRAPPED"
+		} else {
+			subReason += "|OI_BOOTSTRAPPED"
+		}
+	}
+
+	evaluatedSide := "NONE"
+	if ok {
+		evaluatedSide = string(intent.Side)
+	} else if candle.Close > ema200 {
+		evaluatedSide = "LONG"
+	} else if candle.Close < ema200 {
+		evaluatedSide = "SHORT"
+	}
+	slog.Info("signal evaluated", "symbol", snap.Symbol, "side", evaluatedSide, "decision", decision, "reason", reason, "subReason", subReason, "oiBootstrapped", snap.IsOIBootstrapped)
+
+	var limitPriceFloat, slPriceFloat, tpPriceFloat float64
+	if ok {
+		limitPriceFloat, _ = intent.LimitPrice.Float64()
+		slPriceFloat, _ = intent.SLPrice.Float64()
+		tpPriceFloat, _ = intent.TPPrice.Float64()
+	}
+
+	sigID, err := e.repo.LogSignalAudit(
+		context.Background(),
+		candle.OpenTime,
+		snap.Symbol,
+		evaluatedSide,
+		candle.Close,
+		ema200,
+		snap.CurrentSessionVWAP,
+		atr14,
+		zScore,
+		oiDelta,
+		snap.FundingRate,
+		spreadPct,
+		rvol,
+		impulseATRMult,
+		limitPriceFloat,
+		slPriceFloat,
+		tpPriceFloat,
+		decision,
+		reason,
+		subReason,
+	)
+	if err != nil {
+		slog.Error("failed to log signal audit", "symbol", snap.Symbol, "err", err)
+	}
+
+	if ok && reason == "SIGNAL_APPROVED" {
+		intent.SignalAuditID = sigID
+		slog.Info("SIGNAL APPROVED! Spawning async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "qty", intent.Qty, "price", intent.LimitPrice, "signalAuditID", sigID)
+		go func(targetIntent model.OrderIntent) {
+			reserved, err := e.broker.SubmitLimitEntry(targetIntent)
+			if reserved && err == nil {
+				slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", targetIntent.Symbol, "clientOrderID", targetIntent.ClientOrderID)
+			} else {
+				slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", targetIntent.Symbol, "err", err)
+			}
+		}(intent)
+	}
 }
 
 func (e *BotEngine) runUserDataStreamSupervisor(ctx context.Context) {

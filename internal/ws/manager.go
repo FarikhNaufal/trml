@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -91,6 +93,26 @@ func (m *StreamManager) StartSupervisedStream(ctx context.Context, streamURL str
 	}
 }
 
+func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, connStart time.Time) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			// Idle watchdog: 60 detik batas maksimal tanpa frame sebelum socket dianggap mati
+			readCtx, readCancel := context.WithTimeout(ctx, 60*time.Second)
+			typ, msg, err := conn.Read(readCtx)
+			readCancel()
+			if err != nil {
+				return fmt.Errorf("ws: read error (connAge=%s): %w", time.Since(connStart).Round(time.Millisecond), err)
+			}
+			if typ == websocket.MessageText {
+				m.ProcessMessage(msg)
+			}
+		}
+	}
+}
+
 // ConnectAndStream membuka koneksi WebSocket menggunakan dial timeout dan idle watchdog
 func (m *StreamManager) ConnectAndStream(ctx context.Context, streamURL string) error {
 	opts := &websocket.DialOptions{
@@ -105,25 +127,192 @@ func (m *StreamManager) ConnectAndStream(ctx context.Context, streamURL string) 
 	}
 	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "closing") }()
 
+	connStart := time.Now()
 	slog.Info("ws: connected successfully", "url", streamURL)
+	return m.readLoop(ctx, conn, connStart)
+}
 
+// DynamicStream mengelola koneksi WebSocket gabungan dengan pembaruan SUBSCRIBE/UNSUBSCRIBE diferensial
+// tanpa memutus koneksi untuk simbol yang tetap berada di watchlist.
+type DynamicStream struct {
+	mgr     *StreamManager
+	baseURL string
+
+	mu      sync.Mutex
+	sendMu  sync.Mutex
+	streams []string
+	conn    *websocket.Conn
+	reqID   atomic.Int64
+}
+
+func NewDynamicStream(mgr *StreamManager, baseURL string, initialStreams []string) *DynamicStream {
+	copied := make([]string, len(initialStreams))
+	copy(copied, initialStreams)
+	return &DynamicStream{
+		mgr:     mgr,
+		baseURL: baseURL,
+		streams: copied,
+	}
+}
+
+func diffStreams(current, target []string) (added, removed []string) {
+	curSet := make(map[string]bool, len(current))
+	for _, s := range current {
+		curSet[s] = true
+	}
+	tgtSet := make(map[string]bool, len(target))
+	for _, s := range target {
+		tgtSet[s] = true
+		if !curSet[s] {
+			added = append(added, s)
+		}
+	}
+	for _, s := range current {
+		if !tgtSet[s] {
+			removed = append(removed, s)
+		}
+	}
+	return added, removed
+}
+
+// Start menjalankan supervisor loop reconnect dengan backoff dan jitter serta memakai daftar stream terbaru saat reconnect.
+func (d *DynamicStream) Start(ctx context.Context) {
+	backoff := 1 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			slog.Info("ws: dynamic supervised stream terminating", "baseURL", d.baseURL)
+			return
 		default:
-			// Idle watchdog: 60 detik batas maksimal tanpa frame sebelum socket dianggap mati
-			readCtx, readCancel := context.WithTimeout(ctx, 60*time.Second)
-			typ, msg, err := conn.Read(readCtx)
-			readCancel()
-			if err != nil {
-				return fmt.Errorf("ws: read error: %w", err)
+			startTime := time.Now()
+			err := d.connectAndStreamOnce(ctx)
+			if time.Since(startTime) > 5*time.Second {
+				backoff = 1 * time.Second
 			}
-			if typ == websocket.MessageText {
-				m.ProcessMessage(msg)
+			if err != nil && ctx.Err() == nil {
+				jitter := time.Duration(rand.Int64N(int64(backoff/3) + 1))
+				waitDuration := backoff + jitter
+				d.mu.Lock()
+				nStreams := len(d.streams)
+				d.mu.Unlock()
+				slog.Warn("ws: dynamic connection lost, reconnecting...",
+					"baseURL", d.baseURL, "streams", nStreams, "connAge", time.Since(startTime).Round(time.Millisecond),
+					"backoff", backoff, "waitWithJitter", waitDuration, "err", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(waitDuration):
+					backoff *= 2
+					if backoff > 3*time.Second {
+						backoff = 3 * time.Second
+					}
+				}
 			}
 		}
 	}
+}
+
+func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
+	d.mu.Lock()
+	dialed := make([]string, len(d.streams))
+	copy(dialed, d.streams)
+	d.mu.Unlock()
+
+	streamURL := BuildCombinedStreamURL(d.baseURL, dialed)
+	opts := &websocket.DialOptions{
+		HTTPClient: http.DefaultClient,
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+	conn, _, err := websocket.Dial(dialCtx, streamURL, opts)
+	dialCancel()
+	if err != nil {
+		return fmt.Errorf("ws: dial error for %s: %w", streamURL, err)
+	}
+	defer func() {
+		d.mu.Lock()
+		if d.conn == conn {
+			d.conn = nil
+		}
+		d.mu.Unlock()
+		_ = conn.Close(websocket.StatusNormalClosure, "closing")
+	}()
+
+	d.mu.Lock()
+	d.conn = conn
+	latest := make([]string, len(d.streams))
+	copy(latest, d.streams)
+	d.mu.Unlock()
+
+	// Sinkronkan diff bila UpdateStreams terjadi selama proses dial
+	added, removed := diffStreams(dialed, latest)
+	if len(removed) > 0 {
+		_ = d.sendControlMsg(ctx, conn, "UNSUBSCRIBE", removed)
+	}
+	if len(added) > 0 {
+		_ = d.sendControlMsg(ctx, conn, "SUBSCRIBE", added)
+	}
+
+	connStart := time.Now()
+	slog.Info("ws: dynamic stream connected", "baseURL", d.baseURL, "streamCount", len(latest))
+	return d.mgr.readLoop(ctx, conn, connStart)
+}
+
+// UpdateStreams memperbarui langganan secara diferensial via SUBSCRIBE/UNSUBSCRIBE tanpa memutus soket aktif.
+func (d *DynamicStream) UpdateStreams(ctx context.Context, newStreams []string) error {
+	d.mu.Lock()
+	added, removed := diffStreams(d.streams, newStreams)
+	if len(added) == 0 && len(removed) == 0 {
+		d.mu.Unlock()
+		return nil
+	}
+	copied := make([]string, len(newStreams))
+	copy(copied, newStreams)
+	d.streams = copied
+	conn := d.conn
+	d.mu.Unlock()
+
+	if conn == nil {
+		return nil
+	}
+
+	if len(removed) > 0 {
+		if err := d.sendControlMsg(ctx, conn, "UNSUBSCRIBE", removed); err != nil {
+			return err
+		}
+	}
+	if len(added) > 0 {
+		if err := d.sendControlMsg(ctx, conn, "SUBSCRIBE", added); err != nil {
+			return err
+		}
+	}
+	slog.Info("ws: applied differential stream update", "baseURL", d.baseURL, "added", len(added), "removed", len(removed))
+	return nil
+}
+
+func (d *DynamicStream) sendControlMsg(ctx context.Context, conn *websocket.Conn, method string, params []string) error {
+	if len(params) == 0 {
+		return nil
+	}
+	payload := struct {
+		Method string   `json:"method"`
+		Params []string `json:"params"`
+		ID     int64    `json:"id"`
+	}{
+		Method: method,
+		Params: params,
+		ID:     d.reqID.Add(1),
+	}
+	raw, err := sonic.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	d.sendMu.Lock()
+	defer d.sendMu.Unlock()
+	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer wCancel()
+	return conn.Write(wCtx, websocket.MessageText, raw)
 }
 
 // ProcessMessage membedah JSON payload dari Binance dengan penanganan parse error fail-closed (Solusi M4)

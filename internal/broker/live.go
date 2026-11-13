@@ -94,6 +94,9 @@ type BinanceLiveBroker struct {
 	TPRepairInFlight    map[string]bool            // symbol -> true if TP repair order in flight
 	AlgoUpdateInFlight  map[string]bool            // symbol -> true if algo order update goroutine in flight
 	TP1InFlight         map[string]bool            // symbol -> true if partial TP1 close in flight
+	TP1FilledQtys       map[string]decimal.Decimal // symbol -> cumulative filled qty on resting TP1 order before final StatusFilled
+	TP1LastFillPrices   map[string]decimal.Decimal // symbol -> last reported avg price for partially filled TP1 order
+	TP1CommittedQtys    map[string]decimal.Decimal // symbol -> partial TP1 qty already logged after a canceled/expired resting TP1 order
 	LastAlgoUpdateTimes map[string]time.Time       // symbol -> time of last algo order update
 	LastSentSLPrices    map[string]decimal.Decimal // symbol -> last stop loss price sent to exchange
 	ActiveMAE           map[string]float64         // symbol -> max adverse excursion pct
@@ -157,6 +160,9 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		TPRepairInFlight:       make(map[string]bool),
 		AlgoUpdateInFlight:     make(map[string]bool),
 		TP1InFlight:            make(map[string]bool),
+		TP1FilledQtys:          make(map[string]decimal.Decimal),
+		TP1LastFillPrices:      make(map[string]decimal.Decimal),
+		TP1CommittedQtys:       make(map[string]decimal.Decimal),
 		LastAlgoUpdateTimes:    make(map[string]time.Time),
 		LastSentSLPrices:       make(map[string]decimal.Decimal),
 		ActiveMAE:              make(map[string]float64),
@@ -261,7 +267,7 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 		slStatus = model.ProtectionFailed
 	}
 	tpStatus := model.ProtectionAcked
-	if pos.TPOrderID == 0 || pos.TPPrice.IsZero() {
+	if !b.Cfg.PartialTPEnabled && (pos.TPOrderID == 0 || pos.TPPrice.IsZero()) {
 		tpStatus = model.ProtectionFailed
 	}
 
@@ -656,15 +662,50 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 		b.Mu.Unlock()
 	}
 	if isTP1Order {
-		if status == model.StatusFilled || (status == model.StatusPartiallyFilled && cumFilledQty.GreaterThan(decimal.Zero)) {
-			go b.processTP1Executed(symbol, cumFilledQty, avgPrice, clientOrderID, true)
+		if status == model.StatusPartiallyFilled && cumFilledQty.GreaterThan(decimal.Zero) {
+			b.recordTP1PartialChunk(symbol, clientOrderID, cumFilledQty, avgPrice)
+		} else if status == model.StatusFilled {
+			b.processTP1Executed(symbol, cumFilledQty, avgPrice, clientOrderID, true)
 		} else if status == model.StatusCanceled || status == model.StatusExpired || status == model.StatusRejected {
+			var canceledPartialRec *TradeClosedRecord
 			b.Mu.Lock()
 			if prot, ok := b.Protections[symbol]; ok && (prot.TP1OrderID == exchangeOrderID || prot.TP1ClientOrderID == clientOrderID) {
 				prot.TP1OrderID = 0
 				prot.TP1ClientOrderID = ""
 			}
+			if !b.IsTP1Hits[symbol] {
+				prevFilled := b.TP1FilledQtys[symbol]
+				if cumFilledQty.GreaterThan(prevFilled) {
+					delta := cumFilledQty.Sub(prevFilled)
+					if curQty, hasPos := b.ActivePositions[symbol]; hasPos {
+						rem := curQty.Sub(delta)
+						if rem.IsNegative() {
+							rem = decimal.Zero
+						}
+						b.ActivePositions[symbol] = rem
+					}
+					prevFilled = cumFilledQty
+				}
+				if prevFilled.GreaterThan(decimal.Zero) {
+					exitP := avgPrice
+					if exitP.IsZero() {
+						exitP = b.TP1LastFillPrices[symbol]
+					}
+					if exitP.IsZero() {
+						exitP = b.TP1Prices[symbol]
+					}
+					recVal := b.buildTP1TradeRecordLocked(symbol, prevFilled, exitP, clientOrderID, true)
+					canceledPartialRec = &recVal
+					b.TP1CommittedQtys[symbol] = b.TP1CommittedQtys[symbol].Add(prevFilled)
+					delete(b.TP1FilledQtys, symbol)
+					delete(b.TP1LastFillPrices, symbol)
+					b.notifyPositionSavedLocked(symbol)
+				}
+			}
 			b.Mu.Unlock()
+			if canceledPartialRec != nil && b.OnTradeClosedFn != nil {
+				go b.OnTradeClosedFn(*canceledPartialRec)
+			}
 		}
 		return
 	}
@@ -735,6 +776,7 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 		// Jika posisi sudah mencapai TP1 milestone, tolak penambahan fill ke runner
 		if b.IsTP1Hits[symbol] {
 			slog.Warn("live: received entry fill after TP1 milestone reached; ignoring to protect runner state", "symbol", symbol, "orderID", exchangeOrderID)
+			b.Mu.Unlock()
 			return
 		}
 
@@ -945,6 +987,9 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 			delete(b.IsTP1Hits, symbol)
 			delete(b.AlgoUpdateInFlight, symbol)
 			delete(b.TP1InFlight, symbol)
+			delete(b.TP1FilledQtys, symbol)
+			delete(b.TP1LastFillPrices, symbol)
+			delete(b.TP1CommittedQtys, symbol)
 			delete(b.LastAlgoUpdateTimes, symbol)
 			delete(b.LastSentSLPrices, symbol)
 		}
@@ -1001,8 +1046,8 @@ func (b *BinanceLiveBroker) planProtectionSyncLocked(entryRec *model.LiveOrderRe
 	}
 
 	now := time.Now().UTC()
-	slAlgoClientID := fmt.Sprintf("ALGO_SL_%s_%d", entryRec.Symbol, now.UnixNano())
-	tpAlgoClientID := fmt.Sprintf("ALGO_TP_%s_%d", entryRec.Symbol, now.UnixNano())
+	slAlgoClientID := model.FormatClientID("ALGO_SL", entryRec.Symbol, now)
+	tpAlgoClientID := model.FormatClientID("ALGO_TP", entryRec.Symbol, now)
 
 	needTP := !b.Cfg.PartialTPEnabled
 	action := model.ProtectionPlanAction{
@@ -1045,10 +1090,7 @@ func (b *BinanceLiveBroker) planProtectionSyncLocked(entryRec *model.LiveOrderRe
 		splitPossible := closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(entryRec.CumulativeFilledQty)
 		remQty := entryRec.CumulativeFilledQty.Sub(closeQty)
 		if splitPossible && closeQty.Mul(entryRec.TP1Price).GreaterThanOrEqual(minNotional) && remQty.Mul(entryRec.TP1Price).GreaterThanOrEqual(minNotional) {
-			tp1ClientID := fmt.Sprintf("ALGO_TP1_%s_%d", entryRec.Symbol, now.UnixNano())
-			if len(tp1ClientID) > 36 {
-				tp1ClientID = tp1ClientID[:36]
-			}
+			tp1ClientID := model.FormatClientID("ALGO_TP1", entryRec.Symbol, now)
 			action.NeedNewTP1Limit = true
 			action.TP1Qty = closeQty
 			action.TP1Price = entryRec.TP1Price
@@ -1475,7 +1517,7 @@ func (b *BinanceLiveBroker) RepairFailedProtections(now time.Time) {
 		prot.SLRetryCount++
 		prot.LastAttemptTime = now
 
-		clientAlgoID := fmt.Sprintf("ALGOSL_REP_%s_%d", sym, now.UnixNano())
+		clientAlgoID := model.FormatClientID("ALGOSL_R", sym, now)
 		slTargets = append(slTargets, slRepairTarget{
 			symbol:         sym,
 			exitSide:       exitSide,
@@ -1572,6 +1614,9 @@ func (b *BinanceLiveBroker) RepairFailedProtections(now time.Time) {
 
 	b.Mu.Lock()
 	for sym, prot := range b.Protections {
+		if b.Cfg.PartialTPEnabled {
+			continue
+		}
 		if prot.TPStatus != model.ProtectionFailed {
 			continue
 		}
@@ -1604,7 +1649,7 @@ func (b *BinanceLiveBroker) RepairFailedProtections(now time.Time) {
 		prot.TPRetryCount++
 		prot.LastTPAttempt = now
 
-		clientAlgoID := fmt.Sprintf("ALGOTP_REP_%s_%d", sym, now.Unix())
+		clientAlgoID := model.FormatClientID("ALGOTP_R", sym, now)
 		targets = append(targets, tpRepairTarget{
 			symbol:         sym,
 			exitSide:       exitSide,
@@ -1708,8 +1753,123 @@ func (b *BinanceLiveBroker) isDailyDrawdownBreachedLocked() bool {
 	return false
 }
 
+// recordTP1PartialChunk mencatat fill parsial berulang dari resting Limit Maker TP1
+// agar ActivePositions dan delta qty tetap sinkron sebelum StatusFilled final tiba.
+func (b *BinanceLiveBroker) recordTP1PartialChunk(symbol, clientOrderID string, cumFilledQty, avgPrice decimal.Decimal) {
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+
+	if b.IsTP1Hits[symbol] {
+		return
+	}
+	prevFilled := b.TP1FilledQtys[symbol]
+	if cumFilledQty.LessThanOrEqual(prevFilled) {
+		return
+	}
+
+	delta := cumFilledQty.Sub(prevFilled)
+	curQty, hasPos := b.ActivePositions[symbol]
+	if !hasPos || curQty.LessThanOrEqual(decimal.Zero) {
+		return
+	}
+
+	if delta.GreaterThan(curQty) {
+		delta = curQty
+	}
+	remQty := curQty.Sub(delta)
+	if remQty.IsNegative() {
+		remQty = decimal.Zero
+	}
+
+	b.TP1FilledQtys[symbol] = prevFilled.Add(delta)
+	if avgPrice.GreaterThan(decimal.Zero) {
+		b.TP1LastFillPrices[symbol] = avgPrice
+	}
+	b.ActivePositions[symbol] = remQty
+
+	if prot, ok := b.Protections[symbol]; ok && prot != nil {
+		prot.ProtectedQty = remQty
+	}
+	if clientOrderID != "" {
+		if ord, exists := b.OrdersByClient[clientOrderID]; exists {
+			ord.Status = model.StatusPartiallyFilled
+			ord.CumulativeFilledQty = b.TP1FilledQtys[symbol]
+			if avgPrice.GreaterThan(decimal.Zero) {
+				ord.AvgPrice = avgPrice
+			}
+		}
+	}
+	b.notifyPositionSavedLocked(symbol)
+}
+
+// buildTP1TradeRecordLocked menyusun TradeClosedRecord untuk leg TP1 dengan memperhitungkan fee Maker/Taker.
+// Pemanggil wajib memegang b.Mu.
+func (b *BinanceLiveBroker) buildTP1TradeRecordLocked(
+	symbol string,
+	closedQty, exitPrice decimal.Decimal,
+	clientOrderID string,
+	isMaker bool,
+) TradeClosedRecord {
+	side := b.PositionSides[symbol]
+	ePrice := b.PositionEntryPrices[symbol]
+	prot, ok := b.Protections[symbol]
+
+	var grossPnL decimal.Decimal
+	if side == model.SideLong {
+		grossPnL = exitPrice.Sub(ePrice).Mul(closedQty)
+	} else {
+		grossPnL = ePrice.Sub(exitPrice).Mul(closedQty)
+	}
+
+	feeRate := b.Cfg.TakerFeeRate
+	if isMaker {
+		feeRate = b.Cfg.MakerFeeRate
+	}
+	if feeRate <= 0 {
+		if isMaker {
+			feeRate = 0.0002
+		} else {
+			feeRate = 0.0005
+		}
+	}
+	takerRate := b.Cfg.TakerFeeRate
+	if takerRate <= 0 {
+		takerRate = 0.0005
+	}
+	exitFee := exitPrice.Mul(closedQty).Mul(decimal.NewFromFloat(feeRate))
+	entryFee := ePrice.Mul(closedQty).Mul(decimal.NewFromFloat(takerRate))
+	netPnL := grossPnL.Sub(entryFee).Sub(exitFee)
+
+	initialSL := b.InitialSLPrices[symbol]
+	if initialSL.IsZero() && ok {
+		initialSL = prot.SLPrice
+	}
+	sigID := int64(0)
+	if ok {
+		sigID = prot.SignalAuditID
+	}
+
+	return TradeClosedRecord{
+		ClientOrderID: clientOrderID,
+		Symbol:        symbol,
+		Side:          string(side),
+		Qty:           closedQty,
+		EntryPrice:    ePrice,
+		ExitPrice:     exitPrice,
+		SLPrice:       initialSL,
+		TPPrice:       b.TP1Prices[symbol],
+		NetPnL:        netPnL,
+		MAE:           b.ActiveMAE[symbol],
+		MFE:           b.ActiveMFE[symbol],
+		ExitReason:    "PARTIAL_TAKE_PROFIT",
+		OpenedAt:      b.PositionOpenTimes[symbol],
+		ClosedAt:      time.Now().UTC(),
+		SignalAuditID: sigID,
+	}
+}
+
 // processTP1Executed memproses eksekusi TP1 (baik dari Limit Maker WebSocket maupun Fallback Market Taker),
-// memperbarui lot runner, memindahkan SL ke Break-Even, mencatat TradeClosedRecord, dan menembakkan callback.
+// memperbarui lot runner secara deterministik di bawah lock, memindahkan SL ke Break-Even secara asinkron, dan mencatat TradeClosedRecord.
 func (b *BinanceLiveBroker) processTP1Executed(
 	symbol string,
 	actualCloseQty, actualExitPrice decimal.Decimal,
@@ -1724,6 +1884,12 @@ func (b *BinanceLiveBroker) processTP1Executed(
 	b.IsTP1Hits[symbol] = true
 	delete(b.TP1InFlight, symbol)
 
+	prevFilled := b.TP1FilledQtys[symbol]
+	prevPrice := b.TP1LastFillPrices[symbol]
+	delete(b.TP1FilledQtys, symbol)
+	delete(b.TP1LastFillPrices, symbol)
+	delete(b.TP1CommittedQtys, symbol)
+
 	curQty, hasPos := b.ActivePositions[symbol]
 	if !hasPos || curQty.LessThanOrEqual(decimal.Zero) {
 		b.Mu.Unlock()
@@ -1737,14 +1903,33 @@ func (b *BinanceLiveBroker) processTP1Executed(
 	if actualCloseQty.IsZero() {
 		actualCloseQty = curQty.Mul(decimal.NewFromFloat(ratio))
 	}
-	if actualCloseQty.GreaterThan(curQty) {
-		actualCloseQty = curQty
+
+	// Untuk Limit Maker WS update, actualCloseQty adalah kumulatif order; kurangi chunk yang sudah dipotong sebelumnya.
+	deductQty := actualCloseQty
+	if isMaker && prevFilled.GreaterThan(decimal.Zero) {
+		deductQty = actualCloseQty.Sub(prevFilled)
+		if deductQty.IsNegative() {
+			deductQty = decimal.Zero
+		}
 	}
-	if actualExitPrice.IsZero() {
-		actualExitPrice = b.TP1Prices[symbol]
+	if deductQty.GreaterThan(curQty) {
+		deductQty = curQty
+		if isMaker {
+			actualCloseQty = prevFilled.Add(deductQty)
+		} else {
+			actualCloseQty = deductQty
+		}
 	}
 
-	remQty := curQty.Sub(actualCloseQty)
+	if actualExitPrice.IsZero() {
+		if !prevPrice.IsZero() {
+			actualExitPrice = prevPrice
+		} else {
+			actualExitPrice = b.TP1Prices[symbol]
+		}
+	}
+
+	remQty := curQty.Sub(deductQty)
 	if remQty.LessThanOrEqual(decimal.Zero) {
 		delete(b.ActivePositions, symbol)
 		delete(b.PositionSides, symbol)
@@ -1786,7 +1971,7 @@ func (b *BinanceLiveBroker) processTP1Executed(
 	var oldSLID int64
 	var oldClientSLID string
 	var gen uint64 = 1
-	clientSLID := fmt.Sprintf("live_sl_be_%s_%d", symbol, time.Now().UnixNano())
+	clientSLID := model.FormatClientID("live_sl_be", symbol, time.Now().UTC())
 	if ok {
 		oldSLID = prot.SLOrderID
 		oldClientSLID = prot.SLClientAlgoID
@@ -1806,59 +1991,7 @@ func (b *BinanceLiveBroker) processTP1Executed(
 		}
 	}
 
-	// Hitung estimasi PnL untuk record leg TP1 dengan fee dinamis (Maker vs Taker)
-	var grossPnL decimal.Decimal
-	if side == model.SideLong {
-		grossPnL = actualExitPrice.Sub(ePrice).Mul(actualCloseQty)
-	} else {
-		grossPnL = ePrice.Sub(actualExitPrice).Mul(actualCloseQty)
-	}
-
-	feeRate := b.Cfg.TakerFeeRate
-	if isMaker {
-		feeRate = b.Cfg.MakerFeeRate
-	}
-	if feeRate <= 0 {
-		if isMaker {
-			feeRate = 0.0002
-		} else {
-			feeRate = 0.0005
-		}
-	}
-	takerRate := b.Cfg.TakerFeeRate
-	if takerRate <= 0 {
-		takerRate = 0.0005
-	}
-	exitFee := actualExitPrice.Mul(actualCloseQty).Mul(decimal.NewFromFloat(feeRate))
-	entryFee := ePrice.Mul(actualCloseQty).Mul(decimal.NewFromFloat(takerRate))
-	netPnL := grossPnL.Sub(entryFee).Sub(exitFee)
-
-	initialSL := b.InitialSLPrices[symbol]
-	if initialSL.IsZero() && ok {
-		initialSL = prot.SLPrice
-	}
-	sigID := int64(0)
-	if ok {
-		sigID = prot.SignalAuditID
-	}
-
-	tradeRec := TradeClosedRecord{
-		ClientOrderID: clientOrderID,
-		Symbol:        symbol,
-		Side:          string(side),
-		Qty:           actualCloseQty,
-		EntryPrice:    ePrice,
-		ExitPrice:     actualExitPrice,
-		SLPrice:       initialSL,
-		TPPrice:       b.TP1Prices[symbol],
-		NetPnL:        netPnL,
-		MAE:           b.ActiveMAE[symbol],
-		MFE:           b.ActiveMFE[symbol],
-		ExitReason:    "PARTIAL_TAKE_PROFIT",
-		OpenedAt:      b.PositionOpenTimes[symbol],
-		ClosedAt:      time.Now().UTC(),
-		SignalAuditID: sigID,
-	}
+	tradeRec := b.buildTP1TradeRecordLocked(symbol, actualCloseQty, actualExitPrice, clientOrderID, isMaker)
 	b.notifyPositionSavedLocked(symbol)
 	b.Mu.Unlock()
 
@@ -1866,60 +1999,62 @@ func (b *BinanceLiveBroker) processTP1Executed(
 		go b.OnTradeClosedFn(tradeRec)
 	}
 
-	// Pasang SL baru untuk remaining lot di Break-Even (3-attempt retry loop)
+	// Pasang SL baru untuk remaining lot di Break-Even (3-attempt retry loop asinkron agar tidak memblokir read-loop WS)
 	if b.PlaceAlgoOrderFn != nil {
 		exitSide := model.OppositeSide(side)
-		var newSLID int64
-		var slErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
-			newSLID, slErr = b.PlaceAlgoOrderFn(ctxSL, symbol, exitSide, "STOP_MARKET", remQty, beSL, clientSLID)
-			cancelSL()
+		go func(sym string, eSide model.Side, remainQty, targetSL decimal.Decimal, cSLID string, oSLID int64, oClientSLID string, generation uint64, closedQ decimal.Decimal, maker bool) {
+			var newSLID int64
+			var slErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				ctxSL, cancelSL := context.WithTimeout(context.Background(), 5*time.Second)
+				newSLID, slErr = b.PlaceAlgoOrderFn(ctxSL, sym, eSide, "STOP_MARKET", remainQty, targetSL, cSLID)
+				cancelSL()
+				if slErr == nil && newSLID != 0 {
+					break
+				}
+				time.Sleep(time.Duration(attempt*250) * time.Millisecond)
+			}
 			if slErr == nil && newSLID != 0 {
-				break
-			}
-			time.Sleep(time.Duration(attempt*250) * time.Millisecond)
-		}
-		if slErr == nil && newSLID != 0 {
-			b.Mu.Lock()
-			if p, ok := b.Protections[symbol]; ok && p.PlanGeneration == gen {
-				p.SLOrderID = newSLID
-				p.SLPrice = beSL
-				p.SLClientAlgoID = clientSLID
-				b.LastSentSLPrices[symbol] = beSL
-				b.ProtectionTiers[symbol] = 1
-				b.OrdersByClient[clientSLID] = &model.LiveOrderRecord{
-					ClientOrderID:   clientSLID,
-					ExchangeOrderID: newSLID,
-					Symbol:          symbol,
-					Side:            exitSide,
-					TargetQty:       remQty,
-					SLPrice:         beSL,
-					Status:          model.StatusNew,
-					IsEntry:         false,
-					IsAlgo:          true,
-					CreatedAt:       time.Now().UTC(),
+				b.Mu.Lock()
+				if p, ok := b.Protections[sym]; ok && p.PlanGeneration == generation {
+					p.SLOrderID = newSLID
+					p.SLPrice = targetSL
+					p.SLClientAlgoID = cSLID
+					b.LastSentSLPrices[sym] = targetSL
+					b.ProtectionTiers[sym] = 1
+					b.OrdersByClient[cSLID] = &model.LiveOrderRecord{
+						ClientOrderID:   cSLID,
+						ExchangeOrderID: newSLID,
+						Symbol:          sym,
+						Side:            eSide,
+						TargetQty:       remainQty,
+						SLPrice:         targetSL,
+						Status:          model.StatusNew,
+						IsEntry:         false,
+						IsAlgo:          true,
+						CreatedAt:       time.Now().UTC(),
+					}
+					b.OrdersByExchangeID[newSLID] = b.OrdersByClient[cSLID]
+					if oSLID != 0 && oSLID != newSLID {
+						delete(b.OrdersByExchangeID, oSLID)
+					}
+					if oClientSLID != "" && oClientSLID != cSLID {
+						delete(b.OrdersByClient, oClientSLID)
+					}
+					b.notifyPositionSavedLocked(sym)
 				}
-				b.OrdersByExchangeID[newSLID] = b.OrdersByClient[clientSLID]
-				if oldSLID != 0 && oldSLID != newSLID {
-					delete(b.OrdersByExchangeID, oldSLID)
+				b.Mu.Unlock()
+				if oSLID != 0 && b.CancelAlgoOrderFn != nil {
+					ctxC, cancelC := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = b.CancelAlgoOrderFn(ctxC, sym, oSLID)
+					cancelC()
 				}
-				if oldClientSLID != "" && oldClientSLID != clientSLID {
-					delete(b.OrdersByClient, oldClientSLID)
-				}
-				b.notifyPositionSavedLocked(symbol)
+				slog.Info("live: Partial TP1 executed and SL moved to BE",
+					"symbol", sym, "closedQty", closedQ, "remainingQty", remainQty, "beSL", targetSL, "isMaker", maker)
+			} else {
+				slog.Error("live: failed to place BE SL after TP1", "symbol", sym, "err", slErr)
 			}
-			b.Mu.Unlock()
-			if oldSLID != 0 && b.CancelAlgoOrderFn != nil {
-				ctxC, cancelC := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = b.CancelAlgoOrderFn(ctxC, symbol, oldSLID)
-				cancelC()
-			}
-			slog.Info("live: Partial TP1 executed and SL moved to BE",
-				"symbol", symbol, "closedQty", actualCloseQty, "remainingQty", remQty, "beSL", beSL, "isMaker", isMaker)
-		} else {
-			slog.Error("live: failed to place BE SL after TP1", "symbol", symbol, "err", slErr)
-		}
+		}(symbol, exitSide, remQty, beSL, clientSLID, oldSLID, oldClientSLID, gen, actualCloseQty, isMaker)
 	}
 }
 
@@ -2014,6 +2149,9 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				initialQty = qty
 			}
 			closeQty := initialQty.Mul(decimal.NewFromFloat(ratio))
+			if alreadyTP1 := b.TP1FilledQtys[symbol].Add(b.TP1CommittedQtys[symbol]); alreadyTP1.GreaterThan(decimal.Zero) {
+				closeQty = closeQty.Sub(alreadyTP1)
+			}
 			if b.GetExchangeFilterFn != nil {
 				if f, ok := b.GetExchangeFilterFn(symbol); ok && f.StepSize.GreaterThan(decimal.Zero) {
 					if qQty, err := model.QuantizeQtyFloor(closeQty, f.StepSize); err == nil {
@@ -2078,7 +2216,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 				var oldSLID int64
 				var oldClientSLID string
 				var gen uint64 = 1
-				clientSLID := fmt.Sprintf("live_sl_be_%s_%d", symbol, time.Now().UnixNano())
+				clientSLID := model.FormatClientID("live_sl_be", symbol, time.Now().UTC())
 				if hasProt {
 					oldSLID = prot.SLOrderID
 					oldClientSLID = prot.SLClientAlgoID
@@ -2180,10 +2318,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 					tp1ClientOrderID = fmt.Sprintf("%s_TP1", baseID)
 				}
 			} else {
-				tp1ClientOrderID = fmt.Sprintf("ALGO_TP1_%s_%d", symbol, time.Now().UnixNano())
-				if len(tp1ClientOrderID) > 36 {
-					tp1ClientOrderID = tp1ClientOrderID[:36]
-				}
+				tp1ClientOrderID = model.FormatClientID("ALGO_TP1", symbol, time.Now().UTC())
 			}
 
 			go func(sym string, eSide model.Side, cQty decimal.Decimal, cID string, cTP1ID int64, cTP1CID string) {
@@ -2348,7 +2483,7 @@ skipTP1Handling:
 				prot.PlanGeneration++
 				gen := prot.PlanGeneration
 				exitSide := model.OppositeSide(side)
-				clientSLID := fmt.Sprintf("live_sl_%s_%d", symbol, nowUTC.UnixNano())
+				clientSLID := model.FormatClientID("live_sl", symbol, nowUTC)
 
 				b.AlgoUpdateInFlight[symbol] = true
 				b.LastAlgoUpdateTimes[symbol] = nowUTC

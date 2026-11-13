@@ -678,12 +678,18 @@ func TestSimBroker_MultiLegFundingAccounting(t *testing.T) {
 		t.Fatalf("expected TP1 funding fee 5.0, got %s", tp1Trade.FundingTotal)
 	}
 
-	// Sisa funding di posisi harus tinggal $5.0 dan InitialQty disesuaikan menjadi 1.0
+	// Sisa funding di posisi harus tinggal $5.0 dan InitialQty tetap utuh (2.0), sementara pos.Qty sisa 1.0
 	if !pos.FundingPaid.Equal(decimal.NewFromFloat(5.0)) {
 		t.Fatalf("expected remaining FundingPaid 5.0, got %s", pos.FundingPaid)
 	}
-	if !pos.InitialQty.Equal(decimal.NewFromFloat(1.0)) {
-		t.Fatalf("expected remaining InitialQty 1.0, got %s", pos.InitialQty)
+	if !pos.Qty.Equal(decimal.NewFromFloat(1.0)) {
+		t.Fatalf("expected remaining Qty 1.0, got %s", pos.Qty)
+	}
+	if !pos.InitialQty.Equal(decimal.NewFromFloat(2.0)) {
+		t.Fatalf("expected immutable InitialQty 2.0, got %s", pos.InitialQty)
+	}
+	if !tp1Trade.InitialQty.Equal(decimal.NewFromFloat(2.0)) {
+		t.Fatalf("expected TP1 trade record InitialQty 2.0, got %s", tp1Trade.InitialQty)
 	}
 
 	// Bar 2: Runner kena full TP at 130.0
