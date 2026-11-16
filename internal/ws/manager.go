@@ -31,8 +31,16 @@ type EventHandlers struct {
 }
 
 type StreamManager struct {
-	Handlers EventHandlers
+	Handlers     EventHandlers
+	IdleTimeout  time.Duration
+	PingInterval time.Duration
 }
+
+const (
+	defaultWSIdleTimeout  = 60 * time.Second
+	defaultWSPingInterval = 25 * time.Second
+	defaultWSPingTimeout  = 10 * time.Second
+)
 
 func NewStreamManager(handlers EventHandlers) *StreamManager {
 	return &StreamManager{Handlers: handlers}
@@ -94,21 +102,73 @@ func (m *StreamManager) StartSupervisedStream(ctx context.Context, streamURL str
 }
 
 func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, connStart time.Time) error {
+	idleTimeout := m.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultWSIdleTimeout
+	}
+	pingInterval := m.PingInterval
+	if pingInterval <= 0 {
+		pingInterval = defaultWSPingInterval
+	}
+
+	readCtx, readCancel := context.WithCancel(ctx)
+	defer readCancel()
+
+	var lastFrameNano atomic.Int64
+	lastFrameNano.Store(time.Now().UnixNano())
+
+	watchdogInterval := idleTimeout / 4
+	if watchdogInterval < 20*time.Millisecond {
+		watchdogInterval = 20 * time.Millisecond
+	} else if watchdogInterval > 10*time.Second {
+		watchdogInterval = 10 * time.Second
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		watchdogTicker := time.NewTicker(watchdogInterval)
+		pingTicker := time.NewTicker(pingInterval)
+		defer watchdogTicker.Stop()
+		defer pingTicker.Stop()
+
+		for {
+			select {
+			case <-readCtx.Done():
+				return
+			case <-watchdogTicker.C:
+				lastAt := time.Unix(0, lastFrameNano.Load())
+				if time.Since(lastAt) > idleTimeout {
+					slog.Warn("ws: idle watchdog timeout triggered",
+						"connAge", time.Since(connStart).Round(time.Millisecond),
+						"idleFor", time.Since(lastAt).Round(time.Millisecond))
+					readCancel()
+					return
+				}
+			case <-pingTicker.C:
+				pCtx, pCancel := context.WithTimeout(readCtx, defaultWSPingTimeout)
+				err := conn.Ping(pCtx)
+				pCancel()
+				if err != nil && readCtx.Err() == nil {
+					slog.Debug("ws: ping failed, resetting connection", "err", err)
+					readCancel()
+					return
+				}
+			}
+		}
+	}()
+	defer wg.Wait()
+
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			// Idle watchdog: 60 detik batas maksimal tanpa frame sebelum socket dianggap mati
-			readCtx, readCancel := context.WithTimeout(ctx, 60*time.Second)
-			typ, msg, err := conn.Read(readCtx)
+		typ, msg, err := conn.Read(readCtx)
+		if err != nil {
 			readCancel()
-			if err != nil {
-				return fmt.Errorf("ws: read error (connAge=%s): %w", time.Since(connStart).Round(time.Millisecond), err)
-			}
-			if typ == websocket.MessageText {
-				m.ProcessMessage(msg)
-			}
+			return fmt.Errorf("ws: read error (connAge=%s): %w", time.Since(connStart).Round(time.Millisecond), err)
+		}
+		lastFrameNano.Store(time.Now().UnixNano())
+		if typ == websocket.MessageText {
+			m.ProcessMessage(msg)
 		}
 	}
 }
@@ -313,6 +373,216 @@ func (d *DynamicStream) sendControlMsg(ctx context.Context, conn *websocket.Conn
 	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wCancel()
 	return conn.Write(wCtx, websocket.MessageText, raw)
+}
+
+type streamShard struct {
+	ds      *DynamicStream
+	cancel  context.CancelFunc
+	streams []string
+}
+
+// ShardedDynamicStream memecah daftar stream berfrekuensi tinggi (mis. @bookTicker) menjadi beberapa koneksi
+// DynamicStream dengan ukuran maksimal maxPerShard per soket agar tidak melewati batas throughput bursa.
+type ShardedDynamicStream struct {
+	mgr         *StreamManager
+	baseURL     string
+	maxPerShard int
+
+	mu      sync.Mutex
+	ctx     context.Context
+	started bool
+	wg      sync.WaitGroup
+	shards  []*streamShard
+}
+
+func NewShardedDynamicStream(mgr *StreamManager, baseURL string, initialStreams []string, maxPerShard int) *ShardedDynamicStream {
+	chunks := chunkStreams(initialStreams, maxPerShard)
+	shards := make([]*streamShard, 0, len(chunks))
+	for _, ch := range chunks {
+		copied := make([]string, len(ch))
+		copy(copied, ch)
+		shards = append(shards, &streamShard{
+			ds:      NewDynamicStream(mgr, baseURL, copied),
+			streams: copied,
+		})
+	}
+	return &ShardedDynamicStream{
+		mgr:         mgr,
+		baseURL:     baseURL,
+		maxPerShard: maxPerShard,
+		shards:      shards,
+	}
+}
+
+func chunkStreams(streams []string, maxPerShard int) [][]string {
+	if len(streams) == 0 {
+		return nil
+	}
+	if maxPerShard <= 0 || len(streams) <= maxPerShard {
+		return [][]string{streams}
+	}
+	chunks := make([][]string, 0, (len(streams)+maxPerShard-1)/maxPerShard)
+	for start := 0; start < len(streams); start += maxPerShard {
+		end := start + maxPerShard
+		if end > len(streams) {
+			end = len(streams)
+		}
+		chunks = append(chunks, streams[start:end])
+	}
+	return chunks
+}
+
+func (s *ShardedDynamicStream) ShardCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.shards)
+}
+
+func (s *ShardedDynamicStream) Start(ctx context.Context) {
+	s.mu.Lock()
+	s.ctx = ctx
+	s.started = true
+	for _, sh := range s.shards {
+		if sh.cancel == nil && len(sh.streams) > 0 {
+			shCtx, shCancel := context.WithCancel(ctx)
+			sh.cancel = shCancel
+			ds := sh.ds
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				ds.Start(shCtx)
+			}()
+		}
+	}
+	s.mu.Unlock()
+
+	<-ctx.Done()
+
+	s.mu.Lock()
+	for _, sh := range s.shards {
+		if sh.cancel != nil {
+			sh.cancel()
+			sh.cancel = nil
+		}
+	}
+	s.mu.Unlock()
+	s.wg.Wait()
+}
+
+// UpdateStreams memperbarui langganan lintas shard sambil mempertahankan stream lama di shard asalnya
+// sehingga simbol yang tetap aktif tidak terkena pemutusan atau pindah koneksi.
+func (s *ShardedDynamicStream) UpdateStreams(ctx context.Context, newStreams []string) error {
+	targetSet := make(map[string]bool, len(newStreams))
+	uniqueTargets := make([]string, 0, len(newStreams))
+	for _, st := range newStreams {
+		if !targetSet[st] {
+			targetSet[st] = true
+			uniqueTargets = append(uniqueTargets, st)
+		}
+	}
+
+	s.mu.Lock()
+	existingOwner := make(map[string]bool, len(uniqueTargets))
+	updatedSlices := make([][]string, len(s.shards))
+	for i, sh := range s.shards {
+		kept := make([]string, 0, len(sh.streams))
+		for _, st := range sh.streams {
+			if targetSet[st] && !existingOwner[st] {
+				if s.maxPerShard <= 0 || len(kept) < s.maxPerShard {
+					kept = append(kept, st)
+					existingOwner[st] = true
+				}
+			}
+		}
+		updatedSlices[i] = kept
+	}
+
+	pendingAdds := make([]string, 0)
+	for _, st := range uniqueTargets {
+		if !existingOwner[st] {
+			pendingAdds = append(pendingAdds, st)
+		}
+	}
+
+	type newShardSpec struct {
+		idx int
+	}
+	var newShardsToStart []newShardSpec
+
+	for _, st := range pendingAdds {
+		placed := false
+		for i := range updatedSlices {
+			if len(updatedSlices[i]) > 0 && (s.maxPerShard <= 0 || len(updatedSlices[i]) < s.maxPerShard) {
+				updatedSlices[i] = append(updatedSlices[i], st)
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			for i := range updatedSlices {
+				if len(updatedSlices[i]) == 0 {
+					updatedSlices[i] = append(updatedSlices[i], st)
+					placed = true
+					break
+				}
+			}
+		}
+		if !placed {
+			idx := len(s.shards)
+			s.shards = append(s.shards, &streamShard{})
+			updatedSlices = append(updatedSlices, []string{st})
+			newShardsToStart = append(newShardsToStart, newShardSpec{idx: idx})
+		}
+	}
+
+	isNewIdx := make(map[int]bool, len(newShardsToStart))
+	for _, spec := range newShardsToStart {
+		isNewIdx[spec.idx] = true
+	}
+
+	type shardUpdateJob struct {
+		ds     *DynamicStream
+		target []string
+	}
+	var jobs []shardUpdateJob
+	keptShards := make([]*streamShard, 0, len(s.shards))
+	for i, sh := range s.shards {
+		nextSlice := updatedSlices[i]
+		if len(nextSlice) == 0 {
+			if sh.cancel != nil {
+				sh.cancel()
+				sh.cancel = nil
+			}
+			continue
+		}
+		sh.streams = nextSlice
+		if isNewIdx[i] {
+			sh.ds = NewDynamicStream(s.mgr, s.baseURL, nextSlice)
+			if s.started && s.ctx != nil && s.ctx.Err() == nil {
+				shCtx, shCancel := context.WithCancel(s.ctx)
+				sh.cancel = shCancel
+				ds := sh.ds
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					ds.Start(shCtx)
+				}()
+			}
+		} else {
+			jobs = append(jobs, shardUpdateJob{ds: sh.ds, target: nextSlice})
+		}
+		keptShards = append(keptShards, sh)
+	}
+	s.shards = keptShards
+	s.mu.Unlock()
+
+	var firstErr error
+	for _, j := range jobs {
+		if err := j.ds.UpdateStreams(ctx, j.target); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // ProcessMessage membedah JSON payload dari Binance dengan penanganan parse error fail-closed (Solusi M4)

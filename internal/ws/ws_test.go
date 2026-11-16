@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -201,4 +202,243 @@ func TestDynamicStream_DifferentialSubscribeUnsubscribe(t *testing.T) {
 	if methods[0] != "UNSUBSCRIBE" || methods[1] != "SUBSCRIBE" {
 		t.Fatalf("expected [UNSUBSCRIBE SUBSCRIBE], got %v", methods)
 	}
+}
+
+func TestShardedDynamicStream_PartitionAndDifferentialUpdate(t *testing.T) {
+	var totalConns atomic.Int32
+	type ctrlEvent struct {
+		url    string
+		method string
+		params []string
+	}
+	ctrlCh := make(chan ctrlEvent, 32)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		totalConns.Add(1)
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+		for {
+			_, raw, err := c.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var msg struct {
+				Method string   `json:"method"`
+				Params []string `json:"params"`
+			}
+			if json.Unmarshal(raw, &msg) == nil && msg.Method != "" {
+				ctrlCh <- ctrlEvent{url: r.URL.RawQuery, method: msg.Method, params: msg.Params}
+			}
+		}
+	}))
+	defer ts.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http") + "/public/stream"
+	mgr := NewStreamManager(EventHandlers{})
+	initial := []string{
+		"a@bookTicker",
+		"b@bookTicker",
+		"c@bookTicker",
+		"d@bookTicker",
+		"e@bookTicker",
+	}
+	sds := NewShardedDynamicStream(mgr, wsBase, initial, 2)
+	if sds.ShardCount() != 3 {
+		t.Fatalf("expected 3 shards for 5 streams with maxPerShard=2, got %d", sds.ShardCount())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sds.Start(ctx)
+
+	waitConnected := func(expected int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			sds.mu.Lock()
+			ready := len(sds.shards) == expected
+			for _, sh := range sds.shards {
+				sh.ds.mu.Lock()
+				if sh.ds.conn == nil {
+					ready = false
+				}
+				sh.ds.mu.Unlock()
+			}
+			sds.mu.Unlock()
+			if ready {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timeout waiting for %d connected shards", expected)
+	}
+	waitConnected(3)
+
+	// Ganti 1 stream (d -> f) tanpa mengubah jumlah shard; tidak boleh ada reconnect penuh!
+	updated := []string{
+		"a@bookTicker",
+		"b@bookTicker",
+		"c@bookTicker",
+		"f@bookTicker",
+		"e@bookTicker",
+	}
+	if err := sds.UpdateStreams(ctx, updated); err != nil {
+		t.Fatalf("UpdateStreams diff failed: %v", err)
+	}
+	if sds.ShardCount() != 3 {
+		t.Fatalf("expected ShardCount=3 after same-size diff update, got %d", sds.ShardCount())
+	}
+
+	var gotUnsub, gotSub bool
+	deadline := time.After(2 * time.Second)
+	for !(gotUnsub && gotSub) {
+		select {
+		case ev := <-ctrlCh:
+			if ev.method == "UNSUBSCRIBE" && len(ev.params) == 1 && ev.params[0] == "d@bookTicker" {
+				gotUnsub = true
+			}
+			if ev.method == "SUBSCRIBE" && len(ev.params) == 1 && ev.params[0] == "f@bookTicker" {
+				gotSub = true
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for sharded UNSUBSCRIBE(d) + SUBSCRIBE(f), unsub=%v sub=%v", gotUnsub, gotSub)
+		}
+	}
+	if totalConns.Load() != 3 {
+		t.Fatalf("expected zero reconnects across shards (still 3 total connections), got %d", totalConns.Load())
+	}
+
+	// Shrink menjadi 2 stream -> harus menyusut ke 1 shard
+	if err := sds.UpdateStreams(ctx, []string{"a@bookTicker", "b@bookTicker"}); err != nil {
+		t.Fatalf("UpdateStreams shrink failed: %v", err)
+	}
+	if sds.ShardCount() != 1 {
+		t.Fatalf("expected ShardCount=1 after shrink, got %d", sds.ShardCount())
+	}
+
+	// Grow kembali menjadi 5 stream -> menambah 2 shard baru
+	if err := sds.UpdateStreams(ctx, initial); err != nil {
+		t.Fatalf("UpdateStreams grow failed: %v", err)
+	}
+	if sds.ShardCount() != 3 {
+		t.Fatalf("expected ShardCount=3 after grow, got %d", sds.ShardCount())
+	}
+	waitConnected(3)
+}
+
+func TestStreamManager_PingAndIdleWatchdog(t *testing.T) {
+	t.Run("idle connection triggers watchdog disconnect", func(t *testing.T) {
+		var mu sync.Mutex
+		var conns int
+		disconnected := make(chan struct{}, 4)
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns++
+			mu.Unlock()
+			defer func() {
+				_ = c.Close(websocket.StatusNormalClosure, "")
+				select {
+				case disconnected <- struct{}{}:
+				default:
+				}
+			}()
+			for {
+				if _, _, err := c.Read(r.Context()); err != nil {
+					return
+				}
+			}
+		}))
+		defer ts.Close()
+
+		mgr := NewStreamManager(EventHandlers{})
+		mgr.IdleTimeout = 100 * time.Millisecond
+		mgr.PingInterval = 500 * time.Millisecond
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream?streams=btcusdt@bookTicker"
+		c, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		err = mgr.readLoop(ctx, c, time.Now())
+		_ = c.Close(websocket.StatusNormalClosure, "")
+		if err == nil || ctx.Err() != nil {
+			t.Fatalf("expected readLoop internal idle watchdog exit before parent ctx deadline, got err=%v ctxErr=%v", err, ctx.Err())
+		}
+		select {
+		case <-disconnected:
+		case <-time.After(1 * time.Second):
+			t.Fatalf("expected server to observe client disconnect after idle timeout")
+		}
+	})
+
+	t.Run("active frames and periodic ping stay healthy", func(t *testing.T) {
+		var parsedTicks atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+			go func() {
+				for {
+					if _, _, err := c.Read(r.Context()); err != nil {
+						return
+					}
+				}
+			}()
+
+			payload := []byte(`{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","s":"BTCUSDT","b":"65000.0","a":"65001.0"}}`)
+			ticker := time.NewTicker(40 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-ticker.C:
+					if err := c.Write(r.Context(), websocket.MessageText, payload); err != nil {
+						return
+					}
+				}
+			}
+		}))
+		defer ts.Close()
+
+		mgr := NewStreamManager(EventHandlers{
+			OnBookTicker: func(symbol string, bestBid, bestAsk float64, now time.Time) {
+				parsedTicks.Add(1)
+			},
+		})
+		mgr.IdleTimeout = 250 * time.Millisecond
+		mgr.PingInterval = 30 * time.Millisecond
+
+		ctx, cancel := context.WithTimeout(context.Background(), 220*time.Millisecond)
+		defer cancel()
+
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream?streams=btcusdt@bookTicker"
+		c, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		err = mgr.readLoop(ctx, c, time.Now())
+		_ = c.Close(websocket.StatusNormalClosure, "")
+		if err == nil || ctx.Err() != context.DeadlineExceeded {
+			t.Fatalf("expected clean context expiry under healthy pings + frames, got err=%v ctxErr=%v", err, ctx.Err())
+		}
+		if parsedTicks.Load() < 3 {
+			t.Fatalf("expected >= 3 bookTicker frames processed while periodic Ping active, got %d", parsedTicks.Load())
+		}
+	})
 }

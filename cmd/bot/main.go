@@ -54,8 +54,8 @@ type BotEngine struct {
 	verifiedMu      sync.RWMutex
 	verifiedSymbols map[string]bool
 	streamCancel    context.CancelFunc
-	publicDynStream *ws.DynamicStream
-	marketDynStream *ws.DynamicStream
+	publicDynStream *ws.ShardedDynamicStream
+	marketDynStream *ws.ShardedDynamicStream
 	streamMu        sync.Mutex
 
 	oiPollRunning   atomic.Bool
@@ -279,6 +279,8 @@ func main() {
 			TakerFeeRate:             takerFeeFloat,
 			SlippageRate:             slippageFloat,
 			EntryOrderType:           cfg.EntryOrderType,
+			MaxEntryRepegAttempts:    resolveBrokerRepegAttempts(cfg.EntryRepegMaxAttempts),
+			MaxEntryRepegDriftPct:    cfg.EntryRepegMaxDriftPct,
 		}
 		engine.dryRunBroker = broker.NewDryRunBroker(initialEquity, dryRunCfg)
 		defer engine.dryRunBroker.Close()
@@ -346,6 +348,7 @@ func main() {
 			f, ok := engine.exchangeFilters[symbol]
 			return f, ok
 		}
+		engine.dryRunBroker.GetBestQuoteFn = engine.getBestQuote
 
 		// Pulihkan posisi terbuka dry-run dari database jika ada (tahan restart/rebuild)
 		if storedPositions, err := repo.GetAllDryRunPositions(ctx); err == nil && len(storedPositions) > 0 {
@@ -408,6 +411,9 @@ func main() {
 			SlippageRate:             cfg.SlippageRate.InexactFloat64(),
 			TakerFeeRate:             cfg.TakerFeeRate.InexactFloat64(),
 			MakerFeeRate:             cfg.MakerFeeRate.InexactFloat64(),
+			EntryOrderType:           cfg.EntryOrderType,
+			MaxEntryRepegAttempts:    resolveBrokerRepegAttempts(cfg.EntryRepegMaxAttempts),
+			MaxEntryRepegDriftPct:    cfg.EntryRepegMaxDriftPct,
 		}
 		engine.liveBroker = broker.NewBinanceLiveBroker(liveCfg)
 		defer engine.liveBroker.Close()
@@ -445,6 +451,7 @@ func main() {
 			f, ok := engine.exchangeFilters[symbol]
 			return f, ok
 		}
+		engine.liveBroker.GetBestQuoteFn = engine.getBestQuote
 		engine.liveBroker.EmergencyMarketCloseFn = func(ctx context.Context, symbol string, positionSide model.Side, qty decimal.Decimal, reason string) error {
 			slog.Warn("TRIGGERING EMERGENCY MARKET CLOSE", "symbol", symbol, "positionSide", positionSide, "qty", qty, "reason", reason)
 			return client.EmergencyMarketClose(ctx, symbol, positionSide, qty)
@@ -1629,14 +1636,62 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 	handlers.OnKline5m = handlers.OnKlineClosed
 
 	publicMgr := ws.NewStreamManager(handlers)
-	publicDyn := ws.NewDynamicStream(publicMgr, e.cfg.WSPublicURL, publicStreams)
+	publicDyn := ws.NewShardedDynamicStream(publicMgr, e.cfg.WSPublicURL, publicStreams, maxBookTickerStreamsPerConn)
 	e.publicDynStream = publicDyn
 	go publicDyn.Start(publicCtx)
 
 	marketMgr := ws.NewStreamManager(handlers)
-	marketDyn := ws.NewDynamicStream(marketMgr, e.cfg.WSMarketURL, marketStreams)
+	marketDyn := ws.NewShardedDynamicStream(marketMgr, e.cfg.WSMarketURL, marketStreams, 0)
 	e.marketDynStream = marketDyn
 	go marketDyn.Start(marketCtx)
+}
+
+const maxBookTickerStreamsPerConn = 10
+
+func resolveBrokerRepegAttempts(attempts int) int {
+	if attempts <= 0 {
+		return -1
+	}
+	return attempts
+}
+
+func (e *BotEngine) getBestQuote(symbol string) (float64, float64, bool) {
+	e.statesMu.RLock()
+	st := e.activeStates[symbol]
+	e.statesMu.RUnlock()
+	if st == nil {
+		return 0, 0, false
+	}
+
+	var maxStale time.Duration
+	if e.cfg != nil && e.cfg.MaxBookStaleness > 0 {
+		maxStale = e.cfg.MaxBookStaleness
+	}
+
+	st.Mu.Lock()
+	bid := st.BestBid
+	ask := st.BestAsk
+	updatedAt := st.BookUpdatedAt
+	st.Mu.Unlock()
+
+	if bid <= 0 || ask <= 0 || updatedAt.IsZero() {
+		return 0, 0, false
+	}
+	if maxStale > 0 && time.Since(updatedAt) > maxStale {
+		return 0, 0, false
+	}
+	return bid, ask, true
+}
+
+func (e *BotEngine) attachSignalAuditID(symbol, clientOrderID string, signalAuditID int64) {
+	if signalAuditID <= 0 || e.broker == nil {
+		return
+	}
+	if attacher, ok := e.broker.(interface {
+		AttachSignalAuditID(symbol, clientOrderID string, signalAuditID int64)
+	}); ok {
+		attacher.AttachSignalAuditID(symbol, clientOrderID, signalAuditID)
+	}
 }
 
 func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.SymbolState) {
@@ -1672,6 +1727,23 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		availBal,
 		e.evaluatorCfg,
 	)
+
+	// Eksekusi submission order segera tanpa menunggu kalkulasi metrik & penulisan audit SQLite agar tidak terkena adverse selection GTX.
+	var resolvedAuditID atomic.Int64
+	if ok && reason == "SIGNAL_APPROVED" {
+		slog.Info("SIGNAL APPROVED! Spawning immediate async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "qty", intent.Qty, "price", intent.LimitPrice)
+		go func(targetIntent model.OrderIntent) {
+			reserved, submitErr := e.broker.SubmitLimitEntry(targetIntent)
+			if reserved && submitErr == nil {
+				if sid := resolvedAuditID.Load(); sid > 0 {
+					e.attachSignalAuditID(targetIntent.Symbol, targetIntent.ClientOrderID, sid)
+				}
+				slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", targetIntent.Symbol, "clientOrderID", targetIntent.ClientOrderID)
+			} else {
+				slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", targetIntent.Symbol, "err", submitErr)
+			}
+		}(intent)
+	}
 
 	// Simpan audit log lengkap dengan metrik analitik riil
 	decision := "REJECT"
@@ -1787,17 +1859,9 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		slog.Error("failed to log signal audit", "symbol", snap.Symbol, "err", err)
 	}
 
-	if ok && reason == "SIGNAL_APPROVED" {
-		intent.SignalAuditID = sigID
-		slog.Info("SIGNAL APPROVED! Spawning async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "qty", intent.Qty, "price", intent.LimitPrice, "signalAuditID", sigID)
-		go func(targetIntent model.OrderIntent) {
-			reserved, err := e.broker.SubmitLimitEntry(targetIntent)
-			if reserved && err == nil {
-				slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", targetIntent.Symbol, "clientOrderID", targetIntent.ClientOrderID)
-			} else {
-				slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", targetIntent.Symbol, "err", err)
-			}
-		}(intent)
+	if ok && reason == "SIGNAL_APPROVED" && sigID > 0 {
+		resolvedAuditID.Store(sigID)
+		e.attachSignalAuditID(intent.Symbol, intent.ClientOrderID, sigID)
 	}
 }
 

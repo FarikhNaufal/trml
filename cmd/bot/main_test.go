@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"trml/internal/broker"
 	"trml/internal/config"
 	"trml/internal/exchange"
 	"trml/internal/model"
 	"trml/internal/scanner"
 	"trml/internal/storage"
+	"github.com/shopspring/decimal"
 )
 
 func TestPollOpenInterest_ConcurrentAndPartialFailure(t *testing.T) {
@@ -356,5 +358,76 @@ func TestRunMarketScanRetainsPriorWatchlistOnFetchTimeout(t *testing.T) {
 
 	if !slices.Equal(eng.watchedCoins, []string{"ETHUSDT"}) {
 		t.Fatalf("expected prior watchlist [ETHUSDT] retained on scan timeout, got %v", eng.watchedCoins)
+	}
+}
+
+func TestBotEngine_RepegConfigAndGetBestQuoteAndAttachAudit(t *testing.T) {
+	if resolveBrokerRepegAttempts(0) != -1 || resolveBrokerRepegAttempts(-3) != -1 {
+		t.Fatalf("expected <=0 config attempts to map to -1 (explicit disable)")
+	}
+	if resolveBrokerRepegAttempts(3) != 3 {
+		t.Fatalf("expected positive attempts preserved")
+	}
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			MaxBookStaleness: 5 * time.Second,
+		},
+		activeStates: make(map[string]*model.SymbolState),
+	}
+
+	if _, _, ok := eng.getBestQuote("MISSINGUSDT"); ok {
+		t.Fatalf("expected ok=false for missing symbol")
+	}
+
+	now := time.Now().UTC()
+	st := &model.SymbolState{
+		Symbol:        "ETHUSDT",
+		BestBid:       2500.1,
+		BestAsk:       2500.2,
+		BookUpdatedAt: now.Add(-10 * time.Second), // Stale > 5s
+	}
+	eng.activeStates["ETHUSDT"] = st
+	if _, _, ok := eng.getBestQuote("ETHUSDT"); ok {
+		t.Fatalf("expected ok=false for stale BBO quote")
+	}
+
+	st.Mu.Lock()
+	st.BookUpdatedAt = now.Add(-500 * time.Millisecond)
+	st.Mu.Unlock()
+	bid, ask, ok := eng.getBestQuote("ETHUSDT")
+	if !ok || bid != 2500.1 || ask != 2500.2 {
+		t.Fatalf("expected fresh quote (2500.1, 2500.2, true), got (%v, %v, %v)", bid, ask, ok)
+	}
+
+	// Uji attachSignalAuditID ke DryRunBroker secara paralel/asinkron
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(1000.0), broker.DryRunConfig{
+		MaxSlots:        3,
+		AccountLeverage: 8.0,
+	})
+	defer dry.Close()
+	eng.broker = dry
+
+	intent := model.OrderIntent{
+		ClientOrderID: "BOT_ASYNC_1",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(1),
+		LimitPrice:    decimal.NewFromFloat(2500.2),
+		SLPrice:       decimal.NewFromFloat(2550.0),
+		TPPrice:       decimal.NewFromFloat(2400.0),
+		ATRAtEntry:    decimal.NewFromFloat(25.0),
+		CreatedAt:     now,
+	}
+	if ok, err := dry.SubmitLimitEntry(intent); !ok || err != nil {
+		t.Fatalf("SubmitLimitEntry failed: %v", err)
+	}
+	eng.attachSignalAuditID("ETHUSDT", "BOT_ASYNC_1", 9123)
+
+	dry.Mu.Lock()
+	gotAuditID := dry.PendingOrders["ETHUSDT"].Intent.SignalAuditID
+	dry.Mu.Unlock()
+	if gotAuditID != 9123 {
+		t.Fatalf("expected SignalAuditID=9123 attached on pending order, got %d", gotAuditID)
 	}
 }

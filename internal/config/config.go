@@ -133,10 +133,12 @@ type Config struct {
 	MinOIInterval        time.Duration
 	MaxOIInterval        time.Duration
 	MaxOIStaleness       time.Duration
-	LimitOrderTimeout    time.Duration
-	MaxHoldingDuration   time.Duration
-	OrphanPositionPolicy string
-	RecvWindowMS         int64
+	LimitOrderTimeout     time.Duration
+	MaxHoldingDuration    time.Duration
+	EntryRepegMaxAttempts int
+	EntryRepegMaxDriftPct float64
+	OrphanPositionPolicy  string
+	RecvWindowMS          int64
 
 	// Keamanan Dashboard & AI Copilot
 	DashboardPIN     string
@@ -629,6 +631,29 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		maxHoldingDuration = 4 * time.Hour
 	}
 
+	limitOrderTimeoutStr := getEnv("LIMIT_ORDER_TIMEOUT", "90s")
+	limitOrderTimeout, err := time.ParseDuration(limitOrderTimeoutStr)
+	if err != nil {
+		if sec, secErr := strconv.Atoi(limitOrderTimeoutStr); secErr == nil && sec >= 5 {
+			limitOrderTimeout = time.Duration(sec) * time.Second
+		}
+	}
+	if limitOrderTimeout < 5*time.Second {
+		limitOrderTimeout = 90 * time.Second
+	}
+
+	entryRepegMaxAttemptsStr := getEnv("ENTRY_REPEG_MAX_ATTEMPTS", "3")
+	entryRepegMaxAttempts, err := strconv.Atoi(entryRepegMaxAttemptsStr)
+	if err != nil || entryRepegMaxAttempts < 0 || entryRepegMaxAttempts > 10 {
+		entryRepegMaxAttempts = 3
+	}
+
+	entryRepegMaxDriftStr := getEnv("ENTRY_REPEG_MAX_DRIFT_PCT", "0.0005")
+	entryRepegMaxDriftPct, err := parseFloatEnv(entryRepegMaxDriftStr)
+	if err != nil || entryRepegMaxDriftPct <= 0 || entryRepegMaxDriftPct > 0.01 {
+		entryRepegMaxDriftPct = 0.0005
+	}
+
 	orphanPolicy := strings.ToUpper(getEnv("ORPHAN_POSITION_POLICY", "CLOSE"))
 	if orphanPolicy != "ADOPT" && orphanPolicy != "CLOSE" {
 		orphanPolicy = "CLOSE"
@@ -833,10 +858,12 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MinOIInterval:        1 * time.Minute,
 		MaxOIInterval:        maxOIInterval,
 		MaxOIStaleness:       maxOIStaleness,
-		LimitOrderTimeout:    45 * time.Second,
-		MaxHoldingDuration:   maxHoldingDuration,
-		OrphanPositionPolicy: orphanPolicy,
-		RecvWindowMS:         recvWin,
+		LimitOrderTimeout:     limitOrderTimeout,
+		MaxHoldingDuration:    maxHoldingDuration,
+		EntryRepegMaxAttempts: entryRepegMaxAttempts,
+		EntryRepegMaxDriftPct: entryRepegMaxDriftPct,
+		OrphanPositionPolicy:  orphanPolicy,
+		RecvWindowMS:          recvWin,
 
 		DashboardPIN:     dashPIN,
 		GeminiAPIKey:     geminiKey,

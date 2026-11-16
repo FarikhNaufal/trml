@@ -39,6 +39,9 @@ type LiveBrokerConfig struct {
 	SlippageRate             float64
 	TakerFeeRate             float64
 	MakerFeeRate             float64
+	EntryOrderType           string
+	MaxEntryRepegAttempts    int
+	MaxEntryRepegDriftPct    float64
 }
 
 type LiveOpenPosition struct {
@@ -118,6 +121,7 @@ type BinanceLiveBroker struct {
 	EmergencyMarketCloseFn func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error
 	QueryOrderFn           func(ctx context.Context, symbol string, clientOrderID string) (*model.LiveOrderRecord, error)
 	GetExchangeFilterFn    func(symbol string) (model.ExchangeFilter, bool)
+	GetBestQuoteFn         func(symbol string) (bestBid, bestAsk float64, ok bool)
 	OnTradeClosedFn        func(rec TradeClosedRecord)
 	OnPositionSavedFn      func(pos LiveOpenPosition)
 	OnPositionDeletedFn    func(symbol string)
@@ -143,6 +147,9 @@ type LivePositionEvent struct {
 }
 
 func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
+	if cfg.LimitOrderTimeout <= 0 {
+		cfg.LimitOrderTimeout = defaultLimitOrderTimeout
+	}
 	b := &BinanceLiveBroker{
 		Cfg:                    cfg,
 		OrdersByClient:         make(map[string]*model.LiveOrderRecord),
@@ -503,6 +510,33 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 		}
 	}
 
+	origLimit := intent.LimitPrice
+	isLimit := !strings.EqualFold(b.Cfg.EntryOrderType, "MARKET")
+	maxRepegs, maxDrift := resolveEntryRepegSettings(b.Cfg.MaxEntryRepegAttempts, b.Cfg.MaxEntryRepegDriftPct)
+
+	// Pre-repeg BBO tepat sebelum reservasi jika feed BBO bergeser selama logging audit SQLite
+	if isLimit && b.GetBestQuoteFn != nil {
+		if bid, ask, ok := b.GetBestQuoteFn(intent.Symbol); ok && bid > 0 && ask > 0 {
+			if wouldCrossMakerBook(intent.Side, intent.LimitPrice, bid, ask) {
+				if maxRepegs <= 0 {
+					return false, fmt.Errorf("live: limit entry crossed spread before submit (bid=%v ask=%v limit=%s)", bid, ask, intent.LimitPrice)
+				}
+				var ef model.ExchangeFilter
+				if b.GetExchangeFilterFn != nil {
+					ef, _ = b.GetExchangeFilterFn(intent.Symbol)
+				}
+				updated, okRepeg, reason := repegLimitEntryIntent(intent, origLimit, bid, ask, ef, maxDrift)
+				if !okRepeg {
+					return false, fmt.Errorf("live: pre-submit GTX repeg rejected (%s)", reason)
+				}
+				slog.Info("live: entry order PRE-REPEGGED at submit (prevented GTX cross)",
+					"symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID,
+					"oldLimit", intent.LimitPrice, "newLimit", updated.LimitPrice, "bid", bid, "ask", ask)
+				intent = updated
+			}
+		}
+	}
+
 	reserved, err := b.ReserveEntryIntent(intent)
 	if !reserved {
 		return false, err
@@ -516,21 +550,87 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 		return false, fmt.Errorf("PlaceEntryFn adapter is not configured")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	currIntent := intent
+	var exchangeOrderID int64
+	for attempt := 0; attempt <= maxRepegs; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		exchangeOrderID, err = b.PlaceEntryFn(ctx, currIntent)
+		cancel()
+		if err == nil {
+			break
+		}
+		if !isLimit || !isGTXPostOnlyError(err) || attempt >= maxRepegs || b.GetBestQuoteFn == nil {
+			break
+		}
 
-	exchangeOrderID, err := b.PlaceEntryFn(ctx, intent)
+		bid, ask, ok := b.GetBestQuoteFn(currIntent.Symbol)
+		if !ok || bid <= 0 || ask <= 0 {
+			break
+		}
+		var ef model.ExchangeFilter
+		if b.GetExchangeFilterFn != nil {
+			ef, _ = b.GetExchangeFilterFn(currIntent.Symbol)
+		}
+		updated, okRepeg, reason := repegLimitEntryIntent(currIntent, origLimit, bid, ask, ef, maxDrift)
+		if !okRepeg {
+			slog.Warn("live: entry order GTX repeg aborted",
+				"symbol", currIntent.Symbol, "clientOrderID", currIntent.ClientOrderID,
+				"attempt", attempt+1, "reason", reason)
+			break
+		}
+		// Jika target price kebetulan sama persis dengan yang baru saja ditolak -5022, dorong 1 tick keluar
+		if updated.LimitPrice.Equal(currIntent.LimitPrice) && ef.TickSize.GreaterThan(decimal.Zero) {
+			nudgedBid, nudgedAsk := bid, ask
+			if currIntent.Side == model.SideShort {
+				nudgedBid = updated.LimitPrice.InexactFloat64()
+				nudgedAsk, _ = updated.LimitPrice.Add(ef.TickSize).Float64()
+			} else {
+				nudgedAsk = updated.LimitPrice.InexactFloat64()
+				nudgedBid, _ = updated.LimitPrice.Sub(ef.TickSize).Float64()
+			}
+			if altUpdated, okAlt, _ := repegLimitEntryIntent(currIntent, origLimit, nudgedBid, nudgedAsk, ef, maxDrift); okAlt {
+				updated = altUpdated
+			} else {
+				break
+			}
+		}
+
+		oldClientID := currIntent.ClientOrderID
+		updated.ClientOrderID = model.FormatClientID("live_repeg", currIntent.Symbol, time.Now().UTC())
+
+		b.Mu.Lock()
+		if rec, exists := b.OrdersByClient[oldClientID]; exists {
+			delete(b.OrdersByClient, oldClientID)
+			rec.ClientOrderID = updated.ClientOrderID
+			rec.LimitPrice = updated.LimitPrice
+			rec.SLPrice = updated.SLPrice
+			rec.InitialSLPrice = updated.SLPrice
+			rec.TPPrice = updated.TPPrice
+			rec.TP1Price = updated.TP1Price
+			b.OrdersByClient[updated.ClientOrderID] = rec
+			b.InitialSLPrices[updated.Symbol] = updated.SLPrice
+			b.TP1Prices[updated.Symbol] = updated.TP1Price
+			b.PositionClientOrderIDs[updated.Symbol] = updated.ClientOrderID
+		}
+		b.Mu.Unlock()
+
+		slog.Info("live: entry order RE-PEGGED after GTX reject",
+			"symbol", updated.Symbol, "oldClientOrderID", oldClientID, "newClientOrderID", updated.ClientOrderID,
+			"oldLimit", currIntent.LimitPrice, "newLimit", updated.LimitPrice, "attempt", attempt+1)
+		currIntent = updated
+	}
+
 	if err != nil {
 		// Pencegahan Duplikasi: Jika penempatan error/timeout, periksa apakah bursa sebenarnya sudah menerima order
 		if b.QueryOrderFn != nil {
 			ctxQ, cancelQ := context.WithTimeout(context.Background(), 5*time.Second)
-			ordRec, qErr := b.QueryOrderFn(ctxQ, intent.Symbol, intent.ClientOrderID)
+			ordRec, qErr := b.QueryOrderFn(ctxQ, currIntent.Symbol, currIntent.ClientOrderID)
 			cancelQ()
 			if qErr == nil && ordRec != nil && ordRec.ExchangeOrderID != 0 {
 				slog.Warn("entry placement returned error but order confirmed alive on Binance; retaining reservation",
-					"symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID, "exchangeOrderID", ordRec.ExchangeOrderID, "status", ordRec.Status)
+					"symbol", currIntent.Symbol, "clientOrderID", currIntent.ClientOrderID, "exchangeOrderID", ordRec.ExchangeOrderID, "status", ordRec.Status)
 				b.Mu.Lock()
-				if rec, exists := b.OrdersByClient[intent.ClientOrderID]; exists {
+				if rec, exists := b.OrdersByClient[currIntent.ClientOrderID]; exists {
 					rec.Status = ordRec.Status
 					rec.ExchangeOrderID = ordRec.ExchangeOrderID
 					b.OrdersByExchangeID[ordRec.ExchangeOrderID] = rec
@@ -541,14 +641,14 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 		}
 
 		b.Mu.Lock()
-		delete(b.OrdersByClient, intent.ClientOrderID)
-		delete(b.ATRAtEntry, intent.Symbol)
+		delete(b.OrdersByClient, currIntent.ClientOrderID)
+		delete(b.ATRAtEntry, currIntent.Symbol)
 		b.Mu.Unlock()
 		return false, fmt.Errorf("entry placement rejected/failed: %w", err)
 	}
 
 	b.Mu.Lock()
-	if rec, exists := b.OrdersByClient[intent.ClientOrderID]; exists {
+	if rec, exists := b.OrdersByClient[currIntent.ClientOrderID]; exists {
 		rec.Status = model.StatusNew
 		rec.ExchangeOrderID = exchangeOrderID
 		b.OrdersByExchangeID[exchangeOrderID] = rec
@@ -2714,5 +2814,34 @@ func (b *BinanceLiveBroker) toProtectionConfig() protection.ProtectionConfig {
 		RunnerBECushionATR:       b.Cfg.RunnerBECushionATR,
 		TakerFeeRate:             decimal.NewFromFloat(0.0005),
 		SlippageRate:             decimal.NewFromFloat(0.0002),
+	}
+}
+
+// AttachSignalAuditID melampirkan signal_audit ID ke order entry atau proteksi live aktif setelah penulisan SQLite selesai paralel.
+func (b *BinanceLiveBroker) AttachSignalAuditID(symbol, clientOrderID string, signalAuditID int64) {
+	if signalAuditID <= 0 {
+		return
+	}
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+
+	activeCID := b.PositionClientOrderIDs[symbol]
+	matchesForSymbol := func(cID string) bool {
+		if matchesEntryClientID(cID, clientOrderID) {
+			return true
+		}
+		return activeCID != "" && cID == activeCID && strings.HasPrefix(cID, "live_repeg_")
+	}
+
+	for cID, rec := range b.OrdersByClient {
+		if rec != nil && rec.IsEntry && rec.Symbol == symbol && rec.SignalAuditID == 0 && matchesForSymbol(cID) {
+			rec.SignalAuditID = signalAuditID
+		}
+	}
+	if prot, exists := b.Protections[symbol]; exists && prot != nil && prot.SignalAuditID == 0 {
+		if activeCID == "" || matchesForSymbol(activeCID) {
+			prot.SignalAuditID = signalAuditID
+			b.notifyPositionSavedLocked(symbol)
+		}
 	}
 }

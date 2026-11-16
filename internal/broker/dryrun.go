@@ -16,8 +16,11 @@ import (
 )
 
 type VirtualPendingOrder struct {
-	Intent    model.OrderIntent
-	FilledQty decimal.Decimal
+	Intent         model.OrderIntent
+	OrigLimitPrice decimal.Decimal
+	FilledQty      decimal.Decimal
+	RepegAttempts  int
+	GTXValidated   bool
 }
 
 type VirtualOpenPosition struct {
@@ -71,6 +74,8 @@ type DryRunConfig struct {
 	TakerFeeRate             float64
 	SlippageRate             float64
 	EntryOrderType           string
+	MaxEntryRepegAttempts    int
+	MaxEntryRepegDriftPct    float64
 }
 
 type TradeClosedRecord struct {
@@ -117,6 +122,7 @@ type DryRunBroker struct {
 	OnPositionSavedFn     func(pos VirtualOpenPosition)
 	OnPositionDeletedFn   func(clientOrderIDOrSymbol string)
 	GetExchangeFilterFn   func(symbol string) (model.ExchangeFilter, bool)
+	GetBestQuoteFn        func(symbol string) (bestBid, bestAsk float64, ok bool)
 
 	eventChan        chan PositionEvent
 	eventWg          sync.WaitGroup
@@ -203,7 +209,7 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 		cfg.MinBreakEvenOffsetPct = 0.0010
 	}
 	if cfg.LimitOrderTimeout <= 0 {
-		cfg.LimitOrderTimeout = 45 * time.Second
+		cfg.LimitOrderTimeout = defaultLimitOrderTimeout
 	}
 	if cfg.MaxHoldingDuration <= 0 {
 		cfg.MaxHoldingDuration = 8 * time.Hour
@@ -225,6 +231,39 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 }
 
 func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
+	origLimit := intent.LimitPrice
+	gtxValidated := false
+	repegAttempts := 0
+
+	// Lakukan refresh BBO dan pre-repeg di luar lock agar tidak terjadi cross-lock contention
+	if !strings.EqualFold(d.Cfg.EntryOrderType, "MARKET") && d.GetBestQuoteFn != nil {
+		if bid, ask, ok := d.GetBestQuoteFn(intent.Symbol); ok && bid > 0 && ask > 0 {
+			if wouldCrossMakerBook(intent.Side, intent.LimitPrice, bid, ask) {
+				maxRepegs, maxDrift := resolveEntryRepegSettings(d.Cfg.MaxEntryRepegAttempts, d.Cfg.MaxEntryRepegDriftPct)
+				if maxRepegs <= 0 {
+					return false, fmt.Errorf("dryrun: limit entry crossed spread at submit (bid=%v ask=%v limit=%s)", bid, ask, intent.LimitPrice)
+				}
+				var ef model.ExchangeFilter
+				if d.GetExchangeFilterFn != nil {
+					ef, _ = d.GetExchangeFilterFn(intent.Symbol)
+				}
+				updated, okRepeg, reason := repegLimitEntryIntent(intent, origLimit, bid, ask, ef, maxDrift)
+				if !okRepeg {
+					slog.Warn("dryrun: limit entry REJECTED at submit (cross spread & repeg rejected)",
+						"symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID,
+						"origLimit", origLimit, "bid", bid, "ask", ask, "reason", reason)
+					return false, fmt.Errorf("dryrun: limit entry repeg rejected (%s)", reason)
+				}
+				slog.Info("dryrun: limit entry PRE-REPEGGED at submit (prevented GTX cross)",
+					"symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID,
+					"oldLimit", intent.LimitPrice, "newLimit", updated.LimitPrice, "bid", bid, "ask", ask)
+				intent = updated
+				repegAttempts = 1
+			}
+			gtxValidated = true
+		}
+	}
+
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
 
@@ -311,8 +350,11 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 	}
 
 	d.PendingOrders[intent.Symbol] = &VirtualPendingOrder{
-		Intent:    intent,
-		FilledQty: decimal.Zero,
+		Intent:         intent,
+		OrigLimitPrice: origLimit,
+		FilledQty:      decimal.Zero,
+		RepegAttempts:  repegAttempts,
+		GTXValidated:   gtxValidated,
 	}
 	return true, nil
 }
@@ -399,19 +441,44 @@ func (d *DryRunBroker) OnRealtimeTick(
 
 	// 1. Evaluasi Antrean Limit Order Masuk (Solusi P1-1 & P1-2)
 	if ord, exists := d.PendingOrders[symbol]; exists {
-		// Validasi Post-Only (GTX reject)
-		if ord.FilledQty.IsZero() && bestBid > 0 && bestAsk > 0 {
-			if (ord.Intent.Side == model.SideLong && ord.Intent.LimitPrice.GreaterThanOrEqual(decimal.NewFromFloat(bestAsk))) ||
-				(ord.Intent.Side == model.SideShort && ord.Intent.LimitPrice.LessThanOrEqual(decimal.NewFromFloat(bestBid))) {
-				slog.Warn("dryrun: limit entry CANCELED (GTX post-only cross spread)",
-					"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
-					"limitPrice", ord.Intent.LimitPrice, "bestBid", bestBid, "bestAsk", bestAsk)
-				delete(d.PendingOrders, symbol)
-				return
+		// Validasi Post-Only GTX hanya dilakukan sekali saat penempatan / konfirmasi book awal.
+		// Setelah lolos diterima di order book (GTXValidated=true), pergeseran BBO menyentuh/melewati harga limit bukan lagi GTX reject, melainkan potensi fill antrean.
+		if !ord.GTXValidated && ord.FilledQty.IsZero() && bestBid > 0 && bestAsk > 0 {
+			if wouldCrossMakerBook(ord.Intent.Side, ord.Intent.LimitPrice, bestBid, bestAsk) {
+				maxRepegs, maxDrift := resolveEntryRepegSettings(d.Cfg.MaxEntryRepegAttempts, d.Cfg.MaxEntryRepegDriftPct)
+				if ord.RepegAttempts < maxRepegs {
+					var ef model.ExchangeFilter
+					if d.GetExchangeFilterFn != nil {
+						ef, _ = d.GetExchangeFilterFn(symbol)
+					}
+					if updated, okRepeg, reason := repegLimitEntryIntent(ord.Intent, ord.OrigLimitPrice, bestBid, bestAsk, ef, maxDrift); okRepeg {
+						slog.Info("dryrun: limit entry RE-PEGGED (prevented GTX cross spread)",
+							"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
+							"oldLimit", ord.Intent.LimitPrice, "newLimit", updated.LimitPrice,
+							"bestBid", bestBid, "bestAsk", bestAsk, "attempt", ord.RepegAttempts+1)
+						ord.Intent = updated
+						ord.RepegAttempts++
+						ord.GTXValidated = true
+					} else {
+						slog.Warn("dryrun: limit entry CANCELED (GTX post-only cross spread)",
+							"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
+							"limitPrice", ord.Intent.LimitPrice, "bestBid", bestBid, "bestAsk", bestAsk, "repegFailReason", reason)
+						delete(d.PendingOrders, symbol)
+						return
+					}
+				} else {
+					slog.Warn("dryrun: limit entry CANCELED (GTX post-only cross spread)",
+						"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
+						"limitPrice", ord.Intent.LimitPrice, "bestBid", bestBid, "bestAsk", bestAsk, "repegFailReason", "max_attempts_reached")
+					delete(d.PendingOrders, symbol)
+					return
+				}
+			} else {
+				ord.GTXValidated = true
 			}
 		}
 
-		// Timeout 45 Detik
+		// Timeout antrean limit order
 		if now.Sub(ord.Intent.CreatedAt) > d.Cfg.LimitOrderTimeout {
 			slog.Warn("dryrun: limit entry EXPIRED (unfilled after timeout)",
 				"symbol", symbol, "clientOrderID", ord.Intent.ClientOrderID,
@@ -1159,5 +1226,25 @@ func (pos *VirtualOpenPosition) toSnapshot(tickSize decimal.Decimal) protection.
 		ProtectionTier: protection.ProtectionTier(pos.ProtectionTier),
 		IsTP1Hit:       pos.IsTP1Hit,
 		TickSize:       tickSize,
+	}
+}
+
+// AttachSignalAuditID melampirkan signal_audit ID ke pending order atau posisi aktif setelah penulisan SQLite selesai paralel.
+func (d *DryRunBroker) AttachSignalAuditID(symbol, clientOrderID string, signalAuditID int64) {
+	if signalAuditID <= 0 {
+		return
+	}
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+
+	if po, exists := d.PendingOrders[symbol]; exists && po != nil && po.Intent.SignalAuditID == 0 && matchesEntryClientID(po.Intent.ClientOrderID, clientOrderID) {
+		po.Intent.SignalAuditID = signalAuditID
+	}
+	if pos, exists := d.OpenPositions[symbol]; exists && pos != nil && pos.SignalAuditID == 0 && matchesEntryClientID(pos.ClientOrderID, clientOrderID) {
+		pos.SignalAuditID = signalAuditID
+		d.enqueuePositionEvent(PositionEvent{
+			Type: PositionEventSave,
+			Pos:  *pos,
+		})
 	}
 }

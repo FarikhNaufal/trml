@@ -3435,3 +3435,377 @@ func TestLiveBrokerRestoreOpenPosition_PartialTPEnabledSkipsTPRepair(t *testing.
 		t.Fatalf("expected 0 TAKE_PROFIT_MARKET repair calls under PartialTPEnabled=true, got %d", tpRepairCalls.Load())
 	}
 }
+
+func TestDryRunBroker_RestingOrderNotCancelledOnLaterBookTick_AndFills(t *testing.T) {
+	cfg := DryRunConfig{
+		MaxSlots:          3,
+		AccountLeverage:   8.0,
+		LimitOrderTimeout: 0, // Harus default ke 90s
+		MakerFeeRate:      0.0002,
+		TakerFeeRate:      0.0005,
+		SlippageRate:      0.0002,
+	}
+	b := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
+	defer b.Close()
+
+	if b.Cfg.LimitOrderTimeout != 90*time.Second {
+		t.Fatalf("expected default LimitOrderTimeout 90s, got %s", b.Cfg.LimitOrderTimeout)
+	}
+
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.001),
+			StepSize: decimal.NewFromFloat(1),
+		}, true
+	}
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "SIM_ZRO_SHORT",
+		Symbol:        "ZROUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(20),
+		LimitPrice:    decimal.NewFromFloat(1.000),
+		SLPrice:       decimal.NewFromFloat(1.030),
+		TPPrice:       decimal.NewFromFloat(0.940),
+		TP1Price:      decimal.NewFromFloat(0.970),
+		ATRAtEntry:    decimal.NewFromFloat(0.020),
+		CreatedAt:     now,
+	}
+
+	ok, err := b.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("SubmitLimitEntry failed: ok=%v err=%v", ok, err)
+	}
+
+	// Tick 1: BBO awal valid untuk maker SELL di 1.000 (bid < 1.000) -> GTXValidated menjadi true
+	b.OnRealtimeTick("ZROUSDT", 0.998, 1.000, 0.999, 0, 0, false, now.Add(50*time.Millisecond))
+
+	// Tick 2: bestBid naik melewati LimitPrice 1.000 (skenario ZROUSDT/ONEUSDT dulu).
+	// Karena order sudah resting GTXValidated=true, order TIDAK boleh dibatalkan oleh ticker BBO berikutnya.
+	b.OnRealtimeTick("ZROUSDT", 1.001, 1.002, 1.001, 0, 0, false, now.Add(2*time.Second))
+
+	b.Mu.Lock()
+	_, stillPending := b.PendingOrders["ZROUSDT"]
+	gtxValidated := stillPending && b.PendingOrders["ZROUSDT"].GTXValidated
+	b.Mu.Unlock()
+	if !stillPending || !gtxValidated {
+		t.Fatalf("expected resting pending order to stay alive with GTXValidated=true, pending=%v gtx=%v", stillPending, gtxValidated)
+	}
+
+	// Timeout check pada +46s tidak boleh membatalkan karena timeout sekarang 90s
+	b.CheckTimeouts(now.Add(46 * time.Second))
+	if !b.HasActiveOrderOrPosition("ZROUSDT") {
+		t.Fatalf("expected ZROUSDT order to remain active at +46s under 90s timeout")
+	}
+
+	// AggTrade buy (isBuyerMaker=false) di >= LimitPrice mengisi order SHORT
+	b.OnRealtimeTick("ZROUSDT", 1.000, 1.001, 1.000, 1.000, 25, false, now.Add(47*time.Second))
+	b.Mu.Lock()
+	pos := b.OpenPositions["ZROUSDT"]
+	b.Mu.Unlock()
+	if pos == nil || !pos.EntryPrice.Equal(decimal.NewFromFloat(1.000)) {
+		t.Fatalf("expected SHORT position opened at 1.000, got %+v", pos)
+	}
+}
+
+func TestDryRunBroker_PreSubmitAndFirstTickRepegGTX(t *testing.T) {
+	now := time.Now().UTC()
+
+	t.Run("pre-submit repeg via GetBestQuoteFn within drift budget", func(t *testing.T) {
+		b := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+			MaxSlots:              3,
+			AccountLeverage:       8.0,
+			MaxEntryRepegAttempts: 3,
+			MaxEntryRepegDriftPct: 0.0005,
+		})
+		defer b.Close()
+
+		b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+			return model.ExchangeFilter{
+				TickSize: decimal.NewFromFloat(0.0001),
+				StepSize: decimal.NewFromFloat(1),
+			}, true
+		}
+		b.GetBestQuoteFn = func(symbol string) (float64, float64, bool) {
+			return 1.0002, 1.0003, true // +0.03% dari 1.0000 (masih <= 0.05%)
+		}
+
+		intent := model.OrderIntent{
+			ClientOrderID: "REPEG_PRE_1",
+			Symbol:        "SYM1USDT",
+			Side:          model.SideShort,
+			Qty:           decimal.NewFromFloat(10),
+			LimitPrice:    decimal.NewFromFloat(1.0000),
+			SLPrice:       decimal.NewFromFloat(1.0200),
+			TPPrice:       decimal.NewFromFloat(0.9600),
+			TP1Price:      decimal.NewFromFloat(0.9800),
+			ATRAtEntry:    decimal.NewFromFloat(0.015),
+			CreatedAt:     now,
+		}
+		ok, err := b.SubmitLimitEntry(intent)
+		if !ok || err != nil {
+			t.Fatalf("expected pre-repeg submit success, got ok=%v err=%v", ok, err)
+		}
+
+		b.Mu.Lock()
+		ord := b.PendingOrders["SYM1USDT"]
+		b.Mu.Unlock()
+		if ord == nil || !ord.GTXValidated || ord.RepegAttempts != 1 {
+			t.Fatalf("expected GTXValidated=true RepegAttempts=1, got %+v", ord)
+		}
+		if !ord.Intent.LimitPrice.Equal(decimal.NewFromFloat(1.0003)) {
+			t.Fatalf("expected repegged limit 1.0003, got %s", ord.Intent.LimitPrice)
+		}
+		if !ord.Intent.SLPrice.Equal(decimal.NewFromFloat(1.0203)) || !ord.Intent.TPPrice.Equal(decimal.NewFromFloat(0.9603)) {
+			t.Fatalf("expected shifted brackets SL=1.0203 TP=0.9603, got SL=%s TP=%s", ord.Intent.SLPrice, ord.Intent.TPPrice)
+		}
+	})
+
+	t.Run("first-tick repeg when GetBestQuoteFn unavailable", func(t *testing.T) {
+		b := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+			MaxSlots:        3,
+			AccountLeverage: 8.0,
+		})
+		defer b.Close()
+		b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+			return model.ExchangeFilter{
+				TickSize: decimal.NewFromFloat(0.0001),
+				StepSize: decimal.NewFromFloat(1),
+			}, true
+		}
+
+		intent := model.OrderIntent{
+			ClientOrderID: "REPEG_TICK_1",
+			Symbol:        "SYM2USDT",
+			Side:          model.SideShort,
+			Qty:           decimal.NewFromFloat(10),
+			LimitPrice:    decimal.NewFromFloat(1.0000),
+			SLPrice:       decimal.NewFromFloat(1.0200),
+			TPPrice:       decimal.NewFromFloat(0.9600),
+			ATRAtEntry:    decimal.NewFromFloat(0.015),
+			CreatedAt:     now,
+		}
+		ok, err := b.SubmitLimitEntry(intent)
+		if !ok || err != nil {
+			t.Fatalf("SubmitLimitEntry failed: %v", err)
+		}
+
+		b.OnRealtimeTick("SYM2USDT", 1.0001, 1.0002, 1.0001, 0, 0, false, now.Add(20*time.Millisecond))
+
+		b.Mu.Lock()
+		ord := b.PendingOrders["SYM2USDT"]
+		b.Mu.Unlock()
+		if ord == nil || !ord.GTXValidated || !ord.Intent.LimitPrice.Equal(decimal.NewFromFloat(1.0002)) {
+			t.Fatalf("expected first-tick repeg to 1.0002 with GTXValidated=true, got %+v", ord)
+		}
+	})
+
+	t.Run("excessive drift rejected cleanly without holding slot", func(t *testing.T) {
+		b := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+			MaxSlots:              3,
+			AccountLeverage:       8.0,
+			MaxEntryRepegAttempts: 3,
+			MaxEntryRepegDriftPct: 0.0005,
+		})
+		defer b.Close()
+		b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+			return model.ExchangeFilter{
+				TickSize: decimal.NewFromFloat(0.0001),
+				StepSize: decimal.NewFromFloat(1),
+			}, true
+		}
+		b.GetBestQuoteFn = func(symbol string) (float64, float64, bool) {
+			return 0.9960, 0.9962, true // LONG target bid=0.9960 -> -0.40% jauh di atas 0.05%
+		}
+
+		intent := model.OrderIntent{
+			ClientOrderID: "REPEG_DRIFT_REJECT",
+			Symbol:        "SYM3USDT",
+			Side:          model.SideLong,
+			Qty:           decimal.NewFromFloat(10),
+			LimitPrice:    decimal.NewFromFloat(1.0000),
+			SLPrice:       decimal.NewFromFloat(0.9800),
+			TPPrice:       decimal.NewFromFloat(1.0400),
+			ATRAtEntry:    decimal.NewFromFloat(0.015),
+			CreatedAt:     now,
+		}
+		ok, err := b.SubmitLimitEntry(intent)
+		if ok || err == nil {
+			t.Fatalf("expected drift rejection, got ok=%v err=%v", ok, err)
+		}
+		if b.GetActiveSlotCount() != 0 || b.HasActiveOrderOrPosition("SYM3USDT") {
+			t.Fatalf("expected 0 active slots after rejected entry")
+		}
+	})
+}
+
+func TestDryRunBroker_AttachSignalAuditID(t *testing.T) {
+	b := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+		MaxSlots:        3,
+		AccountLeverage: 8.0,
+	})
+	defer b.Close()
+
+	now := time.Now().UTC()
+	intent := model.OrderIntent{
+		ClientOrderID: "CID_AUDIT_DRY",
+		Symbol:        "ADAUSDT",
+		Side:          model.SideLong,
+		Qty:           decimal.NewFromFloat(10),
+		LimitPrice:    decimal.NewFromFloat(1.000),
+		SLPrice:       decimal.NewFromFloat(0.980),
+		TPPrice:       decimal.NewFromFloat(1.040),
+		ATRAtEntry:    decimal.NewFromFloat(0.015),
+		CreatedAt:     now,
+	}
+	if ok, err := b.SubmitLimitEntry(intent); !ok || err != nil {
+		t.Fatalf("SubmitLimitEntry failed: %v", err)
+	}
+
+	b.OnRealtimeTick("ADAUSDT", 1.000, 1.001, 1.000, 0, 0, false, now.Add(10*time.Millisecond))
+	b.AttachSignalAuditID("ADAUSDT", "CID_AUDIT_DRY", 777)
+
+	// Fill posisi -> SignalAuditID harus terbawa ke OpenPosition
+	b.OnRealtimeTick("ADAUSDT", 1.000, 1.001, 1.000, 1.000, 15, true, now.Add(1*time.Second))
+	b.Mu.Lock()
+	pos := b.OpenPositions["ADAUSDT"]
+	b.Mu.Unlock()
+	if pos == nil || pos.SignalAuditID != 777 {
+		t.Fatalf("expected opened position to inherit SignalAuditID=777, got %+v", pos)
+	}
+}
+
+func TestLiveBroker_PreRepegAndGTX5022RetryWithAttachAuditID(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+	})
+	defer b.Close()
+
+	if b.Cfg.LimitOrderTimeout != 90*time.Second {
+		t.Fatalf("expected LiveBroker default LimitOrderTimeout 90s, got %s", b.Cfg.LimitOrderTimeout)
+	}
+
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, now)
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.0001),
+			StepSize: decimal.NewFromFloat(1),
+		}, true
+	}
+
+	var quoteCalls atomic.Int32
+	b.GetBestQuoteFn = func(symbol string) (float64, float64, bool) {
+		if quoteCalls.Add(1) == 1 {
+			return 0.9999, 1.0001, true // Pre-submit aman (limit=1.0000 > bid=0.9999)
+		}
+		return 1.0002, 1.0003, true // Saat retry -5022, ask naik ke 1.0003 (+0.03% <= 0.05%)
+	}
+
+	var attempts atomic.Int32
+	var seenClientIDs []string
+	var seenLimits []decimal.Decimal
+	b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+		n := attempts.Add(1)
+		seenClientIDs = append(seenClientIDs, intent.ClientOrderID)
+		seenLimits = append(seenLimits, intent.LimitPrice)
+		if n == 1 {
+			return 0, fmt.Errorf("binance API error: code=-5022 msg=Due to the order could not be executed as maker, the Post Only order will be rejected.")
+		}
+		return 555111, nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "LIVE_GTX_1",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(10),
+		LimitPrice:    decimal.NewFromFloat(1.0000),
+		SLPrice:       decimal.NewFromFloat(1.0200),
+		TPPrice:       decimal.NewFromFloat(0.9600),
+		TP1Price:      decimal.NewFromFloat(0.9800),
+		ATRAtEntry:    decimal.NewFromFloat(0.015),
+		CreatedAt:     now,
+	}
+
+	ok, err := b.SubmitLimitEntry(intent)
+	if !ok || err != nil {
+		t.Fatalf("expected live GTX retry to succeed, got ok=%v err=%v", ok, err)
+	}
+	if len(seenClientIDs) != 2 || seenClientIDs[0] != "LIVE_GTX_1" || !strings.HasPrefix(seenClientIDs[1], "live_repeg_SOLUSDT_") {
+		t.Fatalf("unexpected retry ClientOrderIDs: %v", seenClientIDs)
+	}
+	if !seenLimits[1].Equal(decimal.NewFromFloat(1.0003)) {
+		t.Fatalf("expected retry LimitPrice 1.0003, got %s", seenLimits[1])
+	}
+
+	b.AttachSignalAuditID("SOLUSDT", "LIVE_GTX_1", 888)
+
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+	if _, leaked := b.OrdersByClient["LIVE_GTX_1"]; leaked {
+		t.Fatalf("old clientOrderID LIVE_GTX_1 should be removed after re-peg swap")
+	}
+	newCID := seenClientIDs[1]
+	rec := b.OrdersByClient[newCID]
+	if rec == nil || rec.ExchangeOrderID != 555111 || !rec.SLPrice.Equal(decimal.NewFromFloat(1.0203)) || rec.SignalAuditID != 888 {
+		t.Fatalf("unexpected live order record after repeg+audit: %+v", rec)
+	}
+	if b.PositionClientOrderIDs["SOLUSDT"] != newCID {
+		t.Fatalf("expected PositionClientOrderIDs updated to %s, got %q", newCID, b.PositionClientOrderIDs["SOLUSDT"])
+	}
+}
+
+func TestLiveBroker_PreRepegExceedsMaxDriftAbortsCleanly(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:              3,
+		MaxDailyDrawdownPct:   -0.05,
+		MaxAccountStaleness:   60 * time.Second,
+		MaxEntryRepegAttempts: 3,
+		MaxEntryRepegDriftPct: 0.0005,
+	})
+	defer b.Close()
+
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, now)
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize: decimal.NewFromFloat(0.0001),
+			StepSize: decimal.NewFromFloat(1),
+		}, true
+	}
+	b.GetBestQuoteFn = func(symbol string) (float64, float64, bool) {
+		return 1.0050, 1.0060, true // +0.60% jauh melampaui batas 0.05%
+	}
+	var placeCalls atomic.Int32
+	b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+		placeCalls.Add(1)
+		return 1, nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "LIVE_DRIFT_ABORT",
+		Symbol:        "DOGEUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(10),
+		LimitPrice:    decimal.NewFromFloat(1.0000),
+		SLPrice:       decimal.NewFromFloat(1.0200),
+		TPPrice:       decimal.NewFromFloat(0.9600),
+		ATRAtEntry:    decimal.NewFromFloat(0.015),
+		CreatedAt:     now,
+	}
+
+	ok, err := b.SubmitLimitEntry(intent)
+	if ok || err == nil || !strings.Contains(err.Error(), "drift_") {
+		t.Fatalf("expected pre-repeg drift rejection, got ok=%v err=%v", ok, err)
+	}
+	if placeCalls.Load() != 0 {
+		t.Fatalf("expected 0 PlaceEntryFn calls when pre-repeg aborts, got %d", placeCalls.Load())
+	}
+	if b.GetActiveSlotCount() != 0 || b.HasActiveOrderOrPosition("DOGEUSDT") {
+		t.Fatalf("expected 0 reserved slots after abort")
+	}
+}

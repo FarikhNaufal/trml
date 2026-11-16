@@ -387,3 +387,40 @@ func TestScannerRankingModeConfig(t *testing.T) {
 	}
 	_ = os.Unsetenv("SCANNER_RANKING_MODE")
 }
+
+func TestLimitEntryExecutionConfig(t *testing.T) {
+	_ = os.Unsetenv("LIMIT_ORDER_TIMEOUT")
+	_ = os.Unsetenv("ENTRY_REPEG_MAX_ATTEMPTS")
+	_ = os.Unsetenv("ENTRY_REPEG_MAX_DRIFT_PCT")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading defaults: %v", err)
+	}
+	if cfg.LimitOrderTimeout != 90*time.Second {
+		t.Errorf("expected default LimitOrderTimeout=90s, got %v", cfg.LimitOrderTimeout)
+	}
+	if cfg.EntryRepegMaxAttempts != 3 {
+		t.Errorf("expected default EntryRepegMaxAttempts=3, got %d", cfg.EntryRepegMaxAttempts)
+	}
+	if cfg.EntryRepegMaxDriftPct != 0.0005 {
+		t.Errorf("expected default EntryRepegMaxDriftPct=0.0005, got %f", cfg.EntryRepegMaxDriftPct)
+	}
+
+	_ = os.Setenv("LIMIT_ORDER_TIMEOUT", "120s")
+	_ = os.Setenv("ENTRY_REPEG_MAX_ATTEMPTS", "2")
+	_ = os.Setenv("ENTRY_REPEG_MAX_DRIFT_PCT", "0.0010")
+	defer func() {
+		_ = os.Unsetenv("LIMIT_ORDER_TIMEOUT")
+		_ = os.Unsetenv("ENTRY_REPEG_MAX_ATTEMPTS")
+		_ = os.Unsetenv("ENTRY_REPEG_MAX_DRIFT_PCT")
+	}()
+
+	custom, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading overrides: %v", err)
+	}
+	if custom.LimitOrderTimeout != 120*time.Second || custom.EntryRepegMaxAttempts != 2 || custom.EntryRepegMaxDriftPct != 0.0010 {
+		t.Errorf("unexpected override values: timeout=%v attempts=%d drift=%f", custom.LimitOrderTimeout, custom.EntryRepegMaxAttempts, custom.EntryRepegMaxDriftPct)
+	}
+}
