@@ -62,6 +62,7 @@ type EvaluatorConfig struct {
 	BTCMax5mPumpPct        float64
 	BTCGatePersistenceBars int
 	BTCCounterMomentumPct  float64
+	BTCChopRiskMult        float64 // Optional risk multiplier when BTC macro regime is choppy/high-vol (1.0 = disabled)
 	AllowedSide            string
 	MaxFrenzyRVOL          float64
 	MaxCounterImpulseATR   float64
@@ -71,6 +72,7 @@ type EvaluatorConfig struct {
 	CooldownLossMinutes      int
 	CooldownProfitMinutes    int
 	VWAPSessionWarmupMinutes int
+	BlockedUTCHours          map[int]bool // Optional UTC hours [0..23] to skip new entries
 
 	// Random Entry Benchmark (Case C)
 	RandomEntrySeed int64
@@ -245,6 +247,9 @@ func EvaluateSignal(
 	minsSinceMidnight := utcNow.Hour()*60 + utcNow.Minute()
 	if minsSinceMidnight < warmupMins {
 		return model.OrderIntent{}, false, "VWAP_SESSION_WARMUP", fmt.Sprintf("UTC_%02d:%02d_IN_WARMUP_%dm", utcNow.Hour(), utcNow.Minute(), warmupMins)
+	}
+	if len(cfg.BlockedUTCHours) > 0 && cfg.BlockedUTCHours[utcNow.Hour()] {
+		return model.OrderIntent{}, false, "UTC_HOUR_BLOCKED", fmt.Sprintf("UTC_HOUR_%02d_BLOCKED_BY_CONFIG", utcNow.Hour())
 	}
 
 	// Filter Anti-Chasing: Batasi jarak maksimal penutupan candle dari garis VWAP
@@ -751,9 +756,57 @@ func EvaluateSignal(
 	if sizingCfg.EntryOrderType == "" {
 		sizingCfg.EntryOrderType = cfg.EntryOrderType
 	}
+	if cfg.BTCChopRiskMult > 0 && cfg.BTCChopRiskMult < 1.0 && btcSnap != nil &&
+		isBTCChopHighVol(btcSnap.ClosedCandles, cfg.EMAPeriod, cfg.ATRPeriod) {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.BTCChopRiskMult))
+	}
 	intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, rawEntryPrice, atr14, sizingCfg)
 	if !ok {
 		return model.OrderIntent{}, false, "SIZING_FAILED", ""
 	}
 	return intent, true, "SIGNAL_APPROVED", ""
+}
+
+func isBTCChopHighVol(btcCandles []model.Candle, emaPeriod, atrPeriod int) bool {
+	n := len(btcCandles)
+	if n < 30 {
+		return false
+	}
+	lastClose := btcCandles[n-1].Close
+	if lastClose <= 0 {
+		return false
+	}
+	if emaPeriod <= 0 || n < emaPeriod {
+		emaPeriod = n / 2
+	}
+	if atrPeriod <= 0 {
+		atrPeriod = 14
+	}
+	ema := indicator.CalculateEMA(btcCandles, emaPeriod)
+	atr := indicator.CalculateATR(btcCandles, atrPeriod)
+	natrPct := (atr / lastClose) * 100.0
+	if natrPct >= 1.20 {
+		return true
+	}
+	if ema > 0 {
+		emaDistPct := math.Abs((lastClose-ema)/ema) * 100.0
+		if emaDistPct <= 0.15 {
+			return true
+		}
+		if n >= 8 {
+			flips := 0
+			prevAbove := btcCandles[n-7].Close >= ema
+			for i := n - 6; i < n; i++ {
+				curAbove := btcCandles[i].Close >= ema
+				if curAbove != prevAbove {
+					flips++
+					prevAbove = curAbove
+				}
+			}
+			if flips >= 2 {
+				return true
+			}
+		}
+	}
+	return false
 }

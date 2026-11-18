@@ -31,10 +31,11 @@ type SymbolAttribution struct {
 }
 
 type SegmentationReport struct {
-	NATRSegments    []SegmentStats `json:"natr_segments"`
-	SessionSegments []SegmentStats `json:"session_segments"`
-	SideSegments    []SegmentStats `json:"side_segments"`
-	HoldingSegments []SegmentStats `json:"holding_segments,omitempty"`
+	NATRSegments      []SegmentStats `json:"natr_segments"`
+	SessionSegments   []SegmentStats `json:"session_segments"`
+	SideSegments      []SegmentStats `json:"side_segments"`
+	HoldingSegments   []SegmentStats `json:"holding_segments,omitempty"`
+	EntryTypeSegments []SegmentStats `json:"entry_type_segments,omitempty"`
 }
 
 // CalculateSegmentation mengelompokkan trade ke dalam bucket statistik bebas path-dependency.
@@ -54,6 +55,10 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 	holdShort := newSegment("15m - 1h")
 	holdMed := newSegment("1h - 4h")
 	holdLong := newSegment("> 4h")
+
+	entryCleanLimit := newSegment("Clean Limit (No Repeg)")
+	entryRepegged := newSegment("GTX Repeg")
+	entryMarket := newSegment("Market Fill")
 
 	for _, t := range trades {
 		if t.NATRPct < 0.80 {
@@ -90,6 +95,15 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 		default:
 			holdLong.addTrade(t)
 		}
+
+		switch {
+		case t.EntryMode == "MARKET":
+			entryMarket.addTrade(t)
+		case t.RepegCount > 0 || t.EntryMode == "GTX_REPEG":
+			entryRepegged.addTrade(t)
+		default:
+			entryCleanLimit.addTrade(t)
+		}
 	}
 
 	return SegmentationReport{
@@ -112,6 +126,11 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 			holdShort.finalize(),
 			holdMed.finalize(),
 			holdLong.finalize(),
+		},
+		EntryTypeSegments: []SegmentStats{
+			entryCleanLimit.finalize(),
+			entryRepegged.finalize(),
+			entryMarket.finalize(),
 		},
 	}
 }

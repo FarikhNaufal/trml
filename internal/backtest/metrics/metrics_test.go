@@ -155,7 +155,7 @@ func TestCalculateMetricsV2_MTMDrawdownRegimeAndAttribution(t *testing.T) {
 			EntryPrice: decimal.NewFromFloat(100), SLPrice: decimal.NewFromFloat(98),
 			InitialQty: decimal.NewFromFloat(5), Qty: decimal.NewFromFloat(5),
 			GrossPnL: decimal.NewFromFloat(25), NetPnL: decimal.NewFromFloat(24),
-			ExitReason: "TAKE_PROFIT",
+			ExitReason: "TAKE_PROFIT", EntryMode: "CLEAN_LIMIT",
 		},
 		{
 			ID: "T2", Symbol: "DOGEUSDT", Side: model.SideLong,
@@ -163,7 +163,7 @@ func TestCalculateMetricsV2_MTMDrawdownRegimeAndAttribution(t *testing.T) {
 			EntryPrice: decimal.NewFromFloat(1), SLPrice: decimal.NewFromFloat(0.95),
 			InitialQty: decimal.NewFromFloat(100), Qty: decimal.NewFromFloat(100),
 			GrossPnL: decimal.NewFromFloat(-4), NetPnL: decimal.NewFromFloat(-5),
-			ExitReason: "STOP_LOSS",
+			ExitReason: "STOP_LOSS", RepegCount: 1, EntryMode: "GTX_REPEG",
 		},
 	}
 
@@ -197,6 +197,11 @@ func TestCalculateMetricsV2_MTMDrawdownRegimeAndAttribution(t *testing.T) {
 	}
 	if bullCount != 2 {
 		t.Fatalf("expected both trades classified into BTC_BULL, got regimes=%+v", summary.RegimeSegments)
+	}
+	if len(summary.Segmentation.EntryTypeSegments) != 3 ||
+		summary.Segmentation.EntryTypeSegments[0].TotalTrades != 1 ||
+		summary.Segmentation.EntryTypeSegments[1].TotalTrades != 1 {
+		t.Fatalf("expected 1 Clean Limit + 1 GTX Repeg segment, got %+v", summary.Segmentation.EntryTypeSegments)
 	}
 }
 

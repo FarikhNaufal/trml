@@ -442,3 +442,32 @@ func TestLoadConfig_FailClosedOnMalformedSecondaryFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfig_BlockedUTCHoursAndBTCChopRiskMult(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "test_key")
+	t.Setenv("BINANCE_API_SECRET", "test_sec")
+	t.Setenv("BLOCKED_UTC_HOURS", "14, 15,21")
+	t.Setenv("BTC_CHOP_RISK_MULT", "0.50")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.BlockedUTCHours[14] || !cfg.BlockedUTCHours[15] || !cfg.BlockedUTCHours[21] || cfg.BlockedUTCHours[10] {
+		t.Fatalf("unexpected BlockedUTCHours: %+v", cfg.BlockedUTCHours)
+	}
+	if cfg.BTCChopRiskMult != 0.50 {
+		t.Fatalf("expected BTCChopRiskMult=0.50, got %v", cfg.BTCChopRiskMult)
+	}
+
+	t.Setenv("BLOCKED_UTC_HOURS", "25")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected error for hour 25")
+	}
+	t.Setenv("BLOCKED_UTC_HOURS", "")
+	t.Setenv("BTC_CHOP_RISK_MULT", "1.5")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected error for BTC_CHOP_RISK_MULT > 1.0")
+	}
+}
+

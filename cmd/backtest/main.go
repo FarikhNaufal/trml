@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"trml/internal/backtest/data"
@@ -252,29 +254,61 @@ func handleDataCommand(args []string) {
 
 	switch sub {
 	case "fetch":
-		fmt.Printf("Mengunduh candlestick %s dari data.binance.vision untuk %d simbol [%s s/d %s]...\n",
-			interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))
-		execSubTF := strings.ToLower(strings.TrimSpace(*execTFFlag))
-		for _, sym := range symbols {
-			candles, err := dl.FetchCandleRange(ctx, sym, interval, from, to)
-			if err != nil {
-				continue
-			}
-			rep := data.ValidateCandles(sym, candles, candleDur)
-			extraMsg := ""
-			if execSubTF == "1m" && !strings.EqualFold(interval, "1m") {
-				if c1m, err1m := dl.FetchCandleRange(ctx, sym, "1m", from, to); err1m == nil {
-					extraMsg += fmt.Sprintf(" | 1m: %d bars", len(c1m))
-				}
-			}
-			if oiDownloader != nil {
-				if pts, oiErr := oiDownloader.FetchOpenInterestRange(ctx, sym, from, to); oiErr == nil {
-					extraMsg += fmt.Sprintf(" | OI 5m: %d pts", len(pts))
-				}
-			}
-			fmt.Printf("    [OK] %-12s: %d bars (Gaps: %d, ZeroVol: %d, Anomalies: %d)%s\n",
-				sym, rep.TotalBars, rep.GapsCount, rep.ZeroVolCount, rep.OHLCAnomalies, extraMsg)
+		workers := 8
+		if *allowRESTFlag {
+			workers = 4
 		}
+		if len(symbols) < workers {
+			workers = len(symbols)
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		fmt.Printf("Mengunduh candlestick %s dari data.binance.vision untuk %d simbol [%s s/d %s] (%d workers)...\n",
+			interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"), workers)
+		execSubTF := strings.ToLower(strings.TrimSpace(*execTFFlag))
+
+		taskCh := make(chan string, len(symbols))
+		for _, sym := range symbols {
+			taskCh <- sym
+		}
+		close(taskCh)
+
+		var printMu sync.Mutex
+		var wg sync.WaitGroup
+		var doneCount atomic.Int32
+		totalSyms := len(symbols)
+
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for sym := range taskCh {
+					candles, err := dl.FetchCandleRange(ctx, sym, interval, from, to)
+					curIdx := doneCount.Add(1)
+					if err != nil {
+						continue
+					}
+					rep := data.ValidateCandles(sym, candles, candleDur)
+					extraMsg := ""
+					if execSubTF == "1m" && !strings.EqualFold(interval, "1m") {
+						if c1m, err1m := dl.FetchCandleRange(ctx, sym, "1m", from, to); err1m == nil {
+							extraMsg += fmt.Sprintf(" | 1m: %d bars", len(c1m))
+						}
+					}
+					if oiDownloader != nil {
+						if pts, oiErr := oiDownloader.FetchOpenInterestRange(ctx, sym, from, to); oiErr == nil {
+							extraMsg += fmt.Sprintf(" | OI 5m: %d pts", len(pts))
+						}
+					}
+					printMu.Lock()
+					fmt.Printf("    [%3d/%3d OK] %-12s: %d bars (Gaps: %d, ZeroVol: %d, Anomalies: %d)%s\n",
+						curIdx, totalSyms, sym, rep.TotalBars, rep.GapsCount, rep.ZeroVolCount, rep.OHLCAnomalies, extraMsg)
+					printMu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
 	case "verify":
 		fmt.Printf("Memverifikasi cache (%s) untuk %d simbol [%s s/d %s]...\n",
 			interval, len(symbols), from.Format("2006-01-02"), to.Format("2006-01-02"))

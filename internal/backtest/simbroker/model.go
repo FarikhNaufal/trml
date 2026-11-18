@@ -80,6 +80,9 @@ type SimTradeRecord struct {
 	HoldingBars   int             `json:"holding_bars"`
 	SignalAuditID int64           `json:"signal_audit_id"`
 	ATRAtEntry    decimal.Decimal `json:"atr_at_entry"`
+	RepegCount    int             `json:"repeg_count"`
+	EntryWasMaker bool            `json:"entry_was_maker"`
+	EntryMode     string          `json:"entry_mode,omitempty"`
 }
 
 type SimPendingOrder struct {
@@ -114,4 +117,5 @@ type SimPosition struct {
 	SignalAuditID    int64
 	ProtectionTier   int
 	LastClosePrice   decimal.Decimal
+	RepegCount       int
 }

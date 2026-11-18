@@ -82,6 +82,8 @@ type AggregatedTrade struct {
 	FundingPaid float64   `json:"funding_paid"`
 	ExitReasons []string  `json:"exit_reasons"`
 	HoldingBars int       `json:"holding_bars"`
+	RepegCount  int       `json:"repeg_count"`
+	EntryMode   string    `json:"entry_mode,omitempty"`
 }
 
 // CalculateMetrics mengagregasikan seluruh record trade mentah menjadi metrik performa statistik standar.
@@ -306,6 +308,8 @@ func aggregateSetupTrades(rawTrades []simbroker.SimTradeRecord) []AggregatedTrad
 				EntryTime:   tr.EntryTime,
 				ExitTime:    tr.ExitTime,
 				ExitReasons: make([]string, 0, 2),
+				RepegCount:  tr.RepegCount,
+				EntryMode:   tr.EntryMode,
 			}
 			grouped[key] = agg
 			orderedKeys = append(orderedKeys, key)

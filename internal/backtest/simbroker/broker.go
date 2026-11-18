@@ -518,6 +518,13 @@ func (s *SimBroker) recordClosedTradeLocked(
 	// Saat exit, kita membukukan grossPnL dikurangi exitFee ke RealizedEquityUSDT.
 	s.RealizedEquityUSDT = s.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
 
+	entryMode := "CLEAN_LIMIT"
+	if !pos.EntryWasMaker {
+		entryMode = "MARKET"
+	} else if pos.RepegCount > 0 {
+		entryMode = "GTX_REPEG"
+	}
+
 	tradeID := fmt.Sprintf("SIM_%s_%d", pos.Symbol, closedAt.UnixNano())
 	rec := SimTradeRecord{
 		ID:            tradeID,
@@ -542,6 +549,9 @@ func (s *SimBroker) recordClosedTradeLocked(
 		HoldingBars:   holdingBars,
 		SignalAuditID: pos.SignalAuditID,
 		ATRAtEntry:    pos.ATRAtEntry,
+		RepegCount:    pos.RepegCount,
+		EntryWasMaker: pos.EntryWasMaker,
+		EntryMode:     entryMode,
 	}
 
 	s.ClosedTrades = append(s.ClosedTrades, rec)
@@ -726,6 +736,7 @@ func (s *SimBroker) newSimPositionLocked(
 		OpenBarIndex:   barIndex,
 		SignalAuditID:  pending.Intent.SignalAuditID,
 		LastClosePrice: decimal.NewFromFloat(c.Close),
+		RepegCount:     pending.RepegAttempts,
 	}
 }
 

@@ -102,6 +102,7 @@ type Config struct {
 	BTCMax5mPumpPct          float64
 	BTCGatePersistenceBars   int
 	BTCCounterMomentumPct    float64
+	BTCChopRiskMult          float64
 	AllowedSide              string
 	MaxFrenzyRVOL            float64
 	MaxCounterImpulseATR     float64
@@ -110,6 +111,7 @@ type Config struct {
 	CooldownLossMinutes      int
 	CooldownProfitMinutes    int
 	VWAPSessionWarmupMinutes int
+	BlockedUTCHours          map[int]bool
 
 	// Option C: Optimasi Seleksi Entry & Eksit Sisi LONG
 	MinCandleBodyRatioLong   float64
@@ -714,6 +716,27 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid VWAP_SESSION_WARMUP_MINUTES '%s' (must be integer >= 0)", vwapWarmupMinsStr)
 	}
 
+	blockedHours := make(map[int]bool)
+	if blockedRaw := strings.TrimSpace(getEnv("BLOCKED_UTC_HOURS", "")); blockedRaw != "" {
+		for _, part := range strings.Split(blockedRaw, ",") {
+			p := strings.TrimSpace(part)
+			if p == "" {
+				continue
+			}
+			hr, hErr := strconv.Atoi(p)
+			if hErr != nil || hr < 0 || hr > 23 {
+				return nil, fmt.Errorf("config: invalid BLOCKED_UTC_HOURS entry '%s' (must be integer 0..23)", p)
+			}
+			blockedHours[hr] = true
+		}
+	}
+
+	btcChopRiskMultStr := getEnv("BTC_CHOP_RISK_MULT", "1.0")
+	btcChopRiskMult, err := parseFloatEnv(btcChopRiskMultStr)
+	if err != nil || btcChopRiskMult <= 0.0 || btcChopRiskMult > 1.0 {
+		return nil, fmt.Errorf("config: invalid BTC_CHOP_RISK_MULT '%s' (must be float in (0.0, 1.0])", btcChopRiskMultStr)
+	}
+
 	minCandleBodyRatioLongStr := getEnv("MIN_CANDLE_BODY_RATIO_LONG", "0.0")
 	minCandleBodyRatioLong, err := parseFloatEnv(minCandleBodyRatioLongStr)
 	if err != nil || minCandleBodyRatioLong < 0.0 || minCandleBodyRatioLong > 1.0 {
@@ -866,6 +889,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		BTCMax5mPumpPct:          btcMaxPump,
 		BTCGatePersistenceBars:   btcPersistenceBars,
 		BTCCounterMomentumPct:    btcCounterMom,
+		BTCChopRiskMult:          btcChopRiskMult,
 		AllowedSide:              allowedSide,
 		MaxFrenzyRVOL:            maxFrenzyRVOL,
 		MaxCounterImpulseATR:     maxCounterImpulseATR,
@@ -874,6 +898,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		CooldownLossMinutes:      cooldownLossMins,
 		CooldownProfitMinutes:    cooldownProfitMins,
 		VWAPSessionWarmupMinutes: vwapWarmupMins,
+		BlockedUTCHours:          blockedHours,
 
 		MinCandleBodyRatioLong:   minCandleBodyRatioLong,
 		MaxPullbackRVOLLong:      maxPullbackRVOLLong,

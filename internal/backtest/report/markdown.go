@@ -208,6 +208,9 @@ func renderRegimeAndSegmentationSection(sb *strings.Builder, summary metrics.Bac
 		renderSegmentTable(sb, "Kategori NATR", summary.Segmentation.NATRSegments)
 		renderSegmentTable(sb, "Sesi Pasar (UTC)", summary.Segmentation.SessionSegments)
 		renderSegmentTable(sb, "Arah Posisi", summary.Segmentation.SideSegments)
+		if len(summary.Segmentation.EntryTypeSegments) > 0 {
+			renderSegmentTable(sb, "Tipe Eksekusi Entry (Clean Limit vs GTX Repeg)", summary.Segmentation.EntryTypeSegments)
+		}
 	}
 }
 

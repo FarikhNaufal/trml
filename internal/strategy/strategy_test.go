@@ -2282,3 +2282,57 @@ func TestEvaluateSignal_ZeroWinCooldownAndBTCGateShortVWAPAllowance(t *testing.T
 		}
 	})
 }
+
+func TestEvaluateSignal_BlockedUTCHoursAndBTCChopRiskMult(t *testing.T) {
+	now := time.Date(2026, 6, 1, 16, 15, 0, 0, time.UTC)
+	snap, cfg := helperCreateValidShortSnapshot(now)
+
+	// 1. BlockedUTCHours blocks UTC hour 16
+	cfg.BlockedUTCHours = map[int]bool{16: true}
+	_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if ok || reason != "UTC_HOUR_BLOCKED" {
+		t.Fatalf("expected UTC_HOUR_BLOCKED for hour 16, got ok=%v reason=%s", ok, reason)
+	}
+
+	// 2. When hour is not blocked and BTC is in high-vol chop, BTCChopRiskMult=0.5 halves position qty vs baseline
+	cfg.BlockedUTCHours = nil
+	btcChop := make([]model.Candle, 60)
+	for i := range btcChop {
+		p := 50000.0
+		if i%2 == 0 {
+			p = 50700.0
+		}
+		btcChop[i] = model.Candle{
+			OpenTime:  now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:      p,
+			High:      p * 1.015,
+			Low:       p * 0.985,
+			Close:     p,
+		}
+	}
+	btcSnap := &model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		Now:                now,
+		ClosedCandles:      btcChop,
+		CurrentSessionVWAP: 50350.0,
+	}
+
+	// Compare quantity sizing with BTCChopRiskMult=1.0 vs 0.50 (BTCGateEnabled=false so chop doesn't outright veto).
+	cfg.BTCGateEnabled = false
+	cfg.BTCChopRiskMult = 1.0
+	baseIntent, okBase, rBase, _ := EvaluateSignal(snap, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if !okBase || rBase != "SIGNAL_APPROVED" {
+		t.Fatalf("expected base approved, got ok=%v reason=%s", okBase, rBase)
+	}
+
+	cfg.BTCChopRiskMult = 0.50
+	chopIntent, okChop, rChop, _ := EvaluateSignal(snap, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+	if !okChop || rChop != "SIGNAL_APPROVED" {
+		t.Fatalf("expected chop throttled approved, got ok=%v reason=%s", okChop, rChop)
+	}
+	if !chopIntent.Qty.LessThan(baseIntent.Qty) {
+		t.Fatalf("expected chop throttled qty (%s) < base qty (%s)", chopIntent.Qty, baseIntent.Qty)
+	}
+}
+

@@ -181,6 +181,7 @@ func main() {
 			BTCMax5mPumpPct:          cfg.BTCMax5mPumpPct,
 			BTCGatePersistenceBars:   cfg.BTCGatePersistenceBars,
 			BTCCounterMomentumPct:    cfg.BTCCounterMomentumPct,
+			BTCChopRiskMult:          cfg.BTCChopRiskMult,
 			AllowedSide:              cfg.AllowedSide,
 			MaxFrenzyRVOL:            cfg.MaxFrenzyRVOL,
 			MaxCounterImpulseATR:     cfg.MaxCounterImpulseATR,
@@ -189,6 +190,7 @@ func main() {
 			CooldownLossMinutes:      cfg.CooldownLossMinutes,
 			CooldownProfitMinutes:    cfg.CooldownProfitMinutes,
 			VWAPSessionWarmupMinutes: cfg.VWAPSessionWarmupMinutes,
+			BlockedUTCHours:          cfg.BlockedUTCHours,
 			Sizing: strategy.SizingConfig{
 				RiskPerTradePct:                cfg.RiskPerTradePct,
 				MaxSlotMarginFraction:          cfg.MaxSlotMarginFrac,
