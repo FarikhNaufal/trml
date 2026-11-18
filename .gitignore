@@ -27,3 +27,7 @@ bin/
 
 # Backtest Archives & Artifacts
 backtest_archive/
+
+# Agent Skills (local only)
+.agents/
+skills-lock.json
