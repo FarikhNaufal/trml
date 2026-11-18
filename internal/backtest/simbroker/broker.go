@@ -2,6 +2,7 @@ package simbroker
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,8 @@ type SimBroker struct {
 	PendingOrders   map[string]*SimPendingOrder // symbol -> pending
 	OpenPositions   map[string]*SimPosition     // symbol -> open
 	ClosedTrades    []SimTradeRecord
+	EquityCurve     []EquityPoint
+	Stats           SimExecutionStats
 	ExchangeFilters map[string]model.ExchangeFilter
 }
 
@@ -68,6 +71,7 @@ func NewSimBroker(cfg SimBrokerConfig) *SimBroker {
 		PendingOrders:      make(map[string]*SimPendingOrder),
 		OpenPositions:      make(map[string]*SimPosition),
 		ClosedTrades:       make([]SimTradeRecord, 0),
+		EquityCurve:        make([]EquityPoint, 0, 256),
 		ExchangeFilters:    make(map[string]model.ExchangeFilter),
 	}
 }
@@ -145,12 +149,18 @@ func (s *SimBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
 		return false, fmt.Errorf("max slots (%d) occupied", s.Cfg.MaxSlots)
 	}
 
-	timeout := intent.CreatedAt.Add(time.Duration(s.Cfg.LimitTimeoutBars*5) * time.Minute)
-	s.PendingOrders[intent.Symbol] = &SimPendingOrder{
-		Intent:      intent,
-		PlacedTime:  intent.CreatedAt,
-		TimeoutTime: timeout,
+	timeoutDur := s.Cfg.LimitOrderTimeout
+	if timeoutDur <= 0 {
+		timeoutDur = time.Duration(s.Cfg.LimitTimeoutBars*5) * time.Minute
 	}
+	timeout := intent.CreatedAt.Add(timeoutDur)
+	s.PendingOrders[intent.Symbol] = &SimPendingOrder{
+		Intent:         intent,
+		OrigLimitPrice: intent.LimitPrice,
+		PlacedTime:     intent.CreatedAt,
+		TimeoutTime:    timeout,
+	}
+	s.Stats.Submitted++
 
 	return true, nil
 }
@@ -185,61 +195,86 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		}
 	}
 
-	// 2. Evaluasi Pending Limit Order
+	// 2. Evaluasi Pending Entry Order (LIMIT + GTX Repeg opsional / MARKET)
 	if pending, exists := s.PendingOrders[c.Symbol]; exists {
-		// Syarat signal delay bar
 		if c.OpenTime.After(pending.PlacedTime) || c.OpenTime.Equal(pending.PlacedTime) {
-			penTick := filter.TickSize.Mul(decimal.NewFromInt(int64(s.Cfg.PenetrationTicks)))
-			if penTick.IsZero() {
-				penTick = decimal.NewFromFloat(0.01)
-			}
-
-			filled := false
-			limitP := pending.Intent.LimitPrice
+			openDec := decimal.NewFromFloat(c.Open)
 			lowDec := decimal.NewFromFloat(c.Low)
 			highDec := decimal.NewFromFloat(c.High)
 
-			if pending.Intent.Side == model.SideLong {
-				// LIMIT Buy terisi hanya jika Low menembus sedikitnya 1 tick di bawah limit price
-				if lowDec.LessThanOrEqual(limitP.Sub(penTick)) {
-					filled = true
+			if strings.EqualFold(s.Cfg.EntryOrderType, "MARKET") {
+				fillPrice := openDec
+				if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
+					if pending.Intent.Side == model.SideLong {
+						fillPrice = openDec.Mul(decimal.NewFromFloat(1.0).Add(s.Cfg.SlippageRate))
+					} else {
+						fillPrice = openDec.Mul(decimal.NewFromFloat(1.0).Sub(s.Cfg.SlippageRate))
+					}
 				}
-			} else {
-				// LIMIT Sell terisi hanya jika High menembus sedikitnya 1 tick di atas limit price
-				if highDec.GreaterThanOrEqual(limitP.Add(penTick)) {
-					filled = true
+				if filter.TickSize.GreaterThan(decimal.Zero) {
+					if q, qErr := model.QuantizePrice(fillPrice, filter.TickSize, pending.Intent.Side == model.SideLong); qErr == nil && q.GreaterThan(decimal.Zero) {
+						fillPrice = q
+					}
 				}
-			}
+				takerFee := fillPrice.Mul(pending.Intent.Qty).Mul(s.Cfg.TakerFeeRate)
+				s.RealizedEquityUSDT = s.RealizedEquityUSDT.Sub(takerFee)
 
-			if filled {
-				fillPrice := limitP
-				makerFee := fillPrice.Mul(pending.Intent.Qty).Mul(s.Cfg.MakerFeeRate)
-				s.RealizedEquityUSDT = s.RealizedEquityUSDT.Sub(makerFee)
-
-				pos := &SimPosition{
-					Symbol:         c.Symbol,
-					Side:           pending.Intent.Side,
-					Qty:            pending.Intent.Qty,
-					InitialQty:     pending.Intent.Qty,
-					EntryPrice:     fillPrice,
-					EntryFee:       makerFee,
-					CurrentSLPrice: pending.Intent.SLPrice,
-					InitialSLPrice: pending.Intent.SLPrice,
-					TPPrice:        pending.Intent.TPPrice,
-					TP1Price:       pending.Intent.TP1Price,
-					IsTP1Hit:       false,
-					ATRAtEntry:     pending.Intent.ATRAtEntry,
-					PeakPrice:      fillPrice,
-					OpenTime:       c.OpenTime,
-					OpenBarIndex:   barIndex,
-					SignalAuditID:  pending.Intent.SignalAuditID,
-					LastClosePrice: decimal.NewFromFloat(c.Close),
-				}
+				pos := s.newSimPositionLocked(c, pending, fillPrice, takerFee, false, barIndex)
 				s.OpenPositions[c.Symbol] = pos
 				delete(s.PendingOrders, c.Symbol)
-			} else if !c.CloseTime.Before(pending.TimeoutTime) {
-				// Expired timeout
-				delete(s.PendingOrders, c.Symbol)
+				s.Stats.Filled++
+				s.Stats.MarketFilled++
+			} else {
+				// Opsional: Simulasi GTX Repeg di harga pembukaan bar bila pasar membuka menjauh dari limit
+				shouldEvalFill := true
+				if s.Cfg.MaxEntryRepegAttempts > 0 && pending.RepegAttempts < s.Cfg.MaxEntryRepegAttempts && openDec.GreaterThan(decimal.Zero) {
+					movedAway := (pending.Intent.Side == model.SideLong && openDec.GreaterThan(pending.Intent.LimitPrice)) ||
+						(pending.Intent.Side == model.SideShort && openDec.LessThan(pending.Intent.LimitPrice))
+					if movedAway {
+						if repegged, okRepeg := s.tryRepegPendingLocked(pending, openDec, filter); okRepeg {
+							pending.Intent = repegged
+							pending.RepegAttempts++
+							s.Stats.Repegged++
+						} else {
+							delete(s.PendingOrders, c.Symbol)
+							s.Stats.RepegAborted++
+							shouldEvalFill = false
+						}
+					}
+				}
+
+				if shouldEvalFill {
+					penTick := filter.TickSize.Mul(decimal.NewFromInt(int64(s.Cfg.PenetrationTicks)))
+					if penTick.IsZero() {
+						penTick = decimal.NewFromFloat(0.01)
+					}
+
+					filled := false
+					limitP := pending.Intent.LimitPrice
+					if pending.Intent.Side == model.SideLong {
+						if lowDec.LessThanOrEqual(limitP.Sub(penTick)) {
+							filled = true
+						}
+					} else {
+						if highDec.GreaterThanOrEqual(limitP.Add(penTick)) {
+							filled = true
+						}
+					}
+
+					if filled {
+						fillPrice := limitP
+						makerFee := fillPrice.Mul(pending.Intent.Qty).Mul(s.Cfg.MakerFeeRate)
+						s.RealizedEquityUSDT = s.RealizedEquityUSDT.Sub(makerFee)
+
+						pos := s.newSimPositionLocked(c, pending, fillPrice, makerFee, true, barIndex)
+						s.OpenPositions[c.Symbol] = pos
+						delete(s.PendingOrders, c.Symbol)
+						s.Stats.Filled++
+					} else if !c.CloseTime.Before(pending.TimeoutTime) {
+						delete(s.PendingOrders, c.Symbol)
+						s.Stats.TimedOut++
+					}
+				}
 			}
 		}
 	}
@@ -318,6 +353,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	// [PESSIMISTIC INTRABAR CONFLICT]
 	// Jika SL dan TP sama-sama tersentuh di candle yang sama: SL dieksekusi lebih dulu!
 	if slTouched && (tp1Touched || tpFullTouched) && s.Cfg.IntrabarConflictSLFirst {
+		s.Stats.SLFirstConflicts++
 		tp1Touched = false
 		tpFullTouched = false
 	}
@@ -401,6 +437,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			pos.ProtectionTier = 1
 		} else {
 			// Posisi terlalu kecil untuk dipecah (MinNotional / MinQty): transisikan 100% menjadi runner BE
+			s.Stats.UnsplittableTP1++
 			pos.IsTP1Hit = true
 			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
 			pos.CurrentSLPrice = beSL
@@ -458,7 +495,11 @@ func (s *SimBroker) recordClosedTradeLocked(
 	} else {
 		exitFee = exitPrice.Mul(qty).Mul(s.Cfg.TakerFeeRate)
 	}
-	entryFeeLeg := pos.EntryPrice.Mul(qty).Mul(s.Cfg.MakerFeeRate)
+	entryFeeRate := s.Cfg.MakerFeeRate
+	if !pos.EntryWasMaker {
+		entryFeeRate = s.Cfg.TakerFeeRate
+	}
+	entryFeeLeg := pos.EntryPrice.Mul(qty).Mul(entryFeeRate)
 	totalFee := entryFeeLeg.Add(exitFee)
 
 	// Proporsi funding yang diatribusikan ke trade leg ini menggunakan sisa lot sebelum penutupan (pos.Qty)
@@ -633,10 +674,18 @@ func (s *SimBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, markPrice, t
 func (s *SimBroker) Close() {}
 
 func (s *SimBroker) toProtectionConfig() protection.ProtectionConfig {
+	t1Long := s.Cfg.Tier1BETriggerLongATR
+	if t1Long <= 0 {
+		t1Long = 0.70
+	}
+	t1Short := s.Cfg.Tier1BETriggerShortATR
+	if t1Short <= 0 {
+		t1Short = 0.90
+	}
 	return protection.ProtectionConfig{
 		Tier1BEEnabled:           s.Cfg.Tier1BEEnabled,
-		Tier1BETriggerLongATR:    0.70,
-		Tier1BETriggerShortATR:   0.90,
+		Tier1BETriggerLongATR:    t1Long,
+		Tier1BETriggerShortATR:   t1Short,
 		Tier2ProfitLockEnabled:   s.Cfg.Tier2ProfitLockEnabled,
 		Tier2ProfitLockATR:       s.Cfg.Tier2ProfitLockATR,
 		Tier2ProfitLockOffsetATR: s.Cfg.Tier2ProfitLockOffsetATR,
@@ -649,6 +698,112 @@ func (s *SimBroker) toProtectionConfig() protection.ProtectionConfig {
 		TakerFeeRate:             s.Cfg.TakerFeeRate,
 		SlippageRate:             s.Cfg.SlippageRate,
 	}
+}
+
+func (s *SimBroker) newSimPositionLocked(
+	c data.HistoricalCandle,
+	pending *SimPendingOrder,
+	fillPrice, entryFee decimal.Decimal,
+	wasMaker bool,
+	barIndex int64,
+) *SimPosition {
+	return &SimPosition{
+		Symbol:         c.Symbol,
+		Side:           pending.Intent.Side,
+		Qty:            pending.Intent.Qty,
+		InitialQty:     pending.Intent.Qty,
+		EntryPrice:     fillPrice,
+		EntryFee:       entryFee,
+		EntryWasMaker:  wasMaker,
+		CurrentSLPrice: pending.Intent.SLPrice,
+		InitialSLPrice: pending.Intent.SLPrice,
+		TPPrice:        pending.Intent.TPPrice,
+		TP1Price:       pending.Intent.TP1Price,
+		IsTP1Hit:       false,
+		ATRAtEntry:     pending.Intent.ATRAtEntry,
+		PeakPrice:      fillPrice,
+		OpenTime:       c.OpenTime,
+		OpenBarIndex:   barIndex,
+		SignalAuditID:  pending.Intent.SignalAuditID,
+		LastClosePrice: decimal.NewFromFloat(c.Close),
+	}
+}
+
+func (s *SimBroker) tryRepegPendingLocked(pending *SimPendingOrder, openDec decimal.Decimal, filter model.ExchangeFilter) (model.OrderIntent, bool) {
+	orig := pending.OrigLimitPrice
+	if orig.LessThanOrEqual(decimal.Zero) {
+		orig = pending.Intent.LimitPrice
+	}
+	maxDrift := s.Cfg.MaxEntryRepegDriftPct
+	if maxDrift <= 0 {
+		maxDrift = 0.0005
+	}
+
+	target := openDec
+	tick := filter.TickSize
+	if tick.GreaterThan(decimal.Zero) {
+		roundUp := pending.Intent.Side == model.SideShort
+		if q, err := model.QuantizePrice(openDec, tick, roundUp); err == nil && q.GreaterThan(decimal.Zero) {
+			if pending.Intent.Side == model.SideLong {
+				// Place resting maker bid strictly below open to preserve GTX post-only semantics.
+				if q.GreaterThanOrEqual(openDec) {
+					q = q.Sub(tick)
+				}
+			} else {
+				if q.LessThanOrEqual(openDec) {
+					q = q.Add(tick)
+				}
+			}
+			if q.GreaterThan(decimal.Zero) {
+				target = q
+			}
+		}
+	}
+
+	diff := target.Sub(orig).Abs()
+	maxDist := orig.Mul(decimal.NewFromFloat(maxDrift))
+	if filter.TickSize.GreaterThan(decimal.Zero) {
+		minTick := filter.TickSize.Mul(decimal.NewFromFloat(1.5))
+		if minTick.GreaterThan(maxDist) {
+			maxDist = minTick
+		}
+	}
+	if diff.GreaterThan(maxDist) {
+		return pending.Intent, false
+	}
+	if pending.Intent.ATRAtEntry.GreaterThan(decimal.Zero) && diff.GreaterThan(pending.Intent.ATRAtEntry.Mul(decimal.NewFromFloat(0.25))) {
+		return pending.Intent, false
+	}
+
+	delta := target.Sub(pending.Intent.LimitPrice)
+	updated := pending.Intent
+	updated.LimitPrice = target
+	isShort := updated.Side == model.SideShort
+	if updated.SLPrice.GreaterThan(decimal.Zero) {
+		if q, err := model.QuantizePrice(updated.SLPrice.Add(delta), filter.TickSize, isShort); err == nil {
+			updated.SLPrice = q
+		} else {
+			updated.SLPrice = updated.SLPrice.Add(delta)
+		}
+	}
+	if updated.TPPrice.GreaterThan(decimal.Zero) {
+		if q, err := model.QuantizePrice(updated.TPPrice.Add(delta), filter.TickSize, !isShort); err == nil {
+			updated.TPPrice = q
+		} else {
+			updated.TPPrice = updated.TPPrice.Add(delta)
+		}
+	}
+	if updated.TP1Price.GreaterThan(decimal.Zero) {
+		if q, err := model.QuantizePrice(updated.TP1Price.Add(delta), filter.TickSize, !isShort); err == nil {
+			updated.TP1Price = q
+		} else {
+			updated.TP1Price = updated.TP1Price.Add(delta)
+		}
+	}
+	if filter.MinNotional.GreaterThan(decimal.Zero) && updated.Qty.Mul(updated.LimitPrice).LessThan(filter.MinNotional) {
+		return pending.Intent, false
+	}
+	return updated, true
 }
 
 func (pos *SimPosition) toSnapshot(tickSize decimal.Decimal) protection.PositionSnapshot {

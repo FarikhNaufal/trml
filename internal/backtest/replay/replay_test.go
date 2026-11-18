@@ -9,6 +9,7 @@ import (
 	"trml/internal/backtest/data"
 	"trml/internal/backtest/simbroker"
 	"trml/internal/model"
+	"trml/internal/scanner"
 	"trml/internal/strategy"
 )
 
@@ -185,4 +186,230 @@ func TestSimBrokerFixedEquityAvailableBalanceDeductsUsedMargin(t *testing.T) {
 		t.Fatalf("expected available balance 80.0 USDT (100 - 20 usedMargin) in fixed-equity mode, got %s", avail)
 	}
 }
+
+func TestCalcRollingBufferCap_Minimum1000AndScaled1m(t *testing.T) {
+	if cap5m := CalcRollingBufferCap(5*time.Minute, 200); cap5m != 1000 {
+		t.Fatalf("expected 5m buffer cap 1000, got %d", cap5m)
+	}
+	if cap1m := CalcRollingBufferCap(1*time.Minute, 200); cap1m != 1640 {
+		t.Fatalf("expected 1m buffer cap 1640 (1440 + 200), got %d", cap1m)
+	}
+}
+
+func TestReplayEngine_OIModeStrictVsAutoAndScannerStats(t *testing.T) {
+	t0 := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	step := 5 * time.Minute
+	candles := make([]data.HistoricalCandle, 120)
+	price := 100.0
+	for i := 0; i < len(candles); i++ {
+		if i > 100 {
+			price += 0.2
+		}
+		candles[i] = data.HistoricalCandle{
+			OpenTime:    t0.Add(time.Duration(i) * step),
+			CloseTime:   t0.Add(time.Duration(i+1) * step),
+			Symbol:      "SOLUSDT",
+			Open:        price,
+			High:        price + 0.3,
+			Low:         price - 0.2,
+			Close:       price + 0.1,
+			Volume:      1000,
+			QuoteVolume: 100000,
+		}
+	}
+
+	filters := map[string]model.ExchangeFilter{
+		"SOLUSDT": {
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		},
+	}
+	evalCfg := strategy.EvaluatorConfig{
+		EMAPeriod:           20,
+		ATRPeriod:           14,
+		MaxSlots:            3,
+		MaxSpreadPct:        0.10,
+		BTCGateEnabled:      false,
+		MinOIInterval:       4 * time.Minute,
+		MaxOIInterval:       7 * time.Minute,
+		MaxOIStaleness:      10 * time.Minute,
+		DisableOIFilter:     false,
+		MaxDailyDrawdownPct: -0.05,
+	}
+
+	// 1. Strict mode without OI samples -> must record MISSING_OI_DATA and OIMissingCount > 0
+	simStrict := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000),
+		MaxSlots:          3,
+	})
+	engStrict := NewReplayEngine(ReplayConfig{
+		WarmupBars:            30,
+		DynamicScannerEnabled: true,
+		ScannerInterval:       15 * time.Minute,
+		ScannerCfg: scanner.ScannerConfig{
+			CandleDuration:   5 * time.Minute,
+			MaxWatchedCoins:  5,
+			BootstrapCount:   25,
+			MinVolume24hUSDT: 1000,
+			MaxSpreadPct:     0.15,
+			ATRPeriod:        14,
+			EMAPeriod:        20,
+			MinRVOL:          0.1,
+			MinFallbackRVOL:  0.1,
+			RVOLLookback:     10,
+			MaxNATRPct:       10.0,
+		},
+		OIMode: OIModeStrict,
+	}, evalCfg, simStrict, map[string][]data.HistoricalCandle{"SOLUSDT": candles}, filters)
+	if err := engStrict.Run(context.Background()); err != nil {
+		t.Fatalf("strict run failed: %v", err)
+	}
+	if engStrict.Stats.OIMissingCount == 0 || engStrict.RejectReasons["MISSING_OI_DATA"] == 0 {
+		t.Fatalf("expected MISSING_OI_DATA rejections in strict mode without OI, stats=%+v rejects=%+v", engStrict.Stats, engStrict.RejectReasons)
+	}
+	if engStrict.Stats.ScannerStats.CyclesRun == 0 {
+		t.Fatalf("expected scanner cycles > 0, got %+v", engStrict.Stats.ScannerStats)
+	}
+	if len(simStrict.EquityCurve) == 0 {
+		t.Fatalf("expected timeline EquityCurve points recorded")
+	}
+
+	// 2. Auto/Strict mode with valid 5m OI series -> covered > 0 (~100% coverage)
+	oiMgr := data.NewMetricsOIDownloader(t.TempDir(), nil, nil)
+	pts := make([]data.OpenInterestPoint, 0, len(candles))
+	for _, c := range candles {
+		pts = append(pts, data.OpenInterestPoint{
+			Timestamp:            c.CloseTime,
+			SumOpenInterest:      50000.0,
+			SumOpenInterestValue: 5000000.0,
+		})
+	}
+	oiMgr.SetSeriesForTesting("SOLUSDT", pts)
+	simCovered := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000),
+		MaxSlots:          3,
+	})
+	engCovered := NewReplayEngine(ReplayConfig{
+		WarmupBars: 30,
+		OIMode:     OIModeAuto,
+		OIMgr:      oiMgr,
+	}, evalCfg, simCovered, map[string][]data.HistoricalCandle{"SOLUSDT": candles}, filters)
+	if err := engCovered.Run(context.Background()); err != nil {
+		t.Fatalf("covered run failed: %v", err)
+	}
+	if engCovered.Stats.OICoveredCount == 0 || engCovered.Stats.OICoveragePct < 99.0 {
+		t.Fatalf("expected ~100%% OI coverage from metrics csv, got %+v", engCovered.Stats)
+	}
+}
+
+func TestReplayEngine_SubBar1mExecutionAndDelistSettlement(t *testing.T) {
+	t0 := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	step5m := 5 * time.Minute
+
+	// Two symbols:
+	// BTCUSDT stays alive for 50 bars
+	// DEADUSDT stops producing bars after bar 31 while holding a pending/open position -> ForceClosePosition settles it!
+	btcCandles := make([]data.HistoricalCandle, 60)
+	for i := range btcCandles {
+		btcCandles[i] = data.HistoricalCandle{
+			OpenTime:    t0.Add(time.Duration(i) * step5m),
+			CloseTime:   t0.Add(time.Duration(i+1) * step5m),
+			Symbol:      "BTCUSDT",
+			Open:        50000,
+			High:        50100,
+			Low:         49900,
+			Close:       50050,
+			Volume:      100,
+			QuoteVolume: 5000000,
+		}
+	}
+
+	deadCandles := make([]data.HistoricalCandle, 12)
+	for i := range deadCandles {
+		deadCandles[i] = data.HistoricalCandle{
+			OpenTime:    t0.Add(time.Duration(i) * step5m),
+			CloseTime:   t0.Add(time.Duration(i+1) * step5m),
+			Symbol:      "DEADUSDT",
+			Open:        10.0,
+			High:        10.2,
+			Low:         9.8,
+			Close:       10.0,
+			Volume:      1000,
+			QuoteVolume: 10000,
+		}
+	}
+
+	// Build 1m sub-bars covering deadCandles for minutes inside the 5m intervals
+	dead1m := make([]data.HistoricalCandle, 0, len(deadCandles)*5)
+	for _, c5 := range deadCandles {
+		for m := 0; m < 5; m++ {
+			mo := c5.OpenTime.Add(time.Duration(m) * time.Minute)
+			dead1m = append(dead1m, data.HistoricalCandle{
+				OpenTime:  mo,
+				CloseTime: mo.Add(time.Minute),
+				Symbol:    "DEADUSDT",
+				Open:      10.0,
+				High:      10.1,
+				Low:       9.9,
+				Close:     10.0,
+				Volume:    200,
+			})
+		}
+	}
+
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000),
+		MaxSlots:          3,
+		EntryOrderType:    "MARKET",
+		MakerFeeRate:      decimal.NewFromFloat(0.0002),
+		TakerFeeRate:      decimal.NewFromFloat(0.0005),
+	})
+	sim.SetExchangeFilter("DEADUSDT", model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(1.0),
+		MinNotional: decimal.NewFromFloat(5.0),
+	})
+	// Pre-place an entry right before bar 10 closes so 1m sub-bars fill DEADUSDT before bar 12 stops.
+	_, _ = sim.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "DELIST_POS",
+		Symbol:        "DEADUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(10.0),
+		Qty:           decimal.NewFromFloat(5.0),
+		SLPrice:       decimal.NewFromFloat(8.0),
+		TPPrice:       decimal.NewFromFloat(15.0),
+		CreatedAt:     deadCandles[9].CloseTime,
+	})
+
+	eng := NewReplayEngine(ReplayConfig{
+		WarmupBars:    5,
+		BenchmarkSym:  "BTCUSDT",
+		OIMode:        OIModeOff,
+		ExecCandleMap: map[string][]data.HistoricalCandle{"DEADUSDT": dead1m},
+	}, strategy.EvaluatorConfig{
+		EMAPeriod:           200, // disable auto signals; test isolates sub-bar fill + delist settlement
+		MaxDailyDrawdownPct: -0.05,
+	}, sim, map[string][]data.HistoricalCandle{
+		"BTCUSDT":  btcCandles,
+		"DEADUSDT": deadCandles,
+	}, map[string]model.ExchangeFilter{
+		"DEADUSDT": {TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(1.0), MinNotional: decimal.NewFromFloat(5.0)},
+	})
+
+	if err := eng.Run(context.Background()); err != nil {
+		t.Fatalf("replay failed: %v", err)
+	}
+	if eng.Stats.SubBarExecCount == 0 {
+		t.Fatalf("expected 1m sub-bar execution count > 0, got %+v", eng.Stats)
+	}
+	if eng.Stats.DelistForceClosed != 1 || sim.Stats.DelistSettled != 1 {
+		t.Fatalf("expected DelistForceClosed=1 and DelistSettled=1, replay=%+v sim=%+v", eng.Stats, sim.Stats)
+	}
+	if len(sim.ClosedTrades) != 1 || sim.ClosedTrades[0].ExitReason != "DELIST_OR_DATA_END_SETTLE" {
+		t.Fatalf("expected DELIST_OR_DATA_END_SETTLE trade, got %+v", sim.ClosedTrades)
+	}
+}
+
 

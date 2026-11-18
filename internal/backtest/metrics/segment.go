@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"math"
+	"sort"
+	"time"
 )
 
 type SegmentStats struct {
@@ -18,10 +20,21 @@ type SegmentStats struct {
 	ProfitFactor float64 `json:"profit_factor"`
 }
 
+// SymbolAttribution summarizes net profit/loss contribution by trading pair.
+type SymbolAttribution struct {
+	Symbol      string  `json:"symbol"`
+	Trades      int     `json:"trades"`
+	Wins        int     `json:"wins"`
+	WinRatePct  float64 `json:"win_rate_pct"`
+	TotalNetPnL float64 `json:"total_net_pnl"`
+	TotalFees   float64 `json:"total_fees"`
+}
+
 type SegmentationReport struct {
 	NATRSegments    []SegmentStats `json:"natr_segments"`
 	SessionSegments []SegmentStats `json:"session_segments"`
 	SideSegments    []SegmentStats `json:"side_segments"`
+	HoldingSegments []SegmentStats `json:"holding_segments,omitempty"`
 }
 
 // CalculateSegmentation mengelompokkan trade ke dalam bucket statistik bebas path-dependency.
@@ -37,15 +50,18 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 	sideLong := newSegment("LONG Positions")
 	sideShort := newSegment("SHORT Positions")
 
+	holdQuick := newSegment("< 15m (Scalp)")
+	holdShort := newSegment("15m - 1h")
+	holdMed := newSegment("1h - 4h")
+	holdLong := newSegment("> 4h")
+
 	for _, t := range trades {
-		// 1. NATR
 		if t.NATRPct < 0.80 {
 			natrLow.addTrade(t)
 		} else {
 			natrHigh.addTrade(t)
 		}
 
-		// 2. Session
 		h := t.EntryTime.UTC().Hour()
 		if h >= 0 && h < 8 {
 			sessAsia.addTrade(t)
@@ -57,11 +73,22 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 			sessLate.addTrade(t)
 		}
 
-		// 3. Side
 		if t.Side == "SHORT" {
 			sideShort.addTrade(t)
 		} else {
 			sideLong.addTrade(t)
+		}
+
+		dur := t.ExitTime.Sub(t.EntryTime)
+		switch {
+		case dur < 15*time.Minute:
+			holdQuick.addTrade(t)
+		case dur < time.Hour:
+			holdShort.addTrade(t)
+		case dur <= 4*time.Hour:
+			holdMed.addTrade(t)
+		default:
+			holdLong.addTrade(t)
 		}
 	}
 
@@ -80,7 +107,71 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 			sideLong.finalize(),
 			sideShort.finalize(),
 		},
+		HoldingSegments: []SegmentStats{
+			holdQuick.finalize(),
+			holdShort.finalize(),
+			holdMed.finalize(),
+			holdLong.finalize(),
+		},
 	}
+}
+
+// CalculateSymbolAttribution returns the topN most profitable and bottomN worst symbols.
+func CalculateSymbolAttribution(trades []AggregatedTrade, topN int) (top, bottom []SymbolAttribution) {
+	if len(trades) == 0 || topN <= 0 {
+		return nil, nil
+	}
+	bySym := make(map[string]*SymbolAttribution)
+	for _, t := range trades {
+		sa, ok := bySym[t.Symbol]
+		if !ok {
+			sa = &SymbolAttribution{Symbol: t.Symbol}
+			bySym[t.Symbol] = sa
+		}
+		sa.Trades++
+		if t.NetPnL > 0.0001 {
+			sa.Wins++
+		}
+		sa.TotalNetPnL += t.NetPnL
+		sa.TotalFees += t.TotalFees
+	}
+
+	all := make([]SymbolAttribution, 0, len(bySym))
+	for _, sa := range bySym {
+		if sa.Trades > 0 {
+			sa.WinRatePct = (float64(sa.Wins) / float64(sa.Trades)) * 100.0
+		}
+		all = append(all, *sa)
+	}
+
+	// Best performers descending
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].TotalNetPnL != all[j].TotalNetPnL {
+			return all[i].TotalNetPnL > all[j].TotalNetPnL
+		}
+		return all[i].Symbol < all[j].Symbol
+	})
+	if len(all) <= topN {
+		top = append([]SymbolAttribution(nil), all...)
+	} else {
+		top = append([]SymbolAttribution(nil), all[:topN]...)
+	}
+
+	// Worst performers ascending
+	rev := make([]SymbolAttribution, len(all))
+	copy(rev, all)
+	sort.Slice(rev, func(i, j int) bool {
+		if rev[i].TotalNetPnL != rev[j].TotalNetPnL {
+			return rev[i].TotalNetPnL < rev[j].TotalNetPnL
+		}
+		return rev[i].Symbol < rev[j].Symbol
+	})
+	if len(rev) <= topN {
+		bottom = rev
+	} else {
+		bottom = rev[:topN]
+	}
+	return top, bottom
 }
 
 type segmentAccumulator struct {

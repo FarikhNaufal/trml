@@ -8,32 +8,52 @@ import (
 )
 
 type SimBrokerConfig struct {
-	InitialEquityUSDT       decimal.Decimal
-	MaxSlots                int
-	MaxDailyDrawdownPct     float64
-	AccountLeverage         float64
-	MakerFeeRate            decimal.Decimal // default 0.0002 (2.0 bps)
-	TakerFeeRate            decimal.Decimal // default 0.0005 (5.0 bps)
-	SlippageRate            decimal.Decimal // default 0.0005 (5.0 bps pada market SL/exit)
-	SLGapFillEnabled        bool            // default false (9815362: nominal SL, true: candle open gap fill)
-	SignalDelayBars         int             // delay bar sebelum limit entry aktif (default 1)
-	LimitTimeoutBars        int             // batas bar sebelum limit order expired (default 1)
-	PenetrationTicks        int             // syarat tembus tick agar limit order terisi (default 1)
-	IntrabarConflictSLFirst bool            // pesimistis default: jika SL dan TP tersentuh di bar yg sama, SL kena duluan
-	PartialTPEnabled        bool            // default true
-	PartialTP1Ratio         float64         // default 0.50
-	PartialTP1ATRMult       float64         // default 1.00
-	Tier1BEEnabled          bool            // default true
-	MinBreakEvenOffsetPct   float64         // default 0.0010
-	RunnerBECushionATR      float64         // default 0.0
-	Tier2ProfitLockEnabled  bool            // default false
-	Tier2ProfitLockATR      float64         // default 1.55 (atau 1.80)
-	Tier2ProfitLockOffsetATR float64        // default 0.75 (atau 0.90)
-	TrailingEnabled         bool            // default true
-	TrailingActivateATR     float64         // default 1.10
-	TrailingDistanceATR     float64         // default 0.55
-	MaxHoldingDuration      time.Duration   // default 4 hours (48 bars 5m)
-	EquityModeCompounding   bool            // true: compounding, false: fixed start equity
+	InitialEquityUSDT        decimal.Decimal
+	MaxSlots                 int
+	MaxDailyDrawdownPct      float64
+	AccountLeverage          float64
+	EntryOrderType           string          // "LIMIT" or "MARKET"
+	MakerFeeRate             decimal.Decimal // default 0.0002 (2.0 bps)
+	TakerFeeRate             decimal.Decimal // default 0.0005 (5.0 bps)
+	SlippageRate             decimal.Decimal // default 0.0005 (5.0 bps pada market SL/exit)
+	SLGapFillEnabled         bool            // default false (9815362: nominal SL, true: candle open gap fill)
+	SignalDelayBars          int             // delay bar sebelum limit entry aktif (default 1)
+	LimitTimeoutBars         int             // fallback batas bar bila LimitOrderTimeout <= 0 (default 1)
+	LimitOrderTimeout        time.Duration   // presisi detik timeout limit entry (misal 150s, selaras Live/DryRun)
+	MaxEntryRepegAttempts    int             // batas GTX Repeg pada pembukaan bar (default 0 untuk backtest murni atau 3 dari env)
+	MaxEntryRepegDriftPct    float64         // batas drift max repeg (default 0.0005)
+	PenetrationTicks         int             // syarat tembus tick agar limit order terisi (default 1)
+	IntrabarConflictSLFirst  bool            // pesimistis default: jika SL dan TP tersentuh di bar yg sama, SL kena duluan
+	PartialTPEnabled         bool            // default true
+	PartialTP1Ratio          float64         // default 0.50
+	PartialTP1ATRMult        float64         // default 1.00
+	Tier1BEEnabled           bool            // default true
+	Tier1BETriggerLongATR    float64         // default 0.70
+	Tier1BETriggerShortATR   float64         // default 0.90
+	MinBreakEvenOffsetPct    float64         // default 0.0010
+	RunnerBECushionATR       float64         // default 0.0
+	Tier2ProfitLockEnabled   bool            // default false
+	Tier2ProfitLockATR       float64         // default 1.55 (atau 1.80)
+	Tier2ProfitLockOffsetATR float64         // default 0.75 (atau 0.90)
+	TrailingEnabled          bool            // default true
+	TrailingActivateATR      float64         // default 1.10
+	TrailingDistanceATR      float64         // default 0.55
+	MaxHoldingDuration       time.Duration   // default 4 hours (48 bars 5m)
+	EquityModeCompounding    bool            // true: compounding, false: fixed start equity
+}
+
+// SimExecutionStats records execution microstructure telemetry across a backtest run.
+type SimExecutionStats struct {
+	Submitted           int `json:"submitted"`
+	Filled              int `json:"filled"`
+	MarketFilled        int `json:"market_filled"`
+	TimedOut            int `json:"timed_out"`
+	Repegged            int `json:"repegged"`
+	RepegAborted        int `json:"repeg_aborted"`
+	UnsplittableTP1     int `json:"unsplittable_tp1"`
+	SLFirstConflicts    int `json:"sl_first_conflicts"`
+	DelistSettled       int `json:"delist_settled"`
+	FundingSettlements  int `json:"funding_settlements"`
 }
 
 type SimTradeRecord struct {
@@ -63,32 +83,35 @@ type SimTradeRecord struct {
 }
 
 type SimPendingOrder struct {
-	Intent      model.OrderIntent
-	PlacedBar   int64
-	PlacedTime  time.Time
-	TimeoutTime time.Time
+	Intent         model.OrderIntent
+	OrigLimitPrice decimal.Decimal
+	PlacedBar      int64
+	PlacedTime     time.Time
+	TimeoutTime    time.Time
+	RepegAttempts  int
 }
 
 type SimPosition struct {
-	Symbol         string
-	Side           model.Side
-	Qty            decimal.Decimal
-	InitialQty     decimal.Decimal
-	EntryPrice     decimal.Decimal
-	EntryFee       decimal.Decimal
-	FundingPaid    decimal.Decimal
-	CurrentSLPrice decimal.Decimal
-	InitialSLPrice decimal.Decimal
-	TPPrice        decimal.Decimal
-	TP1Price       decimal.Decimal
-	IsTP1Hit       bool
-	ATRAtEntry     decimal.Decimal
-	PeakPrice      decimal.Decimal
-	OpenTime       time.Time
-	OpenBarIndex   int64
-	MaxMAE         float64
-	MaxMFE         float64
-	SignalAuditID  int64
-	ProtectionTier int
-	LastClosePrice decimal.Decimal
+	Symbol           string
+	Side             model.Side
+	Qty              decimal.Decimal
+	InitialQty       decimal.Decimal
+	EntryPrice       decimal.Decimal
+	EntryFee         decimal.Decimal
+	EntryWasMaker    bool
+	FundingPaid      decimal.Decimal
+	CurrentSLPrice   decimal.Decimal
+	InitialSLPrice   decimal.Decimal
+	TPPrice          decimal.Decimal
+	TP1Price         decimal.Decimal
+	IsTP1Hit         bool
+	ATRAtEntry       decimal.Decimal
+	PeakPrice        decimal.Decimal
+	OpenTime         time.Time
+	OpenBarIndex     int64
+	MaxMAE           float64
+	MaxMFE           float64
+	SignalAuditID    int64
+	ProtectionTier   int
+	LastClosePrice   decimal.Decimal
 }

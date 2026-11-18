@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/backtest/data"
 	"trml/internal/backtest/simbroker"
 	"trml/internal/model"
 )
@@ -126,4 +127,77 @@ func TestCalculateMetrics_NetProfitFactor(t *testing.T) {
 		t.Errorf("expected NetProfitFactor 1.6 (8.0/5.0), got %f", summary.NetProfitFactor)
 	}
 }
+
+func TestCalculateMetricsV2_MTMDrawdownRegimeAndAttribution(t *testing.T) {
+	t0 := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	// Build 60 BTC bull trend candles (rising smoothly so Close > EMA & VWAP).
+	btc := make([]data.HistoricalCandle, 60)
+	price := 40000.0
+	for i := range btc {
+		price += 20.0
+		btc[i] = data.HistoricalCandle{
+			Symbol:    "BTCUSDT",
+			OpenTime:  t0.Add(time.Duration(i) * 5 * time.Minute),
+			CloseTime: t0.Add(time.Duration(i+1) * 5 * time.Minute),
+			Open:      price - 10,
+			High:      price + 20,
+			Low:       price - 20,
+			Close:     price,
+			Volume:    100,
+		}
+	}
+
+	raw := []simbroker.SimTradeRecord{
+		{
+			ID: "T1", Symbol: "SOLUSDT", Side: model.SideLong,
+			EntryTime: btc[50].CloseTime, ExitTime: btc[50].CloseTime.Add(20 * time.Minute),
+			EntryPrice: decimal.NewFromFloat(100), SLPrice: decimal.NewFromFloat(98),
+			InitialQty: decimal.NewFromFloat(5), Qty: decimal.NewFromFloat(5),
+			GrossPnL: decimal.NewFromFloat(25), NetPnL: decimal.NewFromFloat(24),
+			ExitReason: "TAKE_PROFIT",
+		},
+		{
+			ID: "T2", Symbol: "DOGEUSDT", Side: model.SideLong,
+			EntryTime: btc[52].CloseTime, ExitTime: btc[52].CloseTime.Add(10 * time.Minute),
+			EntryPrice: decimal.NewFromFloat(1), SLPrice: decimal.NewFromFloat(0.95),
+			InitialQty: decimal.NewFromFloat(100), Qty: decimal.NewFromFloat(100),
+			GrossPnL: decimal.NewFromFloat(-4), NetPnL: decimal.NewFromFloat(-5),
+			ExitReason: "STOP_LOSS",
+		},
+	}
+
+	// Equity curve includes an unrealized floating dip down to 920 before recovering -> MTM DD must exceed closed-trade DD!
+	curve := []simbroker.EquityPoint{
+		{Time: t0, RealizedEquity: 1000, EffectiveEquity: 1000, OpenPositions: 1},
+		{Time: t0.Add(24 * time.Hour), RealizedEquity: 1000, EffectiveEquity: 920, OpenPositions: 1},
+		{Time: t0.Add(48 * time.Hour), RealizedEquity: 1019, EffectiveEquity: 1019, OpenPositions: 0},
+	}
+
+	summary := CalculateMetricsV2(raw, curve, 1000.0, btc, &ScannerAudit{CyclesRun: 10}, &ExecutionAudit{OICoveragePct: 95.5})
+	if summary.MTMMaxDrawdownUSDT < 79.9 || summary.MTMMaxDrawdownPct <= summary.MaxDrawdownPct {
+		t.Fatalf("expected MTM DD (%.2f USDT / %.2f%%) > Closed DD (%.2f%%)",
+			summary.MTMMaxDrawdownUSDT, summary.MTMMaxDrawdownPct, summary.MaxDrawdownPct)
+	}
+	if summary.UlcerIndex <= 0 || summary.ExposurePct <= 0 || summary.AvgRMultiple == 0 {
+		t.Fatalf("expected non-zero UlcerIndex/ExposurePct/AvgRMultiple: %+v", summary)
+	}
+	if len(summary.TopSymbols) != 2 || summary.TopSymbols[0].Symbol != "SOLUSDT" || summary.BottomSymbols[0].Symbol != "DOGEUSDT" {
+		t.Fatalf("unexpected symbol attribution: top=%+v bottom=%+v", summary.TopSymbols, summary.BottomSymbols)
+	}
+	if len(summary.Segmentation.HoldingSegments) != 4 {
+		t.Fatalf("expected 4 holding buckets, got %d", len(summary.Segmentation.HoldingSegments))
+	}
+
+	bullCount := 0
+	for _, r := range summary.RegimeSegments {
+		if r.Name == RegimeBTCBull {
+			bullCount = r.TotalTrades
+		}
+	}
+	if bullCount != 2 {
+		t.Fatalf("expected both trades classified into BTC_BULL, got regimes=%+v", summary.RegimeSegments)
+	}
+}
+
 

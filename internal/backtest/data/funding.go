@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,27 +27,37 @@ type HistoricalFundingRate struct {
 
 // FundingManager bertugas mengunduh, menyimpan cache, dan melayani data historical funding rate.
 type FundingManager struct {
-	cacheDir string
-	client   *http.Client
-	rates    map[string][]HistoricalFundingRate // symbol -> sorted rates
-	offline  bool
+	dirs       BacktestDirs
+	cacheDir   string
+	httpClient *BacktestHTTPClient
+	rates      map[string][]HistoricalFundingRate
+	offline    bool
 }
 
 func NewFundingManager(cacheDir string) *FundingManager {
-	if cacheDir == "" {
-		cacheDir = filepath.Join("data", "backtest", "cache")
-	}
+	dirs := ResolveBacktestDirs(cacheDir)
 	return &FundingManager{
-		cacheDir: cacheDir,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		rates: make(map[string][]HistoricalFundingRate),
+		dirs:       dirs,
+		cacheDir:   dirs.LegacyCSV,
+		httpClient: NewBacktestHTTPClient(BacktestHTTPConfig{AllowRESTFallback: false}),
+		rates:      make(map[string][]HistoricalFundingRate),
 	}
 }
 
 func (fm *FundingManager) SetOffline(offline bool) {
 	fm.offline = offline
+}
+
+func (fm *FundingManager) SetHTTPClient(client *BacktestHTTPClient) {
+	if client != nil {
+		fm.httpClient = client
+	}
+}
+
+func (fm *FundingManager) SetAllowRESTFallback(allow bool) {
+	if fm.httpClient != nil {
+		fm.httpClient.SetAllowRESTFallback(allow)
+	}
 }
 
 // LoadFundingRates memuat funding rates untuk sekumpulan simbol dalam rentang tanggal [from..to] secara paralel.
@@ -64,7 +73,7 @@ func (fm *FundingManager) LoadFundingRates(ctx context.Context, symbols []string
 	}
 	close(taskChan)
 
-	numWorkers := 16
+	numWorkers := 8
 	if total < numWorkers {
 		numWorkers = total
 	}
@@ -93,29 +102,28 @@ func (fm *FundingManager) LoadFundingRates(ctx context.Context, symbols []string
 }
 
 // GetFundingRate mengembalikan funding rate yang aktif pada waktu simTime untuk simbol tertentu.
+// Jika simTime lebih awal dari sampel historis pertama, mengembalikan baseline 0.0001 (tanpa look-ahead).
 func (fm *FundingManager) GetFundingRate(symbol string, simTime time.Time) float64 {
 	list, ok := fm.rates[symbol]
 	if !ok || len(list) == 0 {
-		return 0.0001 // Fallback jika data historis tidak tersedia (0.01% baseline)
+		return 0.0001
 	}
 
-	// Binary search mencari funding rate terakhir sebelum atau tepat pada simTime
 	idx := sort.Search(len(list), func(i int) bool {
 		return list[i].FundingTime.After(simTime)
 	})
 
 	if idx == 0 {
-		return list[0].FundingRate
+		return 0.0001
 	}
 	return list[idx-1].FundingRate
 }
 
 // CheckSettlement memeriksa apakah pada bar candlestick [openTime, closeTime] terjadi settlement pendanaan bursa.
-// Mengembalikan nilai funding rate dan true jika bar ini adalah bar settlement.
+// Menghindari double-settlement ketika closeTime tepat jatuh pada detik pembukaan bar berikutnya.
 func (fm *FundingManager) CheckSettlement(symbol string, openTime, closeTime time.Time) (float64, bool) {
 	list, ok := fm.rates[symbol]
 	if !ok || len(list) == 0 {
-		// Fallback settlement jika tidak ada data: periksa jam 00, 08, 16 UTC tepat pada openTime
 		if openTime.Minute() == 0 && (openTime.Hour()%8 == 0) {
 			return 0.0001, true
 		}
@@ -124,11 +132,20 @@ func (fm *FundingManager) CheckSettlement(symbol string, openTime, closeTime tim
 
 	openSec := openTime.Unix()
 	closeSec := closeTime.Unix()
+	// Binance standard closes at ...999ms (unix second strictly < next bar).
+	// If closeTime is exact second (e.g. openTime + 5m), treat upper boundary as half-open [openSec, closeSec).
+	exclusiveUpper := closeTime.UnixMilli()%1000 == 0 && closeSec > openSec
 
-	// Cari apakah ada funding event di dalam rentang detik bar ini
 	for _, f := range list {
 		fSec := f.FundingTime.Unix()
-		if fSec >= openSec && fSec <= closeSec {
+		if fSec < openSec {
+			continue
+		}
+		if exclusiveUpper {
+			if fSec < closeSec {
+				return f.FundingRate, true
+			}
+		} else if fSec <= closeSec {
 			return f.FundingRate, true
 		}
 		if fSec > closeSec+300 {
@@ -160,8 +177,7 @@ func (fm *FundingManager) fetchSymbolFunding(ctx context.Context, symbol string,
 		month := int(cur.Month())
 
 		rates, err := fm.fetchMonthlyFunding(ctx, symbol, year, month, fundingDir)
-		if err != nil && !fm.offline {
-			// Fallback ke REST API jika arsip bulanan Binance Vision belum terbit (misal bulan berjalan / hari ini)
+		if err != nil && !fm.offline && fm.httpClient.AllowRESTFallback() {
 			rates, err = fm.fetchLiveAPIFunding(ctx, symbol, cur, fundingDir)
 			if err != nil {
 				slog.Debug("fallback live funding failed", "symbol", symbol, "year", year, "month", month, "err", err)
@@ -175,22 +191,19 @@ func (fm *FundingManager) fetchSymbolFunding(ctx context.Context, symbol string,
 		cur = cur.AddDate(0, 1, 0)
 	}
 
-	if len(allRates) == 0 && !fm.offline {
-		// Percobaan terakhir: fetch langsung via live API untuk rentang tanggal
+	if len(allRates) == 0 && !fm.offline && fm.httpClient.AllowRESTFallback() {
 		rates, err := fm.fetchLiveAPIFundingRange(ctx, symbol, from, to)
 		if err == nil && len(rates) > 0 {
 			allRates = rates
 		}
 	}
 
-	// Urutkan berdasarkan waktu
 	sort.Slice(allRates, func(i, j int) bool {
 		return allRates[i].FundingTime.Before(allRates[j].FundingTime)
 	})
 
-	// Deduplikasi
 	deduped := make([]HistoricalFundingRate, 0, len(allRates))
-	seen := make(map[int64]bool)
+	seen := make(map[int64]bool, len(allRates))
 	for _, r := range allRates {
 		sec := r.FundingTime.Unix()
 		if !seen[sec] {
@@ -208,45 +221,40 @@ func (fm *FundingManager) fetchMonthlyFunding(
 	year, month int,
 	fundingDir string,
 ) ([]HistoricalFundingRate, error) {
-	cacheFile := filepath.Join(fundingDir, fmt.Sprintf("%s-fundingRate-%04d-%02d.csv", symbol, year, month))
+	ym := fmt.Sprintf("%04d-%02d", year, month)
+	binPath := filepath.Join(fm.dirs.StoreDir, symbol, "funding", ym+".bin")
+	isCurrentMonth := year == time.Now().UTC().Year() && time.Month(month) == time.Now().UTC().Month()
+	if !isCurrentMonth {
+		if rates, err := ReadCompactFundingBin(binPath); err == nil && len(rates) > 0 {
+			return rates, nil
+		}
+	}
 
-	// 1. Cek disk cache
+	cacheFile := filepath.Join(fundingDir, fmt.Sprintf("%s-fundingRate-%s.csv", symbol, ym))
 	if fileInfo, err := os.Stat(cacheFile); err == nil && fileInfo.Size() > 0 {
-		isCurrentMonth := year == time.Now().UTC().Year() && time.Month(month) == time.Now().UTC().Month()
-		// Jika bulan lampau, cache permanen berlaku. Jika bulan berjalan, gunakan cache jika masih fresh (< 4 jam).
 		if !isCurrentMonth || time.Since(fileInfo.ModTime()) < 4*time.Hour || fm.offline {
 			if fileBytes, err := os.ReadFile(cacheFile); err == nil && len(fileBytes) > 0 {
-				return parseFundingCSV(bytes.NewReader(fileBytes))
+				rates, pErr := parseFundingCSV(bytes.NewReader(fileBytes))
+				if pErr == nil && len(rates) > 0 && !isCurrentMonth {
+					_ = WriteCompactFundingBin(binPath, rates)
+				}
+				return rates, pErr
 			}
 		}
 	}
 
 	if fm.offline {
-		return nil, fmt.Errorf("offline: funding rate %s-%04d-%02d tidak ada di cache", symbol, year, month)
+		return nil, fmt.Errorf("offline: funding rate %s-%s tidak ada di cache", symbol, ym)
 	}
 
-	// 2. Unduh zip dari Binance Vision
-	zipName := fmt.Sprintf("%s-fundingRate-%04d-%02d.zip", symbol, year, month)
-	url := fmt.Sprintf("https://data.binance.vision/data/futures/um/monthly/fundingRate/%s/%s", symbol, zipName)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	zipName := fmt.Sprintf("%s-fundingRate-%s.zip", symbol, ym)
+	rawURL := fmt.Sprintf("https://data.binance.vision/data/futures/um/monthly/fundingRate/%s/%s", symbol, zipName)
+	zipBytes, status, err := fm.httpClient.GetVision(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
-
-	resp, err := fm.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance vision funding zip not found: HTTP %d", resp.StatusCode)
-	}
-
-	zipBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if status != 200 {
+		return nil, fmt.Errorf("binance vision funding zip not found: HTTP %d", status)
 	}
 
 	zipReader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
@@ -266,8 +274,14 @@ func (fm *FundingManager) fetchMonthlyFunding(
 				return nil, err
 			}
 
-			_ = os.WriteFile(cacheFile, csvBytes, 0644)
-			return parseFundingCSV(bytes.NewReader(csvBytes))
+			rates, pErr := parseFundingCSV(bytes.NewReader(csvBytes))
+			if pErr == nil && len(rates) > 0 {
+				_ = WriteFileAtomic(cacheFile, csvBytes, 0644)
+				if !isCurrentMonth {
+					_ = WriteCompactFundingBin(binPath, rates)
+				}
+			}
+			return rates, pErr
 		}
 	}
 
@@ -295,7 +309,6 @@ func (fm *FundingManager) fetchLiveAPIFunding(
 	}
 
 	if len(rates) > 0 {
-		// Simpan cache ke disk agar tidak menembak REST API berulang-ulang
 		fm.saveRatesToCSV(rates, cacheFile)
 	}
 
@@ -307,9 +320,7 @@ func (fm *FundingManager) fetchLiveAPIFundingRange(
 	symbol string,
 	from, to time.Time,
 ) ([]HistoricalFundingRate, error) {
-	startMs := from.UnixMilli()
-	endMs := to.UnixMilli()
-	return fm.queryBinanceFundingAPI(ctx, symbol, startMs, endMs)
+	return fm.queryBinanceFundingAPI(ctx, symbol, from.UnixMilli(), to.UnixMilli())
 }
 
 func (fm *FundingManager) queryBinanceFundingAPI(
@@ -320,19 +331,9 @@ func (fm *FundingManager) queryBinanceFundingAPI(
 	apiURL := fmt.Sprintf("https://fapi.binance.com/fapi/v1/fundingRate?symbol=%s&startTime=%d&endTime=%d&limit=1000",
 		symbol, startMs, endMs)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	body, _, err := fm.httpClient.GetREST(ctx, apiURL, 1, false)
 	if err != nil {
 		return nil, err
-	}
-
-	resp, err := fm.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance api funding status %d", resp.StatusCode)
 	}
 
 	var rawList []struct {
@@ -341,7 +342,7 @@ func (fm *FundingManager) queryBinanceFundingAPI(
 		FundingTime int64  `json:"fundingTime"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&rawList); err != nil {
+	if err := json.Unmarshal(body, &rawList); err != nil {
 		return nil, err
 	}
 
@@ -365,7 +366,7 @@ func (fm *FundingManager) saveRatesToCSV(rates []HistoricalFundingRate, path str
 	for _, r := range rates {
 		fmt.Fprintf(&sb, "%d,%d,%.8f\n", r.FundingTime.UnixMilli(), r.IntervalHours, r.FundingRate)
 	}
-	_ = os.WriteFile(path, []byte(sb.String()), 0644)
+	_ = WriteFileAtomic(path, []byte(sb.String()), 0644)
 }
 
 func parseFundingCSV(r io.Reader) ([]HistoricalFundingRate, error) {
@@ -383,7 +384,6 @@ func parseFundingCSV(r io.Reader) ([]HistoricalFundingRate, error) {
 		if len(row) < 3 {
 			continue
 		}
-		// Skip header
 		if i == 0 && (strings.Contains(row[0], "calc_time") || strings.Contains(row[0], "time")) {
 			continue
 		}
@@ -408,4 +408,3 @@ func parseFundingCSV(r io.Reader) ([]HistoricalFundingRate, error) {
 
 	return res, nil
 }
-

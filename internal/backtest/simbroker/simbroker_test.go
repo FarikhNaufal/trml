@@ -776,5 +776,213 @@ func TestSimBroker_PartialTP1_UnsplittableMovesToBERunner(t *testing.T) {
 	}
 }
 
+func TestSimBroker_MarketEntryUsesTakerFeeAndOpenSlippage(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		EntryOrderType:    "MARKET",
+		MakerFeeRate:      decimal.NewFromFloat(0.0002),
+		TakerFeeRate:      decimal.NewFromFloat(0.0005),
+		SlippageRate:      decimal.NewFromFloat(0.0010), // 10 bps
+	}
+	b := NewSimBroker(cfg)
+	b.SetExchangeFilter("ETHUSDT", model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.1),
+		StepSize: decimal.NewFromFloat(0.01),
+	})
+
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	ok, reason := b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "MKT_1",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(90.0),
+		TPPrice:       decimal.NewFromFloat(120.0),
+		CreatedAt:     now,
+	})
+	if !ok {
+		t.Fatalf("expected submit ok, got %s", reason)
+	}
+
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now, CloseTime: now.Add(5 * time.Minute),
+		Symbol: "ETHUSDT", Open: 100.0, High: 101.0, Low: 99.5, Close: 100.5,
+	}, 0)
+
+	pos := b.OpenPositions["ETHUSDT"]
+	if pos == nil {
+		t.Fatalf("expected open position")
+	}
+	expectedEntry := decimal.NewFromFloat(100.1) // 100.0 * (1 + 0.001)
+	if !pos.EntryPrice.Equal(expectedEntry) {
+		t.Fatalf("expected market fill at %s, got %s", expectedEntry, pos.EntryPrice)
+	}
+	if pos.EntryWasMaker {
+		t.Fatalf("expected EntryWasMaker=false for MARKET order")
+	}
+	expectedFee := expectedEntry.Mul(cfg.TakerFeeRate)
+	if !pos.EntryFee.Equal(expectedFee) {
+		t.Fatalf("expected taker entry fee %s, got %s", expectedFee, pos.EntryFee)
+	}
+	if b.Stats.MarketFilled != 1 || b.Stats.Filled != 1 {
+		t.Fatalf("expected MarketFilled=1 Filled=1, got %+v", b.Stats)
+	}
+}
+
+func TestSimBroker_GTXRepegAndDriftAbort(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT:     decimal.NewFromFloat(1000.0),
+		MakerFeeRate:          decimal.NewFromFloat(0.0002),
+		TakerFeeRate:          decimal.NewFromFloat(0.0005),
+		SlippageRate:          decimal.Zero,
+		PenetrationTicks:      1,
+		MaxEntryRepegAttempts: 2,
+		MaxEntryRepegDriftPct: 0.01, // 1%
+		LimitOrderTimeout:     15 * time.Minute,
+	}
+	b := NewSimBroker(cfg)
+	b.SetExchangeFilter("SOLUSDT", model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.01),
+		StepSize: decimal.NewFromFloat(0.1),
+	})
+
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "REPEG_1",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(110.0),
+		CreatedAt:     now,
+	})
+
+	// Bar 0: Open moves to 100.50 (+0.5% <= 1% drift), Low drops to 100.40 (< repegged 100.49) -> fills via repeg!
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now, CloseTime: now.Add(5 * time.Minute),
+		Symbol: "SOLUSDT", Open: 100.50, High: 101.00, Low: 100.40, Close: 100.80,
+	}, 0)
+
+	if b.Stats.Repegged != 1 {
+		t.Fatalf("expected Repegged=1, got %+v", b.Stats)
+	}
+	pos := b.OpenPositions["SOLUSDT"]
+	if pos == nil {
+		t.Fatalf("expected repegged order to fill on bar 0")
+	}
+	if !pos.EntryPrice.Equal(decimal.NewFromFloat(100.49)) {
+		t.Fatalf("expected repegged limit 100.49, got %s", pos.EntryPrice)
+	}
+
+	// Second case: drift exceeds MaxEntryRepegDriftPct -> RepegAborted and order cancelled
+	b.ForceClosePosition("SOLUSDT", decimal.NewFromFloat(100.50), "CLEANUP", now.Add(5*time.Minute), 1)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "REPEG_ABORT",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(110.0),
+		CreatedAt:     now.Add(5 * time.Minute),
+	})
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now.Add(5 * time.Minute), CloseTime: now.Add(10 * time.Minute),
+		Symbol: "SOLUSDT", Open: 103.00, High: 103.50, Low: 102.50, Close: 103.00,
+	}, 1)
+
+	if b.Stats.RepegAborted != 1 {
+		t.Fatalf("expected RepegAborted=1, got %+v", b.Stats)
+	}
+	if _, stillPending := b.PendingOrders["SOLUSDT"]; stillPending {
+		t.Fatalf("expected pending order cancelled on drift abort")
+	}
+}
+
+func TestSimBroker_LimitTimeoutSecondsAndTimelineEquityAndDelistSettle(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT:      decimal.NewFromFloat(1000.0),
+		AccountLeverage:        5.0,
+		MakerFeeRate:           decimal.NewFromFloat(0.0002),
+		TakerFeeRate:           decimal.NewFromFloat(0.0005),
+		SlippageRate:           decimal.NewFromFloat(0.0005),
+		LimitOrderTimeout:      150 * time.Second,
+		PenetrationTicks:       1,
+		Tier1BETriggerLongATR:  0.60,
+		Tier1BETriggerShortATR: 0.90,
+		Tier1BEEnabled:         true,
+		MinBreakEvenOffsetPct:  0.001,
+	}
+	b := NewSimBroker(cfg)
+	b.SetExchangeFilter("BTCUSDT", model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.1),
+		StepSize: decimal.NewFromFloat(0.01),
+	})
+
+	t0 := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "TIMEOUT_1",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(90.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(85.0),
+		TPPrice:       decimal.NewFromFloat(110.0),
+		CreatedAt:     t0,
+	})
+
+	// 1m bars: after 3rd minute (t0+3m = 180s > 150s), pending order should time out before filling.
+	for i := 0; i < 4; i++ {
+		cOpen := t0.Add(time.Duration(i) * time.Minute)
+		b.ProcessCandle(data.HistoricalCandle{
+			OpenTime: cOpen, CloseTime: cOpen.Add(time.Minute),
+			Symbol: "BTCUSDT", Open: 95.0, High: 95.5, Low: 94.5, Close: 95.0,
+		}, int64(i))
+	}
+	if b.Stats.TimedOut != 1 {
+		t.Fatalf("expected 150s LimitOrderTimeout to expire pending order, stats=%+v", b.Stats)
+	}
+
+	// Now fill an entry, test custom Tier1BETriggerLongATR (0.60 * ATR 10 = +6.0 -> triggers BE), RecordTimelineEquity, and ForceClosePosition
+	t1 := t0.Add(10 * time.Minute)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "BE_DELIST",
+		Symbol:        "BTCUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0),
+		SLPrice:       decimal.NewFromFloat(90.0),
+		TPPrice:       decimal.NewFromFloat(130.0),
+		ATRAtEntry:    decimal.NewFromFloat(10.0),
+		CreatedAt:     t1,
+	})
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: t1, CloseTime: t1.Add(time.Minute),
+		Symbol: "BTCUSDT", Open: 100.0, High: 100.5, Low: 99.8, Close: 100.0,
+	}, 10)
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: t1.Add(time.Minute), CloseTime: t1.Add(2 * time.Minute),
+		Symbol: "BTCUSDT", Open: 100.0, High: 106.5, Low: 100.0, Close: 106.2,
+	}, 11)
+
+	pos := b.OpenPositions["BTCUSDT"]
+	if pos == nil || pos.ProtectionTier < 1 || !pos.CurrentSLPrice.GreaterThan(pos.EntryPrice) {
+		t.Fatalf("expected Tier1BETriggerLongATR=0.60 to promote SL above entry, got %+v", pos)
+	}
+
+	b.RecordTimelineEquity(t1.Add(2 * time.Minute))
+	if len(b.EquityCurve) != 1 || b.EquityCurve[0].OpenPositions != 1 || b.EquityCurve[0].UsedMargin <= 0 {
+		t.Fatalf("unexpected EquityCurve sample: %+v", b.EquityCurve)
+	}
+
+	closed := b.ForceClosePosition("BTCUSDT", decimal.NewFromFloat(105.0), "DELIST_OR_DATA_END_SETTLE", t1.Add(2*time.Hour), 35)
+	if !closed || len(b.OpenPositions) != 0 || b.Stats.DelistSettled != 1 {
+		t.Fatalf("expected delist settle close, closed=%v stats=%+v", closed, b.Stats)
+	}
+}
+
+
 
 

@@ -22,6 +22,7 @@ TIMEFRAME=15m
 MAX_CONCURRENT_SLOTS=10
 MAX_DAILY_DRAWDOWN_PCT=-0.05
 ACCOUNT_LEVERAGE=8
+ENTRY_ORDER_TYPE=LIMIT
 MAKER_FEE_RATE=0.0002
 TAKER_FEE_RATE=0.0005
 SLIPPAGE_RATE=0.0002
@@ -53,6 +54,12 @@ EQUITY_MODE_COMPOUNDING=true
 	}
 	if simCfg.PartialTP1Ratio != 0.45 {
 		t.Errorf("expected PartialTP1Ratio 0.45, got %f", simCfg.PartialTP1Ratio)
+	}
+	if simCfg.LimitOrderTimeout != 150*time.Second {
+		t.Errorf("expected default LimitOrderTimeout 150s, got %v", simCfg.LimitOrderTimeout)
+	}
+	if simCfg.MaxEntryRepegAttempts != 3 || simCfg.EntryOrderType != "LIMIT" {
+		t.Errorf("expected default LIMIT repeg=3, got type=%s repeg=%d", simCfg.EntryOrderType, simCfg.MaxEntryRepegAttempts)
 	}
 
 	evalCfg := buildDefaultEvaluatorConfig(envFile)

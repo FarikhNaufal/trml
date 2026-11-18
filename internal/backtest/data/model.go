@@ -41,12 +41,15 @@ func (c *HistoricalCandle) ToModelCandle() model.Candle {
 
 // DataValidationResult menyimpan hasil audit kualitas data historis.
 type DataValidationResult struct {
-	Symbol       string    `json:"symbol"`
-	TotalBars    int       `json:"total_bars"`
-	StartTime    time.Time `json:"start_time"`
-	EndTime      time.Time `json:"end_time"`
-	GapsCount    int       `json:"gaps_count"`
-	ZeroVolCount int       `json:"zero_vol_count"`
-	Duplicates   int       `json:"duplicates"`
-	Warnings     []string  `json:"warnings"`
+	Symbol        string    `json:"symbol"`
+	TotalBars     int       `json:"total_bars"`
+	StartTime     time.Time `json:"start_time"`
+	EndTime       time.Time `json:"end_time"`
+	GapsCount     int       `json:"gaps_count"`
+	ZeroVolCount  int       `json:"zero_vol_count"`
+	Duplicates    int       `json:"duplicates"`
+	FutureBars    int       `json:"future_bars"`
+	OHLCAnomalies int       `json:"ohlc_anomalies"`
+	OICoveragePct float64   `json:"oi_coverage_pct"`
+	Warnings      []string  `json:"warnings"`
 }

@@ -2,6 +2,7 @@ package data
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"time"
 )
@@ -28,6 +29,7 @@ func ValidateCandles(symbol string, candles []HistoricalCandle, expectedStep tim
 	res.EndTime = candles[len(candles)-1].CloseTime
 
 	seenTimes := make(map[int64]bool)
+	nowUTC := time.Now().UTC()
 
 	for i := 0; i < len(candles); i++ {
 		c := candles[i]
@@ -39,11 +41,18 @@ func ValidateCandles(symbol string, candles []HistoricalCandle, expectedStep tim
 		}
 		seenTimes[openMs] = true
 
-		// Deteksi harga tidak valid
-		if c.Open <= 0 || c.High <= 0 || c.Low <= 0 || c.Close <= 0 {
-			res.Warnings = append(res.Warnings, fmt.Sprintf("bar %s memiliki harga <= 0", c.OpenTime.Format(time.RFC3339)))
+		if c.CloseTime.After(nowUTC) {
+			res.FutureBars++
 		}
-		if c.Low > c.Open || c.Low > c.Close || c.High < c.Open || c.High < c.Close {
+
+		// Deteksi harga tidak valid / NaN / Inf
+		if math.IsNaN(c.Open) || math.IsNaN(c.High) || math.IsNaN(c.Low) || math.IsNaN(c.Close) ||
+			math.IsInf(c.Open, 0) || math.IsInf(c.High, 0) || math.IsInf(c.Low, 0) || math.IsInf(c.Close, 0) ||
+			c.Open <= 0 || c.High <= 0 || c.Low <= 0 || c.Close <= 0 {
+			res.OHLCAnomalies++
+			res.Warnings = append(res.Warnings, fmt.Sprintf("bar %s memiliki harga <= 0 atau NaN/Inf", c.OpenTime.Format(time.RFC3339)))
+		} else if c.Low > c.High || c.Low > math.Min(c.Open, c.Close) || c.High < math.Max(c.Open, c.Close) {
+			res.OHLCAnomalies++
 			res.Warnings = append(res.Warnings, fmt.Sprintf("bar %s anomali High/Low vs Open/Close", c.OpenTime.Format(time.RFC3339)))
 		}
 
@@ -71,4 +80,30 @@ func ValidateCandles(symbol string, candles []HistoricalCandle, expectedStep tim
 
 	return res
 }
+
+// ValidateCandlesWithOI audits OHLCV integrity and calculates historical point-in-time Open Interest coverage percentage.
+func ValidateCandlesWithOI(
+	symbol string,
+	candles []HistoricalCandle,
+	expectedStep time.Duration,
+	oiMgr *MetricsOIDownloader,
+	minOIInterval, maxOIInterval, maxOIStaleness time.Duration,
+) DataValidationResult {
+	res := ValidateCandles(symbol, candles, expectedStep)
+	if oiMgr == nil || len(candles) == 0 {
+		return res
+	}
+	covered := 0
+	for _, c := range candles {
+		if _, _, _, _, ok := oiMgr.LookupOpenInterestStrict(symbol, c.CloseTime, minOIInterval, maxOIInterval, maxOIStaleness); ok {
+			covered++
+		}
+	}
+	res.OICoveragePct = (float64(covered) / float64(len(candles))) * 100.0
+	if res.OICoveragePct < 90.0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("cakupan OI historis 5m hanya %.1f%% (< 90%%)", res.OICoveragePct))
+	}
+	return res
+}
+
 

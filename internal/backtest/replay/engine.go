@@ -3,31 +3,44 @@ package replay
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"time"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/backtest/data"
 	"trml/internal/backtest/simbroker"
-	"trml/internal/indicator"
 	"trml/internal/model"
 	"trml/internal/scanner"
 	"trml/internal/strategy"
 )
 
+// ReplayConfig configures synchronized multi-symbol bar-by-bar simulation.
 type ReplayConfig struct {
-	WarmupBars            int                   // jumlah bar awal untuk warmup indikator (default 200)
-	SpreadPct             float64               // baseline estimasi spread jika dyn calc gagal (default 0.0002)
-	FundingRate           float64               // default fallback funding jika manager kosong (0.01% = 0.0001)
-	FundingMgr            *data.FundingManager  // manager data historical funding rate Binance Vision/API
-	BenchmarkSym          string                // default "BTCUSDT"
-	DynamicScannerEnabled bool                  // apakah dynamic rolling scanner aktif
-	ScannerInterval       time.Duration         // interval scanning ulang (default 15 menit)
-	ScannerCfg            scanner.ScannerConfig // konfigurasi scanner produksi
-	UnconstrainedMode     bool                  // mode evaluasi sinyal murni (tanpa batas slot portofolio & cooldown)
-	DeductPendingMargin   bool                  // kurangi available margin intra-bar saat order disubmit (default: false = behavior 9815362)
-	EquityModeCompounding bool                  // compounding vs modal tetap (default: false)
+	WarmupBars            int                              // jumlah bar awal untuk warmup indikator (default 200)
+	SpreadPct             float64                          // baseline estimasi spread jika dyn calc gagal (default 0.0002)
+	FundingRate           float64                          // default fallback funding jika manager kosong (0.01% = 0.0001)
+	FundingMgr            *data.FundingManager             // manager data historical funding rate Binance Vision/API
+	OIMode                string                           // "auto" | "strict" | "off" (default "auto")
+	OIMgr                 *data.MetricsOIDownloader        // loader 5m historical OI metrics Binance Vision
+	ExecCandleMap         map[string][]data.HistoricalCandle // opsional: bar eksekusi 1m untuk sub-bar step broker
+	BenchmarkSym          string                           // default "BTCUSDT"
+	DynamicScannerEnabled bool                             // apakah dynamic rolling scanner aktif
+	ScannerInterval       time.Duration                    // interval scanning ulang (default 15 menit)
+	ScannerCfg            scanner.ScannerConfig            // konfigurasi scanner produksi
+	UnconstrainedMode     bool                             // mode evaluasi sinyal murni (tanpa batas slot portofolio & cooldown)
+	DeductPendingMargin   bool                             // kurangi available margin intra-bar saat order disubmit
+	EquityModeCompounding bool                             // compounding vs modal tetap
+}
+
+// ReplayStats captures execution, scanner, and data-coverage telemetry produced by a ReplayEngine run.
+type ReplayStats struct {
+	OICoveredCount    int64             `json:"oi_covered_count"`
+	OIFallbackCount   int64             `json:"oi_fallback_count"`
+	OIMissingCount    int64             `json:"oi_missing_count"`
+	OICoveragePct     float64           `json:"oi_coverage_pct"`
+	SubBarExecCount   int64             `json:"sub_bar_exec_count"`
+	DelistForceClosed int64             `json:"delist_force_closed"`
+	ScannerStats      ScannerAuditStats `json:"scanner_stats"`
 }
 
 type lastExitInfo struct {
@@ -35,6 +48,7 @@ type lastExitInfo struct {
 	reason string
 }
 
+// ReplayEngine replays historical market candles, scanner cycles, signal generation, and simulated execution.
 type ReplayEngine struct {
 	cfg          ReplayConfig
 	evaluatorCfg strategy.EvaluatorConfig
@@ -42,6 +56,7 @@ type ReplayEngine struct {
 	candleMap    map[string][]data.HistoricalCandle
 	filters      map[string]model.ExchangeFilter
 	fundingMgr   *data.FundingManager
+	oiMgr        *data.MetricsOIDownloader
 	lastExits    map[string]lastExitInfo
 
 	// Signal observability
@@ -49,6 +64,7 @@ type ReplayEngine struct {
 	SignalsApproved       int64
 	SignalsRejected       int64
 	RejectReasons         map[string]int64
+	Stats                 ReplayStats
 }
 
 func NewReplayEngine(
@@ -67,6 +83,7 @@ func NewReplayEngine(
 	if cfg.BenchmarkSym == "" {
 		cfg.BenchmarkSym = "BTCUSDT"
 	}
+	cfg.OIMode = NormalizeOIMode(cfg.OIMode)
 	if evaluatorCfg.MaxDailyDrawdownPct >= 0 {
 		evaluatorCfg.MaxDailyDrawdownPct = -0.05
 	}
@@ -81,6 +98,7 @@ func NewReplayEngine(
 		candleMap:     candleMap,
 		filters:       filters,
 		fundingMgr:    cfg.FundingMgr,
+		oiMgr:         cfg.OIMgr,
 		lastExits:     make(map[string]lastExitInfo),
 		RejectReasons: make(map[string]int64),
 	}
@@ -91,49 +109,45 @@ func (r *ReplayEngine) SetFundingManager(fm *data.FundingManager) {
 	r.fundingMgr = fm
 }
 
+// SetOIDownloader menyetel atau memperbarui loader Open Interest 5m historis.
+func (r *ReplayEngine) SetOIDownloader(oi *data.MetricsOIDownloader) {
+	r.oiMgr = oi
+}
+
 // Run mengeksekusi replay tersinkronisasi bar-demi-bar lintas seluruh simbol.
 func (r *ReplayEngine) Run(ctx context.Context) error {
-	// 1. Kumpulkan seluruh timestamp unik candle close
-	timeMap := make(map[int64]time.Time)
-	for _, candles := range r.candleMap {
-		for _, c := range candles {
-			timeMap[c.CloseTime.UnixMilli()] = c.CloseTime
-		}
-	}
-
-	if len(timeMap) == 0 {
+	timeline := r.buildTimeline()
+	if len(timeline) == 0 {
 		return fmt.Errorf("no candle data available for replay")
 	}
 
-	timeline := make([]time.Time, 0, len(timeMap))
-	for _, t := range timeMap {
-		timeline = append(timeline, t)
-	}
-	sort.Slice(timeline, func(i, j int) bool {
-		return timeline[i].Before(timeline[j])
-	})
-
-	// Indeks posisi candle per simbol untuk akses O(1)
-	candleIndices := make(map[string]int)
-	rollingCandles := make(map[string][]model.Candle)
-	rollingDeltas := make(map[string][]float64)
-
-	// Urutkan simbol secara leksikografis untuk determinisme 100%
 	sortedSymbols := make([]string, 0, len(r.candleMap))
 	for sym := range r.candleMap {
 		sortedSymbols = append(sortedSymbols, sym)
 	}
 	sort.Strings(sortedSymbols)
 
-	var lastScanTime time.Time
-	watchedSymbols := make(map[string]bool)
-
-	// Inisialisasi filter bursa pada simbroker
 	for sym, f := range r.filters {
 		r.broker.SetExchangeFilter(sym, f)
 	}
 
-	// 2. Loop Utama Waktu Simulasi (Bar-by-Bar Synchronized Step)
+	candleIndices := make(map[string]int, len(sortedSymbols))
+	execIndices := make(map[string]int, len(r.cfg.ExecCandleMap))
+	rollingCandles := make(map[string][]model.Candle, len(sortedSymbols))
+	rollingDeltas := make(map[string][]float64, len(sortedSymbols))
+	lastSeenBarTime := make(map[string]time.Time, len(sortedSymbols))
+	lastSeenClose := make(map[string]float64, len(sortedSymbols))
+
+	bufferCap := CalcRollingBufferCap(r.cfg.ScannerCfg.CandleDuration, r.cfg.WarmupBars)
+	scanSim := NewScannerSimulator(r.cfg.ScannerCfg, r.filters, func(cList []model.Candle, lastClose float64) float64 {
+		return calculateDynamicSpread(cList, lastClose, r.cfg.SpreadPct)
+	})
+
+	var lastScanTime time.Time
+	watchedSymbols := make(map[string]bool)
+	lastClosedTradeIdx := 0
+	var prevSimTime time.Time
+
 	for barIdx, simTime := range timeline {
 		select {
 		case <-ctx.Done():
@@ -141,274 +155,291 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		default:
 		}
 
-		// A. Update SimBroker pada setiap candle aktif di timestamp ini
-		// dan tambahkan ke rolling buffers
+		// A. Step execution & update rolling buffers per symbol at simTime
 		for _, sym := range sortedSymbols {
-			candles := r.candleMap[sym]
-			idx := candleIndices[sym]
-			if idx < len(candles) && candles[idx].CloseTime.Equal(simTime) {
-				c := candles[idx]
-
-				// Simbroker mengevaluasi settlement biaya pendanaan (funding rate) jika bar ini tepat melintasi waktu settlement
-				if r.fundingMgr != nil {
-					if rate, isSettlement := r.fundingMgr.CheckSettlement(sym, c.OpenTime, c.CloseTime); isSettlement {
-						r.broker.ApplyFundingSettlement(sym, decimal.NewFromFloat(c.Close), decimal.NewFromFloat(rate))
-					}
-				}
-
-				// Simbroker mengevaluasi fill pending order dan exit ladder posisi aktif
-				r.broker.ProcessCandle(c, int64(barIdx))
-
-				// Update rolling buffer
-				mCandle := c.ToModelCandle()
-				rollingCandles[sym] = append(rollingCandles[sym], mCandle)
-				rollingDeltas[sym] = append(rollingDeltas[sym], c.BarDeltaUSDT)
-
-				// Batasi panjang rolling buffer agar hemat memori (maks 300 bar)
-				if len(rollingCandles[sym]) > 300 {
-					rollingCandles[sym] = rollingCandles[sym][len(rollingCandles[sym])-300:]
-				}
-				if len(rollingDeltas[sym]) > 300 {
-					rollingDeltas[sym] = rollingDeltas[sym][len(rollingDeltas[sym])-300:]
-				}
-
-				candleIndices[sym]++
-			}
+			r.stepSymbolAtTime(
+				sym, simTime, prevSimTime, int64(barIdx), bufferCap,
+				candleIndices, execIndices, rollingCandles, rollingDeltas,
+				lastSeenBarTime, lastSeenClose,
+			)
 		}
 
-		// Update data last exit dari closed trades broker
-		// Abaikan PARTIAL_TAKE_PROFIT agar status exit terakhir mencerminkan terminal exit
-		// dan selaras dengan production storage (internal/storage/repository.go)
-		r.broker.Mu.Lock()
-		for _, tr := range r.broker.ClosedTrades {
-			if tr.ExitReason == "PARTIAL_TAKE_PROFIT" {
-				continue
-			}
-			r.lastExits[tr.Symbol] = lastExitInfo{
-				time:   tr.ExitTime,
-				reason: tr.ExitReason,
-			}
-		}
-		r.broker.Mu.Unlock()
+		lastClosedTradeIdx = r.syncLastExits(lastClosedTradeIdx)
 
-		// Warmup period: lewati evaluasi sinyal jika belum mencapai batas warmup bar
-		if barIdx < r.cfg.WarmupBars {
+		if barIdx >= r.cfg.WarmupBars {
+			r.broker.RecordTimelineEquity(simTime)
+
+			// B. Prepare BTC macro snapshot and evaluate signals on active/watched symbols
+			btcSnap := r.buildBTCMacro(simTime, rollingCandles, rollingDeltas)
+			r.evaluateSignalsAtBar(simTime, sortedSymbols, watchedSymbols, rollingCandles, rollingDeltas, btcSnap)
+		}
+
+		// C. Post-bar dynamic scan cadence: new watchlist activates on subsequent closed bars
+		// (begins at the end of the final warmup bar so barIdx == WarmupBars has an active watchlist).
+		if r.cfg.DynamicScannerEnabled && barIdx >= r.cfg.WarmupBars-1 &&
+			(lastScanTime.IsZero() || simTime.Sub(lastScanTime) >= r.cfg.ScannerInterval) {
+			lastScanTime = simTime
+			watchedSymbols = scanSim.RunCycle(sortedSymbols, rollingCandles, simTime)
+		}
+
+		prevSimTime = simTime
+	}
+
+	// Settle any dangling positions whose symbol data ended prematurely before the simulation horizon.
+	lastTime := timeline[len(timeline)-1]
+	lastBarIdx := int64(len(timeline) - 1)
+	for _, sym := range sortedSymbols {
+		if !r.broker.HasActiveOrderOrPosition(sym) {
 			continue
 		}
-
-		// B. Siapkan BTC Macro Snapshot
-		var btcSnap *model.MarketSnapshot
-		if r.evaluatorCfg.BTCGateEnabled {
-			if btcCandles, ok := rollingCandles[r.cfg.BenchmarkSym]; ok && len(btcCandles) >= 30 {
-				lastBTC := btcCandles[len(btcCandles)-1]
-				vwapBTC := indicator.CalculateSessionVWAP(btcCandles)
-				btcSpread := calculateDynamicSpread(btcCandles, lastBTC.Close, r.cfg.SpreadPct)
-				bSnap := model.MarketSnapshot{
-					Symbol:              r.cfg.BenchmarkSym,
-					Now:                 simTime,
-					MarkPrice:           lastBTC.Close,
-					BestBid:             lastBTC.Close * (1.0 - btcSpread/2.0),
-					BestAsk:             lastBTC.Close * (1.0 + btcSpread/2.0),
-					CurrentSessionVWAP:  vwapBTC,
-					ClosedCandles:       btcCandles,
-					ClosedBarDeltasUSDT: rollingDeltas[r.cfg.BenchmarkSym],
-				}
-				btcSnap = &bSnap
-			}
-		}
-
-		// C. Dynamic Rolling Scanner: update watchlist aktif jika diaktifkan
-		if r.cfg.DynamicScannerEnabled && (lastScanTime.IsZero() || simTime.Sub(lastScanTime) >= r.cfg.ScannerInterval) {
-			lastScanTime = simTime
-			vol24hMap := make(map[string]float64, len(rollingCandles))
-			bookMap := make(map[string]model.BookQuote, len(rollingCandles))
-			activeStates := make(map[string]*model.SymbolState)
-
-			for _, sym := range sortedSymbols {
-				cList, ok := rollingCandles[sym]
-				if !ok || len(cList) == 0 {
-					continue
-				}
-				bars24h := 288
-				if r.cfg.ScannerCfg.CandleDuration > 0 {
-					bars24h = int((24 * time.Hour) / r.cfg.ScannerCfg.CandleDuration)
-				}
-				if bars24h <= 0 {
-					bars24h = 288
-				}
-				startIdx := len(cList) - bars24h
-				if startIdx < 0 {
-					startIdx = 0
-				}
-				var sumVol float64
-				for _, c := range cList[startIdx:] {
-					sumVol += c.QuoteVolumeUSDT
-				}
-				vol24hMap[sym] = sumVol
-
-				lastClose := cList[len(cList)-1].Close
-				symSpread := calculateDynamicSpread(cList, lastClose, r.cfg.SpreadPct)
-				bookMap[sym] = model.BookQuote{
-					BestBid: lastClose * (1.0 - symSpread/2.0),
-					BestAsk: lastClose * (1.0 + symSpread/2.0),
-				}
-			}
-
-			fetchKlinesFn := func(symbol string, limit int) []model.Candle {
-				cList := rollingCandles[symbol]
-				if len(cList) == 0 {
-					return nil
-				}
-				start := len(cList) - limit
-				if start < 0 {
-					start = 0
-				}
-				return cList[start:]
-			}
-
-			selectedSyms := scanner.RunBulkMarketScanner(
-				r.cfg.ScannerCfg,
-				activeStates,
-				r.filters,
-				vol24hMap,
-				bookMap,
-				fetchKlinesFn,
-				simTime,
-			)
-
-			watchedSymbols = make(map[string]bool, len(selectedSyms))
-			for _, sym := range selectedSyms {
-				watchedSymbols[sym] = true
-			}
-		}
-
-		// D. Evaluasi Sinyal per Simbol
-		activeSlots := r.broker.GetActiveSlotCount()
-		availBal := r.broker.GetAvailableBalanceUSDT()
-		totEq := r.broker.GetEffectiveTotalEquityUSDT()
-		isDailyBreached := r.broker.IsCircuitBreakerTripped() || (r.broker.GetDailyTotalDrawdownPct() <= r.evaluatorCfg.MaxDailyDrawdownPct)
-
-		if r.cfg.UnconstrainedMode {
-			activeSlots = 0
-			isDailyBreached = false
-			availBal = decimal.NewFromFloat(1000000.0)
-		}
-
-		for _, sym := range sortedSymbols {
-			cList, ok := rollingCandles[sym]
-			if !ok {
-				continue
-			}
-			// Lewati benchmark symbol jika bukan target trading
-			if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
-				continue
-			}
-
-			// Lewati koin jika dynamic scanner aktif dan tidak masuk watchlist (kecuali sedang memegang posisi aktif)
-			if r.cfg.DynamicScannerEnabled && !watchedSymbols[sym] && !r.broker.HasActiveOrderOrPosition(sym) {
-				continue
-			}
-
-			// Syarat data bar mencukupi untuk EMA200
-			if len(cList) < r.evaluatorCfg.EMAPeriod {
-				continue
-			}
-
-			hasActive := r.broker.HasActiveOrderOrPosition(sym)
-			lastC := cList[len(cList)-1]
-			sessionVWAP := indicator.CalculateSessionVWAP(cList)
-			if sessionVWAP <= 0 || math.IsNaN(sessionVWAP) {
-				continue
-			}
-
-			filter, ok := r.filters[sym]
-			if !ok {
-				filter = model.ExchangeFilter{
-					TickSize:    decimal.NewFromFloat(0.01),
-					StepSize:    decimal.NewFromFloat(0.1),
-					MinNotional: decimal.NewFromFloat(5.0),
-				}
-			}
-
-			exitInfo := r.lastExits[sym]
-			if r.cfg.UnconstrainedMode {
-				exitInfo = lastExitInfo{}
-			}
-
-			dynSpread := calculateDynamicSpread(cList, lastC.Close, r.cfg.SpreadPct)
-			fundingRate := r.cfg.FundingRate
-			if r.fundingMgr != nil {
-				fundingRate = r.fundingMgr.GetFundingRate(sym, simTime)
-			}
-
-			snap := model.MarketSnapshot{
-				Symbol:              sym,
-				Filter:              filter,
-				Now:                 simTime,
-				BestBid:             lastC.Close * (1.0 - dynSpread/2.0),
-				BestAsk:             lastC.Close * (1.0 + dynSpread/2.0),
-				BookUpdatedAt:       simTime,
-				MarkPrice:           lastC.Close,
-				MarkPriceUpdatedAt:  simTime,
-				FundingRate:         fundingRate,
-				FundingUpdatedAt:    simTime,
-				CurrentSessionVWAP:  sessionVWAP,
-				ClosedCandles:       cList,
-				ClosedBarDeltasUSDT: rollingDeltas[sym],
-				LastExitTime:        exitInfo.time,
-				LastExitReason:      exitInfo.reason,
-			}
-
-			r.TotalSignalsEvaluated++
-
-			intent, approved, reason, _ := strategy.EvaluateSignal(
-				snap,
-				btcSnap,
-				activeSlots,
-				isDailyBreached,
-				hasActive,
-				totEq,
-				availBal,
-				r.evaluatorCfg,
-			)
-
-			if approved {
-				r.SignalsApproved++
-				_, _ = r.broker.SubmitLimitEntry(intent)
-				// Perbarui active slot count seketika agar tidak overflow
-				activeSlots = r.broker.GetActiveSlotCount()
-				if r.cfg.DeductPendingMargin {
-					availBal = r.broker.GetAvailableBalanceUSDT()
-				}
-			} else {
-				r.SignalsRejected++
-				r.RejectReasons[reason]++
+		lastSymTime := lastSeenBarTime[sym]
+		if !lastSymTime.IsZero() && lastTime.Sub(lastSymTime) >= 15*time.Minute {
+			if r.broker.ForceClosePosition(sym, decimal.NewFromFloat(lastSeenClose[sym]), "DELIST_OR_DATA_END_SETTLE", lastTime, lastBarIdx) {
+				r.Stats.DelistForceClosed++
 			}
 		}
 	}
 
+	r.finalizeStats(scanSim.Stats)
 	return nil
 }
 
+func (r *ReplayEngine) buildTimeline() []time.Time {
+	timeMap := make(map[int64]time.Time)
+	for _, candles := range r.candleMap {
+		for _, c := range candles {
+			timeMap[c.CloseTime.UnixMilli()] = c.CloseTime
+		}
+	}
+	timeline := make([]time.Time, 0, len(timeMap))
+	for _, t := range timeMap {
+		timeline = append(timeline, t)
+	}
+	sort.Slice(timeline, func(i, j int) bool {
+		return timeline[i].Before(timeline[j])
+	})
+	return timeline
+}
+
+func (r *ReplayEngine) stepSymbolAtTime(
+	sym string,
+	simTime, prevSimTime time.Time,
+	barIndex int64,
+	bufferCap int,
+	candleIndices, execIndices map[string]int,
+	rollingCandles map[string][]model.Candle,
+	rollingDeltas map[string][]float64,
+	lastSeenBarTime map[string]time.Time,
+	lastSeenClose map[string]float64,
+) {
+	candles := r.candleMap[sym]
+	idx := candleIndices[sym]
+	hasBar := idx < len(candles) && candles[idx].CloseTime.Equal(simTime)
+
+	if hasBar {
+		c := candles[idx]
+		lastSeenBarTime[sym] = c.CloseTime
+		lastSeenClose[sym] = c.Close
+
+		if r.fundingMgr != nil {
+			if rate, isSettlement := r.fundingMgr.CheckSettlement(sym, c.OpenTime, c.CloseTime); isSettlement {
+				r.broker.ApplyFundingSettlement(sym, decimal.NewFromFloat(c.Close), decimal.NewFromFloat(rate))
+			}
+		}
+
+		if !r.processExecSubBars(sym, simTime, prevSimTime, barIndex, execIndices) {
+			r.broker.ProcessCandle(c, barIndex)
+		}
+
+		rollingCandles[sym] = append(rollingCandles[sym], c.ToModelCandle())
+		rollingDeltas[sym] = append(rollingDeltas[sym], c.BarDeltaUSDT)
+		if len(rollingCandles[sym]) > bufferCap {
+			rollingCandles[sym] = rollingCandles[sym][len(rollingCandles[sym])-bufferCap:]
+		}
+		if len(rollingDeltas[sym]) > bufferCap {
+			rollingDeltas[sym] = rollingDeltas[sym][len(rollingDeltas[sym])-bufferCap:]
+		}
+		candleIndices[sym]++
+		return
+	}
+
+	// No base bar at simTime: advance any 1m cursor cleanly and settle delisted/stale open positions.
+	_ = r.processExecSubBars(sym, simTime, prevSimTime, barIndex, execIndices)
+	if r.broker.HasActiveOrderOrPosition(sym) {
+		lastSym := lastSeenBarTime[sym]
+		if !lastSym.IsZero() && simTime.Sub(lastSym) >= 2*time.Hour {
+			if r.broker.ForceClosePosition(sym, decimal.NewFromFloat(lastSeenClose[sym]), "DELIST_OR_DATA_END_SETTLE", simTime, barIndex) {
+				r.Stats.DelistForceClosed++
+			}
+		}
+	}
+}
+
+func (r *ReplayEngine) processExecSubBars(
+	sym string,
+	simTime, prevSimTime time.Time,
+	barIndex int64,
+	execIndices map[string]int,
+) bool {
+	if len(r.cfg.ExecCandleMap) == 0 {
+		return false
+	}
+	subCandles := r.cfg.ExecCandleMap[sym]
+	if len(subCandles) == 0 {
+		return false
+	}
+
+	idx := execIndices[sym]
+	if !prevSimTime.IsZero() {
+		for idx < len(subCandles) && !subCandles[idx].CloseTime.After(prevSimTime) {
+			idx++
+		}
+	}
+
+	processed := false
+	for idx < len(subCandles) && !subCandles[idx].CloseTime.After(simTime) {
+		if r.broker.HasActiveOrderOrPosition(sym) {
+			r.broker.ProcessCandle(subCandles[idx], barIndex)
+			r.Stats.SubBarExecCount++
+			processed = true
+		}
+		idx++
+	}
+	execIndices[sym] = idx
+	return processed
+}
+
+func (r *ReplayEngine) syncLastExits(fromIdx int) int {
+	r.broker.Mu.Lock()
+	defer r.broker.Mu.Unlock()
+
+	for i := fromIdx; i < len(r.broker.ClosedTrades); i++ {
+		tr := r.broker.ClosedTrades[i]
+		if tr.ExitReason == "PARTIAL_TAKE_PROFIT" {
+			continue
+		}
+		r.lastExits[tr.Symbol] = lastExitInfo{
+			time:   tr.ExitTime,
+			reason: tr.ExitReason,
+		}
+	}
+	return len(r.broker.ClosedTrades)
+}
+
+func (r *ReplayEngine) buildBTCMacro(
+	simTime time.Time,
+	rollingCandles map[string][]model.Candle,
+	rollingDeltas map[string][]float64,
+) *model.MarketSnapshot {
+	if !r.evaluatorCfg.BTCGateEnabled {
+		return nil
+	}
+	return BuildBTCMacroSnapshot(
+		r.cfg.BenchmarkSym,
+		simTime,
+		rollingCandles[r.cfg.BenchmarkSym],
+		rollingDeltas[r.cfg.BenchmarkSym],
+		r.cfg.SpreadPct,
+	)
+}
+
+func (r *ReplayEngine) evaluateSignalsAtBar(
+	simTime time.Time,
+	sortedSymbols []string,
+	watchedSymbols map[string]bool,
+	rollingCandles map[string][]model.Candle,
+	rollingDeltas map[string][]float64,
+	btcSnap *model.MarketSnapshot,
+) {
+	activeSlots := r.broker.GetActiveSlotCount()
+	availBal := r.broker.GetAvailableBalanceUSDT()
+	totEq := r.broker.GetEffectiveTotalEquityUSDT()
+	isDailyBreached := r.broker.IsCircuitBreakerTripped() || (r.broker.GetDailyTotalDrawdownPct() <= r.evaluatorCfg.MaxDailyDrawdownPct)
+
+	if r.cfg.UnconstrainedMode {
+		activeSlots = 0
+		isDailyBreached = false
+		availBal = decimal.NewFromFloat(1000000.0)
+	}
+
+	for _, sym := range sortedSymbols {
+		cList, ok := rollingCandles[sym]
+		if !ok {
+			continue
+		}
+		if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
+			continue
+		}
+		if r.cfg.DynamicScannerEnabled && !watchedSymbols[sym] && !r.broker.HasActiveOrderOrPosition(sym) {
+			continue
+		}
+		if len(cList) < r.evaluatorCfg.EMAPeriod {
+			continue
+		}
+
+		hasActive := r.broker.HasActiveOrderOrPosition(sym)
+		exitInfo := r.lastExits[sym]
+		if r.cfg.UnconstrainedMode {
+			exitInfo = lastExitInfo{}
+		}
+
+		fundingRate := r.cfg.FundingRate
+		if r.fundingMgr != nil {
+			fundingRate = r.fundingMgr.GetFundingRate(sym, simTime)
+		}
+
+		snap, evalCfg, oiStatus, okSnap := BuildSymbolSnapshot(
+			sym, simTime, cList, rollingDeltas[sym], r.filters[sym], exitInfo,
+			r.cfg.SpreadPct, fundingRate, r.cfg.OIMode, r.oiMgr, r.evaluatorCfg,
+		)
+		if !okSnap {
+			continue
+		}
+		switch oiStatus {
+		case oiStatusCovered:
+			r.Stats.OICoveredCount++
+		case oiStatusFallback:
+			r.Stats.OIFallbackCount++
+		case oiStatusMissing:
+			r.Stats.OIMissingCount++
+		}
+
+		r.TotalSignalsEvaluated++
+		intent, approved, reason, _ := strategy.EvaluateSignal(
+			snap,
+			btcSnap,
+			activeSlots,
+			isDailyBreached,
+			hasActive,
+			totEq,
+			availBal,
+			evalCfg,
+		)
+
+		if approved {
+			r.SignalsApproved++
+			_, _ = r.broker.SubmitLimitEntry(intent)
+			activeSlots = r.broker.GetActiveSlotCount()
+			if r.cfg.DeductPendingMargin {
+				availBal = r.broker.GetAvailableBalanceUSDT()
+			}
+		} else {
+			r.SignalsRejected++
+			r.RejectReasons[reason]++
+		}
+	}
+}
+
+func (r *ReplayEngine) finalizeStats(scanStats ScannerAuditStats) {
+	r.Stats.ScannerStats = scanStats
+	totalOI := r.Stats.OICoveredCount + r.Stats.OIFallbackCount + r.Stats.OIMissingCount
+	if totalOI > 0 {
+		r.Stats.OICoveragePct = (float64(r.Stats.OICoveredCount) / float64(totalOI)) * 100.0
+	}
+}
+
 func (r *ReplayEngine) isSymbolTarget(symbol string) bool {
-	// Simbol target trading valid jika terdaftar di filters
 	_, ok := r.filters[symbol]
 	return ok
 }
 
-// calculateDynamicSpread menghitung estimasi bid-ask spread secara dinamis berdasarkan volatilitas (NATR).
-// Pada bursa berjangka Binance, instrumen dengan volatilitas tinggi memiliki orderbook yang lebih renggang.
-func calculateDynamicSpread(cList []model.Candle, lastClose float64, fallbackSpread float64) float64 {
-	if len(cList) < 14 || lastClose <= 0 {
-		if fallbackSpread > 0 {
-			return fallbackSpread
-		}
-		return 0.0002
-	}
-	atr := indicator.CalculateATR(cList, 14)
-	natrPct := atr / lastClose
-	// Model likuiditas dinamis:
-	// Base spread 1.2 bps (0.00012) berskala linier terhadap NATR.
-	// Diklem secara realistis antara 1.0 bps (0.0001) s/d 6.0 bps (0.0006).
-	return math.Max(0.0001, math.Min(0.0006, 0.00012+natrPct*0.02))
-}
