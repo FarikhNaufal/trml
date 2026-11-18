@@ -34,6 +34,7 @@ type StreamManager struct {
 	Handlers     EventHandlers
 	IdleTimeout  time.Duration
 	PingInterval time.Duration
+	PingTimeout  time.Duration
 }
 
 const (
@@ -110,6 +111,10 @@ func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, conn
 	if pingInterval <= 0 {
 		pingInterval = defaultWSPingInterval
 	}
+	pingTimeout := m.PingTimeout
+	if pingTimeout <= 0 {
+		pingTimeout = defaultWSPingTimeout
+	}
 
 	readCtx, readCancel := context.WithCancel(ctx)
 	defer readCancel()
@@ -147,11 +152,16 @@ func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, conn
 					return
 				}
 			case <-pingTicker.C:
-				pCtx, pCancel := context.WithTimeout(readCtx, defaultWSPingTimeout)
+				lastAt := time.Unix(0, lastFrameNano.Load())
+				// Kirim Ping hanya jika koneksi memang idle >= pingInterval agar stream sibuk tidak terputus palsu oleh antrean Pong
+				if time.Since(lastAt) < pingInterval {
+					continue
+				}
+				pCtx, pCancel := context.WithTimeout(readCtx, pingTimeout)
 				err := conn.Ping(pCtx)
 				pCancel()
-				if err != nil && readCtx.Err() == nil {
-					slog.Debug("ws: ping failed, resetting connection", "err", err)
+				if err != nil && readCtx.Err() == nil && time.Since(time.Unix(0, lastFrameNano.Load())) >= pingInterval {
+					slog.Debug("ws: idle ping failed, resetting connection", "err", err)
 					readCancel()
 					return
 				}

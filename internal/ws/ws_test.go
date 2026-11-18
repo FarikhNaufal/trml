@@ -441,4 +441,91 @@ func TestStreamManager_PingAndIdleWatchdog(t *testing.T) {
 			t.Fatalf("expected >= 3 bookTicker frames processed while periodic Ping active, got %d", parsedTicks.Load())
 		}
 	})
+
+	t.Run("busy stream skips Ping and survives even without server Pong", func(t *testing.T) {
+		var parsedTicks atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+			// Sengaja tidak memanggil c.Read() agar tidak ada Pong otomatis dari server:
+			// jika client tetap mengirim Ping saat data aktif, PingTimeout 30ms akan memutus koneksi.
+			payload := []byte(`{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","s":"BTCUSDT","b":"65000.0","a":"65001.0"}}`)
+			ticker := time.NewTicker(15 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-ticker.C:
+					if err := c.Write(r.Context(), websocket.MessageText, payload); err != nil {
+						return
+					}
+				}
+			}
+		}))
+		defer ts.Close()
+
+		mgr := NewStreamManager(EventHandlers{
+			OnBookTicker: func(symbol string, bestBid, bestAsk float64, now time.Time) {
+				parsedTicks.Add(1)
+			},
+		})
+		mgr.IdleTimeout = 400 * time.Millisecond
+		mgr.PingInterval = 35 * time.Millisecond
+		mgr.PingTimeout = 30 * time.Millisecond
+
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Millisecond)
+		defer cancel()
+
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream?streams=btcusdt@bookTicker"
+		c, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		err = mgr.readLoop(ctx, c, time.Now())
+		_ = c.Close(websocket.StatusNormalClosure, "")
+		if err == nil || ctx.Err() != context.DeadlineExceeded {
+			t.Fatalf("expected busy stream to survive without sending unnecessary pings, got err=%v ctxErr=%v", err, ctx.Err())
+		}
+		if parsedTicks.Load() < 5 {
+			t.Fatalf("expected >= 5 bookTicker frames, got %d", parsedTicks.Load())
+		}
+	})
+
+	t.Run("silent dead socket triggers idle Ping timeout before IdleTimeout", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+			<-r.Context().Done()
+		}))
+		defer ts.Close()
+
+		mgr := NewStreamManager(EventHandlers{})
+		mgr.IdleTimeout = 2 * time.Second
+		mgr.PingInterval = 40 * time.Millisecond
+		mgr.PingTimeout = 40 * time.Millisecond
+
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		defer cancel()
+
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream?streams=btcusdt@bookTicker"
+		c, _, err := websocket.Dial(ctx, wsURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		start := time.Now()
+		err = mgr.readLoop(ctx, c, start)
+		elapsed := time.Since(start)
+		_ = c.Close(websocket.StatusNormalClosure, "")
+		if err == nil || ctx.Err() != nil {
+			t.Fatalf("expected idle Ping timeout exit well before parent ctx, got err=%v ctxErr=%v elapsed=%s", err, ctx.Err(), elapsed)
+		}
+	})
 }

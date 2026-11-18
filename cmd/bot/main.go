@@ -1943,6 +1943,16 @@ func (e *BotEngine) runUserDataStreamSupervisor(ctx context.Context) {
 		}
 
 		streamMgr := ws.NewStreamManager(handlers)
+		// Rekonsiliasi snapshot akun segera tiap kali sesi User Data Stream baru dimulai / reconnect
+		if e.liveBroker != nil {
+			go func() {
+				rCtx, rCancel := context.WithTimeout(sessionCtx, 8*time.Second)
+				defer rCancel()
+				if err := e.liveBroker.RefreshAccount(rCtx); err != nil {
+					slog.Warn("user stream reconnect account reconciliation failed", "err", err)
+				}
+			}()
+		}
 		streamMgr.StartSupervisedStream(sessionCtx, userStreamURL)
 
 		// Saat session berhenti/batal, hapus listenKey lama sebelum membuat yang baru

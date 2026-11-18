@@ -397,8 +397,8 @@ func TestLimitEntryExecutionConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error loading defaults: %v", err)
 	}
-	if cfg.LimitOrderTimeout != 90*time.Second {
-		t.Errorf("expected default LimitOrderTimeout=90s, got %v", cfg.LimitOrderTimeout)
+	if cfg.LimitOrderTimeout != 150*time.Second {
+		t.Errorf("expected default LimitOrderTimeout=150s, got %v", cfg.LimitOrderTimeout)
 	}
 	if cfg.EntryRepegMaxAttempts != 3 {
 		t.Errorf("expected default EntryRepegMaxAttempts=3, got %d", cfg.EntryRepegMaxAttempts)

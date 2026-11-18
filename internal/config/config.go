@@ -631,7 +631,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		maxHoldingDuration = 4 * time.Hour
 	}
 
-	limitOrderTimeoutStr := getEnv("LIMIT_ORDER_TIMEOUT", "90s")
+	limitOrderTimeoutStr := getEnv("LIMIT_ORDER_TIMEOUT", "150s")
 	limitOrderTimeout, err := time.ParseDuration(limitOrderTimeoutStr)
 	if err != nil {
 		if sec, secErr := strconv.Atoi(limitOrderTimeoutStr); secErr == nil && sec >= 5 {
@@ -639,7 +639,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		}
 	}
 	if limitOrderTimeout < 5*time.Second {
-		limitOrderTimeout = 90 * time.Second
+		limitOrderTimeout = 150 * time.Second
 	}
 
 	entryRepegMaxAttemptsStr := getEnv("ENTRY_REPEG_MAX_ATTEMPTS", "3")

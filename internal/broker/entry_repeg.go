@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	defaultLimitOrderTimeout     = 90 * time.Second
+	defaultLimitOrderTimeout     = 150 * time.Second
 	defaultMaxEntryRepegAttempts = 3
 	defaultMaxEntryRepegDriftPct = 0.0005
 	maxEntryRepegATRFraction     = 0.25

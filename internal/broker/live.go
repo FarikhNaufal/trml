@@ -659,7 +659,8 @@ func (b *BinanceLiveBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, er
 }
 
 // RefreshAccount mengambil data saldo dompet dan posisi aktif terkini via REST API Binance (FetchAccountFn)
-// dan langsung memperbarui state in-memory live broker (Solusi P0-2 untuk mencegah account staleness).
+// dan langsung memperbarui state in-memory live broker (Solusi P0-2 untuk mencegah account staleness),
+// sekaligus merekonsiliasi posisi yang terisi atau tertutup selama User Data WS terputus.
 func (b *BinanceLiveBroker) RefreshAccount(ctx context.Context) error {
 	if b.FetchAccountFn == nil {
 		return nil
@@ -668,8 +669,190 @@ func (b *BinanceLiveBroker) RefreshAccount(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("refresh account balance: %w", err)
 	}
-	b.HandleAccountUpdate(wb, up, ab, pos, time.Now().UTC())
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(wb, up, ab, pos, now)
+	b.reconcileAfterAccountSnapshot(pos, now)
 	return nil
+}
+
+const offlineReconcileGrace = 15 * time.Second
+
+func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]model.LivePosition, now time.Time) {
+	var plans []model.ProtectionPlanAction
+	type offlineCloseCleanup struct {
+		symbol      string
+		slAlgoID    int64
+		tpAlgoID    int64
+		tp1OrderID  int64
+	}
+	var closedCleanups []offlineCloseCleanup
+
+	b.Mu.Lock()
+	// 1. Posisi terbuka di Binance yang belum punya SL/TP lokal (miss ORDER_TRADE_UPDATE saat WS/internet mati)
+	for sym, pos := range positions {
+		if !pos.Qty.GreaterThan(decimal.Zero) {
+			continue
+		}
+		if _, hasProt := b.Protections[sym]; hasProt || b.IsTP1Hits[sym] {
+			continue
+		}
+		var entryRec *model.LiveOrderRecord
+		if cid, ok := b.PositionClientOrderIDs[sym]; ok && cid != "" {
+			if r := b.OrdersByClient[cid]; r != nil && r.IsEntry && r.Symbol == sym {
+				entryRec = r
+			}
+		}
+		if entryRec == nil {
+			for _, r := range b.OrdersByClient {
+				if r != nil && r.IsEntry && r.Symbol == sym {
+					entryRec = r
+					break
+				}
+			}
+		}
+		if entryRec == nil {
+			continue
+		}
+		// Hindari race dengan SubmitLimitEntry yang baru beberapa milidetik berjalan sebelum ExchangeOrderID terisi
+		if entryRec.Status == model.StatusPendingNew && entryRec.ExchangeOrderID == 0 && now.Sub(entryRec.CreatedAt) < 5*time.Second {
+			continue
+		}
+		entryRec.Status = model.StatusFilled
+		entryRec.CumulativeFilledQty = pos.Qty
+		entryRec.AvgPrice = pos.EntryPrice
+		if plan, needExec := b.applyEntryFillLocked(entryRec, pos.Qty, pos.EntryPrice, now); needExec {
+			slog.Warn("live: reconciled missed entry fill from REST account snapshot; arming SL/TP protections",
+				"symbol", sym, "clientOrderID", entryRec.ClientOrderID, "qty", pos.Qty, "entryPrice", pos.EntryPrice)
+			plans = append(plans, plan)
+		}
+	}
+
+	// 2. Posisi lokal yang sudah tidak ada di snapshot REST Binance penuh (tertutup SL/TP saat offline)
+	trackedSymbols := make(map[string]bool)
+	for sym, q := range b.ActivePositions {
+		if q.GreaterThan(decimal.Zero) {
+			trackedSymbols[sym] = true
+		}
+	}
+	for sym := range b.Protections {
+		trackedSymbols[sym] = true
+	}
+
+	for sym := range trackedSymbols {
+		if pos, exists := positions[sym]; exists && pos.Qty.GreaterThan(decimal.Zero) {
+			continue
+		}
+		if b.ClosingInFlight[sym] {
+			continue
+		}
+		if openTime, hasOpen := b.PositionOpenTimes[sym]; hasOpen && now.Sub(openTime) < offlineReconcileGrace {
+			continue
+		}
+		var slAlgoID, tpAlgoID, tp1OrderID int64
+		if prot := b.Protections[sym]; prot != nil {
+			slAlgoID = prot.SLOrderID
+			tpAlgoID = prot.TPOrderID
+			tp1OrderID = prot.TP1OrderID
+		}
+		b.clearSymbolStateLocked(sym)
+		closedCleanups = append(closedCleanups, offlineCloseCleanup{
+			symbol:     sym,
+			slAlgoID:   slAlgoID,
+			tpAlgoID:   tpAlgoID,
+			tp1OrderID: tp1OrderID,
+		})
+	}
+	b.Mu.Unlock()
+
+	for _, plan := range plans {
+		go b.executeProtectionPlan(plan)
+	}
+
+	for _, cl := range closedCleanups {
+		slog.Warn("live: reconciled offline-closed position from full account snapshot; cleaning stale local state",
+			"symbol", cl.symbol, "slAlgoID", cl.slAlgoID, "tpAlgoID", cl.tpAlgoID)
+		b.notifyPositionDeleted(cl.symbol)
+		for _, algoID := range []int64{cl.slAlgoID, cl.tpAlgoID} {
+			if algoID != 0 && b.CancelAlgoOrderFn != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = b.CancelAlgoOrderFn(ctx, cl.symbol, algoID)
+				cancel()
+			}
+		}
+		if cl.tp1OrderID != 0 && b.CancelOrderFn != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = b.CancelOrderFn(ctx, cl.symbol, cl.tp1OrderID, "")
+			cancel()
+		}
+	}
+}
+
+func (b *BinanceLiveBroker) applyEntryFillLocked(
+	rec *model.LiveOrderRecord,
+	filledQty, avgPrice decimal.Decimal,
+	now time.Time,
+) (model.ProtectionPlanAction, bool) {
+	symbol := rec.Symbol
+	b.ActivePositions[symbol] = filledQty
+	b.PositionSides[symbol] = rec.Side
+	if avgPrice.GreaterThan(decimal.Zero) {
+		b.PositionEntryPrices[symbol] = avgPrice
+	}
+	if _, hasOpenTime := b.PositionOpenTimes[symbol]; !hasOpenTime {
+		b.PositionOpenTimes[symbol] = now
+	}
+	if b.InitialQtys[symbol].IsZero() {
+		b.InitialQtys[symbol] = filledQty
+	}
+	if b.InitialSLPrices[symbol].IsZero() {
+		if rec.InitialSLPrice.GreaterThan(decimal.Zero) {
+			b.InitialSLPrices[symbol] = rec.InitialSLPrice
+		} else {
+			b.InitialSLPrices[symbol] = rec.SLPrice
+		}
+	}
+	if b.TP1Prices[symbol].IsZero() {
+		b.TP1Prices[symbol] = rec.TP1Price
+	}
+	if b.ATRAtEntry[symbol].IsZero() {
+		b.ATRAtEntry[symbol] = rec.ATRAtEntry
+	}
+	return b.planProtectionSyncLocked(rec)
+}
+
+func (b *BinanceLiveBroker) clearSymbolStateLocked(symbol string) {
+	delete(b.ActivePositions, symbol)
+	delete(b.PositionOpenTimes, symbol)
+	delete(b.PositionSides, symbol)
+	delete(b.PositionEntryPrices, symbol)
+	delete(b.ClosingInFlight, symbol)
+	delete(b.ClosingReason, symbol)
+	delete(b.ProtectionTiers, symbol)
+	delete(b.ATRAtEntry, symbol)
+	delete(b.PeakPrices, symbol)
+	delete(b.PositionClientOrderIDs, symbol)
+	delete(b.ActiveMAE, symbol)
+	delete(b.ActiveMFE, symbol)
+	delete(b.Protections, symbol)
+	delete(b.InitialQtys, symbol)
+	delete(b.InitialSLPrices, symbol)
+	delete(b.TP1Prices, symbol)
+	delete(b.IsTP1Hits, symbol)
+	delete(b.AlgoUpdateInFlight, symbol)
+	delete(b.TP1InFlight, symbol)
+	delete(b.TP1FilledQtys, symbol)
+	delete(b.TP1LastFillPrices, symbol)
+	delete(b.TP1CommittedQtys, symbol)
+	delete(b.LastAlgoUpdateTimes, symbol)
+	delete(b.LastSentSLPrices, symbol)
+	for cID, ord := range b.OrdersByClient {
+		if ord != nil && ord.Symbol == symbol {
+			if ord.ExchangeOrderID != 0 {
+				delete(b.OrdersByExchangeID, ord.ExchangeOrderID)
+			}
+			delete(b.OrdersByClient, cID)
+		}
+	}
 }
 
 // HandleAccountUpdate memproses pembaruan akun dari REST atau event ACCOUNT_UPDATE (Solusi P0-2)
@@ -883,59 +1066,11 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 		switch status {
 		case model.StatusPartiallyFilled, model.StatusFilled:
 			if cumFilledQty.GreaterThan(decimal.Zero) {
-				b.ActivePositions[symbol] = cumFilledQty
-				b.PositionSides[symbol] = rec.Side
-				if avgPrice.GreaterThan(decimal.Zero) {
-					b.PositionEntryPrices[symbol] = avgPrice
-				}
-				if _, hasOpenTime := b.PositionOpenTimes[symbol]; !hasOpenTime {
-					b.PositionOpenTimes[symbol] = time.Now().UTC()
-				}
-				if b.InitialQtys[symbol].IsZero() {
-					b.InitialQtys[symbol] = cumFilledQty
-				}
-				if b.InitialSLPrices[symbol].IsZero() {
-					if rec.InitialSLPrice.GreaterThan(decimal.Zero) {
-						b.InitialSLPrices[symbol] = rec.InitialSLPrice
-					} else {
-						b.InitialSLPrices[symbol] = rec.SLPrice
-					}
-				}
-				if b.TP1Prices[symbol].IsZero() {
-					b.TP1Prices[symbol] = rec.TP1Price
-				}
-				if b.ATRAtEntry[symbol].IsZero() {
-					b.ATRAtEntry[symbol] = rec.ATRAtEntry
-				}
-				plan, needPlanExecution = b.planProtectionSyncLocked(rec)
+				plan, needPlanExecution = b.applyEntryFillLocked(rec, cumFilledQty, avgPrice, time.Now().UTC())
 			}
 		case model.StatusCanceled, model.StatusExpired:
 			if cumFilledQty.GreaterThan(decimal.Zero) {
-				b.ActivePositions[symbol] = cumFilledQty
-				b.PositionSides[symbol] = rec.Side
-				if avgPrice.GreaterThan(decimal.Zero) {
-					b.PositionEntryPrices[symbol] = avgPrice
-				}
-				if _, hasOpenTime := b.PositionOpenTimes[symbol]; !hasOpenTime {
-					b.PositionOpenTimes[symbol] = time.Now().UTC()
-				}
-				if b.InitialQtys[symbol].IsZero() {
-					b.InitialQtys[symbol] = cumFilledQty
-				}
-				if b.InitialSLPrices[symbol].IsZero() {
-					if rec.InitialSLPrice.GreaterThan(decimal.Zero) {
-						b.InitialSLPrices[symbol] = rec.InitialSLPrice
-					} else {
-						b.InitialSLPrices[symbol] = rec.SLPrice
-					}
-				}
-				if b.TP1Prices[symbol].IsZero() {
-					b.TP1Prices[symbol] = rec.TP1Price
-				}
-				if b.ATRAtEntry[symbol].IsZero() {
-					b.ATRAtEntry[symbol] = rec.ATRAtEntry
-				}
-				plan, needPlanExecution = b.planProtectionSyncLocked(rec)
+				plan, needPlanExecution = b.applyEntryFillLocked(rec, cumFilledQty, avgPrice, time.Now().UTC())
 			} else {
 				delete(b.OrdersByClient, rec.ClientOrderID)
 				delete(b.OrdersByExchangeID, exchangeOrderID)
@@ -1471,15 +1606,57 @@ func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
 		err := b.CancelOrderFn(ctx, ord.Symbol, ord.ExchangeOrderID, ord.ClientOrderID)
 		cancel()
 
-		b.Mu.Lock()
-		if err == nil || (err != nil && (strings.Contains(err.Error(), "Unknown order") || strings.Contains(err.Error(), "-2011"))) {
+		if err == nil {
+			b.Mu.Lock()
 			ord.Status = model.StatusExpired
 			if ord.CumulativeFilledQty.IsZero() {
 				delete(b.OrdersByClient, ord.ClientOrderID)
 				delete(b.OrdersByExchangeID, ord.ExchangeOrderID)
 			}
+			b.Mu.Unlock()
+			continue
 		}
-		b.Mu.Unlock()
+
+		if strings.Contains(err.Error(), "Unknown order") || strings.Contains(err.Error(), "-2011") {
+			// Jika order sudah tidak ditemukan (-2011), periksa REST QueryOrder agar fill yang terjadi saat WS mati
+			// tidak terbuang tanpa pemasangan proteksi SL/TP.
+			if b.QueryOrderFn != nil {
+				qCtx, qCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				qRec, qErr := b.QueryOrderFn(qCtx, ord.Symbol, ord.ClientOrderID)
+				qCancel()
+				if qErr == nil && qRec != nil && qRec.CumulativeFilledQty.GreaterThan(decimal.Zero) {
+					if b.FetchAccountFn != nil {
+						rCtx, rCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						_ = b.RefreshAccount(rCtx)
+						rCancel()
+					}
+					b.Mu.Lock()
+					openQty := b.ActivePositions[ord.Symbol]
+					_, hasProt := b.Protections[ord.Symbol]
+					b.Mu.Unlock()
+					if (b.FetchAccountFn == nil || openQty.GreaterThan(decimal.Zero)) && !hasProt {
+						b.HandleUserDataOrderUpdate(
+							qRec.ClientOrderID,
+							qRec.ExchangeOrderID,
+							qRec.Symbol,
+							qRec.Status,
+							qRec.CumulativeFilledQty,
+							qRec.AvgPrice,
+							decimal.Zero,
+						)
+					}
+					continue
+				}
+			}
+
+			b.Mu.Lock()
+			ord.Status = model.StatusExpired
+			if ord.CumulativeFilledQty.IsZero() {
+				delete(b.OrdersByClient, ord.ClientOrderID)
+				delete(b.OrdersByExchangeID, ord.ExchangeOrderID)
+			}
+			b.Mu.Unlock()
+		}
 	}
 }
 

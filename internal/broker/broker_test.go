@@ -3448,8 +3448,8 @@ func TestDryRunBroker_RestingOrderNotCancelledOnLaterBookTick_AndFills(t *testin
 	b := NewDryRunBroker(decimal.NewFromFloat(1000.0), cfg)
 	defer b.Close()
 
-	if b.Cfg.LimitOrderTimeout != 90*time.Second {
-		t.Fatalf("expected default LimitOrderTimeout 90s, got %s", b.Cfg.LimitOrderTimeout)
+	if b.Cfg.LimitOrderTimeout != 150*time.Second {
+		t.Fatalf("expected default LimitOrderTimeout 150s, got %s", b.Cfg.LimitOrderTimeout)
 	}
 
 	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
@@ -3493,14 +3493,14 @@ func TestDryRunBroker_RestingOrderNotCancelledOnLaterBookTick_AndFills(t *testin
 		t.Fatalf("expected resting pending order to stay alive with GTXValidated=true, pending=%v gtx=%v", stillPending, gtxValidated)
 	}
 
-	// Timeout check pada +46s tidak boleh membatalkan karena timeout sekarang 90s
-	b.CheckTimeouts(now.Add(46 * time.Second))
+	// Timeout check pada +120s (skenario WLDUSDT menit ke-2) tidak boleh membatalkan karena timeout sekarang 150s
+	b.CheckTimeouts(now.Add(120 * time.Second))
 	if !b.HasActiveOrderOrPosition("ZROUSDT") {
-		t.Fatalf("expected ZROUSDT order to remain active at +46s under 90s timeout")
+		t.Fatalf("expected ZROUSDT order to remain active at +120s under 150s timeout")
 	}
 
 	// AggTrade buy (isBuyerMaker=false) di >= LimitPrice mengisi order SHORT
-	b.OnRealtimeTick("ZROUSDT", 1.000, 1.001, 1.000, 1.000, 25, false, now.Add(47*time.Second))
+	b.OnRealtimeTick("ZROUSDT", 1.000, 1.001, 1.000, 1.000, 25, false, now.Add(121*time.Second))
 	b.Mu.Lock()
 	pos := b.OpenPositions["ZROUSDT"]
 	b.Mu.Unlock()
@@ -3684,8 +3684,8 @@ func TestLiveBroker_PreRepegAndGTX5022RetryWithAttachAuditID(t *testing.T) {
 	})
 	defer b.Close()
 
-	if b.Cfg.LimitOrderTimeout != 90*time.Second {
-		t.Fatalf("expected LiveBroker default LimitOrderTimeout 90s, got %s", b.Cfg.LimitOrderTimeout)
+	if b.Cfg.LimitOrderTimeout != 150*time.Second {
+		t.Fatalf("expected LiveBroker default LimitOrderTimeout 150s, got %s", b.Cfg.LimitOrderTimeout)
 	}
 
 	now := time.Now().UTC()
@@ -3808,4 +3808,236 @@ func TestLiveBroker_PreRepegExceedsMaxDriftAbortsCleanly(t *testing.T) {
 	if b.GetActiveSlotCount() != 0 || b.HasActiveOrderOrPosition("DOGEUSDT") {
 		t.Fatalf("expected 0 reserved slots after abort")
 	}
+}
+
+func TestLiveBroker_OfflineReconciliation_MissedFill_And_OfflineClose(t *testing.T) {
+	t.Run("timeout -2011 checks QueryOrderFn and arms SL/TP if filled during offline outage", func(t *testing.T) {
+		b := NewBinanceLiveBroker(LiveBrokerConfig{
+			MaxSlots:            3,
+			MaxDailyDrawdownPct: -0.05,
+			MaxAccountStaleness: 60 * time.Second,
+			LimitOrderTimeout:   150 * time.Second,
+		})
+		defer b.Close()
+
+		t0 := time.Now().UTC().Add(-200 * time.Second)
+		b.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, time.Now().UTC())
+
+		b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+			return 444111, nil
+		}
+		b.CancelOrderFn = func(ctx context.Context, symbol string, orderID int64, clientOrderID string) error {
+			return fmt.Errorf("binance error code=-2011 Unknown order sent")
+		}
+		b.QueryOrderFn = func(ctx context.Context, symbol, clientOrderID string) (*model.LiveOrderRecord, error) {
+			return &model.LiveOrderRecord{
+				ClientOrderID:       clientOrderID,
+				ExchangeOrderID:     444111,
+				Symbol:              symbol,
+				Side:                model.SideShort,
+				IsEntry:             true,
+				Status:              model.StatusFilled,
+				TargetQty:           decimal.NewFromFloat(5),
+				CumulativeFilledQty: decimal.NewFromFloat(5),
+				AvgPrice:            decimal.NewFromFloat(100.0),
+			}, nil
+		}
+		b.FetchAccountFn = func(ctx context.Context) (decimal.Decimal, decimal.Decimal, decimal.Decimal, map[string]model.LivePosition, error) {
+			return decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(950.0), map[string]model.LivePosition{
+				"SOLUSDT": {Symbol: "SOLUSDT", Side: model.SideShort, Qty: decimal.NewFromFloat(5), EntryPrice: decimal.NewFromFloat(100.0)},
+			}, nil
+		}
+
+		var slPlaced, tpPlaced atomic.Int32
+		b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+			if orderType == "STOP_MARKET" {
+				slPlaced.Add(1)
+				return 801, nil
+			}
+			tpPlaced.Add(1)
+			return 802, nil
+		}
+
+		ok, err := b.SubmitLimitEntry(model.OrderIntent{
+			ClientOrderID: "OFFLINE_FILL_SOL",
+			Symbol:        "SOLUSDT",
+			Side:          model.SideShort,
+			Qty:           decimal.NewFromFloat(5),
+			LimitPrice:    decimal.NewFromFloat(100.0),
+			SLPrice:       decimal.NewFromFloat(103.0),
+			TPPrice:       decimal.NewFromFloat(94.0),
+			ATRAtEntry:    decimal.NewFromFloat(2.0),
+			CreatedAt:     t0,
+		})
+		if !ok || err != nil {
+			t.Fatalf("SubmitLimitEntry failed: ok=%v err=%v", ok, err)
+		}
+		b.Mu.Lock()
+		b.OrdersByClient["OFFLINE_FILL_SOL"].CreatedAt = t0
+		b.Mu.Unlock()
+
+		// Simulasikan internet pulih setelah 200 detik dan Worker 4 mengecek timeout
+		b.CheckPendingEntryTimeouts(time.Now().UTC())
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if slPlaced.Load() > 0 && tpPlaced.Load() > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if slPlaced.Load() != 1 || tpPlaced.Load() != 1 {
+			t.Fatalf("expected SL & TP algo orders armed after -2011 QueryOrder recovery, got SL=%d TP=%d", slPlaced.Load(), tpPlaced.Load())
+		}
+		b.Mu.Lock()
+		prot := b.Protections["SOLUSDT"]
+		b.Mu.Unlock()
+		if prot == nil || prot.SLStatus != model.ProtectionAcked {
+			t.Fatalf("expected ProtectionAcked on SOLUSDT, got %+v", prot)
+		}
+	})
+
+	t.Run("RefreshAccount cleans offline-closed position and cancels orphan algo orders", func(t *testing.T) {
+		b := NewBinanceLiveBroker(LiveBrokerConfig{
+			MaxSlots:            3,
+			MaxDailyDrawdownPct: -0.05,
+			MaxAccountStaleness: 60 * time.Second,
+		})
+		defer b.Close()
+
+		deletedCh := make(chan string, 2)
+		b.OnPositionDeletedFn = func(sym string) { deletedCh <- sym }
+
+		var canceledAlgos []int64
+		var mu sync.Mutex
+		b.CancelAlgoOrderFn = func(ctx context.Context, symbol string, algoID int64) error {
+			mu.Lock()
+			canceledAlgos = append(canceledAlgos, algoID)
+			mu.Unlock()
+			return nil
+		}
+		var canceledTP1 int64
+		b.CancelOrderFn = func(ctx context.Context, symbol string, orderID int64, clientOrderID string) error {
+			canceledTP1 = orderID
+			return nil
+		}
+
+		// Posisi BTCUSDT aktif & terproteksi sejak 5 menit lalu (> grace 15s)
+		b.RestoreOpenPosition(&LiveOpenPosition{
+			Symbol:         "BTCUSDT",
+			Side:           model.SideShort,
+			Qty:            decimal.NewFromFloat(0.5),
+			InitialQty:     decimal.NewFromFloat(0.5),
+			EntryPrice:     decimal.NewFromFloat(65000.0),
+			SLOrderID:      701,
+			SLClientAlgoID: "ALGO_SL_701",
+			SLPrice:        decimal.NewFromFloat(66000.0),
+			TPOrderID:      702,
+			TPClientAlgoID: "ALGO_TP_702",
+			TPPrice:        decimal.NewFromFloat(63000.0),
+			TP1OrderID:     703,
+			TP1Price:       decimal.NewFromFloat(64000.0),
+			ATRAtEntry:     decimal.NewFromFloat(500.0),
+			OpenTime:       time.Now().UTC().Add(-5 * time.Minute),
+		})
+
+		// Snapshot REST Binance mengembalikan positions kosong (sudah tutup SL/TP di bursa saat offline)
+		b.FetchAccountFn = func(ctx context.Context) (decimal.Decimal, decimal.Decimal, decimal.Decimal, map[string]model.LivePosition, error) {
+			return decimal.NewFromFloat(990.0), decimal.Zero, decimal.NewFromFloat(990.0), map[string]model.LivePosition{}, nil
+		}
+
+		if err := b.RefreshAccount(context.Background()); err != nil {
+			t.Fatalf("RefreshAccount failed: %v", err)
+		}
+
+		b.Mu.Lock()
+		_, stillActive := b.ActivePositions["BTCUSDT"]
+		_, stillProt := b.Protections["BTCUSDT"]
+		b.Mu.Unlock()
+		if stillActive || stillProt {
+			t.Fatalf("expected stale BTCUSDT position and protection cleared, active=%v prot=%v", stillActive, stillProt)
+		}
+		select {
+		case deletedSym := <-deletedCh:
+			if deletedSym != "BTCUSDT" {
+				t.Fatalf("expected OnPositionDeletedFn('BTCUSDT'), got %q", deletedSym)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatalf("timeout waiting for OnPositionDeletedFn('BTCUSDT')")
+		}
+		mu.Lock()
+		gotAlgos := append([]int64(nil), canceledAlgos...)
+		mu.Unlock()
+		if len(gotAlgos) != 2 || canceledTP1 != 703 {
+			t.Fatalf("expected orphan SL/TP algos (701,702) and TP1 (703) canceled, got algos=%v tp1=%d", gotAlgos, canceledTP1)
+		}
+	})
+
+	t.Run("timeout -2011 checks QueryOrderFn alone even when FetchAccountFn nil", func(t *testing.T) {
+		b := NewBinanceLiveBroker(LiveBrokerConfig{
+			MaxSlots:            3,
+			MaxDailyDrawdownPct: -0.05,
+			MaxAccountStaleness: 60 * time.Second,
+			LimitOrderTimeout:   150 * time.Second,
+		})
+		defer b.Close()
+
+		t0 := time.Now().UTC().Add(-200 * time.Second)
+		b.HandleAccountUpdate(decimal.NewFromFloat(1000.0), decimal.Zero, decimal.NewFromFloat(1000.0), nil, time.Now().UTC())
+		b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+			return 444222, nil
+		}
+		b.CancelOrderFn = func(ctx context.Context, symbol string, orderID int64, clientOrderID string) error {
+			return fmt.Errorf("binance API error code=-2011 msg=Unknown order sent")
+		}
+		b.QueryOrderFn = func(ctx context.Context, symbol, clientOrderID string) (*model.LiveOrderRecord, error) {
+			return &model.LiveOrderRecord{
+				ClientOrderID:       clientOrderID,
+				ExchangeOrderID:     444222,
+				Symbol:              symbol,
+				Side:                model.SideShort,
+				IsEntry:             true,
+				Status:              model.StatusFilled,
+				TargetQty:           decimal.NewFromFloat(2),
+				CumulativeFilledQty: decimal.NewFromFloat(2),
+				AvgPrice:            decimal.NewFromFloat(2000.0),
+			}, nil
+		}
+		var slPlaced atomic.Int32
+		b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+			if orderType == "STOP_MARKET" {
+				slPlaced.Add(1)
+			}
+			return 901, nil
+		}
+
+		if ok, err := b.SubmitLimitEntry(model.OrderIntent{
+			ClientOrderID: "OFFLINE_ETH_2011",
+			Symbol:        "ETHUSDT",
+			Side:          model.SideShort,
+			Qty:           decimal.NewFromFloat(2),
+			LimitPrice:    decimal.NewFromFloat(2000.0),
+			SLPrice:       decimal.NewFromFloat(2060.0),
+			TPPrice:       decimal.NewFromFloat(1880.0),
+			ATRAtEntry:    decimal.NewFromFloat(40.0),
+			CreatedAt:     t0,
+		}); !ok || err != nil {
+			t.Fatalf("SubmitLimitEntry failed: %v", err)
+		}
+		b.Mu.Lock()
+		b.OrdersByClient["OFFLINE_ETH_2011"].CreatedAt = t0
+		b.Mu.Unlock()
+
+		b.CheckPendingEntryTimeouts(time.Now().UTC())
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if slPlaced.Load() > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if slPlaced.Load() != 1 {
+			t.Fatalf("expected SL algo order placed via QueryOrderFn fallback, got %d", slPlaced.Load())
+		}
+	})
 }
