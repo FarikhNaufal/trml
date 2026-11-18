@@ -129,6 +129,7 @@ func handleDataCommand(args []string) {
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
+	symbols = ensureBenchmarkSymbol(symbols)
 	downloader := data.NewDownloader(*cacheDirFlag)
 
 	switch sub {
@@ -271,16 +272,8 @@ func handleRunCommand(args []string) {
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
-	hasBTC := false
-	for _, s := range symbols {
-		if s == "BTCUSDT" {
-			hasBTC = true
-			break
-		}
-	}
-	if !hasBTC {
-		symbols = append([]string{"BTCUSDT"}, symbols...)
-	}
+	symbols = ensureBenchmarkSymbol(symbols)
+	symbols = ensureBenchmarkSymbol(symbols)
 
 	downloader := data.NewDownloader(*cacheDirFlag)
 	if *offlineFlag {
@@ -566,6 +559,7 @@ func handleAblateCommand(args []string) {
 	} else {
 		symbols = []string{"SOLUSDT", "DOGEUSDT", "NEARUSDT"}
 	}
+	symbols = ensureBenchmarkSymbol(symbols)
 
 	var exchangeFilters map[string]model.ExchangeFilter
 	if *offlineFlag {
@@ -1077,6 +1071,15 @@ func getGitCommitHash() string {
 		}
 	}
 	return "8c35d9e"
+}
+
+func ensureBenchmarkSymbol(symbols []string) []string {
+	for _, s := range symbols {
+		if s == "BTCUSDT" {
+			return symbols
+		}
+	}
+	return append([]string{"BTCUSDT"}, symbols...)
 }
 
 func isCompoundingConfigured(envPath string) bool {

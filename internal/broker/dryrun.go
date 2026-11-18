@@ -119,6 +119,7 @@ type DryRunBroker struct {
 	PendingOrders         map[string]*VirtualPendingOrder
 	OpenPositions         map[string]*VirtualOpenPosition
 	OnTradeClosedFn       func(rec TradeClosedRecord)
+	OnCooldownRecordedFn  func(symbol string, closedAt time.Time, exitReason string)
 	OnPositionSavedFn     func(pos VirtualOpenPosition)
 	OnPositionDeletedFn   func(clientOrderIDOrSymbol string)
 	GetExchangeFilterFn   func(symbol string) (model.ExchangeFilter, bool)
@@ -376,14 +377,40 @@ func (d *DryRunBroker) isDailyDrawdownBreachedLocked() bool {
 	return false
 }
 
+func (d *DryRunBroker) cancelAllPendingOrdersLocked(reason string) {
+	for sym, ord := range d.PendingOrders {
+		slog.Warn("dryrun: canceling pending limit order",
+			"symbol", sym, "clientOrderID", ord.Intent.ClientOrderID,
+			"limitPrice", ord.Intent.LimitPrice, "reason", reason)
+		if ord.FilledQty.GreaterThan(decimal.Zero) {
+			if pos, exists := d.OpenPositions[sym]; exists {
+				pos.InitialQty = ord.FilledQty
+				d.enqueuePositionEvent(PositionEvent{
+					Type: PositionEventSave,
+					Pos:  *pos,
+				})
+			}
+		}
+		delete(d.PendingOrders, sym)
+	}
+}
+
 func (d *DryRunBroker) OnRealtimeTick(
 	symbol string,
 	bestBid, bestAsk, markPrice, tradePrice, tradeQty float64,
 	isBuyerMaker bool,
 	now time.Time,
 ) {
+	var closedRecs []TradeClosedRecord
 	d.Mu.Lock()
-	defer d.Mu.Unlock()
+	defer func() {
+		d.Mu.Unlock()
+		if len(closedRecs) > 0 && d.OnCooldownRecordedFn != nil {
+			for _, rec := range closedRecs {
+				d.OnCooldownRecordedFn(rec.Symbol, rec.ClosedAt, rec.ExitReason)
+			}
+		}
+	}()
 
 	// Solusi P1-7: Mark-to-market terlebih dahulu SEBELUM rollover baseline harian
 	if markPrice > 0 {
@@ -437,6 +464,10 @@ func (d *DryRunBroker) OnRealtimeTick(
 		d.SessionDayEpochUTC = epochDay
 		d.SessionStartEquity = d.calculateEffectiveEquityLocked()
 		d.CircuitBreakerTripped = false
+	}
+
+	if d.isDailyDrawdownBreachedLocked() && len(d.PendingOrders) > 0 {
+		d.cancelAllPendingOrdersLocked("CIRCUIT_BREAKER_BREACHED")
 	}
 
 	// 1. Evaluasi Antrean Limit Order Masuk (Solusi P1-1 & P1-2)
@@ -595,7 +626,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 		beOffsetRate := decimal.NewFromFloat(math.Max(d.Cfg.MinBreakEvenOffsetPct, 2.0*d.Cfg.TakerFeeRate+d.Cfg.SlippageRate))
 
 		if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
-			d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING")
+			closedRecs = append(closedRecs, d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
 			delete(d.PendingOrders, symbol)
 			return
 		}
@@ -613,7 +644,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 			isTPHit := triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
 			if isTPHit && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
-				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
+				closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
 				delete(d.PendingOrders, symbol)
 				return
 			}
@@ -628,7 +659,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 				} else if pos.IsBreakEvenMoved {
 					exitReason = "BREAK_EVEN"
 				}
-				d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason)
+				closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason))
 				delete(d.PendingOrders, symbol)
 				return
 			}
@@ -645,7 +676,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 			isTPHit := triggerRefPrice.LessThanOrEqual(pos.TPPrice) ||
 				(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
 			if isTPHit && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
-				d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT")
+				closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
 				delete(d.PendingOrders, symbol)
 				return
 			}
@@ -660,7 +691,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 				} else if pos.IsBreakEvenMoved {
 					exitReason = "BREAK_EVEN"
 				}
-				d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason)
+				closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason))
 				delete(d.PendingOrders, symbol)
 				return
 			}
@@ -905,7 +936,7 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		"newSL", pos.CurrentSLPrice)
 }
 
-func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, reason string) {
+func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, reason string) TradeClosedRecord {
 	var grossPnL decimal.Decimal
 	if pos.Side == model.SideLong {
 		grossPnL = exitPrice.Sub(pos.EntryPrice).Mul(pos.Qty)
@@ -962,6 +993,7 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	if d.OnTradeClosedFn != nil {
 		go d.OnTradeClosedFn(rec)
 	}
+	return rec
 }
 
 func (d *DryRunBroker) calculateEffectiveEquityLocked() decimal.Decimal {
@@ -1085,8 +1117,20 @@ func (d *DryRunBroker) GetMonitoredSymbols() []string {
 }
 
 func (d *DryRunBroker) CheckTimeouts(now time.Time) {
+	var closedRecs []TradeClosedRecord
 	d.Mu.Lock()
-	defer d.Mu.Unlock()
+	defer func() {
+		d.Mu.Unlock()
+		if len(closedRecs) > 0 && d.OnCooldownRecordedFn != nil {
+			for _, rec := range closedRecs {
+				d.OnCooldownRecordedFn(rec.Symbol, rec.ClosedAt, rec.ExitReason)
+			}
+		}
+	}()
+
+	if d.isDailyDrawdownBreachedLocked() && len(d.PendingOrders) > 0 {
+		d.cancelAllPendingOrdersLocked("CIRCUIT_BREAKER_BREACHED")
+	}
 
 	if d.Cfg.LimitOrderTimeout > 0 {
 		for sym, ord := range d.PendingOrders {
@@ -1113,7 +1157,7 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 			if now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
 				triggerRefPrice := pos.LastMarkPrice
 				if triggerRefPrice.GreaterThan(decimal.Zero) {
-					d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING")
+					closedRecs = append(closedRecs, d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
 					delete(d.PendingOrders, sym)
 				}
 			}

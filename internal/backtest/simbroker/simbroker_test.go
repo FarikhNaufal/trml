@@ -714,5 +714,67 @@ func TestSimBroker_MultiLegFundingAccounting(t *testing.T) {
 	}
 }
 
+func TestSimBroker_PartialTP1_UnsplittableMovesToBERunner(t *testing.T) {
+	cfg := SimBrokerConfig{
+		InitialEquityUSDT:       decimal.NewFromFloat(100.0),
+		MaxSlots:                3,
+		MaxDailyDrawdownPct:     -0.05,
+		AccountLeverage:         8.0,
+		MakerFeeRate:            decimal.NewFromFloat(0.0002),
+		TakerFeeRate:            decimal.NewFromFloat(0.0005),
+		SlippageRate:            decimal.NewFromFloat(0.0002),
+		SignalDelayBars:         1,
+		LimitTimeoutBars:        1,
+		PenetrationTicks:        1,
+		IntrabarConflictSLFirst: true,
+		PartialTPEnabled:        true,
+		PartialTP1Ratio:         0.35,
+		TrailingEnabled:         true,
+		TrailingActivateATR:     1.50,
+		TrailingDistanceATR:     0.35,
+	}
+	b := NewSimBroker(cfg)
+	b.SetExchangeFilter("ADAUSDT", model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.001),
+		StepSize:    decimal.NewFromFloat(1.0),
+		MinQty:      decimal.NewFromFloat(1.0),
+		MinNotional: decimal.NewFromFloat(5.0),
+	})
+
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	// Total notional ~8 USDT -> 35% = 2.8 USDT < MinNotional 5 USDT (unsplittable)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "SMALL_TP1",
+		Symbol:        "ADAUSDT",
+		Side:          model.SideShort,
+		Qty:           decimal.NewFromFloat(8.0),
+		LimitPrice:    decimal.NewFromFloat(1.000),
+		SLPrice:       decimal.NewFromFloat(1.020),
+		TPPrice:       decimal.NewFromFloat(0.950),
+		TP1Price:      decimal.NewFromFloat(0.985),
+		ATRAtEntry:    decimal.NewFromFloat(0.012),
+		CreatedAt:     now,
+	})
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now, CloseTime: now.Add(5 * time.Minute),
+		Symbol: "ADAUSDT", Open: 1.000, High: 1.005, Low: 0.995, Close: 0.998,
+	}, 0)
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now.Add(5 * time.Minute), CloseTime: now.Add(10 * time.Minute),
+		Symbol: "ADAUSDT", Open: 0.998, High: 1.000, Low: 0.984, Close: 0.984,
+	}, 1)
+
+	pos := b.OpenPositions["ADAUSDT"]
+	if pos == nil || !pos.IsTP1Hit || !pos.Qty.Equal(decimal.NewFromFloat(8.0)) {
+		t.Fatalf("expected unsplittable position to keep full qty 8.0 and mark IsTP1Hit=true, got %+v", pos)
+	}
+	if !pos.CurrentSLPrice.LessThan(pos.EntryPrice) || pos.ProtectionTier != 1 {
+		t.Fatalf("expected SL moved to BE (< 1.000) and ProtectionTier=1, got SL=%s tier=%d", pos.CurrentSLPrice, pos.ProtectionTier)
+	}
+	if len(b.ClosedTrades) != 0 {
+		t.Fatalf("expected 0 partial closed trades when below MinNotional, got %d", len(b.ClosedTrades))
+	}
+}
+
 
 

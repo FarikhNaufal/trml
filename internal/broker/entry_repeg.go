@@ -179,6 +179,12 @@ func repegLimitEntryIntent(
 		}
 	}
 
+	if filter.MinNotional.GreaterThan(decimal.Zero) && updated.Qty.GreaterThan(decimal.Zero) {
+		if updated.Qty.Mul(updated.LimitPrice).LessThan(filter.MinNotional) {
+			return intent, false, fmt.Sprintf("repeg_notional_%s_below_min_%s", updated.Qty.Mul(updated.LimitPrice).String(), filter.MinNotional.String())
+		}
+	}
+
 	return updated, true, ""
 }
 

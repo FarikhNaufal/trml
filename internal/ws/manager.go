@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -42,6 +43,10 @@ const (
 	defaultWSPingInterval = 25 * time.Second
 	defaultWSPingTimeout  = 10 * time.Second
 )
+
+func isInvalidWSFloat(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0)
+}
 
 func NewStreamManager(handlers EventHandlers) *StreamManager {
 	return &StreamManager{Handlers: handlers}
@@ -698,7 +703,12 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 			tbq, errT := strconv.ParseFloat(ke.Kline.TakerBuyQuoteUSDT, 64)
 
 			if errO == nil && errH == nil && errL == nil && errC == nil && errV == nil && errQ == nil && errT == nil {
-				if o > 0 && h > 0 && l > 0 && c > 0 && l <= h && vb >= 0 && qv >= 0 {
+				validFloats := !isInvalidWSFloat(o) && !isInvalidWSFloat(h) && !isInvalidWSFloat(l) && !isInvalidWSFloat(c) &&
+					!isInvalidWSFloat(vb) && !isInvalidWSFloat(qv) && !isInvalidWSFloat(tbq)
+				validOHLC := o > 0 && h > 0 && l > 0 && c > 0 && l <= h &&
+					h >= math.Max(o, c) && l <= math.Min(o, c) &&
+					vb >= 0 && qv >= 0 && tbq >= 0
+				if validFloats && validOHLC {
 					candle := model.Candle{
 						OpenTime:          time.UnixMilli(ke.Kline.OpenTime).UTC(),
 						CloseTime:         time.UnixMilli(ke.Kline.CloseTime).UTC(),
@@ -816,7 +826,8 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 				}
 			}
 
-			eventTime := time.UnixMilli(baseEvent.EventTime).UTC()
+			// Gunakan timestamp penerimaan lokal UTC agar tidak terjadi false stale rejection akibat clock skew jam bursa vs jam lokal
+			eventTime := time.Now().UTC()
 			m.Handlers.OnAccountUpdate(walletBal, unRealizedTotal, availBal, positions, eventTime)
 		}
 

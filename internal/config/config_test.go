@@ -424,3 +424,21 @@ func TestLimitEntryExecutionConfig(t *testing.T) {
 		t.Errorf("unexpected override values: timeout=%v attempts=%d drift=%f", custom.LimitOrderTimeout, custom.EntryRepegMaxAttempts, custom.EntryRepegMaxDriftPct)
 	}
 }
+
+func TestLoadConfig_FailClosedOnMalformedSecondaryFlags(t *testing.T) {
+	badVars := [][2]string{
+		{"TRAILING_ENABLED", "ture"},
+		{"INITIAL_EQUITY", "not_a_decimal"},
+		{"MAX_HOLDING_DURATION", "bad_dur"},
+		{"ORPHAN_POSITION_POLICY", "IGNORE"},
+		{"BTC_GATE_ENABLED", "maybe"},
+	}
+	for _, pair := range badVars {
+		_ = os.Setenv(pair[0], pair[1])
+		_, err := LoadConfig()
+		_ = os.Unsetenv(pair[0])
+		if err == nil {
+			t.Fatalf("expected fail-closed error for %s=%s, got nil", pair[0], pair[1])
+		}
+	}
+}

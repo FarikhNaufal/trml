@@ -371,3 +371,55 @@ func TestPlaceAlgoOrder_RejectsClientAlgoIDExceeding36Chars(t *testing.T) {
 		t.Fatalf("expected error rejecting clientAlgoId > 36 chars, got: %v", err)
 	}
 }
+
+func TestInitAndVerifySymbol_FailClosedOnInvalidDualSideJSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fapi/v1/positionSide/dual" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{invalid_json`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	ok, err := client.InitAndVerifySymbol(context.Background(), "BTCUSDT", 8)
+	if ok || err == nil || !strings.Contains(err.Error(), "decode position mode") {
+		t.Fatalf("expected fail-closed JSON decode error, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestInitAndVerifySymbol_VerifiesAndFailsClosedOnRiskMismatch(t *testing.T) {
+	marginType := "CROSSED"
+	lev := "8"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fapi/v1/positionSide/dual":
+			_, _ = w.Write([]byte(`{"dualSidePosition":false}`))
+		case "/fapi/v1/marginType", "/fapi/v1/leverage":
+			_, _ = w.Write([]byte(`{"code":200,"msg":"success"}`))
+		case "/fapi/v2/positionRisk":
+			_, _ = w.Write([]byte(fmt.Sprintf(`[{"symbol":"BTCUSDT","positionAmt":"0","marginType":"%s","leverage":"%s"}]`, marginType, lev)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	if ok, err := client.InitAndVerifySymbol(context.Background(), "BTCUSDT", 8); ok || err == nil || !strings.Contains(err.Error(), "marginType") {
+		t.Fatalf("expected mismatch marginType error, got ok=%v err=%v", ok, err)
+	}
+
+	marginType = "isolated"
+	lev = "10"
+	if ok, err := client.InitAndVerifySymbol(context.Background(), "BTCUSDT", 8); ok || err == nil || !strings.Contains(err.Error(), "leverage") {
+		t.Fatalf("expected mismatch leverage error, got ok=%v err=%v", ok, err)
+	}
+
+	lev = "8"
+	if ok, err := client.InitAndVerifySymbol(context.Background(), "BTCUSDT", 8); !ok || err != nil {
+		t.Fatalf("expected InitAndVerifySymbol success when verified isolated & 8x, got ok=%v err=%v", ok, err)
+	}
+}

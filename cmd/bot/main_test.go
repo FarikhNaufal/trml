@@ -431,3 +431,96 @@ func TestBotEngine_RepegConfigAndGetBestQuoteAndAttachAudit(t *testing.T) {
 		t.Fatalf("expected SignalAuditID=9123 attached on pending order, got %d", gotAuditID)
 	}
 }
+
+func TestBotEngine_FreshCachedMarkPriceLocked(t *testing.T) {
+	eng := &BotEngine{
+		cfg: &config.Config{
+			MaxMarkStaleness: 15 * time.Second,
+		},
+	}
+	now := time.Now().UTC()
+	st := &model.SymbolState{
+		Symbol:             "ETHUSDT",
+		MarkPrice:          2500.0,
+		MarkPriceUpdatedAt: now.Add(-20 * time.Second), // Stale > 15s
+	}
+	if mp := eng.freshCachedMarkPriceLocked(st, now); mp != 0 {
+		t.Fatalf("expected 0 for stale cached mark price, got %v", mp)
+	}
+
+	st.MarkPriceUpdatedAt = now.Add(-2 * time.Second)
+	if mp := eng.freshCachedMarkPriceLocked(st, now); mp != 2500.0 {
+		t.Fatalf("expected 2500.0 for fresh cached mark price, got %v", mp)
+	}
+}
+
+func TestBotEngine_VerifyLiveWatchlist_PreservesMonitoredSymbolOnFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream error", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	live := broker.NewBinanceLiveBroker(broker.LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		MaxAccountStaleness: 60 * time.Second,
+	})
+	defer live.Close()
+
+	// ADAUSDT sudah punya posisi terbuka di live broker; XRPUSDT hanya kandidat scan
+	live.Mu.Lock()
+	live.ActivePositions["ADAUSDT"] = decimal.NewFromFloat(10.0)
+	live.Mu.Unlock()
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:   false,
+			Leverage: 5.0,
+		},
+		client:          exchange.NewClient(ts.URL, "KEY", "SECRET"),
+		broker:          live,
+		liveBroker:      live,
+		activeStates:    make(map[string]*model.SymbolState),
+		verifiedSymbols: make(map[string]bool),
+		cooldownExits:   make(map[string]storage.RecentExitRecord),
+	}
+	eng.activeStates["ADAUSDT"] = model.NewSymbolState("ADAUSDT", model.ExchangeFilter{}, 10, 10)
+	eng.activeStates["XRPUSDT"] = model.NewSymbolState("XRPUSDT", model.ExchangeFilter{}, 10, 10)
+
+	got := eng.verifyLiveWatchlist(context.Background(), []string{"ADAUSDT", "XRPUSDT"})
+	if !slices.Contains(got, "ADAUSDT") {
+		t.Fatalf("expected actively monitored ADAUSDT preserved in watchlist despite setup failure, got %v", got)
+	}
+	if slices.Contains(got, "XRPUSDT") {
+		t.Fatalf("expected unmonitored failed XRPUSDT excluded from watchlist, got %v", got)
+	}
+	if eng.activeStates["ADAUSDT"] == nil || eng.activeStates["ADAUSDT"].IsLeverageIsolatedVerified {
+		t.Fatalf("expected ADAUSDT activeState retained with IsLeverageIsolatedVerified=false")
+	}
+	if _, exists := eng.activeStates["XRPUSDT"]; exists {
+		t.Fatalf("expected unmonitored failed XRPUSDT deleted from activeStates")
+	}
+}
+
+func TestBotEngine_RecordSymbolExit_SyncsCooldownAndState(t *testing.T) {
+	now := time.Now().UTC()
+	st := model.NewSymbolState("SOLUSDT", model.ExchangeFilter{}, 10, 10)
+	eng := &BotEngine{
+		activeStates:  map[string]*model.SymbolState{"SOLUSDT": st},
+		cooldownExits: make(map[string]storage.RecentExitRecord),
+	}
+
+	eng.recordSymbolExit("SOLUSDT", now, "STOP_LOSS")
+	if st.LastExitTime.IsZero() || st.LastExitReason != "STOP_LOSS" {
+		t.Fatalf("expected SymbolState exit recorded, got time=%v reason=%q", st.LastExitTime, st.LastExitReason)
+	}
+	if rec, ok := eng.cooldownExits["SOLUSDT"]; !ok || rec.ExitReason != "STOP_LOSS" {
+		t.Fatalf("expected cooldownExits recorded for SOLUSDT, got %+v ok=%v", rec, ok)
+	}
+
+	// PARTIAL_TAKE_PROFIT tidak boleh memicu cooldown penuh
+	eng.recordSymbolExit("SOLUSDT", now.Add(time.Minute), "PARTIAL_TAKE_PROFIT")
+	if eng.cooldownExits["SOLUSDT"].ExitReason != "STOP_LOSS" {
+		t.Fatalf("expected PARTIAL_TAKE_PROFIT ignored for cooldown, got %+v", eng.cooldownExits["SOLUSDT"])
+	}
+}

@@ -270,10 +270,13 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	initEqStr := getEnv("INITIAL_EQUITY", "125.0")
 	initEq, err := decimal.NewFromString(initEqStr)
 	if err != nil || initEq.LessThanOrEqual(decimal.Zero) {
-		initEq = decimal.NewFromFloat(125.0)
+		return nil, fmt.Errorf("config: invalid INITIAL_EQUITY '%s' (must be positive decimal)", initEqStr)
 	}
 
-	compounding := parseBoolEnv(getEnv("EQUITY_MODE_COMPOUNDING", "false"))
+	compounding, err := parseBoolEnvStrict("EQUITY_MODE_COMPOUNDING", getEnv("EQUITY_MODE_COMPOUNDING", "false"))
+	if err != nil {
+		return nil, err
+	}
 
 	riskPct, err := decimal.NewFromString(getEnv("RISK_PER_TRADE_PCT", "0.01"))
 	if err != nil || riskPct.LessThanOrEqual(decimal.Zero) || riskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
@@ -476,17 +479,30 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	}
 
 	tier1BEStr := getEnv("FLAG_TIER1_EARLY_BE", getEnv("TIER1_BE_ENABLED", "false"))
-	tier1BEEnabled := parseBoolEnv(tier1BEStr)
-	btcGateShortOnly := parseBoolEnv(getEnv("FLAG_BTC_GATE_SHORT_ONLY", "true")) // default true (best practice)
-	slGapFillEnabled := parseBoolEnv(getEnv("FLAG_SL_GAP_FILL", "false"))
-	deductPendingMargin := parseBoolEnv(getEnv("FLAG_DEDUCT_PENDING_MARGIN", "false"))
+	tier1BEEnabled, err := parseBoolEnvStrict("FLAG_TIER1_EARLY_BE / TIER1_BE_ENABLED", tier1BEStr)
+	if err != nil {
+		return nil, err
+	}
+	btcGateShortOnly, err := parseBoolEnvStrict("FLAG_BTC_GATE_SHORT_ONLY", getEnv("FLAG_BTC_GATE_SHORT_ONLY", "true")) // default true (best practice)
+	if err != nil {
+		return nil, err
+	}
+	slGapFillEnabled, err := parseBoolEnvStrict("FLAG_SL_GAP_FILL", getEnv("FLAG_SL_GAP_FILL", "false"))
+	if err != nil {
+		return nil, err
+	}
+	deductPendingMargin, err := parseBoolEnvStrict("FLAG_DEDUCT_PENDING_MARGIN", getEnv("FLAG_DEDUCT_PENDING_MARGIN", "false"))
+	if err != nil {
+		return nil, err
+	}
 	t1BETriggerLongStr := getEnv("TIER1_BE_TRIGGER_LONG_ATR", "")
 	var t1BETriggerLong float64
 	if t1BETriggerLongStr != "" {
 		val, err := parseFloatEnv(t1BETriggerLongStr)
-		if err == nil && val >= 0.05 && val <= 10.0 {
-			t1BETriggerLong = val
+		if err != nil || val < 0.05 || val > 10.0 {
+			return nil, fmt.Errorf("config: invalid TIER1_BE_TRIGGER_LONG_ATR '%s' (must be float between 0.05 and 10.0)", t1BETriggerLongStr)
 		}
+		t1BETriggerLong = val
 	}
 	if t1BETriggerLong == 0 {
 		t1BETriggerLong = beTrigger
@@ -496,26 +512,30 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	var t1BETriggerShort float64
 	if t1BETriggerShortStr != "" {
 		val, err := parseFloatEnv(t1BETriggerShortStr)
-		if err == nil && val >= 0.05 && val <= 10.0 {
-			t1BETriggerShort = val
+		if err != nil || val < 0.05 || val > 10.0 {
+			return nil, fmt.Errorf("config: invalid TIER1_BE_TRIGGER_SHORT_ATR '%s' (must be float between 0.05 and 10.0)", t1BETriggerShortStr)
 		}
+		t1BETriggerShort = val
 	}
 	if t1BETriggerShort == 0 {
 		t1BETriggerShort = beTrigger
 	}
 
-	tier2ProfitLockEnabled := parseBoolEnv(getEnv("TIER2_PROFIT_LOCK_ENABLED", "false"))
+	tier2ProfitLockEnabled, err := parseBoolEnvStrict("TIER2_PROFIT_LOCK_ENABLED", getEnv("TIER2_PROFIT_LOCK_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
 
 	t2ProfitLockStr := getEnv("TIER2_PROFIT_LOCK_ATR", "1.80")
 	t2ProfitLock, err := parseFloatEnv(t2ProfitLockStr)
 	if err != nil || t2ProfitLock <= 0.1 || t2ProfitLock > 10.0 {
-		t2ProfitLock = 1.80
+		return nil, fmt.Errorf("config: invalid TIER2_PROFIT_LOCK_ATR '%s' (must be float between 0.1 and 10.0)", t2ProfitLockStr)
 	}
 
 	t2OffsetStr := getEnv("TIER2_PROFIT_LOCK_OFFSET_ATR", "0.90")
 	t2Offset, err := parseFloatEnv(t2OffsetStr)
 	if err != nil || t2Offset <= 0.05 || t2Offset > 10.0 {
-		t2Offset = 0.90
+		return nil, fmt.Errorf("config: invalid TIER2_PROFIT_LOCK_OFFSET_ATR '%s' (must be float between 0.05 and 10.0)", t2OffsetStr)
 	}
 
 	minSLDistPctStr := getEnv("MIN_SL_DISTANCE_PCT", "0.0150")
@@ -524,7 +544,10 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_SL_DISTANCE_PCT '%s' (must be between 0.00 and 0.20)", minSLDistPctStr)
 	}
 
-	partialTPEnabled := parseBoolEnv(getEnv("PARTIAL_TP_ENABLED", "true"))
+	partialTPEnabled, err := parseBoolEnvStrict("PARTIAL_TP_ENABLED", getEnv("PARTIAL_TP_ENABLED", "true"))
+	if err != nil {
+		return nil, err
+	}
 
 	partialTP1RatioStr := getEnv("PARTIAL_TP1_RATIO", "0.50")
 	partialTP1Ratio, err := parseFloatEnv(partialTP1RatioStr)
@@ -544,22 +567,28 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid RUNNER_BE_CUSHION_ATR '%s' (must be float between 0.0 and 5.0)", runnerBECushionATRStr)
 	}
 
-	trailingEnabled := parseBoolEnv(getEnv("TRAILING_ENABLED", "true"))
+	trailingEnabled, err := parseBoolEnvStrict("TRAILING_ENABLED", getEnv("TRAILING_ENABLED", "true"))
+	if err != nil {
+		return nil, err
+	}
 
 	trailingActivateATRStr := getEnv("TRAILING_ACTIVATE_ATR", "2.00")
 	trailingActivateATR, err := parseFloatEnv(trailingActivateATRStr)
 	if err != nil || trailingActivateATR <= 0.1 || trailingActivateATR > 10.0 {
-		trailingActivateATR = 2.00
+		return nil, fmt.Errorf("config: invalid TRAILING_ACTIVATE_ATR '%s' (must be float between 0.1 and 10.0)", trailingActivateATRStr)
 	}
 
 	trailingDistATRStr := getEnv("TRAILING_DISTANCE_ATR", "0.80")
 	trailingDistATR, err := parseFloatEnv(trailingDistATRStr)
 	if err != nil || trailingDistATR <= 0.05 || trailingDistATR > 10.0 {
-		trailingDistATR = 0.80
+		return nil, fmt.Errorf("config: invalid TRAILING_DISTANCE_ATR '%s' (must be float between 0.05 and 10.0)", trailingDistATRStr)
 	}
 
 	btcGateEnabledStr := getEnv("BTC_GATE_ENABLED", "true")
-	btcGateEnabled := parseBoolEnv(btcGateEnabledStr)
+	btcGateEnabled, err := parseBoolEnvStrict("BTC_GATE_ENABLED", btcGateEnabledStr)
+	if err != nil {
+		return nil, err
+	}
 
 	btcMaxDumpStr := getEnv("BTC_MAX_5M_DUMP_PCT", "0.60")
 	btcMaxDump, err := parseFloatEnv(btcMaxDumpStr)
@@ -576,7 +605,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	btcPersistenceBarsStr := getEnv("BTC_GATE_PERSISTENCE_BARS", "1")
 	btcPersistenceBars, err := strconv.Atoi(btcPersistenceBarsStr)
 	if err != nil || btcPersistenceBars < 1 || btcPersistenceBars > 20 {
-		btcPersistenceBars = 1
+		return nil, fmt.Errorf("config: invalid BTC_GATE_PERSISTENCE_BARS '%s' (must be integer between 1 and 20)", btcPersistenceBarsStr)
 	}
 
 	allowedSide := strings.ToUpper(strings.TrimSpace(getEnv("ALLOWED_SIDE", "AUTO")))
@@ -616,19 +645,19 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	geminiTimeoutStr := getEnv("GEMINI_TIMEOUT_SEC", "25")
 	geminiTimeout, err := strconv.Atoi(geminiTimeoutStr)
 	if err != nil || geminiTimeout <= 0 {
-		geminiTimeout = 25
+		return nil, fmt.Errorf("config: invalid GEMINI_TIMEOUT_SEC '%s' (must be positive integer)", geminiTimeoutStr)
 	}
 
 	aiRateLimitStr := getEnv("AI_RATE_LIMIT_RPM", "10")
 	aiRateLimit, err := strconv.Atoi(aiRateLimitStr)
 	if err != nil || aiRateLimit <= 0 {
-		aiRateLimit = 10
+		return nil, fmt.Errorf("config: invalid AI_RATE_LIMIT_RPM '%s' (must be positive integer)", aiRateLimitStr)
 	}
 
 	maxHoldingDurationStr := getEnv("MAX_HOLDING_DURATION", "4h")
 	maxHoldingDuration, err := time.ParseDuration(maxHoldingDurationStr)
 	if err != nil || maxHoldingDuration < 15*time.Minute {
-		maxHoldingDuration = 4 * time.Hour
+		return nil, fmt.Errorf("config: invalid MAX_HOLDING_DURATION '%s' (must be duration >= 15m)", maxHoldingDurationStr)
 	}
 
 	limitOrderTimeoutStr := getEnv("LIMIT_ORDER_TIMEOUT", "150s")
@@ -636,95 +665,100 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	if err != nil {
 		if sec, secErr := strconv.Atoi(limitOrderTimeoutStr); secErr == nil && sec >= 5 {
 			limitOrderTimeout = time.Duration(sec) * time.Second
+		} else {
+			return nil, fmt.Errorf("config: invalid LIMIT_ORDER_TIMEOUT '%s' (must be duration >= 5s or integer seconds >= 5)", limitOrderTimeoutStr)
 		}
 	}
 	if limitOrderTimeout < 5*time.Second {
-		limitOrderTimeout = 150 * time.Second
+		return nil, fmt.Errorf("config: invalid LIMIT_ORDER_TIMEOUT '%s' (must be >= 5s)", limitOrderTimeoutStr)
 	}
 
 	entryRepegMaxAttemptsStr := getEnv("ENTRY_REPEG_MAX_ATTEMPTS", "3")
 	entryRepegMaxAttempts, err := strconv.Atoi(entryRepegMaxAttemptsStr)
 	if err != nil || entryRepegMaxAttempts < 0 || entryRepegMaxAttempts > 10 {
-		entryRepegMaxAttempts = 3
+		return nil, fmt.Errorf("config: invalid ENTRY_REPEG_MAX_ATTEMPTS '%s' (must be integer between 0 and 10)", entryRepegMaxAttemptsStr)
 	}
 
 	entryRepegMaxDriftStr := getEnv("ENTRY_REPEG_MAX_DRIFT_PCT", "0.0005")
 	entryRepegMaxDriftPct, err := parseFloatEnv(entryRepegMaxDriftStr)
 	if err != nil || entryRepegMaxDriftPct <= 0 || entryRepegMaxDriftPct > 0.01 {
-		entryRepegMaxDriftPct = 0.0005
+		return nil, fmt.Errorf("config: invalid ENTRY_REPEG_MAX_DRIFT_PCT '%s' (must be float between 0 and 0.01)", entryRepegMaxDriftStr)
 	}
 
 	orphanPolicy := strings.ToUpper(getEnv("ORPHAN_POSITION_POLICY", "CLOSE"))
 	if orphanPolicy != "ADOPT" && orphanPolicy != "CLOSE" {
-		orphanPolicy = "CLOSE"
+		return nil, fmt.Errorf("config: invalid ORPHAN_POSITION_POLICY '%s' (must be 'ADOPT' or 'CLOSE')", orphanPolicy)
 	}
 
 	cooldownMinsStr := getEnv("COOLDOWN_AFTER_EXIT_MINUTES", "20")
 	cooldownMins, err := strconv.Atoi(cooldownMinsStr)
 	if err != nil || cooldownMins < 0 {
-		cooldownMins = 20
+		return nil, fmt.Errorf("config: invalid COOLDOWN_AFTER_EXIT_MINUTES '%s' (must be integer >= 0)", cooldownMinsStr)
 	}
 
 	cooldownLossStr := getEnv("COOLDOWN_AFTER_LOSS_MINUTES", strconv.Itoa(cooldownMins))
 	cooldownLossMins, err := strconv.Atoi(cooldownLossStr)
 	if err != nil || cooldownLossMins < 0 {
-		cooldownLossMins = cooldownMins
+		return nil, fmt.Errorf("config: invalid COOLDOWN_AFTER_LOSS_MINUTES '%s' (must be integer >= 0)", cooldownLossStr)
 	}
 
 	cooldownProfitStr := getEnv("COOLDOWN_AFTER_WIN_MINUTES", "10")
 	cooldownProfitMins, err := strconv.Atoi(cooldownProfitStr)
 	if err != nil || cooldownProfitMins < 0 {
-		cooldownProfitMins = 10
+		return nil, fmt.Errorf("config: invalid COOLDOWN_AFTER_WIN_MINUTES '%s' (must be integer >= 0)", cooldownProfitStr)
 	}
 
 	vwapWarmupMinsStr := getEnv("VWAP_SESSION_WARMUP_MINUTES", "30")
 	vwapWarmupMins, err := strconv.Atoi(vwapWarmupMinsStr)
 	if err != nil || vwapWarmupMins < 0 {
-		vwapWarmupMins = 30
+		return nil, fmt.Errorf("config: invalid VWAP_SESSION_WARMUP_MINUTES '%s' (must be integer >= 0)", vwapWarmupMinsStr)
 	}
 
 	minCandleBodyRatioLongStr := getEnv("MIN_CANDLE_BODY_RATIO_LONG", "0.0")
 	minCandleBodyRatioLong, err := parseFloatEnv(minCandleBodyRatioLongStr)
 	if err != nil || minCandleBodyRatioLong < 0.0 || minCandleBodyRatioLong > 1.0 {
-		minCandleBodyRatioLong = 0.0
+		return nil, fmt.Errorf("config: invalid MIN_CANDLE_BODY_RATIO_LONG '%s' (must be float between 0.0 and 1.0)", minCandleBodyRatioLongStr)
 	}
 
 	maxPullbackRVOLLongStr := getEnv("MAX_PULLBACK_RVOL_LONG", "0.0")
 	maxPullbackRVOLLong, err := parseFloatEnv(maxPullbackRVOLLongStr)
 	if err != nil || maxPullbackRVOLLong < 0.0 || maxPullbackRVOLLong > 10.0 {
-		maxPullbackRVOLLong = 0.0
+		return nil, fmt.Errorf("config: invalid MAX_PULLBACK_RVOL_LONG '%s' (must be float between 0.0 and 10.0)", maxPullbackRVOLLongStr)
 	}
 
 	minImpulseATRLongStr := getEnv("MIN_IMPULSE_ATR_LONG", "0.0")
 	minImpulseATRLong, err := parseFloatEnv(minImpulseATRLongStr)
 	if err != nil || minImpulseATRLong < 0.0 || minImpulseATRLong > 10.0 {
-		minImpulseATRLong = 0.0
+		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR_LONG '%s' (must be float between 0.0 and 10.0)", minImpulseATRLongStr)
 	}
 
 	minEMASlopeLongStr := getEnv("MIN_EMA_SLOPE_LONG", "0.0")
 	minEMASlopeLong, err := parseFloatEnv(minEMASlopeLongStr)
 	if err != nil || minEMASlopeLong < -1.0 || minEMASlopeLong > 10.0 {
-		minEMASlopeLong = 0.0
+		return nil, fmt.Errorf("config: invalid MIN_EMA_SLOPE_LONG '%s' (must be float between -1.0 and 10.0)", minEMASlopeLongStr)
 	}
 
-	requireCleanPullbackLong := parseBoolEnv(getEnv("REQUIRE_CLEAN_PULLBACK_LONG", "false"))
+	requireCleanPullbackLong, err := parseBoolEnvStrict("REQUIRE_CLEAN_PULLBACK_LONG", getEnv("REQUIRE_CLEAN_PULLBACK_LONG", "false"))
+	if err != nil {
+		return nil, err
+	}
 
 	partialTP1ATRMultLongStr := getEnv("PARTIAL_TP1_ATR_MULT_LONG", "0.0")
 	partialTP1ATRMultLong, err := parseFloatEnv(partialTP1ATRMultLongStr)
 	if err != nil || partialTP1ATRMultLong < 0.0 || partialTP1ATRMultLong > 10.0 {
-		partialTP1ATRMultLong = 0.0
+		return nil, fmt.Errorf("config: invalid PARTIAL_TP1_ATR_MULT_LONG '%s' (must be float between 0.0 and 10.0)", partialTP1ATRMultLongStr)
 	}
 
 	slMultLongStr := getEnv("SL_ATR_MULTIPLIER_LONG", "0.0")
 	slMultLong, err := parseFloatEnv(slMultLongStr)
 	if err != nil || slMultLong < 0.0 || slMultLong > 10.0 {
-		slMultLong = 0.0
+		return nil, fmt.Errorf("config: invalid SL_ATR_MULTIPLIER_LONG '%s' (must be float between 0.0 and 10.0)", slMultLongStr)
 	}
 
 	minRVOLStr := getEnv("MIN_RVOL", getEnv("SCANNER_MIN_RVOL", "1.80"))
 	minRVOL, err := parseFloatEnv(minRVOLStr)
 	if err != nil || minRVOL <= 0 {
-		minRVOL = 1.80
+		return nil, fmt.Errorf("config: invalid MIN_RVOL '%s' (must be positive float)", minRVOLStr)
 	}
 
 	scannerRankingMode := strings.ToLower(strings.TrimSpace(getEnv("SCANNER_RANKING_MODE", "pullback")))
@@ -741,6 +775,8 @@ func LoadConfigFile(envPath string) (*Config, error) {
 			scannerInterval = time.Duration(sIntMins) * time.Minute
 		} else if dur, err := time.ParseDuration(sIntStr); err == nil && dur > 0 {
 			scannerInterval = dur
+		} else {
+			return nil, fmt.Errorf("config: invalid SCANNER_INTERVAL '%s' (must be positive minutes or duration)", sIntStr)
 		}
 	}
 
@@ -890,9 +926,16 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-func parseBoolEnv(val string) bool {
+func parseBoolEnvStrict(key, val string) (bool, error) {
 	clean := strings.ToLower(strings.TrimSpace(val))
-	return clean == "true" || clean == "1" || clean == "yes" || clean == "y"
+	switch clean {
+	case "true", "1", "yes", "y":
+		return true, nil
+	case "false", "0", "no", "n":
+		return false, nil
+	default:
+		return false, fmt.Errorf("config: invalid boolean for %s '%s' (expected true/false)", key, val)
+	}
 }
 
 func parseFloatEnv(val string) (float64, error) {

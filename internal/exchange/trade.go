@@ -303,7 +303,10 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 		return false, fmt.Errorf("failed to query position mode: %w", err)
 	}
 	var dualResp DualSidePositionResponse
-	if err := sonic.Unmarshal(dualRespBytes, &dualResp); err == nil && dualResp.DualSidePosition {
+	if err := sonic.Unmarshal(dualRespBytes, &dualResp); err != nil {
+		return false, fmt.Errorf("failed to decode position mode response: %w", err)
+	}
+	if dualResp.DualSidePosition {
 		// Jika Hedge Mode aktif, coba ubah ke One-Way Mode
 		changeParams := url.Values{}
 		changeParams.Set("dualSidePosition", "false")
@@ -326,13 +329,32 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 		}
 	}
 
-	// 3. Set Leverage 5x
+	// 3. Set Leverage
 	levParams := url.Values{}
 	levParams.Set("symbol", symbol)
 	levParams.Set("leverage", strconv.Itoa(leverage))
 	_, err = c.DoRequest(ctx, http.MethodPost, "/fapi/v1/leverage", levParams, true)
 	if err != nil {
 		return false, fmt.Errorf("failed to set leverage: %w", err)
+	}
+
+	// 4. Verifikasi final state simbol di bursa (fail-closed)
+	posRisks, err := c.GetPositionRisk(ctx, symbol)
+	if err != nil {
+		return false, fmt.Errorf("failed to verify symbol risk configuration: %w", err)
+	}
+	for _, pr := range posRisks {
+		if pr.Symbol != symbol {
+			continue
+		}
+		if pr.MarginType != "" && !strings.EqualFold(pr.MarginType, "isolated") {
+			return false, fmt.Errorf("symbol %s marginType expected isolated, got %s", symbol, pr.MarginType)
+		}
+		if pr.Leverage != "" {
+			if actualLev, convErr := strconv.Atoi(strings.TrimSpace(pr.Leverage)); convErr != nil || actualLev != leverage {
+				return false, fmt.Errorf("symbol %s leverage expected %d, got %s", symbol, leverage, pr.Leverage)
+			}
+		}
 	}
 
 	return true, nil

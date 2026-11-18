@@ -2201,3 +2201,84 @@ func TestEvaluateSignal_SymmetricalWickRejection(t *testing.T) {
 		t.Fatalf("expected Short rejection with CANDLE_NOT_BEARISH for hammer, got ok=%v, reason=%s, subReason=%s", okS, reasonS, subReasonS)
 	}
 }
+
+func TestEvaluateSignal_ZeroWinCooldownAndBTCGateShortVWAPAllowance(t *testing.T) {
+	now := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
+
+	t.Run("zero win cooldown allows immediate re-entry when base cooldown is 0", func(t *testing.T) {
+		snap, cfg := helperCreateValidShortSnapshot(now)
+		cfg.CooldownAfterExitMinutes = 0
+		cfg.CooldownProfitMinutes = 0
+		snap.LastExitTime = now.Add(-1 * time.Minute)
+		snap.LastExitReason = "TRAILING_STOP"
+
+		_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+		if !ok || reason != "SIGNAL_APPROVED" {
+			t.Fatalf("expected SIGNAL_APPROVED with 0 win cooldown, got ok=%v reason=%s", ok, reason)
+		}
+	})
+
+	t.Run("BTC Gate Tier 2 Short allows short when BTC above EMA200 but at or below Session VWAP", func(t *testing.T) {
+		snap, cfg := helperCreateValidShortSnapshot(now)
+		cfg.AllowedSide = "SHORT_ONLY"
+		cfg.BTCGateEnabled = true
+		cfg.BTCGateShortOnly = true
+		cfg.BTCGatePersistenceBars = 3
+		cfg.BTCMax5mPumpPct = 2.0
+		cfg.BTCCounterMomentumPct = 1.0
+
+		// Bangun 220 candle BTC dengan EMA200 sekitar 60000 dan 3 bar terakhir di 60500 (> EMA) namun <= VWAP (61000)
+		btcCandles := make([]model.Candle, 220)
+		startT := now.Add(-time.Duration(220*5) * time.Minute)
+		for i := 0; i < 220; i++ {
+			cPrice := 60000.0
+			if i >= 215 {
+				cPrice = 60500.0
+			}
+			btcCandles[i] = model.Candle{
+				OpenTime:  startT.Add(time.Duration(i*5) * time.Minute),
+				CloseTime: startT.Add(time.Duration((i+1)*5) * time.Minute),
+				Open:      cPrice,
+				High:      cPrice + 50,
+				Low:       cPrice - 50,
+				Close:     cPrice,
+			}
+		}
+		btcSnap := &model.MarketSnapshot{
+			Symbol:             "BTCUSDT",
+			ClosedCandles:      btcCandles,
+			CurrentSessionVWAP: 61000.0,
+			Now:                now,
+		}
+
+		_, ok, reason, subReason := EvaluateSignal(snap, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+		if !ok || reason != "SIGNAL_APPROVED" {
+			t.Fatalf("expected Short approved when BTC > EMA200 but <= SessionVWAP, got ok=%v reason=%s sub=%s", ok, reason, subReason)
+		}
+
+		// Jika VWAP turun di bawah BTC close (60200 < 60500), Short wajib di-veto
+		btcSnap.CurrentSessionVWAP = 60200.0
+		_, ok2, reason2, _ := EvaluateSignal(snap, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+		if ok2 || reason2 != "BTC_TREND_BULLISH_SHORT_VETO" {
+			t.Fatalf("expected BTC_TREND_BULLISH_SHORT_VETO when BTC > EMA200 and > VWAP, got ok=%v reason=%s", ok2, reason2)
+		}
+	})
+
+	t.Run("Short OP-01 invalidation uses baseline MinImpulseATR even when MinImpulseATRLong is higher", func(t *testing.T) {
+		snap, cfg := helperCreateValidShortSnapshot(now)
+		cfg.MinImpulseATR = 1.0
+		cfg.MinImpulseATRLong = 5.0 // Tinggi agar LONG lebih ketat, tidak boleh melonggarkan invalidasi SHORT
+
+		// Tambahkan penutupan candle bullish tepat setelah impulse short yang melampaui VWAP + 1.2 * ATR
+		// (di atas minImpulseATR=1.0 namun jauh di bawah minImpulseATRLong=5.0)
+		idxSecondLast := len(snap.ClosedCandles) - 2
+		snap.ClosedCandles[idxSecondLast].Close = snap.CurrentSessionVWAP + 2.5
+		snap.ClosedCandles[idxSecondLast].High = snap.CurrentSessionVWAP + 2.6
+		snap.ClosedCandles[idxSecondLast].Low = snap.CurrentSessionVWAP + 1.5
+
+		_, ok, reason, _ := EvaluateSignal(snap, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfg)
+		if ok || reason == "SIGNAL_APPROVED" {
+			t.Fatalf("expected Short invalidated by baseline MinImpulseATR threshold, got ok=%v reason=%s", ok, reason)
+		}
+	})
+}

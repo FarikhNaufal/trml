@@ -529,3 +529,35 @@ func TestStreamManager_PingAndIdleWatchdog(t *testing.T) {
 		}
 	})
 }
+
+func TestKlineClosed_RejectsInvalidOHLCAndNegativeTBQ(t *testing.T) {
+	var accepted atomic.Int32
+	mgr := NewStreamManager(EventHandlers{
+		OnKlineClosed: func(symbol string, candle model.Candle, isClosed bool) {
+			accepted.Add(1)
+		},
+	})
+
+	// 1. M7 invalid OHLC: High (151.0) < Open (152.0)
+	invalidOHLC := []byte(`{"e":"kline","E":1700000000000,"s":"SOLUSDT","k":{"t":1700000000000,"T":1700000300000,"s":"SOLUSDT","i":"5m","f":1,"L":10,"o":"152.0","c":"150.5","h":"151.0","l":"149.0","v":"1000.0","n":50,"x":true,"q":"151000.0","V":"600.0","Q":"90600.0","B":"0"}}`)
+	mgr.ProcessMessage(invalidOHLC)
+
+	// 2. Negative TakerBuyQuoteUSDT
+	negativeTBQ := []byte(`{"e":"kline","E":1700000000000,"s":"SOLUSDT","k":{"t":1700000000000,"T":1700000300000,"s":"SOLUSDT","i":"5m","f":1,"L":10,"o":"150.0","c":"152.0","h":"153.0","l":"149.0","v":"1000.0","n":50,"x":true,"q":"151000.0","V":"600.0","Q":"-10.0","B":"0"}}`)
+	mgr.ProcessMessage(negativeTBQ)
+
+	// 3. +Inf float value
+	infPrice := []byte(`{"e":"kline","E":1700000000000,"s":"SOLUSDT","k":{"t":1700000000000,"T":1700000300000,"s":"SOLUSDT","i":"5m","f":1,"L":10,"o":"150.0","c":"152.0","h":"+Inf","l":"149.0","v":"1000.0","n":50,"x":true,"q":"151000.0","V":"600.0","Q":"90600.0","B":"0"}}`)
+	mgr.ProcessMessage(infPrice)
+
+	if accepted.Load() != 0 {
+		t.Fatalf("expected 0 invalid klines accepted, got %d", accepted.Load())
+	}
+
+	// 4. Valid OHLC should be accepted
+	validKline := []byte(`{"e":"kline","E":1700000000000,"s":"SOLUSDT","k":{"t":1700000000000,"T":1700000300000,"s":"SOLUSDT","i":"5m","f":1,"L":10,"o":"150.0","c":"152.0","h":"153.0","l":"149.0","v":"1000.0","n":50,"x":true,"q":"151000.0","V":"600.0","Q":"90600.0","B":"0"}}`)
+	mgr.ProcessMessage(validKline)
+	if accepted.Load() != 1 {
+		t.Fatalf("expected 1 valid kline accepted, got %d", accepted.Load())
+	}
+}

@@ -284,25 +284,13 @@ func main() {
 		}
 		engine.dryRunBroker = broker.NewDryRunBroker(initialEquity, dryRunCfg)
 		defer engine.dryRunBroker.Close()
+		engine.dryRunBroker.OnCooldownRecordedFn = func(symbol string, closedAt time.Time, exitReason string) {
+			engine.recordSymbolExit(symbol, closedAt, exitReason)
+		}
 		engine.dryRunBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
-			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
-				engine.cooldownMu.Lock()
-				engine.cooldownExits[rec.Symbol] = storage.RecentExitRecord{
-					Symbol:     rec.Symbol,
-					ClosedAt:   rec.ClosedAt,
-					ExitReason: rec.ExitReason,
-				}
-				engine.cooldownMu.Unlock()
-
-				engine.statesMu.RLock()
-				st := engine.activeStates[rec.Symbol]
-				engine.statesMu.RUnlock()
-				if st != nil {
-					st.SetLastExit(rec.ClosedAt, rec.ExitReason)
-				}
-			}
+			engine.recordSymbolExit(rec.Symbol, rec.ClosedAt, rec.ExitReason)
 			pureRealEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
 			epochDay := time.Now().UTC().Unix() / 86400
 			engine.dryRunBroker.Mu.Lock()
@@ -485,25 +473,13 @@ func main() {
 		engine.liveBroker.OnPositionDeletedFn = func(symbol string) {
 			_ = repo.DeleteLivePosition(context.Background(), symbol)
 		}
+		engine.liveBroker.OnCooldownRecordedFn = func(symbol string, closedAt time.Time, exitReason string) {
+			engine.recordSymbolExit(symbol, closedAt, exitReason)
+		}
 		engine.liveBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
-			if rec.ExitReason != "PARTIAL_TAKE_PROFIT" {
-				engine.cooldownMu.Lock()
-				engine.cooldownExits[rec.Symbol] = storage.RecentExitRecord{
-					Symbol:     rec.Symbol,
-					ClosedAt:   rec.ClosedAt,
-					ExitReason: rec.ExitReason,
-				}
-				engine.cooldownMu.Unlock()
-
-				engine.statesMu.RLock()
-				st := engine.activeStates[rec.Symbol]
-				engine.statesMu.RUnlock()
-				if st != nil {
-					st.SetLastExit(rec.ClosedAt, rec.ExitReason)
-				}
-			}
+			engine.recordSymbolExit(rec.Symbol, rec.ClosedAt, rec.ExitReason)
 		}
 		engine.broker = engine.liveBroker
 	}
@@ -553,6 +529,13 @@ func main() {
 				engine.dryRunBroker.CircuitBreakerTripped = false
 				engine.dryRunBroker.Mu.Unlock()
 			}
+		} else if engine.dryRunBroker != nil {
+			engine.dryRunBroker.Mu.Lock()
+			engine.dryRunBroker.SessionDayEpochUTC = todayEpochDay
+			startEqInit := engine.dryRunBroker.SessionStartEquity
+			realEqInit := engine.dryRunBroker.RealizedEquityUSDT
+			engine.dryRunBroker.Mu.Unlock()
+			_ = repo.SaveDailyState(ctx, todayEpochDay, startEqInit, realEqInit, false)
 		}
 	}
 
@@ -567,6 +550,15 @@ func main() {
 				"availBalance", engine.liveBroker.AvailableBalanceUSDT,
 				"unrealizedPnL", engine.liveBroker.UnrealizedPnLUSDT,
 			)
+			engine.liveBroker.Mu.Lock()
+			sDay := engine.liveBroker.SessionStartEpochDay
+			sEq := engine.liveBroker.SessionStartEquityUSDT
+			effEq := engine.liveBroker.WalletBalanceUSDT.Add(engine.liveBroker.UnrealizedPnLUSDT)
+			breaker := engine.liveBroker.CircuitBreakerTripped
+			engine.liveBroker.Mu.Unlock()
+			if sDay > 0 && sEq.GreaterThan(decimal.Zero) {
+				_ = repo.SaveDailyState(ctx, sDay, sEq, effEq, breaker)
+			}
 		}
 		initCancel()
 
@@ -730,7 +722,8 @@ func main() {
 						"symbol", sp.Symbol, "qty", ep.PositionAmt.Abs(), "entryPrice", ep.EntryPrice,
 						"slPrice", sp.SLPrice, "tpPrice", sp.TPPrice)
 				} else {
-					slog.Warn("live position closed on exchange during downtime; cleaning up stored state", "symbol", sym)
+					slog.Warn("live position closed on exchange during downtime; applying exit cooldown and cleaning up stored state", "symbol", sym)
+					engine.recordSymbolExit(sym, time.Now().UTC(), "OFFLINE_CLOSED")
 					_ = repo.DeleteLivePosition(ctx, sym)
 				}
 			}
@@ -1114,6 +1107,63 @@ func nextSafeScanDelay(now time.Time, scanInterval, candleDur time.Duration) tim
 	return target.Sub(utcNow)
 }
 
+func (e *BotEngine) verifyLiveWatchlist(ctx context.Context, candidates []string) []string {
+	monitoredSet := make(map[string]bool)
+	if e.broker != nil {
+		for _, ms := range e.broker.GetMonitoredSymbols() {
+			monitoredSet[ms] = true
+		}
+	}
+	targetLev := int(math.Round(e.cfg.Leverage))
+	verifiedWatched := make([]string, 0, len(candidates))
+	for _, sym := range candidates {
+		e.verifiedMu.RLock()
+		alreadyVerified := e.verifiedSymbols[sym]
+		e.verifiedMu.RUnlock()
+
+		if alreadyVerified {
+			e.statesMu.Lock()
+			if st, exists := e.activeStates[sym]; exists {
+				st.IsLeverageIsolatedVerified = true
+			}
+			e.statesMu.Unlock()
+			verifiedWatched = append(verifiedWatched, sym)
+			continue
+		}
+
+		verifyCtx, verifyCancel := context.WithTimeout(ctx, 15*time.Second)
+		ok, err := e.client.InitAndVerifySymbol(verifyCtx, sym, targetLev)
+		verifyCancel()
+		if err != nil || !ok {
+			if monitoredSet[sym] {
+				// Pertahankan stream simbol yang sedang punya posisi/order aktif agar monitoring markPrice/SL/TP tidak putus;
+				// tetap biarkan IsLeverageIsolatedVerified=false agar tidak membuka entry baru sebelum terverifikasi.
+				slog.Warn("symbol setup failed on actively monitored symbol; keeping stream feed without enabling new entries", "symbol", sym, "err", err)
+				verifiedWatched = append(verifiedWatched, sym)
+			} else {
+				slog.Warn("symbol setup failed; excluding unverified symbol from live trading", "symbol", sym, "err", err)
+				e.statesMu.Lock()
+				delete(e.activeStates, sym)
+				e.statesMu.Unlock()
+			}
+		} else {
+			e.verifiedMu.Lock()
+			e.verifiedSymbols[sym] = true
+			e.verifiedMu.Unlock()
+			e.statesMu.Lock()
+			if st, exists := e.activeStates[sym]; exists {
+				st.IsLeverageIsolatedVerified = true
+			}
+			e.statesMu.Unlock()
+			verifiedWatched = append(verifiedWatched, sym)
+		}
+	}
+	e.statesMu.Lock()
+	e.watchedCoins = verifiedWatched
+	e.statesMu.Unlock()
+	return verifiedWatched
+}
+
 func (e *BotEngine) runMarketScan(ctx context.Context) {
 	scanCtx, scanCancel := context.WithTimeout(ctx, scanFetchTimeout)
 	defer scanCancel()
@@ -1291,35 +1341,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 
 	// Jika mode Live, verifikasi One-Way mode dan leverage untuk simbol terpilih (M11 FIX & M4 Cache)
 	if !e.cfg.DryRun {
-		for _, sym := range finalWatched {
-			e.verifiedMu.RLock()
-			alreadyVerified := e.verifiedSymbols[sym]
-			e.verifiedMu.RUnlock()
-
-			if alreadyVerified {
-				e.statesMu.Lock()
-				if st, exists := e.activeStates[sym]; exists {
-					st.IsLeverageIsolatedVerified = true
-				}
-				e.statesMu.Unlock()
-				continue
-			}
-			verifyCtx, verifyCancel := context.WithTimeout(ctx, 15*time.Second)
-			ok, err := e.client.InitAndVerifySymbol(verifyCtx, sym, int(e.cfg.Leverage))
-			verifyCancel()
-			if err != nil || !ok {
-				slog.Warn("symbol setup failed; ignoring symbol", "symbol", sym, "err", err)
-			} else {
-				e.verifiedMu.Lock()
-				e.verifiedSymbols[sym] = true
-				e.verifiedMu.Unlock()
-				e.statesMu.Lock()
-				if st, exists := e.activeStates[sym]; exists {
-					st.IsLeverageIsolatedVerified = true
-				}
-				e.statesMu.Unlock()
-			}
-		}
+		finalWatched = e.verifyLiveWatchlist(ctx, finalWatched)
 	} else {
 		e.statesMu.Lock()
 		for _, sym := range finalWatched {
@@ -1567,7 +1589,7 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 				st.BestBid = bestBid
 				st.BestAsk = bestAsk
 				st.BookUpdatedAt = now
-				markPrice = st.MarkPrice
+				markPrice = e.freshCachedMarkPriceLocked(st, now)
 				st.Mu.Unlock()
 			}
 			e.broker.OnRealtimeTick(symbol, bestBid, bestAsk, markPrice, 0, 0, false, now)
@@ -1581,7 +1603,7 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 				st.Mu.Lock()
 				bestBid = st.BestBid
 				bestAsk = st.BestAsk
-				markPrice = st.MarkPrice
+				markPrice = e.freshCachedMarkPriceLocked(st, now)
 				st.Mu.Unlock()
 			}
 			e.broker.OnRealtimeTick(symbol, bestBid, bestAsk, markPrice, tradePrice, tradeQty, isBuyerMaker, now)
@@ -1694,9 +1716,73 @@ func (e *BotEngine) attachSignalAuditID(symbol, clientOrderID string, signalAudi
 	}
 }
 
+func (e *BotEngine) recordSymbolExit(symbol string, closedAt time.Time, exitReason string) {
+	if symbol == "" || exitReason == "" || exitReason == "PARTIAL_TAKE_PROFIT" {
+		return
+	}
+	e.cooldownMu.Lock()
+	if e.cooldownExits == nil {
+		e.cooldownExits = make(map[string]storage.RecentExitRecord)
+	}
+	prev, exists := e.cooldownExits[symbol]
+	if !exists || !closedAt.Before(prev.ClosedAt) {
+		e.cooldownExits[symbol] = storage.RecentExitRecord{
+			Symbol:     symbol,
+			ClosedAt:   closedAt,
+			ExitReason: exitReason,
+		}
+	}
+	e.cooldownMu.Unlock()
+
+	e.statesMu.RLock()
+	st := e.activeStates[symbol]
+	e.statesMu.RUnlock()
+	if st != nil {
+		st.SetLastExit(closedAt, exitReason)
+	}
+}
+
+func (e *BotEngine) freshCachedMarkPriceLocked(st *model.SymbolState, now time.Time) float64 {
+	if st == nil || st.MarkPrice <= 0 || st.MarkPriceUpdatedAt.IsZero() {
+		return 0
+	}
+	if e.cfg != nil && e.cfg.MaxMarkStaleness > 0 && now.Sub(st.MarkPriceUpdatedAt) > e.cfg.MaxMarkStaleness {
+		return 0
+	}
+	return st.MarkPrice
+}
+
 func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.SymbolState) {
 	now := time.Now().UTC()
 	snap := st.Snapshot(now)
+
+	// Sinkronkan cooldown exit terbaru (termasuk posisi yang baru saja tutup atau tutup saat downtime)
+	e.cooldownMu.RLock()
+	if exitRec, exists := e.cooldownExits[snap.Symbol]; exists && exitRec.ClosedAt.After(snap.LastExitTime) {
+		snap.LastExitTime = exitRec.ClosedAt
+		snap.LastExitReason = exitRec.ExitReason
+	}
+	e.cooldownMu.RUnlock()
+
+	if e.cfg != nil && !e.cfg.DryRun {
+		st.Mu.Lock()
+		verified := st.IsLeverageIsolatedVerified
+		st.Mu.Unlock()
+		if !verified {
+			slog.Warn("skipping signal evaluation on unverified live symbol", "symbol", snap.Symbol)
+			return
+		}
+	}
+
+	accountStale := false
+	if e.cfg != nil && !e.cfg.DryRun && e.liveBroker != nil && e.liveBroker.IsAccountStale(now) {
+		rCtx, rCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = e.liveBroker.RefreshAccount(rCtx)
+		rCancel()
+		if e.liveBroker.IsAccountStale(time.Now().UTC()) {
+			accountStale = true
+		}
+	}
 
 	// Evaluasi Sinyal
 	activeSlots := e.broker.GetActiveSlotCount()
@@ -1717,16 +1803,24 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		e.statesMu.RUnlock()
 	}
 
-	intent, ok, reason, subReason := strategy.EvaluateSignal(
-		snap,
-		btcSnap,
-		activeSlots,
-		isDailyBreached,
-		hasActiveSymbol,
-		totEq,
-		availBal,
-		e.evaluatorCfg,
-	)
+	var intent model.OrderIntent
+	var ok bool
+	var reason, subReason string
+	if accountStale {
+		reason = "STALE_ACCOUNT_FEED"
+		subReason = "LIVE_ACCOUNT_SNAPSHOT_EXPIRED"
+	} else {
+		intent, ok, reason, subReason = strategy.EvaluateSignal(
+			snap,
+			btcSnap,
+			activeSlots,
+			isDailyBreached,
+			hasActiveSymbol,
+			totEq,
+			availBal,
+			e.evaluatorCfg,
+		)
+	}
 
 	// Eksekusi submission order segera tanpa menunggu kalkulasi metrik & penulisan audit SQLite agar tidak terkena adverse selection GTX.
 	var resolvedAuditID atomic.Int64

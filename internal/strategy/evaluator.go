@@ -114,8 +114,6 @@ func EvaluateSignal(
 		if isWinningExit(snap.LastExitReason) {
 			if cfg.CooldownProfitMinutes > 0 {
 				cooldownMins = cfg.CooldownProfitMinutes
-			} else {
-				cooldownMins = 10
 			}
 		} else {
 			if cfg.CooldownLossMinutes > 0 {
@@ -276,6 +274,9 @@ func EvaluateSignal(
 	}
 	minBounceZ := cfg.MinBounceZScore
 	if minBounceZ == 0 {
+		minBounceZ = cfg.MinBarDeltaZScore
+	}
+	if minBounceZ == 0 {
 		minBounceZ = 1.20
 	}
 	minBounceZLong := cfg.MinBounceZScoreLong
@@ -312,6 +313,7 @@ func EvaluateSignal(
 		minImpulseATRLong = minImpulseATR
 	}
 	bullishImpulseThreshold := vwap + (minImpulseATRLong * atr14)
+	bullishInvalidationThreshold := vwap + (minImpulseATR * atr14)
 	bearishImpulseThreshold := vwap - (minImpulseATR * atr14)
 
 	for i := startIdx; i < endIdx; i++ {
@@ -338,11 +340,11 @@ func EvaluateSignal(
 		}
 	}
 
-	// Untuk SHORT: Bearish impulse gugur jika setelahnya ada bar yang ditutup di atas bullish threshold (Close > bullishThreshold).
+	// Untuk SHORT: Bearish impulse gugur jika setelahnya ada bar yang ditutup di atas bullish invalidation threshold (Close > bullishInvalidationThreshold).
 	validBearishImpulse := hasPriorBearishImpulse
 	if validBearishImpulse && latestImpulseIdxShort >= 0 {
 		for i := latestImpulseIdxShort + 1; i < endIdx; i++ {
-			if snap.ClosedCandles[i].Close > bullishImpulseThreshold {
+			if snap.ClosedCandles[i].Close > bullishInvalidationThreshold {
 				validBearishImpulse = false
 				break
 			}
@@ -705,7 +707,7 @@ func EvaluateSignal(
 					for p := 0; p < persistenceBars; p++ {
 						idx := len(btcSnap.ClosedCandles) - 1 - p
 						c := btcSnap.ClosedCandles[idx]
-						if c.Close > btcEMA {
+						if c.Close > btcEMA && (btcVWAP <= 0 || c.Close > btcVWAP) {
 							return model.OrderIntent{}, false, "BTC_TREND_SHORT_VETO_PERSISTENCE", fmt.Sprintf("BTC_BAR_%d_AGO_CLOSE_%.1f_ABOVE_EMA_%.1f_REQUIRED_%d_BARS", p, c.Close, btcEMA, persistenceBars)
 						}
 					}

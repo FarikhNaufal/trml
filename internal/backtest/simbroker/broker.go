@@ -368,7 +368,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		return
 	}
 
-	// B. Eksekusi Partial TP1 (Scale-Out 50% + Pindahkan SL ke BE)
+	// B. Eksekusi Partial TP1 (Scale-Out + Pindahkan SL ke BE)
 	if tp1Touched && s.Cfg.PartialTPEnabled && !pos.IsTP1Hit {
 		closeRatio := decimal.NewFromFloat(s.Cfg.PartialTP1Ratio)
 		closeQty := pos.InitialQty.Mul(closeRatio)
@@ -378,12 +378,30 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			}
 		}
 
-		if closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(pos.Qty) {
+		minNotional := filter.MinNotional
+		if minNotional.LessThanOrEqual(decimal.Zero) {
+			minNotional = decimal.NewFromFloat(5.0)
+		}
+		minQty := filter.MinQty
+		remQty := pos.Qty.Sub(closeQty)
+		splitPossible := closeQty.GreaterThan(decimal.Zero) &&
+			closeQty.LessThan(pos.Qty) &&
+			(minQty.IsZero() || (closeQty.GreaterThanOrEqual(minQty) && remQty.GreaterThanOrEqual(minQty))) &&
+			closeQty.Mul(pos.TP1Price).GreaterThanOrEqual(minNotional) &&
+			remQty.Mul(pos.TP1Price).GreaterThanOrEqual(minNotional)
+
+		if splitPossible {
 			s.recordClosedTradeLocked(pos, closeQty, pos.TP1Price, "PARTIAL_TAKE_PROFIT", c.CloseTime, int(barIndex-pos.OpenBarIndex))
-			pos.Qty = pos.Qty.Sub(closeQty)
+			pos.Qty = remQty
 			pos.IsTP1Hit = true
 
 			// Geser SL ke Break-Even (+ Runner Cushion jika ada) via Unified Protection Engine
+			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
+			pos.CurrentSLPrice = beSL
+			pos.ProtectionTier = 1
+		} else {
+			// Posisi terlalu kecil untuk dipecah (MinNotional / MinQty): transisikan 100% menjadi runner BE
+			pos.IsTP1Hit = true
 			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
 			pos.CurrentSLPrice = beSL
 			pos.ProtectionTier = 1
