@@ -30,4 +30,5 @@ backtest_archive/
 
 # Agent Skills (local only)
 .agents/
+.claude/
 skills-lock.json
