@@ -119,8 +119,12 @@ type Config struct {
 	MinImpulseATRLong        float64
 	MinEMASlopeLong          float64
 	RequireCleanPullbackLong bool
-	PartialTP1ATRMultLong    float64
-	SLATRMultiplierLong      float64
+	PartialTP1ATRMultLong      float64
+	SLATRMultiplierLong        float64
+	MinNATRLongPct             float64
+	BTCChopBlockLong           bool
+	DisablePanicDumpFrenzyLong bool
+	BTCTier2LongSymmetric      bool
 
 	// Timeframe Operasional
 	Timeframe      string
@@ -778,6 +782,27 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid SL_ATR_MULTIPLIER_LONG '%s' (must be float between 0.0 and 10.0)", slMultLongStr)
 	}
 
+	minNATRLongStr := getEnv("MIN_NATR_LONG_PCT", "0.0")
+	minNATRLong, err := parseFloatEnv(minNATRLongStr)
+	if err != nil || minNATRLong < 0.0 || minNATRLong > 10.0 {
+		return nil, fmt.Errorf("config: invalid MIN_NATR_LONG_PCT '%s' (must be float between 0.0 and 10.0)", minNATRLongStr)
+	}
+
+	btcChopBlockLong, err := parseBoolEnvStrict("BTC_CHOP_BLOCK_LONG", getEnv("BTC_CHOP_BLOCK_LONG", "false"))
+	if err != nil {
+		return nil, err
+	}
+
+	disablePanicDumpFrenzyLong, err := parseBoolEnvStrict("DISABLE_PANIC_DUMP_FRENZY_LONG", getEnv("DISABLE_PANIC_DUMP_FRENZY_LONG", "false"))
+	if err != nil {
+		return nil, err
+	}
+
+	btcTier2LongSymmetric, err := parseBoolEnvStrict("BTC_TIER2_LONG_SYMMETRIC", getEnv("BTC_TIER2_LONG_SYMMETRIC", "false"))
+	if err != nil {
+		return nil, err
+	}
+
 	minRVOLStr := getEnv("MIN_RVOL", getEnv("SCANNER_MIN_RVOL", "1.80"))
 	minRVOL, err := parseFloatEnv(minRVOLStr)
 	if err != nil || minRVOL <= 0 {
@@ -905,8 +930,12 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MinImpulseATRLong:        minImpulseATRLong,
 		MinEMASlopeLong:          minEMASlopeLong,
 		RequireCleanPullbackLong: requireCleanPullbackLong,
-		PartialTP1ATRMultLong:    partialTP1ATRMultLong,
-		SLATRMultiplierLong:      slMultLong,
+		PartialTP1ATRMultLong:      partialTP1ATRMultLong,
+		SLATRMultiplierLong:        slMultLong,
+		MinNATRLongPct:             minNATRLong,
+		BTCChopBlockLong:           btcChopBlockLong,
+		DisablePanicDumpFrenzyLong: disablePanicDumpFrenzyLong,
+		BTCTier2LongSymmetric:      btcTier2LongSymmetric,
 
 		Timeframe:            timeframeStr,
 		CandleDuration:       candleDur,

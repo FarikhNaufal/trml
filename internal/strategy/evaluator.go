@@ -53,7 +53,11 @@ type EvaluatorConfig struct {
 	MaxPullbackRVOLLong      float64
 	MinImpulseATRLong        float64
 	MinEMASlopeLong          float64
-	RequireCleanPullbackLong bool
+	RequireCleanPullbackLong   bool
+	MinNATRLongPct             float64
+	BTCChopBlockLong           bool
+	DisablePanicDumpFrenzyLong bool
+	BTCTier2LongSymmetric      bool
 
 	// Gerbang Makro Bitcoin (Two-Tiered Soft Veto)
 	BTCGateEnabled         bool
@@ -597,6 +601,11 @@ func EvaluateSignal(
 		return model.OrderIntent{}, false, "SIDE_DISABLED_LONG_ONLY", "SHORT_DISABLED_BY_CONFIG"
 	}
 
+	// Filter volatilitas minimum khusus LONG agar SHORT tetap bisa menangkap koin ber-NATR lebih rendah.
+	if targetSide == model.SideLong && cfg.MinNATRLongPct > 0 && natrPct < cfg.MinNATRLongPct {
+		return model.OrderIntent{}, false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("LONG_NATR_%.2f%%_BELOW_MIN_%.2f%%", natrPct, cfg.MinNATRLongPct)
+	}
+
 	// KONFIRMASI 5C: Proteksi Anti-Frenzy / Explosive Counter-Impulse Filter
 	maxFrenzyRVOL := cfg.MaxFrenzyRVOL
 	if maxFrenzyRVOL <= 0 {
@@ -636,7 +645,7 @@ func EvaluateSignal(
 			if targetSide == model.SideShort && c.Close > c.Open && barRange >= (maxCounterImpulseATR*atr14) {
 				return model.OrderIntent{}, false, "EXPLOSIVE_PUMP_FRENZY", fmt.Sprintf("RVOL_%.2f_AND_EXPANSION_BAR_%.2f_ATR", rvol, barRange/atr14)
 			}
-			if targetSide == model.SideLong && c.Close < c.Open && barRange >= (maxCounterImpulseATR*atr14) {
+			if targetSide == model.SideLong && !cfg.DisablePanicDumpFrenzyLong && c.Close < c.Open && barRange >= (maxCounterImpulseATR*atr14) {
 				return model.OrderIntent{}, false, "PANIC_DUMP_FRENZY", fmt.Sprintf("RVOL_%.2f_AND_DUMP_BAR_%.2f_ATR", rvol, barRange/atr14)
 			}
 		}
@@ -730,7 +739,11 @@ func EvaluateSignal(
 				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
 					return model.OrderIntent{}, false, "INVALID_BTC_VWAP", ""
 				}
-				if latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP) {
+				btcBearish := latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP)
+				if cfg.BTCTier2LongSymmetric {
+					btcBearish = latestBTC.Close < btcEMA && (btcVWAP <= 0 || latestBTC.Close < btcVWAP)
+				}
+				if btcBearish {
 					return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_OR_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
 				}
 
@@ -743,13 +756,22 @@ func EvaluateSignal(
 					for p := 0; p < persistenceBars; p++ {
 						idx := len(btcSnap.ClosedCandles) - 1 - p
 						c := btcSnap.ClosedCandles[idx]
-						if c.Close < btcEMA {
+						barBearish := c.Close < btcEMA
+						if cfg.BTCTier2LongSymmetric {
+							barBearish = c.Close < btcEMA && (btcVWAP <= 0 || c.Close < btcVWAP)
+						}
+						if barBearish {
 							return model.OrderIntent{}, false, "BTC_TREND_LONG_VETO_PERSISTENCE", fmt.Sprintf("BTC_BAR_%d_AGO_CLOSE_%.1f_BELOW_EMA_%.1f_REQUIRED_%d_BARS", p, c.Close, btcEMA, persistenceBars)
 						}
 					}
 				}
 			}
 		}
+	}
+
+	if targetSide == model.SideLong && cfg.BTCChopBlockLong && btcSnap != nil && snap.Symbol != "BTCUSDT" &&
+		isBTCChopHighVol(btcSnap.ClosedCandles, cfg.EMAPeriod, cfg.ATRPeriod) {
+		return model.OrderIntent{}, false, "BTC_CHOP_LONG_VETO", "BTC_CHOP_HIGH_VOL_REGIME"
 	}
 
 	sizingCfg := cfg.Sizing

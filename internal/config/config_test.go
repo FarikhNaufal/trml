@@ -471,3 +471,44 @@ func TestLoadConfig_BlockedUTCHoursAndBTCChopRiskMult(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_MinNATRLongPctAndBTCChopBlockLong(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "test_key")
+	t.Setenv("BINANCE_API_SECRET", "test_sec")
+
+	defCfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig default failed: %v", err)
+	}
+	if defCfg.MinNATRLongPct != 0.0 || defCfg.BTCChopBlockLong {
+		t.Fatalf("expected defaults MinNATRLongPct=0.0 BTCChopBlockLong=false, got %v %v", defCfg.MinNATRLongPct, defCfg.BTCChopBlockLong)
+	}
+
+	t.Setenv("MIN_NATR_LONG_PCT", "0.80")
+	t.Setenv("BTC_CHOP_BLOCK_LONG", "true")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig custom failed: %v", err)
+	}
+	if cfg.MinNATRLongPct != 0.80 || !cfg.BTCChopBlockLong {
+		t.Fatalf("expected MinNATRLongPct=0.80 BTCChopBlockLong=true, got %v %v", cfg.MinNATRLongPct, cfg.BTCChopBlockLong)
+	}
+
+	t.Setenv("MIN_NATR_LONG_PCT", "-0.1")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected error for negative MIN_NATR_LONG_PCT")
+	}
+	t.Setenv("MIN_NATR_LONG_PCT", "0.80")
+	t.Setenv("BTC_CHOP_BLOCK_LONG", "maybe")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected error for invalid BTC_CHOP_BLOCK_LONG")
+	}
+
+	t.Setenv("BTC_CHOP_BLOCK_LONG", "true")
+	t.Setenv("DISABLE_PANIC_DUMP_FRENZY_LONG", "true")
+	t.Setenv("BTC_TIER2_LONG_SYMMETRIC", "true")
+	cfg2, err := LoadConfig()
+	if err != nil || !cfg2.DisablePanicDumpFrenzyLong || !cfg2.BTCTier2LongSymmetric {
+		t.Fatalf("expected DisablePanicDumpFrenzyLong & BTCTier2LongSymmetric true, got err=%v %+v", err, cfg2)
+	}
+}
+

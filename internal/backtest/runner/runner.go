@@ -436,6 +436,7 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 	}
 	if opts.KnockoutBTC {
 		evalCfg.BTCGateEnabled = false
+		evalCfg.BTCChopBlockLong = false
 	}
 	if opts.KnockoutRVOL {
 		evalCfg.MinSignalRVOL = 0.0
@@ -443,6 +444,7 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 	}
 	if opts.KnockoutNATR {
 		evalCfg.MinNATRPct = 0.0
+		evalCfg.MinNATRLongPct = 0.0
 		evalCfg.MaxNATRPct = 999.0
 	}
 	evalCfg.BTCGateShortOnly = opts.BTCGateShortOnly
@@ -1139,6 +1141,10 @@ func BuildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 		MinImpulseATRLong:        cfg.MinImpulseATRLong,
 		MinEMASlopeLong:          cfg.MinEMASlopeLong,
 		RequireCleanPullbackLong: cfg.RequireCleanPullbackLong,
+		MinNATRLongPct:             cfg.MinNATRLongPct,
+		BTCChopBlockLong:           cfg.BTCChopBlockLong,
+		DisablePanicDumpFrenzyLong: cfg.DisablePanicDumpFrenzyLong,
+		BTCTier2LongSymmetric:      cfg.BTCTier2LongSymmetric,
 		BTCGateEnabled:           cfg.BTCGateEnabled,
 		BTCGateShortOnly:         cfg.BTCGateShortOnly,
 		BTCMax5mDumpPct:          cfg.BTCMax5mDumpPct,

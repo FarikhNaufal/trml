@@ -2336,3 +2336,111 @@ func TestEvaluateSignal_BlockedUTCHoursAndBTCChopRiskMult(t *testing.T) {
 	}
 }
 
+func TestEvaluateSignal_MinNATRLongPctAndBTCChopBlockLong(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 15, 0, 0, time.UTC)
+
+	// 1. MinNATRLongPct blocks LONG below threshold while leaving SHORT untouched
+	snapLong, cfgLong := helperCreateValidLongSnapshot(now)
+	cfgLong.AllowedSide = "AUTO"
+	// Keep MinNATRLongPct higher than snapshot's natural NATR (~0.9%+) using 5.0% for isolation,
+	// while still <= MaxNATRPct=10.0 so global NATR check passes.
+	cfgLong.MaxNATRPct = 10.0
+	cfgLong.MinNATRLongPct = 5.0
+	_, ok, reason, _ := EvaluateSignal(snapLong, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong)
+	if ok || reason != "NATR_OUT_OF_BOUNDS" {
+		t.Fatalf("expected LONG rejected by MinNATRLongPct with NATR_OUT_OF_BOUNDS, got ok=%v reason=%s", ok, reason)
+	}
+
+	snapShort, cfgShort := helperCreateValidShortSnapshot(now)
+	cfgShort.AllowedSide = "AUTO"
+	cfgShort.MaxNATRPct = 10.0
+	cfgShort.MinNATRLongPct = 5.0
+	_, ok, reason, _ = EvaluateSignal(snapShort, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort)
+	if !ok || reason != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SHORT unaffected by MinNATRLongPct, got ok=%v reason=%s", ok, reason)
+	}
+
+	// 2. BTCChopBlockLong blocks LONG during high-vol chop while leaving SHORT untouched
+	btcChop := make([]model.Candle, 60)
+	for i := range btcChop {
+		p := 50000.0
+		if i%2 == 0 {
+			p = 50700.0
+		}
+		btcChop[i] = model.Candle{
+			OpenTime:  now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:      p,
+			High:      p * 1.015,
+			Low:       p * 0.985,
+			Close:     p,
+		}
+	}
+	btcSnap := &model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		Now:                now,
+		ClosedCandles:      btcChop,
+		CurrentSessionVWAP: 50350.0,
+	}
+
+	snapLong2, cfgLong2 := helperCreateValidLongSnapshot(now)
+	cfgLong2.BTCGateEnabled = false
+	cfgLong2.BTCChopBlockLong = true
+	_, ok, reason, _ = EvaluateSignal(snapLong2, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgLong2)
+	if ok || reason != "BTC_CHOP_LONG_VETO" {
+		t.Fatalf("expected LONG vetoed by BTCChopBlockLong, got ok=%v reason=%s", ok, reason)
+	}
+
+	snapShort2, cfgShort2 := helperCreateValidShortSnapshot(now)
+	cfgShort2.BTCGateEnabled = false
+	cfgShort2.BTCChopBlockLong = true
+	_, ok, reason, _ = EvaluateSignal(snapShort2, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgShort2)
+	if !ok || reason != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SHORT unaffected by BTCChopBlockLong, got ok=%v reason=%s", ok, reason)
+	}
+
+	// 3. DisablePanicDumpFrenzyLong bypasses PANIC_DUMP_FRENZY for LONG only
+	snapDumpLong, cfgDumpLong := helperCreateValidLongSnapshot(now)
+	cfgDumpLong.MaxFrenzyRVOL = 2.50
+	cfgDumpLong.MaxCounterImpulseATR = 1.50
+	cfgDumpLong.DisablePanicDumpFrenzyLong = true
+	snapDumpLong.ClosedCandles[58].Open = 108.0
+	snapDumpLong.ClosedCandles[58].Close = 103.5
+	snapDumpLong.ClosedCandles[58].High = 108.2
+	snapDumpLong.ClosedCandles[58].Low = 103.3
+	snapDumpLong.ClosedCandles[59].VolumeBase = 3500.0
+	_, _, reason, _ = EvaluateSignal(snapDumpLong, nil, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgDumpLong)
+	if reason == "PANIC_DUMP_FRENZY" {
+		t.Fatalf("expected DisablePanicDumpFrenzyLong to bypass PANIC_DUMP_FRENZY")
+	}
+
+	// 4. BTCTier2LongSymmetric allows LONG when BTC is above EMA200 even if slightly below VWAP (mirroring SHORT's && check)
+	snapSym, cfgSym := helperCreateValidLongSnapshot(now)
+	cfgSym.BTCGateEnabled = true
+	cfgSym.BTCGateShortOnly = true
+	cfgSym.BTCTier2LongSymmetric = true
+	cfgSym.AllowedSide = "AUTO"
+	cfgSym.EMAPeriod = 20
+	btcAboveEMA := make([]model.Candle, 30)
+	for i := range btcAboveEMA {
+		btcAboveEMA[i] = model.Candle{
+			OpenTime:  now.Add(time.Duration(i-30) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-29) * 5 * time.Minute),
+			Open:      100.0 + float64(i),
+			High:      101.0 + float64(i),
+			Low:       99.0 + float64(i),
+			Close:     100.5 + float64(i),
+		}
+	}
+	btcSymSnap := &model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		Now:                now,
+		ClosedCandles:      btcAboveEMA,
+		CurrentSessionVWAP: 200.0, // Close (~129.5) > EMA200, but < VWAP (200)
+	}
+	_, ok, reason, _ = EvaluateSignal(snapSym, btcSymSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgSym)
+	if !ok || reason != "SIGNAL_APPROVED" {
+		t.Fatalf("expected BTCTier2LongSymmetric to approve LONG when BTC > EMA200 and < VWAP, got ok=%v reason=%s", ok, reason)
+	}
+}
+
