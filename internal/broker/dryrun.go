@@ -147,7 +147,13 @@ type DryRunBroker struct {
 }
 
 func (d *DryRunBroker) goAsync(fn func()) {
+	d.eventMu.Lock()
+	if d.isClosed {
+		d.eventMu.Unlock()
+		return
+	}
 	d.asyncWg.Add(1)
+	d.eventMu.Unlock()
 	go func() {
 		defer d.asyncWg.Done()
 		fn()
@@ -204,8 +210,6 @@ func (d *DryRunBroker) dispatchPositionEvent(evt PositionEvent) {
 }
 
 func (d *DryRunBroker) Close() {
-	d.asyncWg.Wait()
-
 	d.eventMu.Lock()
 	if d.isClosed {
 		d.eventMu.Unlock()
@@ -218,6 +222,7 @@ func (d *DryRunBroker) Close() {
 	d.eventMu.Unlock()
 
 	d.eventWg.Wait()
+	d.asyncWg.Wait()
 }
 
 func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBroker {
@@ -630,13 +635,13 @@ func (d *DryRunBroker) OnRealtimeTick(
 		tp1Touched := false
 		tpFullTouched := false
 		if pos.Side == model.SideLong {
-			slTouched = triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice)
-			tp1Touched = triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price))
-			tpFullTouched = triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
+			slTouched = !pos.CurrentSLPrice.IsZero() && triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice)
+			tp1Touched = !pos.TP1Price.IsZero() && (triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price)))
+			tpFullTouched = !pos.TPPrice.IsZero() && (triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice)))
 		} else {
-			slTouched = triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice)
-			tp1Touched = triggerRefPrice.LessThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price))
-			tpFullTouched = triggerRefPrice.LessThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
+			slTouched = !pos.CurrentSLPrice.IsZero() && triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice)
+			tp1Touched = !pos.TP1Price.IsZero() && (triggerRefPrice.LessThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price)))
+			tpFullTouched = !pos.TPPrice.IsZero() && (triggerRefPrice.LessThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice)))
 		}
 
 		// 1. Stop Loss FIRST (pessimistic intrabar conflict parity with SimBroker, plus SL Gap-Fill support)
@@ -674,7 +679,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 		}
 
 		// 3. Full Take Profit
-		if tpFullTouched && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
+		if tpFullTouched && !pos.TPPrice.IsZero() && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
 			closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
 			delete(d.PendingOrders, symbol)
 			return
@@ -985,6 +990,7 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	}
 
 	delete(d.OpenPositions, pos.Symbol)
+	_ = d.isDailyDrawdownBreachedLocked()
 
 	d.enqueuePositionEvent(PositionEvent{
 		Type:                  PositionEventDelete,
@@ -1033,7 +1039,11 @@ func (d *DryRunBroker) GetPureRealizedEquityClosedTradesUSDT() decimal.Decimal {
 	defer d.Mu.Unlock()
 	pure := d.RealizedEquityUSDT
 	for _, pos := range d.OpenPositions {
-		pure = pure.Add(pos.EntryFee).Add(pos.FundingPaid)
+		entryFeeRem := pos.EntryFee
+		if !pos.InitialQty.IsZero() && pos.InitialQty.GreaterThan(pos.Qty) {
+			entryFeeRem = pos.EntryFee.Mul(pos.Qty).Div(pos.InitialQty)
+		}
+		pure = pure.Add(entryFeeRem).Add(pos.FundingPaid)
 	}
 	return pure
 }
@@ -1050,8 +1060,11 @@ func (d *DryRunBroker) GetAvailableBalanceUSDT() decimal.Decimal {
 		usedMargin = usedMargin.Add(notional.Div(lev))
 	}
 	for _, ord := range d.PendingOrders {
-		notional := ord.Intent.LimitPrice.Mul(ord.Intent.Qty)
-		usedMargin = usedMargin.Add(notional.Div(lev))
+		remQty := ord.Intent.Qty.Sub(ord.FilledQty)
+		if remQty.GreaterThan(decimal.Zero) {
+			notional := ord.Intent.LimitPrice.Mul(remQty)
+			usedMargin = usedMargin.Add(notional.Div(lev))
+		}
 	}
 
 	effEquity := d.calculateEffectiveEquityLocked()

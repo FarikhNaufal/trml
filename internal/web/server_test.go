@@ -686,6 +686,21 @@ func TestStrategyStatsAndFiltering(t *testing.T) {
 		t.Fatalf("unexpected filtered trades: %+v", trResp)
 	}
 
+	// 2b. Verify status=TAKE_PROFIT includes TRAILING_STOP (ORD_SWEEP_1) as well as TAKE_PROFIT (ORD_VWAP_1)
+	req = httptest.NewRequest("GET", "/api/trades?page=1&limit=10&status=TAKE_PROFIT", nil)
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/trades?status=TAKE_PROFIT, got %d", rec.Code)
+	}
+	var tpFilterResp struct {
+		Total int `json:"total"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &tpFilterResp)
+	if tpFilterResp.Total != 2 {
+		t.Fatalf("expected status=TAKE_PROFIT to include TRAILING_STOP and TAKE_PROFIT (2 rows), got %d", tpFilterResp.Total)
+	}
+
 	// 3. Verify /api/signals?strategy=LIQUIDITY_SWEEP_SHORT filters cleanly
 	req = httptest.NewRequest("GET", "/api/signals?page=1&limit=10&strategy=LIQUIDITY_SWEEP_SHORT", nil)
 	rec = httptest.NewRecorder()

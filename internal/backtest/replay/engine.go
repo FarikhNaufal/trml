@@ -157,12 +157,15 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		}
 
 		// A. Step execution & update rolling buffers per symbol at simTime
+		closedAtSimTime := make(map[string]bool, len(sortedSymbols))
 		for _, sym := range sortedSymbols {
-			r.stepSymbolAtTime(
+			if r.stepSymbolAtTime(
 				sym, simTime, prevSimTime, int64(barIdx), bufferCap,
 				candleIndices, execIndices, rollingCandles, rollingDeltas,
 				lastSeenBarTime, lastSeenClose,
-			)
+			) {
+				closedAtSimTime[sym] = true
+			}
 		}
 
 		lastClosedTradeIdx = r.syncLastExits(lastClosedTradeIdx)
@@ -172,7 +175,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 			// B. Prepare BTC macro snapshot and evaluate signals on active/watched symbols
 			btcSnap := r.buildBTCMacro(simTime, rollingCandles, rollingDeltas)
-			r.evaluateSignalsAtBar(simTime, sortedSymbols, watchedSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, btcSnap)
+			r.evaluateSignalsAtBar(simTime, sortedSymbols, closedAtSimTime, watchedSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, btcSnap)
 		}
 
 		// C. Post-bar dynamic scan cadence: new watchlist activates on subsequent closed bars
@@ -232,7 +235,7 @@ func (r *ReplayEngine) stepSymbolAtTime(
 	rollingDeltas map[string][]float64,
 	lastSeenBarTime map[string]time.Time,
 	lastSeenClose map[string]float64,
-) {
+) bool {
 	candles := r.candleMap[sym]
 	idx := candleIndices[sym]
 	hasBar := idx < len(candles) && candles[idx].CloseTime.Equal(simTime)
@@ -261,7 +264,7 @@ func (r *ReplayEngine) stepSymbolAtTime(
 			rollingDeltas[sym] = rollingDeltas[sym][len(rollingDeltas[sym])-bufferCap:]
 		}
 		candleIndices[sym]++
-		return
+		return true
 	}
 
 	// No base bar at simTime: advance any 1m cursor cleanly and settle delisted/stale open positions.
@@ -274,6 +277,7 @@ func (r *ReplayEngine) stepSymbolAtTime(
 			}
 		}
 	}
+	return false
 }
 
 func (r *ReplayEngine) processExecSubBars(
@@ -348,6 +352,7 @@ func (r *ReplayEngine) buildBTCMacro(
 func (r *ReplayEngine) evaluateSignalsAtBar(
 	simTime time.Time,
 	sortedSymbols []string,
+	closedAtSimTime map[string]bool,
 	watchedSymbols map[string]bool,
 	sweepExtraSymbols map[string]bool,
 	rollingCandles map[string][]model.Candle,
@@ -366,11 +371,14 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 	}
 
 	for _, sym := range sortedSymbols {
+		if !closedAtSimTime[sym] {
+			continue
+		}
 		cList, ok := rollingCandles[sym]
 		if !ok {
 			continue
 		}
-		if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
+		if sym == r.cfg.BenchmarkSym && (len(sortedSymbols) > 1 || !r.isSymbolTarget(sym)) {
 			continue
 		}
 		hasActive := r.broker.HasActiveOrderOrPosition(sym)
@@ -411,7 +419,7 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 
 		r.TotalSignalsEvaluated++
 		scope := strategy.SymbolScope{
-			AllowPrimary: inPrimary || (!inSweepExtra && hasActive),
+			AllowPrimary: inPrimary,
 			AllowSweep:   inPrimary || inSweepExtra,
 		}
 		dec := strategy.EvaluatePortfolio(
@@ -429,9 +437,11 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		if dec.Approved {
 			r.SignalsApproved++
 			_, _ = r.broker.SubmitLimitEntry(dec.Intent)
-			activeSlots = r.broker.GetActiveSlotCount()
-			if r.cfg.DeductPendingMargin {
-				availBal = r.broker.GetAvailableBalanceUSDT()
+			if !r.cfg.UnconstrainedMode {
+				activeSlots = r.broker.GetActiveSlotCount()
+				if r.cfg.DeductPendingMargin {
+					availBal = r.broker.GetAvailableBalanceUSDT()
+				}
 			}
 		} else {
 			r.SignalsRejected++

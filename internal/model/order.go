@@ -168,6 +168,16 @@ type AccountUpdateEvent struct {
 	IsFullSnapshot   bool
 }
 
+// AlgoOrderUpdateEvent carries Binance Futures User Data Stream ALGO_UPDATE conditional order transitions.
+type AlgoOrderUpdateEvent struct {
+	Symbol       string
+	AlgoID       int64
+	ClientAlgoID string
+	OrderType    string
+	AlgoStatus   string
+	TriggerPrice decimal.Decimal
+}
+
 var clientOrderNonce uint64
 
 const MaxBinanceClientOrderIDLen = 36

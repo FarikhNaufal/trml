@@ -460,6 +460,15 @@ func TestModeIsolatedDailyStateAndFundingPersistence(t *testing.T) {
 		t.Fatalf("unexpected LIVE state: start=%s real=%s breaker=%v", sLV, rLV, bLV)
 	}
 
+	// Out-of-order SaveDailyStateForMode with breakerTripped=false on the SAME UTC day must NOT clear sticky breaker
+	if err := repo.SaveDailyStateForMode(ctx, "LIVE", epochDay, decimal.NewFromFloat(500.0), decimal.NewFromFloat(492.0), false); err != nil {
+		t.Fatalf("SaveDailyStateForMode LIVE sticky check failed: %v", err)
+	}
+	_, _, bLVAfter, _, _ := repo.GetDailyStateForMode(ctx, "LIVE", epochDay)
+	if !bLVAfter {
+		t.Fatalf("expected circuit_breaker_hit to remain sticky (true) on same UTC day after out-of-order false update")
+	}
+
 	// DryRun position funding round-trip
 	now := time.Now().UTC()
 	if err := repo.SaveDryRunPosition(ctx, StoredDryRunPosition{
@@ -490,5 +499,63 @@ func TestModeIsolatedDailyStateAndFundingPersistence(t *testing.T) {
 	}
 	if !loaded[0].FundingPaid.Equal(decimal.NewFromFloat(0.1234)) || loaded[0].LastFundingEpoch != 60000 {
 		t.Fatalf("funding persistence mismatch: got FundingPaid=%s LastFundingEpoch=%d", loaded[0].FundingPaid, loaded[0].LastFundingEpoch)
+	}
+
+	// Late SignalAuditID attachment on SaveDryRunPosition conflict update
+	if err := repo.SaveDryRunPosition(ctx, StoredDryRunPosition{
+		ClientOrderID:    "SIM-FUND-1",
+		Symbol:           "SOLUSDT",
+		Side:             "LONG",
+		StrategyID:       "VWAP_PULLBACK",
+		Qty:              decimal.NewFromFloat(2.0),
+		InitialQty:       decimal.NewFromFloat(2.0),
+		EntryPrice:       decimal.NewFromFloat(100.0),
+		EntryFee:         decimal.NewFromFloat(0.04),
+		CurrentSLPrice:   decimal.NewFromFloat(97.0),
+		InitialSLPrice:   decimal.NewFromFloat(97.0),
+		TPPrice:          decimal.NewFromFloat(106.0),
+		ATRAtEntry:       decimal.NewFromFloat(1.5),
+		LastMarkPrice:    decimal.NewFromFloat(101.0),
+		PeakPrice:        decimal.NewFromFloat(101.5),
+		MarkUpdatedAt:    now,
+		OpenedAt:         now,
+		SignalAuditID:    777,
+		FundingPaid:      decimal.NewFromFloat(0.1234),
+		LastFundingEpoch: 60000,
+	}); err != nil {
+		t.Fatalf("SaveDryRunPosition update SignalAuditID failed: %v", err)
+	}
+	loadedAfterAudit, _ := repo.GetAllDryRunPositions(ctx)
+	if len(loadedAfterAudit) != 1 || loadedAfterAudit[0].SignalAuditID != 777 {
+		t.Fatalf("expected updated SignalAuditID=777 persisted on conflict update, got %+v", loadedAfterAudit)
+	}
+
+	// Live position TP1OrderID / TP1ClientOrderID round-trip
+	if err := repo.SaveLivePosition(ctx, StoredLivePosition{
+		Symbol:           "ETHUSDT",
+		Side:             "LONG",
+		StrategyID:       "VWAP_PULLBACK",
+		Qty:              decimal.NewFromFloat(1.5),
+		InitialQty:       decimal.NewFromFloat(1.5),
+		EntryPrice:       decimal.NewFromFloat(3000.0),
+		SLOrderID:        1001,
+		SLClientAlgoID:   "ALGO_SL_ETH",
+		SLPrice:          decimal.NewFromFloat(2950.0),
+		InitialSLPrice:   decimal.NewFromFloat(2950.0),
+		TPPrice:          decimal.NewFromFloat(3100.0),
+		TP1Price:         decimal.NewFromFloat(3050.0),
+		TP1OrderID:       445566,
+		TP1ClientOrderID: "ALGO_TP1_ETH_1",
+		OpenedAt:         now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("SaveLivePosition failed: %v", err)
+	}
+	liveLoaded, err := repo.GetAllLivePositions(ctx)
+	if err != nil || len(liveLoaded) != 1 {
+		t.Fatalf("GetAllLivePositions failed: len=%d err=%v", len(liveLoaded), err)
+	}
+	if liveLoaded[0].TP1OrderID != 445566 || liveLoaded[0].TP1ClientOrderID != "ALGO_TP1_ETH_1" {
+		t.Fatalf("expected TP1OrderID=445566 TP1ClientOrderID=ALGO_TP1_ETH_1, got %+v", liveLoaded[0])
 	}
 }

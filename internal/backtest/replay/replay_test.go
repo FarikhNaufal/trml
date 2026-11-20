@@ -412,4 +412,89 @@ func TestReplayEngine_SubBar1mExecutionAndDelistSettlement(t *testing.T) {
 	}
 }
 
+func TestReplayEngine_SkipStaleSymbolAndEffectiveEvalTimeOI999(t *testing.T) {
+	t0 := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	step := 5 * time.Minute
+
+	// 1. LIVEUSDT has 40 bars with CloseTime ending in ...59.999 (real Binance kline format)
+	// 2. STALEUSDT stops at bar 32 (simulating halted/delisted coin)
+	liveCandles := make([]data.HistoricalCandle, 40)
+	for i := range liveCandles {
+		tOpen := t0.Add(time.Duration(i) * step)
+		liveCandles[i] = data.HistoricalCandle{
+			OpenTime:    tOpen,
+			CloseTime:   tOpen.Add(step - time.Millisecond), // ...59.999
+			Symbol:      "LIVEUSDT",
+			Open:        100.0,
+			High:        100.5,
+			Low:         99.5,
+			Close:       100.0,
+			Volume:      1000,
+			QuoteVolume: 100000,
+		}
+	}
+	staleCandles := make([]data.HistoricalCandle, 33)
+	copy(staleCandles, liveCandles[:33])
+	for i := range staleCandles {
+		staleCandles[i].Symbol = "STALEUSDT"
+	}
+
+	// OI points are timestamped on the exact 5m boundary (:00.000), as in Binance Vision metrics CSV
+	oiMgr := data.NewMetricsOIDownloader(t.TempDir(), nil, nil)
+	oiPts := make([]data.OpenInterestPoint, 0, len(liveCandles))
+	for _, c := range liveCandles {
+		oiPts = append(oiPts, data.OpenInterestPoint{
+			Timestamp:            c.OpenTime.Add(step), // exact :00.000 (1ms after CloseTime ...59.999)
+			SumOpenInterest:      10000.0,
+			SumOpenInterestValue: 1000000.0,
+		})
+	}
+	oiMgr.SetSeriesForTesting("LIVEUSDT", oiPts)
+	oiMgr.SetSeriesForTesting("STALEUSDT", oiPts)
+
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000),
+		MaxSlots:          3,
+	})
+	f := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	eng := NewReplayEngine(ReplayConfig{
+		WarmupBars: 30,
+		OIMode:     OIModeStrict,
+		OIMgr:      oiMgr,
+	}, strategy.EvaluatorConfig{
+		EMAPeriod:           20,
+		ATRPeriod:           14,
+		MaxSlots:            3,
+		MaxSpreadPct:        0.10,
+		MinOIInterval:       4 * time.Minute,
+		MaxOIInterval:       7 * time.Minute,
+		MaxOIStaleness:      5 * time.Minute, // strict 5m staleness: would fail if 1ms CloseTime off-by-one lagged OI by 1 bar!
+		MaxDailyDrawdownPct: -0.05,
+	}, sim, map[string][]data.HistoricalCandle{
+		"LIVEUSDT":  liveCandles,
+		"STALEUSDT": staleCandles,
+	}, map[string]model.ExchangeFilter{
+		"LIVEUSDT":  f,
+		"STALEUSDT": f,
+	})
+
+	if err := eng.Run(context.Background()); err != nil {
+		t.Fatalf("replay run failed: %v", err)
+	}
+	// Bars evaluated from barIdx=30..39:
+	// - LIVEUSDT closes on all 10 bars (30..39) -> 10 evaluations
+	// - STALEUSDT closes only on bars 30, 31, 32 -> 3 evaluations (must NOT be re-evaluated on bars 33..39!)
+	if eng.TotalSignalsEvaluated != 13 {
+		t.Fatalf("expected exactly 13 signal evaluations (10 LIVEUSDT + 3 STALEUSDT, no phantom re-evaluation of stale symbol), got %d", eng.TotalSignalsEvaluated)
+	}
+	// Because effectiveEvalTime normalizes ...59.999 -> :00.000, current-bar OI at :00.000 is matched with 0 missing OI!
+	if eng.Stats.OIMissingCount != 0 || eng.Stats.OICoveredCount != 13 {
+		t.Fatalf("expected 100%% OI coverage (13 covered, 0 missing) with ...59.999 CloseTime and :00.000 OI timestamps, got %+v", eng.Stats)
+	}
+}
+
 

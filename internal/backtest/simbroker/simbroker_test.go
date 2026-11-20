@@ -1027,6 +1027,62 @@ func TestSimBroker_LimitTimeoutSecondsAndTimelineEquityAndDelistSettle(t *testin
 	}
 }
 
+func TestSimBroker_NoSameBarTP1LookAheadOnEntryFill(t *testing.T) {
+	b := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT:       decimal.NewFromFloat(1000.0),
+		MaxSlots:                3,
+		AccountLeverage:         8.0,
+		MakerFeeRate:            decimal.NewFromFloat(0.0002),
+		TakerFeeRate:            decimal.NewFromFloat(0.0005),
+		PenetrationTicks:        1,
+		PartialTPEnabled:        true,
+		PartialTP1Ratio:         0.50,
+		IntrabarConflictSLFirst: true,
+	})
+	b.SetExchangeFilter("SOLUSDT", model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	})
+
+	now := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "NO_LOOKAHEAD_1",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TP1Price:      decimal.NewFromFloat(102.0),
+		TPPrice:       decimal.NewFromFloat(106.0),
+		ATRAtEntry:    decimal.NewFromFloat(2.0),
+		CreatedAt:     now,
+	})
+
+	// Entry bar: High reaches 102.50 (above TP1 102.0) BEFORE/DURING the bar while Low dips to 99.90 (filling limit 100.0) and closes at 100.20.
+	// Must NOT trigger TP1 or ratify PeakPrice=102.50 on the entry bar itself!
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  now,
+		CloseTime: now.Add(5 * time.Minute),
+		Symbol:    "SOLUSDT",
+		Open:      101.0,
+		High:      102.5,
+		Low:       99.9,
+		Close:     100.2,
+	}, 1)
+
+	pos := b.OpenPositions["SOLUSDT"]
+	if pos == nil {
+		t.Fatalf("expected position to fill on entry bar")
+	}
+	if pos.IsTP1Hit || len(b.ClosedTrades) != 0 {
+		t.Fatalf("expected TP1 NOT to trigger on the same bar as entry fill (no pre-fill wick look-ahead), got IsTP1Hit=%v trades=%d", pos.IsTP1Hit, len(b.ClosedTrades))
+	}
+	if !pos.PeakPrice.Equal(decimal.NewFromFloat(100.2)) {
+		t.Fatalf("expected entry-bar PeakPrice capped at post-fill Close (100.2), got %s", pos.PeakPrice)
+	}
+}
+
 
 
 

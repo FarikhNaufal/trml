@@ -3,10 +3,12 @@ package exchange
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -421,5 +423,106 @@ func TestInitAndVerifySymbol_VerifiesAndFailsClosedOnRiskMismatch(t *testing.T) 
 	lev = "8"
 	if ok, err := client.InitAndVerifySymbol(context.Background(), "BTCUSDT", 8); !ok || err != nil {
 		t.Fatalf("expected InitAndVerifySymbol success when verified isolated & 8x, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestExchangeSignaturePlacement_AlgoType_1021_And_USDTBasis(t *testing.T) {
+	var lastAlgoBody, lastMarketBody, lastGetQuery string
+	var orderAttempts atomic.Int32
+	var timeSynced atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		rawBody := string(bodyBytes)
+		switch r.URL.Path {
+		case "/fapi/v1/time":
+			timeSynced.Store(true)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"serverTime":%d}`, time.Now().UnixMilli())))
+		case "/fapi/v1/algoOrder":
+			lastAlgoBody = rawBody
+			_, _ = w.Write([]byte(`{"algoId":778899,"clientAlgoId":"ALGO_SL_1"}`))
+		case "/fapi/v1/order":
+			if r.Method == http.MethodGet {
+				lastGetQuery = r.URL.RawQuery
+				_, _ = w.Write([]byte(`{"orderId":10,"clientOrderId":"IDEMP_EXP","status":"EXPIRED","executedQty":"0"}`))
+				return
+			}
+			parsedForm, _ := url.ParseQuery(rawBody)
+			if parsedForm.Get("newClientOrderId") == "RETRY_1021" && orderAttempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}`))
+				return
+			}
+			lastMarketBody = rawBody
+			_, _ = w.Write([]byte(`{"orderId":555,"status":"FILLED","avgPrice":"100.0","executedQty":"1.0"}`))
+		case "/fapi/v2/account":
+			// TotalWalletBalance includes $15 BNB, while USDT asset is $125.00
+			_, _ = w.Write([]byte(`{
+				"totalWalletBalance":"140.00",
+				"totalUnrealizedProfit":"2.00",
+				"availableBalance":"135.00",
+				"assets":[
+					{"asset":"BNB","walletBalance":"0.025"},
+					{"asset":"USDT","walletBalance":"125.00","unrealizedProfit":"2.00","availableBalance":"120.00"}
+				],
+				"positions":[]
+			}`))
+		case "/fapi/v1/positionSide/dual":
+			_, _ = w.Write([]byte(`{"dualSidePosition":false}`))
+		case "/fapi/v1/marginType", "/fapi/v1/leverage":
+			_, _ = w.Write([]byte(`{"code":200}`))
+		case "/fapi/v2/positionRisk":
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	ctx := context.Background()
+
+	// 1. PlaceAlgoOrder uses type=STOP_MARKET (not orderType) and signature= at very end
+	algoID, err := client.PlaceAlgoOrder(ctx, "BTCUSDT", model.SideShort, "STOP_MARKET", decimal.NewFromFloat(0.1), decimal.NewFromFloat(60000), "ALGO_SL_1")
+	if err != nil || algoID != 778899 {
+		t.Fatalf("PlaceAlgoOrder failed: algoID=%d err=%v", algoID, err)
+	}
+	parsedAlgo, _ := url.ParseQuery(lastAlgoBody)
+	if parsedAlgo.Get("type") != "STOP_MARKET" || parsedAlgo.Get("orderType") != "" {
+		t.Fatalf("expected type=STOP_MARKET and no orderType param, got body=%s", lastAlgoBody)
+	}
+	if !strings.Contains(lastAlgoBody, "&signature=") || strings.Contains(strings.Split(lastAlgoBody, "&signature=")[1], "&") {
+		t.Fatalf("expected &signature=<hex> strictly at end of algoOrder body, got: %s", lastAlgoBody)
+	}
+
+	// 2. -1021 triggers SyncServerTime and retries successfully + PlaceMarketClose sends newOrderRespType=RESULT
+	_, _, _, err = client.PlaceMarketClose(ctx, "ETHUSDT", model.SideShort, decimal.NewFromFloat(1.0), "RETRY_1021")
+	if err != nil || !timeSynced.Load() || orderAttempts.Load() != 2 {
+		t.Fatalf("expected -1021 auto resync and retry success, synced=%v attempts=%d err=%v", timeSynced.Load(), orderAttempts.Load(), err)
+	}
+	if !strings.Contains(lastMarketBody, "newOrderRespType=RESULT") || strings.Contains(strings.Split(lastMarketBody, "&signature=")[1], "&") {
+		t.Fatalf("expected newOrderRespType=RESULT and trailing signature, got: %s", lastMarketBody)
+	}
+
+	// 3. FetchAccountBalance uses USDT asset balance (125.00), ignoring TotalWalletBalance (140.00 w/ BNB)
+	wb, up, ab, _, err := client.FetchAccountBalance(ctx)
+	if err != nil || !wb.Equal(decimal.NewFromFloat(125.0)) || !up.Equal(decimal.NewFromFloat(2.0)) || !ab.Equal(decimal.NewFromFloat(120.0)) {
+		t.Fatalf("expected USDT basis 125/2/120, got wb=%s up=%s ab=%s err=%v", wb, up, ab, err)
+	}
+
+	// 4. InitAndVerifySymbol fails closed when positionRisk omits symbol
+	if ok, err := client.InitAndVerifySymbol(ctx, "BTCUSDT", 8); ok || err == nil || !strings.Contains(err.Error(), "missing from positionRisk") {
+		t.Fatalf("expected fail-closed missing symbol error, got ok=%v err=%v", ok, err)
+	}
+
+	// 5. verifyPostOrderIdempotency rejects EXPIRED zero-fill orders and keeps trailing signature on GET query
+	idempParams := url.Values{}
+	idempParams.Set("symbol", "BTCUSDT")
+	idempParams.Set("newClientOrderId", "IDEMP_EXP")
+	if _, ok := client.verifyPostOrderIdempotency(ctx, "/fapi/v1/order", idempParams); ok {
+		t.Fatalf("expected verifyPostOrderIdempotency to reject EXPIRED zero-fill order")
+	}
+	if !strings.Contains(lastGetQuery, "&signature=") || strings.Contains(strings.Split(lastGetQuery, "&signature=")[1], "&") {
+		t.Fatalf("expected GET query trailing signature, got: %s", lastGetQuery)
 	}
 }

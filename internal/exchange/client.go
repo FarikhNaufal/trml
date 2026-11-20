@@ -108,15 +108,45 @@ func (c *Client) SyncServerTime(ctx context.Context) error {
 	}
 
 	if res.ServerTime > 0 {
-		c.TimeOffset = res.ServerTime - time.Now().UnixMilli()
+		atomic.StoreInt64(&c.TimeOffset, res.ServerTime-time.Now().UnixMilli())
 	}
 	return nil
 }
 
-func (c *Client) signQuery(params url.Values) string {
+// GetTimeOffset mengembalikan offset jam bursa secara thread-safe (ms).
+func (c *Client) GetTimeOffset() int64 {
+	return atomic.LoadInt64(&c.TimeOffset)
+}
+
+func (c *Client) signString(payload string) string {
 	mac := hmac.New(sha256.New, []byte(c.SecretKey))
-	mac.Write([]byte(params.Encode()))
+	mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (c *Client) buildEncodedParams(params url.Values, signed bool) string {
+	attemptParams := make(url.Values, len(params)+2)
+	for k, v := range params {
+		attemptParams[k] = append([]string(nil), v...)
+	}
+	if signed {
+		ts := time.Now().UnixMilli() + atomic.LoadInt64(&c.TimeOffset)
+		attemptParams.Set("timestamp", strconv.FormatInt(ts, 10))
+		recvWin := c.RecvWindow
+		if recvWin <= 0 {
+			recvWin = 5000
+		}
+		attemptParams.Set("recvWindow", strconv.FormatInt(recvWin, 10))
+	}
+	encoded := attemptParams.Encode()
+	if !signed {
+		return encoded
+	}
+	sig := c.signString(encoded)
+	if encoded == "" {
+		return "signature=" + sig
+	}
+	return encoded + "&signature=" + sig
 }
 
 func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params url.Values, signed bool) ([]byte, error) {
@@ -139,35 +169,18 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 		default:
 		}
 
-		// Jika signed, timestamp harus dibuat baru pada setiap attempt
-		attemptParams := make(url.Values, len(params)+3)
-		for k, v := range params {
-			attemptParams[k] = append([]string(nil), v...)
-		}
-
-		if signed {
-			ts := time.Now().UnixMilli() + c.TimeOffset
-			attemptParams.Set("timestamp", strconv.FormatInt(ts, 10))
-			recvWin := c.RecvWindow
-			if recvWin <= 0 {
-				recvWin = 5000
-			}
-			attemptParams.Set("recvWindow", strconv.FormatInt(recvWin, 10))
-			sig := c.signQuery(attemptParams)
-			attemptParams.Set("signature", sig)
-		}
-
+		encodedBody := c.buildEncodedParams(params, signed)
 		reqURL := fmt.Sprintf("%s%s", c.BaseURL, endpoint)
 		var req *http.Request
 		var err error
 
 		if method == http.MethodGet || method == http.MethodDelete {
-			if len(attemptParams) > 0 {
-				reqURL = fmt.Sprintf("%s?%s", reqURL, attemptParams.Encode())
+			if encodedBody != "" {
+				reqURL = fmt.Sprintf("%s?%s", reqURL, encodedBody)
 			}
 			req, err = http.NewRequestWithContext(ctx, method, reqURL, nil)
 		} else {
-			req, err = http.NewRequestWithContext(ctx, method, reqURL, strings.NewReader(attemptParams.Encode()))
+			req, err = http.NewRequestWithContext(ctx, method, reqURL, strings.NewReader(encodedBody))
 			if req != nil {
 				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			}
@@ -222,9 +235,20 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 			return body, &apiErr
 		}
 
+		// Tangani Rate Limit (429) dengan memeriksa kode -1003 terlebih dahulu tanpa spam GET idempotency
+		if resp.StatusCode == http.StatusTooManyRequests {
+			var apiErr APIError
+			if jsonErr := json.Unmarshal(body, &apiErr); jsonErr == nil && apiErr.Code == -1003 {
+				apiErr.HTTPStatusCode = resp.StatusCode
+				expiry := parseBanExpiry(resp.Header, apiErr.Msg)
+				c.SetBanUntil(expiry)
+				return body, &apiErr
+			}
+		}
+
 		// Tangani Rate Limit (429) dan Server Error (5xx) dengan retry bounded
 		if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode <= 504) {
-			if method == http.MethodPost {
+			if method == http.MethodPost && resp.StatusCode >= 500 && resp.StatusCode <= 504 {
 				if existingBody, ok := c.verifyPostOrderIdempotency(ctx, endpoint, params); ok {
 					return existingBody, nil
 				}
@@ -253,6 +277,11 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 				if apiErr.Code == -1003 {
 					expiry := parseBanExpiry(resp.Header, apiErr.Msg)
 					c.SetBanUntil(expiry)
+					return body, &apiErr
+				}
+				if signed && apiErr.Code == -1021 && attempt < maxRetries-1 {
+					_ = c.SyncServerTime(ctx)
+					continue
 				}
 				return body, &apiErr
 			}
@@ -269,36 +298,25 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 }
 
 func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, params url.Values, signed bool) ([]byte, error) {
+	if banned, until := c.IsIPBanned(); banned {
+		return nil, fmt.Errorf("exchange: outgoing requests paused due to active Binance IP ban until %s", until.Format(time.RFC3339))
+	}
 	if params == nil {
 		params = url.Values{}
 	}
-	attemptParams := make(url.Values, len(params)+3)
-	for k, v := range params {
-		attemptParams[k] = append([]string(nil), v...)
-	}
-	if signed {
-		ts := time.Now().UnixMilli() + c.TimeOffset
-		attemptParams.Set("timestamp", strconv.FormatInt(ts, 10))
-		recvWin := c.RecvWindow
-		if recvWin <= 0 {
-			recvWin = 5000
-		}
-		attemptParams.Set("recvWindow", strconv.FormatInt(recvWin, 10))
-		sig := c.signQuery(attemptParams)
-		attemptParams.Set("signature", sig)
-	}
+	encodedBody := c.buildEncodedParams(params, signed)
 
 	reqURL := fmt.Sprintf("%s%s", c.BaseURL, endpoint)
 	var req *http.Request
 	var err error
 
 	if method == http.MethodGet || method == http.MethodDelete {
-		if len(attemptParams) > 0 {
-			reqURL = fmt.Sprintf("%s?%s", reqURL, attemptParams.Encode())
+		if encodedBody != "" {
+			reqURL = fmt.Sprintf("%s?%s", reqURL, encodedBody)
 		}
 		req, err = http.NewRequestWithContext(ctx, method, reqURL, nil)
 	} else {
-		req, err = http.NewRequestWithContext(ctx, method, reqURL, strings.NewReader(attemptParams.Encode()))
+		req, err = http.NewRequestWithContext(ctx, method, reqURL, strings.NewReader(encodedBody))
 		if req != nil {
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
@@ -320,10 +338,22 @@ func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, par
 	if readErr != nil {
 		return nil, readErr
 	}
+	if resp.StatusCode == 418 {
+		var apiErr APIError
+		_ = json.Unmarshal(body, &apiErr)
+		apiErr.HTTPStatusCode = 418
+		expiry := parseBanExpiry(resp.Header, apiErr.Msg)
+		c.SetBanUntil(expiry)
+		return body, &apiErr
+	}
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
 		if jsonErr := json.Unmarshal(body, &apiErr); jsonErr == nil && apiErr.Code != 0 {
 			apiErr.HTTPStatusCode = resp.StatusCode
+			if apiErr.Code == -1003 {
+				expiry := parseBanExpiry(resp.Header, apiErr.Msg)
+				c.SetBanUntil(expiry)
+			}
 			return body, &apiErr
 		}
 		return body, fmt.Errorf("exchange: API returned HTTP %d: %s", resp.StatusCode, string(body))
@@ -381,6 +411,14 @@ func (c *Client) verifyPostOrderIdempotency(ctx context.Context, endpoint string
 		qParams.Set("origClientOrderId", clientOID)
 		checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/order", qParams, true)
 		if checkErr == nil && len(checkBody) > 0 {
+			var qResp QueryOrderResponse
+			if jErr := json.Unmarshal(checkBody, &qResp); jErr == nil {
+				execQty, _ := strconv.ParseFloat(qResp.ExecutedQty, 64)
+				isTerminalZero := (qResp.Status == "EXPIRED" || qResp.Status == "EXPIRED_IN_MATCH" || qResp.Status == "REJECTED" || qResp.Status == "CANCELED") && execQty <= 0
+				if isTerminalZero {
+					return nil, false
+				}
+			}
 			return checkBody, true
 		}
 	}

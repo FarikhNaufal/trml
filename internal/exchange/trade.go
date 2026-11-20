@@ -138,7 +138,7 @@ func (c *Client) PlaceAlgoOrder(
 		params.Set("side", "SELL")
 	}
 	params.Set("algoType", "CONDITIONAL")
-	params.Set("orderType", orderType) // STOP_MARKET / TAKE_PROFIT_MARKET
+	params.Set("type", orderType) // STOP_MARKET / TAKE_PROFIT_MARKET
 	params.Set("triggerPrice", triggerPrice.String())
 	params.Set("quantity", qty.String())
 	workingType := "MARK_PRICE"
@@ -215,6 +215,7 @@ func (c *Client) EmergencyMarketClose(ctx context.Context, symbol string, positi
 	}
 	params.Set("type", "MARKET")
 	params.Set("reduceOnly", "true")
+	params.Set("newOrderRespType", "RESULT")
 	params.Set("quantity", qty.String())
 	params.Set("newClientOrderId", model.FormatClientID("live_emg", symbol, time.Now().UTC()))
 
@@ -236,6 +237,7 @@ func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model
 	}
 	params.Set("type", "MARKET")
 	params.Set("reduceOnly", "true")
+	params.Set("newOrderRespType", "RESULT")
 	params.Set("quantity", qty.String())
 	if clientOrderID != "" {
 		params.Set("newClientOrderId", clientOrderID)
@@ -280,6 +282,9 @@ func (c *Client) PlaceLimitClose(ctx context.Context, symbol string, side model.
 		errStr := err.Error() + " " + string(respBytes)
 		if strings.Contains(errStr, "-2010") || strings.Contains(errStr, "-5022") || strings.Contains(errStr, "Post Only") {
 			params.Set("timeInForce", "GTC")
+			if clientOrderID != "" {
+				params.Set("newClientOrderId", model.FormatClientID("ALGO_TP1", symbol, time.Now().UTC()))
+			}
 			respBytes, err = c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
 		}
 		if err != nil {
@@ -343,6 +348,7 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 	if err != nil {
 		return false, fmt.Errorf("failed to verify symbol risk configuration: %w", err)
 	}
+	verified := false
 	for _, pr := range posRisks {
 		if pr.Symbol != symbol {
 			continue
@@ -355,6 +361,10 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 				return false, fmt.Errorf("symbol %s leverage expected %d, got %s", symbol, leverage, pr.Leverage)
 			}
 		}
+		verified = true
+	}
+	if !verified {
+		return false, fmt.Errorf("symbol %s missing from positionRisk response", symbol)
 	}
 
 	return true, nil
@@ -396,7 +406,7 @@ func (c *Client) QueryOrder(ctx context.Context, symbol, clientOrderID string) (
 		status = model.StatusCanceled
 	case "REJECTED":
 		status = model.StatusRejected
-	case "EXPIRED":
+	case "EXPIRED", "EXPIRED_IN_MATCH":
 		status = model.StatusExpired
 	default:
 		slog.Warn("exchange: unknown order status encountered, defaulting to EXPIRED", "rawStatus", resp.Status)
@@ -538,36 +548,33 @@ func (c *Client) FetchAccountBalance(ctx context.Context) (walletBal, unrealized
 		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account decode: %w (body: %s)", err, string(respBytes))
 	}
 
-	// 1. Ambil saldo agregat akun
-	if wb, err := decimal.NewFromString(resp.TotalWalletBalance); err == nil {
-		walletBal = wb
-	}
-	if up, err := decimal.NewFromString(resp.TotalUnrealizedProfit); err == nil {
-		unrealizedPnL = up
-	}
-	if ab, err := decimal.NewFromString(resp.AvailableBalance); err == nil {
-		availBal = ab
-	}
-
-	// Fallback ke aset USDT jika saldo agregat belum terisi
+	// 1. Utamakan basis aset USDT agar selaras dengan ACCOUNT_UPDATE WebSocket (cegah fake drawdown jika ada saldo BNB/lainnya)
+	foundUSDT := false
 	for _, a := range resp.Assets {
 		if strings.EqualFold(a.Asset, "USDT") {
-			if walletBal.IsZero() {
-				if wb, err := decimal.NewFromString(a.WalletBalance); err == nil {
-					walletBal = wb
-				}
+			foundUSDT = true
+			if wb, err := decimal.NewFromString(a.WalletBalance); err == nil {
+				walletBal = wb
 			}
-			if unrealizedPnL.IsZero() {
-				if up, err := decimal.NewFromString(a.UnrealizedProfit); err == nil {
-					unrealizedPnL = up
-				}
+			if up, err := decimal.NewFromString(a.UnrealizedProfit); err == nil {
+				unrealizedPnL = up
 			}
-			if availBal.IsZero() {
-				if ab, err := decimal.NewFromString(a.AvailableBalance); err == nil {
-					availBal = ab
-				}
+			if ab, err := decimal.NewFromString(a.AvailableBalance); err == nil {
+				availBal = ab
 			}
 			break
+		}
+	}
+	// Fallback ke saldo agregat hanya bila entri aset USDT tidak ditemukan
+	if !foundUSDT {
+		if wb, err := decimal.NewFromString(resp.TotalWalletBalance); err == nil {
+			walletBal = wb
+		}
+		if up, err := decimal.NewFromString(resp.TotalUnrealizedProfit); err == nil {
+			unrealizedPnL = up
+		}
+		if ab, err := decimal.NewFromString(resp.AvailableBalance); err == nil {
+			availBal = ab
 		}
 	}
 

@@ -30,14 +30,17 @@ type EventHandlers struct {
 	OnOrderTradeUpdateDetailed func(evt model.OrderTradeUpdateEvent)
 	OnAccountUpdate            func(walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, eventTime time.Time)
 	OnAccountUpdateEvent       func(evt model.AccountUpdateEvent)
+	OnAlgoOrderUpdate          func(evt model.AlgoOrderUpdateEvent)
+	OnConnected                func()
 	OnListenKeyExpired         func()
 }
 
 type StreamManager struct {
-	Handlers     EventHandlers
-	IdleTimeout  time.Duration
-	PingInterval time.Duration
-	PingTimeout  time.Duration
+	Handlers                   EventHandlers
+	IdleTimeout                time.Duration
+	PingInterval               time.Duration
+	PingTimeout                time.Duration
+	MaxConsecutiveDialFailures int
 }
 
 const (
@@ -70,7 +73,7 @@ func BuildCombinedStreamURL(baseURL string, streams []string) string {
 func BuildUserDataStreamURL(baseURL, listenKey string, isMainnet bool) string {
 	cleanBase := strings.TrimRight(baseURL, "/")
 	if isMainnet {
-		return fmt.Sprintf("%s?listenKey=%s&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,listenKeyExpired", cleanBase, listenKey)
+		return fmt.Sprintf("%s?listenKey=%s&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,ALGO_UPDATE,listenKeyExpired", cleanBase, listenKey)
 	}
 	return fmt.Sprintf("%s/%s", cleanBase, listenKey)
 }
@@ -78,6 +81,7 @@ func BuildUserDataStreamURL(baseURL, listenKey string, isMainnet bool) string {
 // StartSupervisedStream menjalankan koneksi WebSocket dengan auto-reconnect backoff dan reset timer
 func (m *StreamManager) StartSupervisedStream(ctx context.Context, streamURL string) {
 	backoff := 1 * time.Second
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -87,8 +91,16 @@ func (m *StreamManager) StartSupervisedStream(ctx context.Context, streamURL str
 			startTime := time.Now()
 			err := m.ConnectAndStream(ctx, streamURL)
 			if time.Since(startTime) > 5*time.Second {
-				// Reset backoff jika koneksi sempat terhubung & bertahan > 5 detik
+				// Reset backoff dan counter gagal jika koneksi sempat terhubung & bertahan > 5 detik
 				backoff = 1 * time.Second
+				consecutiveFailures = 0
+			} else if err != nil && ctx.Err() == nil {
+				consecutiveFailures++
+				if m.MaxConsecutiveDialFailures > 0 && consecutiveFailures >= m.MaxConsecutiveDialFailures {
+					slog.Warn("ws: reached max consecutive supervised stream failures; yielding to caller for session reset",
+						"url", streamURL, "failures", consecutiveFailures, "err", err)
+					return
+				}
 			}
 			if err != nil && ctx.Err() == nil {
 				// R1: Tambahkan randomized jitter 0-30% pada backoff untuk mencegah thundering herd
@@ -167,7 +179,9 @@ func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, conn
 				pCtx, pCancel := context.WithTimeout(readCtx, pingTimeout)
 				err := conn.Ping(pCtx)
 				pCancel()
-				if err != nil && readCtx.Err() == nil && time.Since(time.Unix(0, lastFrameNano.Load())) >= pingInterval {
+				if err == nil {
+					lastFrameNano.Store(time.Now().UnixNano())
+				} else if readCtx.Err() == nil && time.Since(time.Unix(0, lastFrameNano.Load())) >= pingInterval {
 					slog.Debug("ws: idle ping failed, resetting connection", "err", err)
 					readCancel()
 					return
@@ -202,10 +216,13 @@ func (m *StreamManager) ConnectAndStream(ctx context.Context, streamURL string) 
 	if err != nil {
 		return fmt.Errorf("ws: dial error for %s: %w", streamURL, err)
 	}
-	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "closing") }()
+	defer func() { _ = conn.CloseNow() }()
 
 	connStart := time.Now()
 	slog.Info("ws: connected successfully", "url", streamURL)
+	if m.Handlers.OnConnected != nil {
+		m.Handlers.OnConnected()
+	}
 	return m.readLoop(ctx, conn, connStart)
 }
 
@@ -312,7 +329,7 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 			d.conn = nil
 		}
 		d.mu.Unlock()
-		_ = conn.Close(websocket.StatusNormalClosure, "closing")
+		_ = conn.CloseNow()
 	}()
 
 	d.mu.Lock()
@@ -324,10 +341,14 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 	// Sinkronkan diff bila UpdateStreams terjadi selama proses dial
 	added, removed := diffStreams(dialed, latest)
 	if len(removed) > 0 {
-		_ = d.sendControlMsg(ctx, conn, "UNSUBSCRIBE", removed)
+		if err := d.sendControlMsg(ctx, conn, "UNSUBSCRIBE", removed); err != nil {
+			return fmt.Errorf("ws: failed to sync initial UNSUBSCRIBE diff: %w", err)
+		}
 	}
 	if len(added) > 0 {
-		_ = d.sendControlMsg(ctx, conn, "SUBSCRIBE", added)
+		if err := d.sendControlMsg(ctx, conn, "SUBSCRIBE", added); err != nil {
+			return fmt.Errorf("ws: failed to sync initial SUBSCRIBE diff: %w", err)
+		}
 	}
 
 	connStart := time.Now()
@@ -735,6 +756,7 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 		var otu struct {
 			Order struct {
 				Symbol          string `json:"s"`
+				Side            string `json:"S"`
 				ClientOrderID   string `json:"c"`
 				ExchangeOrderID int64  `json:"i"`
 				Status          string `json:"X"`
@@ -777,7 +799,7 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 				status = model.StatusCanceled
 			case "REJECTED":
 				status = model.StatusRejected
-			case "EXPIRED":
+			case "EXPIRED", "EXPIRED_IN_MATCH":
 				status = model.StatusExpired
 			default:
 				status = model.OrderLifecycleStatus(otu.Order.Status)
@@ -869,6 +891,44 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 			}
 			if m.Handlers.OnAccountUpdate != nil {
 				m.Handlers.OnAccountUpdate(walletBal, unRealizedTotal, crossWallet, positions, eventTime)
+			}
+		}
+
+	case "ALGO_UPDATE":
+		type algoPayload struct {
+			Symbol       string `json:"s"`
+			Side         string `json:"S"`
+			AlgoID       int64  `json:"aid"`
+			ClientAlgoID string `json:"caid"`
+			OrderType    string `json:"o"`
+			AlgoStatus   string `json:"X"`
+			StopPrice    string `json:"sp"`
+			TriggerPrice string `json:"tp"`
+		}
+		var au struct {
+			Order    *algoPayload `json:"o"`
+			AltOrder *algoPayload `json:"ao"`
+		}
+		if err := sonic.Unmarshal(payload, &au); err == nil && m.Handlers.OnAlgoOrderUpdate != nil {
+			inner := au.Order
+			if inner == nil {
+				inner = au.AltOrder
+			}
+			if inner != nil && inner.Symbol != "" {
+				trig := decimal.Zero
+				if inner.StopPrice != "" {
+					trig, _ = decimal.NewFromString(inner.StopPrice)
+				} else if inner.TriggerPrice != "" {
+					trig, _ = decimal.NewFromString(inner.TriggerPrice)
+				}
+				m.Handlers.OnAlgoOrderUpdate(model.AlgoOrderUpdateEvent{
+					Symbol:       inner.Symbol,
+					AlgoID:       inner.AlgoID,
+					ClientAlgoID: inner.ClientAlgoID,
+					OrderType:    inner.OrderType,
+					AlgoStatus:   inner.AlgoStatus,
+					TriggerPrice: trig,
+				})
 			}
 		}
 

@@ -59,6 +59,7 @@ type BotEngine struct {
 	publicDynStream *ws.ShardedDynamicStream
 	marketDynStream *ws.ShardedDynamicStream
 	streamMu        sync.Mutex
+	streamWg        sync.WaitGroup
 
 	oiPollRunning   atomic.Bool
 	oiBootMu        sync.Mutex
@@ -379,6 +380,16 @@ func main() {
 					tpFound = true
 				}
 			}
+			if slAlgoID != 0 && !slFound {
+				if openOrds, ordErr := client.GetOpenOrders(ctx, symbol); ordErr == nil {
+					for _, oo := range openOrds {
+						if oo.OrderID == slAlgoID || (clientSLID != "" && oo.ClientOrderID == clientSLID) {
+							slFound = true
+							break
+						}
+					}
+				}
+			}
 			return slFound, tpFound, nil
 		}
 		engine.liveBroker.QueryOrderFn = client.QueryOrder
@@ -406,11 +417,13 @@ func main() {
 				SLClientAlgoID: pos.SLClientAlgoID,
 				SLPrice:        pos.SLPrice,
 				InitialSLPrice: pos.InitialSLPrice,
-				TPOrderID:      pos.TPOrderID,
-				TPClientAlgoID: pos.TPClientAlgoID,
-				TPPrice:        pos.TPPrice,
-				TP1Price:       pos.TP1Price,
-				IsTP1Hit:       pos.IsTP1Hit,
+				TPOrderID:        pos.TPOrderID,
+				TPClientAlgoID:   pos.TPClientAlgoID,
+				TPPrice:          pos.TPPrice,
+				TP1Price:         pos.TP1Price,
+				TP1OrderID:       pos.TP1OrderID,
+				TP1ClientOrderID: pos.TP1ClientOrderID,
+				IsTP1Hit:         pos.IsTP1Hit,
 				ATRAtEntry:     pos.ATRAtEntry,
 				ProtectionTier: pos.ProtectionTier,
 				SignalAuditID:  pos.SignalAuditID,
@@ -438,7 +451,7 @@ func main() {
 	if err := client.SyncServerTime(ctx); err != nil {
 		slog.Warn("failed to sync server time with exchange, falling back to local time", "err", err)
 	} else {
-		slog.Info("server time synced successfully", "timeOffsetMs", client.TimeOffset)
+		slog.Info("server time synced successfully", "timeOffsetMs", client.GetTimeOffset())
 	}
 
 	stateMode := "LIVE"
@@ -529,11 +542,13 @@ func main() {
 					SLClientAlgoID: sp.SLClientAlgoID,
 					SLPrice:        sp.SLPrice,
 					InitialSLPrice: sp.InitialSLPrice,
-					TPOrderID:      sp.TPOrderID,
-					TPClientAlgoID: sp.TPClientAlgoID,
-					TPPrice:        sp.TPPrice,
-					TP1Price:       sp.TP1Price,
-					IsTP1Hit:       sp.IsTP1Hit,
+					TPOrderID:        sp.TPOrderID,
+					TPClientAlgoID:   sp.TPClientAlgoID,
+					TPPrice:          sp.TPPrice,
+					TP1Price:         sp.TP1Price,
+					TP1OrderID:       sp.TP1OrderID,
+					TP1ClientOrderID: sp.TP1ClientOrderID,
+					IsTP1Hit:         sp.IsTP1Hit,
 					ATRAtEntry:     sp.ATRAtEntry,
 					ProtectionTier: sp.ProtectionTier,
 					SignalAuditID:  sp.SignalAuditID,
@@ -622,55 +637,97 @@ func main() {
 			// 1. Rekonsiliasi posisi tersimpan
 			for sym, sp := range storedMap {
 				if ep, exists := activeOnExchange[sym]; exists {
-					// Verifikasi apakah SL bursa masih aktif untuk posisi tersimpan ini
+					// Verifikasi apakah SL bursa masih aktif untuk posisi tersimpan ini (hanya reset jika query API sukses & order absen)
 					if sp.SLOrderID != 0 {
 						ctxVer, cancelVer := context.WithTimeout(ctx, 5*time.Second)
-						algoOrds, _ := client.GetOpenAlgoOrders(ctxVer, sym)
+						algoOrds, algoErr := client.GetOpenAlgoOrders(ctxVer, sym)
 						cancelVer()
-						slFound := false
-						for _, ao := range algoOrds {
-							if ao.AlgoID == sp.SLOrderID || (sp.SLClientAlgoID != "" && ao.ClientAlgoID == sp.SLClientAlgoID) {
-								slFound = true
+						if algoErr == nil {
+							slFound := false
+							for _, ao := range algoOrds {
+								if ao.AlgoID == sp.SLOrderID || (sp.SLClientAlgoID != "" && ao.ClientAlgoID == sp.SLClientAlgoID) {
+									slFound = true
+									break
+								}
+							}
+							if !slFound {
+								slog.Warn("stored SL order not found active on Binance; marking unverified for repair", "symbol", sym, "storedSLID", sp.SLOrderID)
+								sp.SLOrderID = 0
+								sp.SLClientAlgoID = ""
+							}
+						} else {
+							slog.Warn("failed to verify stored SL order via GetOpenAlgoOrders; retaining stored SL metadata", "symbol", sym, "storedSLID", sp.SLOrderID, "err", algoErr)
+						}
+					}
+					if errOpen == nil && sp.TP1OrderID != 0 {
+						tp1Found := false
+						for _, oo := range allOpenOrders {
+							if oo.Symbol == sym && (oo.OrderID == sp.TP1OrderID || (sp.TP1ClientOrderID != "" && oo.ClientOrderID == sp.TP1ClientOrderID)) {
+								tp1Found = true
 								break
 							}
 						}
-						if !slFound {
-							slog.Warn("stored SL order not found active on Binance; marking unverified for repair", "symbol", sym, "storedSLID", sp.SLOrderID)
-							sp.SLOrderID = 0
-							sp.SLClientAlgoID = ""
+						if !tp1Found {
+							slog.Warn("stored resting TP1 limit order not found on Binance; clearing stale TP1OrderID", "symbol", sym, "tp1OrderID", sp.TP1OrderID)
+							sp.TP1OrderID = 0
+							sp.TP1ClientOrderID = ""
+						}
+					} else if errOpen == nil && sp.TP1OrderID == 0 && !sp.IsTP1Hit {
+						for _, oo := range allOpenOrders {
+							if oo.Symbol == sym && oo.ReduceOnly && (strings.HasPrefix(oo.ClientOrderID, "ALGO_TP1_") || strings.HasSuffix(oo.ClientOrderID, "_TP1")) {
+								sp.TP1OrderID = oo.OrderID
+								sp.TP1ClientOrderID = oo.ClientOrderID
+								slog.Info("recovered active resting TP1 limit order from Binance openOrders at boot",
+									"symbol", sym, "tp1OrderID", sp.TP1OrderID, "tp1ClientOrderID", sp.TP1ClientOrderID)
+								break
+							}
 						}
 					}
 
 					engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
-						Symbol:         sp.Symbol,
-						Side:           model.Side(sp.Side),
-						StrategyID:     sp.StrategyID,
-						Qty:            ep.PositionAmt.Abs(),
-						InitialQty:     sp.InitialQty,
-						EntryPrice:     ep.EntryPrice,
-						SLOrderID:      sp.SLOrderID,
-						SLClientAlgoID: sp.SLClientAlgoID,
-						SLPrice:        sp.SLPrice,
-						InitialSLPrice: sp.InitialSLPrice,
-						TPOrderID:      sp.TPOrderID,
-						TPClientAlgoID: sp.TPClientAlgoID,
-						TPPrice:        sp.TPPrice,
-						TP1Price:       sp.TP1Price,
-						IsTP1Hit:       sp.IsTP1Hit,
-						ATRAtEntry:     sp.ATRAtEntry,
-						ProtectionTier: sp.ProtectionTier,
-						SignalAuditID:  sp.SignalAuditID,
-						OpenTime:       sp.OpenedAt,
-						MaxMAE:         sp.MaxMAE,
-						MaxMFE:         sp.MaxMFE,
-						PeakPrice:      sp.PeakPrice,
-						UpdatedAt:      sp.UpdatedAt,
+						Symbol:           sp.Symbol,
+						Side:             model.Side(sp.Side),
+						StrategyID:       sp.StrategyID,
+						Qty:              ep.PositionAmt.Abs(),
+						InitialQty:       sp.InitialQty,
+						EntryPrice:       ep.EntryPrice,
+						SLOrderID:        sp.SLOrderID,
+						SLClientAlgoID:   sp.SLClientAlgoID,
+						SLPrice:          sp.SLPrice,
+						InitialSLPrice:   sp.InitialSLPrice,
+						TPOrderID:        sp.TPOrderID,
+						TPClientAlgoID:   sp.TPClientAlgoID,
+						TPPrice:          sp.TPPrice,
+						TP1Price:         sp.TP1Price,
+						TP1OrderID:       sp.TP1OrderID,
+						TP1ClientOrderID: sp.TP1ClientOrderID,
+						IsTP1Hit:         sp.IsTP1Hit,
+						ATRAtEntry:       sp.ATRAtEntry,
+						ProtectionTier:   sp.ProtectionTier,
+						SignalAuditID:    sp.SignalAuditID,
+						OpenTime:         sp.OpenedAt,
+						MaxMAE:           sp.MaxMAE,
+						MaxMFE:           sp.MaxMFE,
+						PeakPrice:        sp.PeakPrice,
+						UpdatedAt:        sp.UpdatedAt,
 					})
 					slog.Info("reconciled & restored active live position from database and exchange",
 						"symbol", sp.Symbol, "qty", ep.PositionAmt.Abs(), "entryPrice", ep.EntryPrice,
 						"slPrice", sp.SLPrice, "tpPrice", sp.TPPrice)
 				} else {
-					slog.Warn("live position closed on exchange during downtime; applying exit cooldown and cleaning up stored state", "symbol", sym)
+					slog.Warn("live position closed on exchange during downtime; canceling leftover protection orders, applying exit cooldown and cleaning up stored state", "symbol", sym)
+					for _, algoID := range []int64{sp.SLOrderID, sp.TPOrderID} {
+						if algoID != 0 {
+							ctxC, cancelC := context.WithTimeout(ctx, 5*time.Second)
+							_ = client.CancelAlgoOrder(ctxC, sym, algoID)
+							cancelC()
+						}
+					}
+					if sp.TP1OrderID != 0 {
+						ctxC, cancelC := context.WithTimeout(ctx, 5*time.Second)
+						_ = client.CancelOrder(ctxC, sym, sp.TP1OrderID, sp.TP1ClientOrderID)
+						cancelC()
+					}
 					engine.recordSymbolExit(sym, time.Now().UTC(), "OFFLINE_CLOSED")
 					_ = repo.DeleteLivePosition(ctx, sym)
 				}
@@ -747,6 +804,7 @@ func main() {
 							slog.Error("FAILED TO EMERGENCY CLOSE UNMANAGED ORPHAN POSITION", "symbol", sym, "err", closeErr)
 						} else {
 							slog.Info("EMERGENCY MARKET CLOSE SUCCESSFUL FOR UNMANAGED ORPHAN POSITION", "symbol", sym)
+							engine.liveBroker.ClearSymbolState(sym)
 						}
 					} else {
 						// Posisi memiliki SL aktif atau policy=ADOPT: adopsi posisi ke memory
@@ -844,6 +902,16 @@ func main() {
 						pollCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 						if err := engine.liveBroker.RefreshAccount(pollCtx); err != nil {
 							slog.Warn("periodic live account balance sync failed", "err", err)
+						} else {
+							engine.liveBroker.Mu.Lock()
+							sDay := engine.liveBroker.SessionStartEpochDay
+							sEq := engine.liveBroker.SessionStartEquityUSDT
+							breaker := engine.liveBroker.CircuitBreakerTripped
+							engine.liveBroker.Mu.Unlock()
+							effEq := engine.liveBroker.GetEffectiveTotalEquityUSDT()
+							if sDay > 0 && sEq.GreaterThan(decimal.Zero) {
+								_ = repo.SaveDailyStateForMode(ctx, "LIVE", sDay, sEq, effEq, breaker)
+							}
 						}
 						cancel()
 					}
@@ -858,12 +926,28 @@ func main() {
 		defer wg.Done()
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
+		var lastSavedDryDay int64
+		var lastSavedDryBreaker bool
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				engine.broker.CheckTimeouts(time.Now().UTC())
+				if engine.dryRunBroker != nil {
+					_ = engine.dryRunBroker.IsCircuitBreakerTripped()
+					engine.dryRunBroker.Mu.Lock()
+					sDay := engine.dryRunBroker.SessionDayEpochUTC
+					sEq := engine.dryRunBroker.SessionStartEquity
+					breaker := engine.dryRunBroker.CircuitBreakerTripped
+					engine.dryRunBroker.Mu.Unlock()
+					if sDay > 0 && (sDay != lastSavedDryDay || breaker != lastSavedDryBreaker) {
+						pureEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
+						_ = repo.SaveDailyStateForMode(ctx, "DRY_RUN", sDay, sEq, pureEq, breaker)
+						lastSavedDryDay = sDay
+						lastSavedDryBreaker = breaker
+					}
+				}
 			}
 		}
 	}()
@@ -963,6 +1047,7 @@ func main() {
 	}
 	engine.streamMu.Unlock()
 
+	engine.streamWg.Wait()
 	wg.Wait()
 	engine.evalWg.Wait()
 	slog.Info("bot terminated gracefully")
@@ -1028,8 +1113,10 @@ const scanFetchTimeout = 2 * time.Minute
 
 func (e *BotEngine) exchangeNow() time.Time {
 	now := time.Now().UTC()
-	if e.client != nil && e.client.TimeOffset != 0 {
-		now = now.Add(time.Duration(e.client.TimeOffset) * time.Millisecond)
+	if e.client != nil {
+		if offsetMs := e.client.GetTimeOffset(); offsetMs != 0 {
+			now = now.Add(time.Duration(offsetMs) * time.Millisecond)
+		}
 	}
 	return now
 }
@@ -1073,7 +1160,9 @@ func (e *BotEngine) verifyLiveWatchlist(ctx context.Context, candidates []string
 		if alreadyVerified {
 			e.statesMu.Lock()
 			if st, exists := e.activeStates[sym]; exists {
+				st.Mu.Lock()
 				st.IsLeverageIsolatedVerified = true
+				st.Mu.Unlock()
 			}
 			e.statesMu.Unlock()
 			verifiedWatched = append(verifiedWatched, sym)
@@ -1103,7 +1192,9 @@ func (e *BotEngine) verifyLiveWatchlist(ctx context.Context, candidates []string
 			e.verifiedMu.Unlock()
 			e.statesMu.Lock()
 			if st, exists := e.activeStates[sym]; exists {
+				st.Mu.Lock()
 				st.IsLeverageIsolatedVerified = true
+				st.Mu.Unlock()
 			}
 			e.statesMu.Unlock()
 			verifiedWatched = append(verifiedWatched, sym)
@@ -1314,7 +1405,9 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		e.statesMu.Lock()
 		for _, sym := range finalWatched {
 			if st, exists := e.activeStates[sym]; exists {
+				st.Mu.Lock()
 				st.IsLeverageIsolatedVerified = true
+				st.Mu.Unlock()
 			}
 		}
 		e.statesMu.Unlock()
@@ -1635,12 +1728,20 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 	publicMgr := ws.NewStreamManager(handlers)
 	publicDyn := ws.NewShardedDynamicStream(publicMgr, e.cfg.WSPublicURL, publicStreams, maxBookTickerStreamsPerConn)
 	e.publicDynStream = publicDyn
-	go publicDyn.Start(publicCtx)
+	e.streamWg.Add(1)
+	go func() {
+		defer e.streamWg.Done()
+		publicDyn.Start(publicCtx)
+	}()
 
 	marketMgr := ws.NewStreamManager(handlers)
 	marketDyn := ws.NewShardedDynamicStream(marketMgr, e.cfg.WSMarketURL, marketStreams, 0)
 	e.marketDynStream = marketDyn
-	go marketDyn.Start(marketCtx)
+	e.streamWg.Add(1)
+	go func() {
+		defer e.streamWg.Done()
+		marketDyn.Start(marketCtx)
+	}()
 }
 
 const maxBookTickerStreamsPerConn = 10
@@ -1728,6 +1829,36 @@ func (e *BotEngine) freshCachedMarkPriceLocked(st *model.SymbolState, now time.T
 }
 
 func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.SymbolState) {
+	st.Mu.Lock()
+	symName := st.Symbol
+	verified := st.IsLeverageIsolatedVerified
+	st.Mu.Unlock()
+	if e.cfg != nil && !e.cfg.DryRun && !verified {
+		slog.Warn("skipping signal evaluation on unverified live symbol", "symbol", symName)
+		return
+	}
+
+	if e.cfg != nil && !e.cfg.DryRun && e.liveBroker != nil && e.liveBroker.IsAccountStale(time.Now().UTC()) {
+		rCtx, rCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = e.liveBroker.RefreshAccount(rCtx)
+		rCancel()
+	}
+
+	scope := strategy.DefaultSymbolScope()
+	e.statesMu.RLock()
+	if len(e.primaryWatchedSet) > 0 || len(e.sweepExtraWatchedSet) > 0 {
+		inSweepExtra := e.sweepExtraWatchedSet[symName]
+		inPrimary := e.primaryWatchedSet[symName]
+		scope = strategy.SymbolScope{
+			AllowPrimary: inPrimary,
+			AllowSweep:   inPrimary || inSweepExtra,
+		}
+	}
+	e.statesMu.RUnlock()
+
+	// Serialisasi evaluasi sinyal + reservasi slot/margin agar tidak terjadi race condition,
+	// sambil menjaga I/O REST live tetap berjalan di luar lock agar simbol lain tidak ikut tertahan/stale.
+	e.evalSubmitMu.Lock()
 	now := time.Now().UTC()
 	snap := st.Snapshot(now)
 
@@ -1739,24 +1870,9 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 	}
 	e.cooldownMu.RUnlock()
 
-	if e.cfg != nil && !e.cfg.DryRun {
-		st.Mu.Lock()
-		verified := st.IsLeverageIsolatedVerified
-		st.Mu.Unlock()
-		if !verified {
-			slog.Warn("skipping signal evaluation on unverified live symbol", "symbol", snap.Symbol)
-			return
-		}
-	}
-
 	accountStale := false
 	if e.cfg != nil && !e.cfg.DryRun && e.liveBroker != nil && e.liveBroker.IsAccountStale(now) {
-		rCtx, rCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = e.liveBroker.RefreshAccount(rCtx)
-		rCancel()
-		if e.liveBroker.IsAccountStale(time.Now().UTC()) {
-			accountStale = true
-		}
+		accountStale = true
 	}
 
 	var btcSnap *model.MarketSnapshot
@@ -1769,20 +1885,6 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		e.statesMu.RUnlock()
 	}
 
-	scope := strategy.DefaultSymbolScope()
-	e.statesMu.RLock()
-	if len(e.primaryWatchedSet) > 0 || len(e.sweepExtraWatchedSet) > 0 {
-		inSweepExtra := e.sweepExtraWatchedSet[snap.Symbol]
-		inPrimary := e.primaryWatchedSet[snap.Symbol] || !inSweepExtra
-		scope = strategy.SymbolScope{
-			AllowPrimary: inPrimary,
-			AllowSweep:   inPrimary || inSweepExtra,
-		}
-	}
-	e.statesMu.RUnlock()
-
-	// Serialisasi evaluasi sinyal + reservasi order agar tidak terjadi race condition slot/balance/active-symbol
-	e.evalSubmitMu.Lock()
 	activeSlots := e.broker.GetActiveSlotCount()
 	availBal := e.broker.GetAvailableBalanceUSDT()
 	totEq := e.broker.GetEffectiveTotalEquityUSDT()
@@ -1821,10 +1923,55 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		strategyID = dec.StrategyID
 	}
 
+	needLiveNetworkSubmit := false
+	liveOrigLimit := intent.LimitPrice
+	liveStartAttempt := 0
 	if ok && reason == "SIGNAL_APPROVED" {
-		slog.Info("SIGNAL APPROVED! Submitting limit entry to broker...", "symbol", intent.Symbol, "side", intent.Side, "strategyID", strategyID, "qty", intent.Qty, "price", intent.LimitPrice)
-		reserved, submitErr := e.broker.SubmitLimitEntry(intent)
-		if reserved && submitErr == nil {
+		if e.liveBroker != nil {
+			prepared, prepErr := e.liveBroker.PreparePreSubmitIntent(intent)
+			if prepErr != nil {
+				slog.Warn("ENTRY ORDER PRE-SUBMIT REJECTED", "symbol", intent.Symbol, "err", prepErr)
+				ok = false
+				reason = "BROKER_REJECTED"
+				subReason = prepErr.Error()
+			} else {
+				if !prepared.LimitPrice.Equal(intent.LimitPrice) {
+					liveStartAttempt = 1
+				}
+				intent = prepared
+				reserved, reserveErr := e.liveBroker.ReserveEntryIntent(intent)
+				if !reserved || reserveErr != nil {
+					slog.Warn("ENTRY RESERVATION REJECTED BY BROKER", "symbol", intent.Symbol, "err", reserveErr)
+					ok = false
+					reason = "BROKER_REJECTED"
+					if reserveErr != nil {
+						subReason = reserveErr.Error()
+					}
+				} else {
+					needLiveNetworkSubmit = true
+				}
+			}
+		} else {
+			slog.Info("SIGNAL APPROVED! Submitting limit entry to broker...", "symbol", intent.Symbol, "side", intent.Side, "strategyID", strategyID, "qty", intent.Qty, "price", intent.LimitPrice)
+			reserved, submitErr := e.broker.SubmitLimitEntry(intent)
+			if reserved && submitErr == nil {
+				slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID)
+			} else {
+				slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", intent.Symbol, "err", submitErr)
+				ok = false
+				reason = "BROKER_REJECTED"
+				if submitErr != nil {
+					subReason = submitErr.Error()
+				}
+			}
+		}
+	}
+	e.evalSubmitMu.Unlock()
+
+	if needLiveNetworkSubmit && e.liveBroker != nil {
+		slog.Info("SIGNAL APPROVED! Submitting reserved live entry to exchange...", "symbol", intent.Symbol, "side", intent.Side, "strategyID", strategyID, "qty", intent.Qty, "price", intent.LimitPrice)
+		submitted, submitErr := e.liveBroker.SubmitReservedEntryWithParams(intent, liveOrigLimit, liveStartAttempt)
+		if submitted && submitErr == nil {
 			slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID)
 		} else {
 			slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", intent.Symbol, "err", submitErr)
@@ -1835,7 +1982,6 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 			}
 		}
 	}
-	e.evalSubmitMu.Unlock()
 
 	// Simpan audit log lengkap dengan metrik analitik riil
 	decision := "REJECT"
@@ -2033,6 +2179,24 @@ func (e *BotEngine) runUserDataStreamSupervisor(ctx context.Context) {
 				epochDay := evt.EventTime.UTC().Unix() / 86400
 				_ = e.repo.SaveDailyStateForMode(ctx, "LIVE", epochDay, startEquity, effEq, breakerTripped)
 			},
+			OnAlgoOrderUpdate: func(evt model.AlgoOrderUpdateEvent) {
+				slog.Info("USER ALGO UPDATE", "symbol", evt.Symbol, "algoID", evt.AlgoID, "clientAlgoID", evt.ClientAlgoID, "type", evt.OrderType, "status", evt.AlgoStatus, "triggerPrice", evt.TriggerPrice)
+				if e.liveBroker != nil {
+					e.liveBroker.HandleAlgoOrderUpdate(evt)
+				}
+			},
+			OnConnected: func() {
+				if e.liveBroker == nil {
+					return
+				}
+				go func() {
+					rCtx, rCancel := context.WithTimeout(sessionCtx, 8*time.Second)
+					defer rCancel()
+					if err := e.liveBroker.RefreshAccount(rCtx); err != nil {
+						slog.Warn("user stream reconnect account reconciliation failed", "err", err)
+					}
+				}()
+			},
 			OnListenKeyExpired: func() {
 				slog.Warn("user data stream received listenKeyExpired, restarting session with fresh key")
 				sessionCancel()
@@ -2040,16 +2204,7 @@ func (e *BotEngine) runUserDataStreamSupervisor(ctx context.Context) {
 		}
 
 		streamMgr := ws.NewStreamManager(handlers)
-		// Rekonsiliasi snapshot akun segera tiap kali sesi User Data Stream baru dimulai / reconnect
-		if e.liveBroker != nil {
-			go func() {
-				rCtx, rCancel := context.WithTimeout(sessionCtx, 8*time.Second)
-				defer rCancel()
-				if err := e.liveBroker.RefreshAccount(rCtx); err != nil {
-					slog.Warn("user stream reconnect account reconciliation failed", "err", err)
-				}
-			}()
-		}
+		streamMgr.MaxConsecutiveDialFailures = 5
 		streamMgr.StartSupervisedStream(sessionCtx, userStreamURL)
 
 		// Saat session berhenti/batal, hapus listenKey lama sebelum membuat yang baru

@@ -543,7 +543,7 @@ func RunBulkMarketScannerPartitioned(
 	stats.SelectedCount = len(selected)
 
 	var sweepSelected []string
-	if cfg.SweepExtendedVWAP && len(sweepCandidates) > 0 {
+	if cfg.SweepExtendedVWAP && cfg.SweepMaxExtraCoins > 0 && len(sweepCandidates) > 0 {
 		var eligible []Candidate
 		for _, cand := range sweepCandidates {
 			if !selectedSet[cand.Symbol] && cand.RVOL >= fallbackFloor {

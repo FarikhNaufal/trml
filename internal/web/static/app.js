@@ -451,7 +451,7 @@ function renderScanner(data) {
         </td>
         <td>${c.natr_pct ? c.natr_pct.toFixed(2) + '%' : '--'}</td>
         <td>${c.rvol ? c.rvol.toFixed(2) : '--'} ${rvolBadge}</td>
-        <td>${c.spread_pct ? (c.spread_pct * 100).toFixed(3) + '%' : '--'}</td>
+        <td>${c.spread_pct != null ? Number(c.spread_pct).toFixed(3) + '%' : '--'}</td>
         <td class="${(c.funding_rate || 0) > 0 ? 'val-red' : 'val-green'}">
           ${c.funding_rate ? (c.funding_rate * 100).toFixed(4) + '%' : '0.0000%'}
         </td>

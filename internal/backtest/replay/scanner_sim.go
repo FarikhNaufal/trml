@@ -84,6 +84,14 @@ func (s *ScannerSimulator) RunCyclePartitioned(
 		if !ok || len(cList) == 0 {
 			continue
 		}
+		lastC := cList[len(cList)-1]
+		maxGap := 3 * s.cfg.CandleDuration
+		if maxGap < 15*time.Minute {
+			maxGap = 15 * time.Minute
+		}
+		if !lastC.CloseTime.IsZero() && simTime.Sub(lastC.CloseTime) > maxGap {
+			continue
+		}
 		startIdx := len(cList) - bars24h
 		if startIdx < 0 {
 			startIdx = 0

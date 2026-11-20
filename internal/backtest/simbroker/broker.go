@@ -196,6 +196,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	}
 
 	// 2. Evaluasi Pending Entry Order (LIMIT + GTX Repeg opsional / MARKET)
+	justFilledOnThisBar := false
 	if pending, exists := s.PendingOrders[c.Symbol]; exists {
 		if c.OpenTime.After(pending.PlacedTime) || c.OpenTime.Equal(pending.PlacedTime) {
 			openDec := decimal.NewFromFloat(c.Open)
@@ -224,6 +225,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 				delete(s.PendingOrders, c.Symbol)
 				s.Stats.Filled++
 				s.Stats.MarketFilled++
+				justFilledOnThisBar = true
 			} else {
 				// Validasi Post-Only GTX saat pembukaan bar pertama menggunakan SSOT protection.WouldCrossMakerBook / RepegLimitEntryIntent
 				// (hanya repeg ketika order menyeberang spread; jika harga menjauh/tetap pasif, biarkan resting hingga terisi atau timeout).
@@ -288,6 +290,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 						s.OpenPositions[c.Symbol] = pos
 						delete(s.PendingOrders, c.Symbol)
 						s.Stats.Filled++
+						justFilledOnThisBar = true
 					} else if !c.CloseTime.Before(pending.TimeoutTime) {
 						delete(s.PendingOrders, c.Symbol)
 						s.Stats.TimedOut++
@@ -305,10 +308,18 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	pos.LastClosePrice = decimal.NewFromFloat(c.Close)
 
 	// Update Peak Price dan MAE/MFE
+	// Pada bar saat entry baru saja terisi (justFilledOnThisBar), jangan gunakan High/Low bar penuh
+	// sebagai PeakPrice/MFE karena kita tidak tahu apakah wick menguntungkan terjadi sebelum atau sesudah
+	// limit fill (mencegah look-ahead bias); gunakan hanya harga Close pasca-fill pada bar entry,
+	// namun tetap evaluasi risiko Stop Loss (MAE & slTouched) secara pesimistis.
 	ePriceF, _ := pos.EntryPrice.Float64()
 	if pos.Side == model.SideLong {
-		if c.High > ePriceF {
-			favPct := ((c.High - ePriceF) / ePriceF) * 100.0
+		favRef := c.High
+		if justFilledOnThisBar {
+			favRef = c.Close
+		}
+		if favRef > ePriceF {
+			favPct := ((favRef - ePriceF) / ePriceF) * 100.0
 			if favPct > pos.MaxMFE {
 				pos.MaxMFE = favPct
 			}
@@ -319,12 +330,17 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 				pos.MaxMAE = advPct
 			}
 		}
-		if decimal.NewFromFloat(c.High).GreaterThan(pos.PeakPrice) {
-			pos.PeakPrice = decimal.NewFromFloat(c.High)
+		favDec := decimal.NewFromFloat(favRef)
+		if favDec.GreaterThan(pos.PeakPrice) {
+			pos.PeakPrice = favDec
 		}
 	} else {
-		if c.Low < ePriceF {
-			favPct := ((ePriceF - c.Low) / ePriceF) * 100.0
+		favRef := c.Low
+		if justFilledOnThisBar {
+			favRef = c.Close
+		}
+		if favRef < ePriceF {
+			favPct := ((ePriceF - favRef) / ePriceF) * 100.0
 			if favPct > pos.MaxMFE {
 				pos.MaxMFE = favPct
 			}
@@ -335,8 +351,9 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 				pos.MaxMAE = advPct
 			}
 		}
-		if pos.PeakPrice.IsZero() || decimal.NewFromFloat(c.Low).LessThan(pos.PeakPrice) {
-			pos.PeakPrice = decimal.NewFromFloat(c.Low)
+		favDec := decimal.NewFromFloat(favRef)
+		if pos.PeakPrice.IsZero() || favDec.LessThan(pos.PeakPrice) {
+			pos.PeakPrice = favDec
 		}
 	}
 
@@ -347,23 +364,23 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	tpFullTouched := false
 
 	if pos.Side == model.SideLong {
-		if lowDec.LessThanOrEqual(pos.CurrentSLPrice) {
+		if !pos.CurrentSLPrice.IsZero() && lowDec.LessThanOrEqual(pos.CurrentSLPrice) {
 			slTouched = true
 		}
-		if !pos.IsTP1Hit && highDec.GreaterThanOrEqual(pos.TP1Price) {
+		if !justFilledOnThisBar && !pos.IsTP1Hit && !pos.TP1Price.IsZero() && highDec.GreaterThanOrEqual(pos.TP1Price) {
 			tp1Touched = true
 		}
-		if highDec.GreaterThanOrEqual(pos.TPPrice) {
+		if !justFilledOnThisBar && !pos.TPPrice.IsZero() && highDec.GreaterThanOrEqual(pos.TPPrice) {
 			tpFullTouched = true
 		}
 	} else {
-		if highDec.GreaterThanOrEqual(pos.CurrentSLPrice) {
+		if !pos.CurrentSLPrice.IsZero() && highDec.GreaterThanOrEqual(pos.CurrentSLPrice) {
 			slTouched = true
 		}
-		if !pos.IsTP1Hit && lowDec.LessThanOrEqual(pos.TP1Price) {
+		if !justFilledOnThisBar && !pos.IsTP1Hit && !pos.TP1Price.IsZero() && lowDec.LessThanOrEqual(pos.TP1Price) {
 			tp1Touched = true
 		}
-		if lowDec.LessThanOrEqual(pos.TPPrice) {
+		if !justFilledOnThisBar && !pos.TPPrice.IsZero() && lowDec.LessThanOrEqual(pos.TPPrice) {
 			tpFullTouched = true
 		}
 	}

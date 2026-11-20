@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS live_open_positions (
     tp_client_algo_id    TEXT NOT NULL DEFAULT '',
     tp_price             TEXT NOT NULL,
     tp1_price            TEXT NOT NULL DEFAULT '',
+    tp1_order_id         INTEGER NOT NULL DEFAULT 0,
+    tp1_client_order_id  TEXT NOT NULL DEFAULT '',
     is_tp1_hit           INTEGER NOT NULL DEFAULT 0,
     atr_at_entry         TEXT NOT NULL DEFAULT '',
     protection_tier      INTEGER NOT NULL DEFAULT 0,
@@ -245,9 +247,16 @@ func OpenDB(dbPath string) (*DB, error) {
 	}
 
 	// Migrasi kolom khusus live_open_positions
-	if err := ensureColumn("live_open_positions", "atr_at_entry", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("failed to migrate live_open_positions schema: %w", err)
+	liveSpecificCols := []struct{ col, def string }{
+		{"atr_at_entry", "TEXT NOT NULL DEFAULT ''"},
+		{"tp1_order_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"tp1_client_order_id", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, lc := range liveSpecificCols {
+		if err := ensureColumn("live_open_positions", lc.col, lc.def); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to migrate live_open_positions schema: %w", err)
+		}
 	}
 
 	// Migrasi kolom funding pada dryrun_open_positions

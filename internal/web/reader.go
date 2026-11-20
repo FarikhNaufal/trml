@@ -156,7 +156,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		sf := strings.ToUpper(strings.TrimSpace(statusFilter))
 		switch sf {
 		case "TAKE_PROFIT", "TP", "WIN":
-			whereClauses = append(whereClauses, "exit_reason IN ('TAKE_PROFIT', 'TP', 'PROFIT_LOCK', 'PARTIAL_TAKE_PROFIT')")
+			whereClauses = append(whereClauses, "exit_reason IN ('TAKE_PROFIT', 'TP', 'TRAILING_STOP', 'PROFIT_LOCK', 'PARTIAL_TAKE_PROFIT')")
 		case "BREAK_EVEN", "BE":
 			whereClauses = append(whereClauses, "exit_reason IN ('BREAK_EVEN', 'BE')")
 		case "STOP_LOSS", "SL":
@@ -460,22 +460,22 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 		stats.TotalTrades++
 		stats.TotalNetPnLUSDT += pnl
 
-		if hasRunnerWin == 1 || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
+		if (hasRunnerWin == 1 && pnl > 0) || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
 			// Full Win: runner mencapai target penuh (TP2, Trailing Stop, atau Profit Lock)
 			stats.WinsCount++
 			stats.FullWinsCount++
 			totalWinVal += pnl
 			totalFullWinVal += pnl
-		} else if hasTP1 == 1 && (hasBE == 1 || pnl > 0.005) {
-			// Partial Win: TP1 mengamankan kas cuan, runner keluar di BE
+		} else if hasTP1 == 1 && pnl > 0.005 {
+			// Partial Win: TP1 mengamankan kas cuan, runner keluar di BE/SL dengan net PnL tetap positif
 			stats.WinsCount++
 			stats.PartialWinsCount++
 			totalWinVal += pnl
-		} else if (hasBE == 1 || (hasSL == 0 && math.Abs(pnl) <= 0.05)) && hasTP1 == 0 {
+		} else if (hasBE == 1 && pnl >= -0.05) || (hasSL == 0 && math.Abs(pnl) <= 0.05) {
 			// Pure Break-Even: Tier 1 rem dini modal kembali utuh (~$0.00)
 			stats.BreakEvenCount++
 		} else {
-			// Full Loss: Stop Loss tersenggol
+			// Full Loss: Stop Loss tersenggol atau net PnL negatif
 			stats.LossesCount++
 			totalLossVal += math.Abs(pnl)
 		}
@@ -567,13 +567,13 @@ func (r *WebReader) GetStrategyStats(ctx context.Context) ([]StrategyStatsItem, 
 		a.item.TotalTrades++
 		a.item.TotalNetPnLUSDT += pnl
 
-		if hasRunnerWin == 1 || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
+		if (hasRunnerWin == 1 && pnl > 0) || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
 			a.item.WinsCount++
 			a.winSum += pnl
-		} else if hasTP1 == 1 && (hasBE == 1 || pnl > 0.005) {
+		} else if hasTP1 == 1 && pnl > 0.005 {
 			a.item.WinsCount++
 			a.winSum += pnl
-		} else if (hasBE == 1 || (hasSL == 0 && math.Abs(pnl) <= 0.05)) && hasTP1 == 0 {
+		} else if (hasBE == 1 && pnl >= -0.05) || (hasSL == 0 && math.Abs(pnl) <= 0.05) {
 			a.item.BreakEvenCount++
 		} else {
 			a.item.LossesCount++

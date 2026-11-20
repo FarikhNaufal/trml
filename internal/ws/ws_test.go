@@ -101,9 +101,9 @@ func TestWebSocketPayloadParsing(t *testing.T) {
 func TestBuildUserDataStreamURL(t *testing.T) {
 	listenKey := "mockListenKey12345"
 
-	// 1. Mainnet 2026 Spec: wss://fstream.binance.com/private/ws?listenKey=<key>&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,listenKeyExpired
+	// 1. Mainnet 2026 Spec: wss://fstream.binance.com/private/ws?listenKey=<key>&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,ALGO_UPDATE,listenKeyExpired
 	mainnetURL := BuildUserDataStreamURL("wss://fstream.binance.com/private/ws", listenKey, true)
-	expectedMainnet := "wss://fstream.binance.com/private/ws?listenKey=mockListenKey12345&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,listenKeyExpired"
+	expectedMainnet := "wss://fstream.binance.com/private/ws?listenKey=mockListenKey12345&events=ORDER_TRADE_UPDATE,ACCOUNT_UPDATE,ALGO_UPDATE,listenKeyExpired"
 	if mainnetURL != expectedMainnet {
 		t.Errorf("expected mainnet user stream URL '%s', got '%s'", expectedMainnet, mainnetURL)
 	}
@@ -605,5 +605,70 @@ func TestWebSocketDetailedUserDataEvents(t *testing.T) {
 	}
 	if pos, ok := gotAcctEvt.Positions["ETHUSDT"]; !ok || !pos.UnrealizedPnL.Equal(decimal.NewFromFloat(15.25)) {
 		t.Fatalf("expected ETHUSDT position in account event, got %+v", gotAcctEvt.Positions)
+	}
+}
+
+func TestStreamManager_HealthyIdlePingKeepsConnectionAlive(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.CloseNow() }()
+		for {
+			// Read loop lets coder/websocket respond to Pings with Pongs while sending 0 text frames
+			if _, _, err := c.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer ts.Close()
+
+	mgr := NewStreamManager(EventHandlers{})
+	mgr.IdleTimeout = 120 * time.Millisecond
+	mgr.PingInterval = 40 * time.Millisecond
+	mgr.PingTimeout = 30 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 280*time.Millisecond)
+	defer cancel()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	err = mgr.readLoop(ctx, c, time.Now())
+	_ = c.CloseNow()
+	if err == nil || ctx.Err() != context.DeadlineExceeded {
+		t.Fatalf("expected idle user-data-style stream to survive >280ms via Pong liveness without idle watchdog disconnect, got err=%v ctxErr=%v", err, ctx.Err())
+	}
+}
+
+func TestWebSocketAlgoUpdateAndExpiredInMatch(t *testing.T) {
+	var algoEvt model.AlgoOrderUpdateEvent
+	var orderEvt model.OrderTradeUpdateEvent
+	var algoCalls, orderCalls atomic.Int32
+
+	mgr := NewStreamManager(EventHandlers{
+		OnAlgoOrderUpdate: func(evt model.AlgoOrderUpdateEvent) {
+			algoEvt = evt
+			algoCalls.Add(1)
+		},
+		OnOrderTradeUpdateDetailed: func(evt model.OrderTradeUpdateEvent) {
+			orderEvt = evt
+			orderCalls.Add(1)
+		},
+	})
+
+	rawAlgo := []byte(`{"e":"ALGO_UPDATE","T":1750515742297,"E":1750515742303,"o":{"caid":"ALGO_SL_SOLUSDT_1","aid":918273,"at":"CONDITIONAL","o":"STOP_MARKET","s":"SOLUSDT","S":"SELL","sp":"95.5","X":"CANCELED"}}`)
+	mgr.ProcessMessage(rawAlgo)
+	if algoCalls.Load() != 1 || algoEvt.Symbol != "SOLUSDT" || algoEvt.AlgoID != 918273 || algoEvt.ClientAlgoID != "ALGO_SL_SOLUSDT_1" || algoEvt.AlgoStatus != "CANCELED" || !algoEvt.TriggerPrice.Equal(decimal.NewFromFloat(95.5)) {
+		t.Fatalf("unexpected ALGO_UPDATE parse result (calls=%d): %+v", algoCalls.Load(), algoEvt)
+	}
+
+	rawSTP := []byte(`{"e":"ORDER_TRADE_UPDATE","E":1700000000000,"T":1700000000000,"o":{"s":"BTCUSDT","c":"ENTRY_STP","X":"EXPIRED_IN_MATCH","i":445566,"l":"0","z":"0","ap":"0","L":"0","N":"USDT","n":"0","m":false,"rp":"0"}}`)
+	mgr.ProcessMessage(rawSTP)
+	if orderCalls.Load() != 1 || orderEvt.Status != model.StatusExpired {
+		t.Fatalf("expected EXPIRED_IN_MATCH mapped to StatusExpired, got calls=%d status=%s", orderCalls.Load(), orderEvt.Status)
 	}
 }

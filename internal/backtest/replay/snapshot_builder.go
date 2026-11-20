@@ -48,6 +48,16 @@ func CalcRollingBufferCap(candleDur time.Duration, warmupBars int) int {
 	return capNeeded
 }
 
+// effectiveEvalTime normalizes Binance kline CloseTime (...59.999) by +1ms to the exact
+// bar-close boundary (:00.000) so Open Interest lookups, UTC hour blocks, and session warmup
+// checks align with live/dry-run wall-clock evaluation immediately after candle close.
+func effectiveEvalTime(t time.Time) time.Time {
+	if t.UnixMilli()%1000 == 999 {
+		return t.Add(time.Millisecond)
+	}
+	return t
+}
+
 // BuildBTCMacroSnapshot constructs the benchmark macro snapshot used by BTCGate.
 func BuildBTCMacroSnapshot(
 	benchmarkSym string,
@@ -59,12 +69,13 @@ func BuildBTCMacroSnapshot(
 	if len(btcCandles) < 30 {
 		return nil
 	}
+	evalTime := effectiveEvalTime(simTime)
 	lastBTC := btcCandles[len(btcCandles)-1]
 	vwapBTC := indicator.CalculateSessionVWAP(btcCandles)
 	btcSpread := calculateDynamicSpread(btcCandles, lastBTC.Close, baseSpreadPct)
 	snap := model.MarketSnapshot{
 		Symbol:              benchmarkSym,
-		Now:                 simTime,
+		Now:                 evalTime,
 		MarkPrice:           lastBTC.Close,
 		BestBid:             lastBTC.Close * (1.0 - btcSpread/2.0),
 		BestAsk:             lastBTC.Close * (1.0 + btcSpread/2.0),
@@ -116,18 +127,19 @@ func BuildSymbolSnapshot(
 		}
 	}
 
+	evalTime := effectiveEvalTime(simTime)
 	dynSpread := calculateDynamicSpread(cList, lastC.Close, baseSpreadPct)
 	snap := model.MarketSnapshot{
 		Symbol:              sym,
 		Filter:              filter,
-		Now:                 simTime,
+		Now:                 evalTime,
 		BestBid:             lastC.Close * (1.0 - dynSpread/2.0),
 		BestAsk:             lastC.Close * (1.0 + dynSpread/2.0),
-		BookUpdatedAt:       simTime,
+		BookUpdatedAt:       evalTime,
 		MarkPrice:           lastC.Close,
-		MarkPriceUpdatedAt:  simTime,
+		MarkPriceUpdatedAt:  evalTime,
 		FundingRate:         fundingRate,
-		FundingUpdatedAt:    simTime,
+		FundingUpdatedAt:    evalTime,
 		CurrentSessionVWAP:  sessionVWAP,
 		ClosedCandles:       cList,
 		ClosedBarDeltasUSDT: deltas,
@@ -147,7 +159,7 @@ func BuildSymbolSnapshot(
 		adjCfg.DisableOIFilter = false
 		if oiMgr != nil {
 			if prevOI, currOI, prevT, currT, ok := oiMgr.LookupOpenInterestStrict(
-				sym, simTime, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
+				sym, evalTime, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
 			); ok {
 				snap.PrevOpenInterest = prevOI
 				snap.CurrOpenInterest = currOI
@@ -163,7 +175,7 @@ func BuildSymbolSnapshot(
 	default: // OIModeAuto
 		if oiMgr != nil {
 			if prevOI, currOI, prevT, currT, ok := oiMgr.LookupOpenInterestStrict(
-				sym, simTime, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
+				sym, evalTime, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
 			); ok {
 				snap.PrevOpenInterest = prevOI
 				snap.CurrOpenInterest = currOI

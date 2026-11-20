@@ -556,4 +556,12 @@ func TestRunBulkMarketScannerPartitioned_PrimaryInvarianceAndSweepExtra(t *testi
 	if _, exists := onStates["UPEXTUSDT"]; exists {
 		t.Fatalf("did not expect uptrend extended symbol UPEXTUSDT bootstrapped into activeStates")
 	}
+
+	// When SweepExtendedVWAP=true but SweepMaxExtraCoins=0, 0 extra coins must be selected
+	zeroExtraCfg := onCfg
+	zeroExtraCfg.SweepMaxExtraCoins = 0
+	zeroRes := RunBulkMarketScannerPartitioned(zeroExtraCfg, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if len(zeroRes.SweepExtra) != 0 {
+		t.Fatalf("expected SweepExtra=[] when SweepMaxExtraCoins=0, got %v", zeroRes.SweepExtra)
+	}
 }

@@ -783,7 +783,7 @@ func ResolveBacktestScannerConfig(cfg *config.Config, intervalOverride string) (
 	if tfErr != nil || candleDur <= 0 {
 		candleDur = 5 * time.Minute
 	}
-	scannerCfg := scanner.FromAppConfig(cfg, 250)
+	scannerCfg := scanner.FromAppConfig(cfg, 600)
 	scannerCfg.Timeframe = interval
 	scannerCfg.CandleDuration = candleDur
 	return interval, candleDur, scannerCfg

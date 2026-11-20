@@ -5159,3 +5159,469 @@ func TestBroker_GracefulCloseDrainsAsyncGoroutines(t *testing.T) {
 		t.Fatalf("expected BinanceLiveBroker.Close() to wait for async OnTradeClosedFn completion")
 	}
 }
+
+func TestLiveBroker_TP1AccountUpdateBeforeOrderUpdateDoesNotCancelSL(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:         3,
+		AccountLeverage:  8.0,
+		EntryOrderType:   "LIMIT",
+		PartialTPEnabled: true,
+		PartialTP1Ratio:  0.50,
+	})
+	b.HandleAccountUpdateEvent(model.AccountUpdateEvent{
+		WalletBalance: decimal.NewFromFloat(1000.0), AvailableBalance: decimal.NewFromFloat(1000.0),
+		EventTime: time.Now().UTC(), IsFullSnapshot: true,
+	})
+
+	var mu sync.Mutex
+	var canceledAlgos []int64
+	var placedSLQtys []decimal.Decimal
+	tp1ClientCh := make(chan string, 1)
+	b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) { return 1001, nil }
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		if orderType == "STOP_MARKET" {
+			mu.Lock()
+			placedSLQtys = append(placedSLQtys, qty)
+			idx := len(placedSLQtys)
+			mu.Unlock()
+			return int64(2000 + idx), nil
+		}
+		return 2099, nil
+	}
+	b.PlaceLimitCloseFn = func(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (int64, error) {
+		tp1ClientCh <- clientOrderID
+		return 3001, nil
+	}
+	b.CancelAlgoOrderFn = func(ctx context.Context, symbol string, algoID int64) error {
+		mu.Lock()
+		canceledAlgos = append(canceledAlgos, algoID)
+		mu.Unlock()
+		return nil
+	}
+	b.CancelOrderFn = func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error { return nil }
+
+	_, err := b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "TP1_RACE_ENTRY", Symbol: "ETHUSDT", Side: model.SideLong,
+		Qty: decimal.NewFromFloat(1.0), LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice: decimal.NewFromFloat(95.0), TPPrice: decimal.NewFromFloat(120.0),
+		TP1Price: decimal.NewFromFloat(110.0), ATRAtEntry: decimal.NewFromFloat(5.0),
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("SubmitLimitEntry failed: %v", err)
+	}
+	b.HandleUserDataOrderUpdateDetailed(model.OrderTradeUpdateEvent{
+		ClientOrderID: "TP1_RACE_ENTRY", ExchangeOrderID: 1001, Symbol: "ETHUSDT",
+		Status: model.StatusFilled, CumFilledQty: decimal.NewFromFloat(1.0), LastFilledQty: decimal.NewFromFloat(1.0),
+		AvgPrice: decimal.NewFromFloat(100.0), HasFillMeta: true, IsMaker: true,
+	})
+	tp1ClientID := <-tp1ClientCh
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b.Mu.Lock()
+		p := b.Protections["ETHUSDT"]
+		ready := p != nil && p.SLOrderID != 0 && p.TP1OrderID == 3001
+		b.Mu.Unlock()
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Binance delivers ACCOUNT_UPDATE (qty reduced to 0.50) BEFORE ORDER_TRADE_UPDATE (FILLED 0.50)
+	b.HandleAccountUpdateEvent(model.AccountUpdateEvent{
+		WalletBalance: decimal.NewFromFloat(1005.0), EventTime: time.Now().UTC(), IsFullSnapshot: false,
+		Positions: map[string]model.LivePosition{
+			"ETHUSDT": {Symbol: "ETHUSDT", Side: model.SideLong, Qty: decimal.NewFromFloat(0.5), EntryPrice: decimal.NewFromFloat(100.0), UnrealizedPnL: decimal.NewFromFloat(5.0)},
+		},
+	})
+	// Deliver as 2-chunk taker TP1 fill (0.25 + 0.50) to verify both C3 & H6
+	b.HandleUserDataOrderUpdateDetailed(model.OrderTradeUpdateEvent{
+		ClientOrderID: tp1ClientID, ExchangeOrderID: 3001, Symbol: "ETHUSDT",
+		Status: model.StatusPartiallyFilled, CumFilledQty: decimal.NewFromFloat(0.25), LastFilledQty: decimal.NewFromFloat(0.25),
+		AvgPrice: decimal.NewFromFloat(110.0), HasFillMeta: true, IsMaker: false,
+	})
+	b.HandleUserDataOrderUpdateDetailed(model.OrderTradeUpdateEvent{
+		ClientOrderID: tp1ClientID, ExchangeOrderID: 3001, Symbol: "ETHUSDT",
+		Status: model.StatusFilled, CumFilledQty: decimal.NewFromFloat(0.50), LastFilledQty: decimal.NewFromFloat(0.25),
+		AvgPrice: decimal.NewFromFloat(110.0), HasFillMeta: true, IsMaker: false,
+	})
+	b.Close()
+
+	b.Mu.Lock()
+	remQty := b.ActivePositions["ETHUSDT"]
+	prot := b.Protections["ETHUSDT"]
+	b.Mu.Unlock()
+
+	if !remQty.Equal(decimal.NewFromFloat(0.50)) || prot == nil || !prot.ProtectedQty.Equal(decimal.NewFromFloat(0.50)) {
+		t.Fatalf("expected runner qty 0.50 preserved with active SL protection, got remQty=%s prot=%+v", remQty, prot)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(placedSLQtys) < 2 || !placedSLQtys[len(placedSLQtys)-1].Equal(decimal.NewFromFloat(0.50)) {
+		t.Fatalf("expected BE SL placed for remaining 0.50 qty, got placedSLQtys=%v", placedSLQtys)
+	}
+	for _, cid := range canceledAlgos {
+		if cid == placedSLQtys[len(placedSLQtys)-1].IntPart() {
+			t.Fatalf("unexpected cancellation of active runner SL")
+		}
+	}
+}
+
+func TestLiveBroker_TP1MarketFallbackAbortsWhenCancelSaysAlreadyFilled(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:         3,
+		AccountLeverage:  8.0,
+		PartialTPEnabled: true,
+		PartialTP1Ratio:  0.50,
+	})
+	now := time.Now().UTC()
+	b.Mu.Lock()
+	b.ActivePositions["SOLUSDT"] = decimal.NewFromFloat(2.0)
+	b.InitialQtys["SOLUSDT"] = decimal.NewFromFloat(2.0)
+	b.PositionSides["SOLUSDT"] = model.SideLong
+	b.PositionEntryPrices["SOLUSDT"] = decimal.NewFromFloat(100.0)
+	b.PositionOpenTimes["SOLUSDT"] = now.Add(-5 * time.Minute)
+	b.ATRAtEntry["SOLUSDT"] = decimal.NewFromFloat(2.0)
+	b.TP1Prices["SOLUSDT"] = decimal.NewFromFloat(105.0)
+	b.Protections["SOLUSDT"] = &model.LivePositionProtection{
+		Symbol:           "SOLUSDT",
+		Side:             model.SideLong,
+		PlanGeneration:   1,
+		ProtectedQty:     decimal.NewFromFloat(2.0),
+		SLOrderID:        2001,
+		SLStatus:         model.ProtectionAcked,
+		SLPrice:          decimal.NewFromFloat(95.0),
+		TP1OrderID:       3001,
+		TP1ClientOrderID: "ALGO_TP1_SOL",
+		TP1Price:         decimal.NewFromFloat(105.0),
+	}
+	b.Mu.Unlock()
+
+	var marketCloseCalls atomic.Int32
+	b.CancelOrderFn = func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error {
+		return fmt.Errorf("exchange: API returned HTTP 400 (code=-2011, msg=Unknown order sent.)")
+	}
+	b.QueryOrderFn = func(ctx context.Context, symbol, clientOrderID string) (*model.LiveOrderRecord, error) {
+		return &model.LiveOrderRecord{
+			ClientOrderID:       clientOrderID,
+			ExchangeOrderID:     3001,
+			Symbol:              symbol,
+			Status:              model.StatusFilled,
+			CumulativeFilledQty: decimal.NewFromFloat(1.0),
+			AvgPrice:            decimal.NewFromFloat(105.0),
+		}, nil
+	}
+	b.MarketCloseFn = func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (int64, decimal.Decimal, decimal.Decimal, error) {
+		marketCloseCalls.Add(1)
+		return 4001, decimal.NewFromFloat(106.5), qty, nil
+	}
+	b.CancelAlgoOrderFn = func(ctx context.Context, symbol string, algoID int64) error { return nil }
+
+	// Tick crosses tp1Price + 0.5*ATR (105 + 1.0 = 106.0)
+	b.OnRealtimeTick("SOLUSDT", 106.4, 106.6, 106.5, 0, 0, false, now)
+	b.Close()
+
+	if marketCloseCalls.Load() != 0 {
+		t.Fatalf("expected MarketCloseFn aborted when resting TP1 cancel failed as already filled, got calls=%d", marketCloseCalls.Load())
+	}
+	b.Mu.Lock()
+	rem := b.ActivePositions["SOLUSDT"]
+	hit := b.IsTP1Hits["SOLUSDT"]
+	b.Mu.Unlock()
+	if !rem.Equal(decimal.NewFromFloat(1.0)) || !hit {
+		t.Fatalf("expected remaining qty 1.0 and IsTP1Hits=true reconciled from QueryOrder, got rem=%s hit=%v", rem, hit)
+	}
+}
+
+func TestLiveBroker_AlgoUpdateCanceledMarksSLFailedForRepair(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{MaxSlots: 3, AccountLeverage: 8.0})
+	now := time.Now().UTC()
+	b.Mu.Lock()
+	b.ActivePositions["ADAUSDT"] = decimal.NewFromFloat(10.0)
+	b.PositionSides["ADAUSDT"] = model.SideLong
+	b.PositionEntryPrices["ADAUSDT"] = decimal.NewFromFloat(1.0)
+	b.PositionOpenTimes["ADAUSDT"] = now.Add(-1 * time.Minute)
+	b.Protections["ADAUSDT"] = &model.LivePositionProtection{
+		Symbol:         "ADAUSDT",
+		Side:           model.SideLong,
+		PlanGeneration: 1,
+		ProtectedQty:   decimal.NewFromFloat(10.0),
+		SLOrderID:      5001,
+		SLClientAlgoID: "ALGO_SL_ADA",
+		SLStatus:       model.ProtectionAcked,
+		SLPrice:        decimal.NewFromFloat(0.95),
+	}
+	b.Mu.Unlock()
+
+	var repaired atomic.Bool
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		repaired.Store(true)
+		return 5002, nil
+	}
+
+	b.HandleAlgoOrderUpdate(model.AlgoOrderUpdateEvent{
+		Symbol: "ADAUSDT", AlgoID: 5001, ClientAlgoID: "ALGO_SL_ADA",
+		OrderType: "STOP_MARKET", AlgoStatus: "CANCELED", TriggerPrice: decimal.NewFromFloat(0.95),
+	})
+
+	b.Mu.Lock()
+	prot := b.Protections["ADAUSDT"]
+	statusAfterEvt := prot.SLStatus
+	idAfterEvt := prot.SLOrderID
+	b.Mu.Unlock()
+	if statusAfterEvt != model.ProtectionFailed || idAfterEvt != 0 {
+		t.Fatalf("expected ProtectionFailed and SLOrderID=0 after ALGO_UPDATE CANCELED, got status=%s id=%d", statusAfterEvt, idAfterEvt)
+	}
+
+	b.RepairFailedProtections(now)
+	b.Mu.Lock()
+	statusAfterRepair := b.Protections["ADAUSDT"].SLStatus
+	idAfterRepair := b.Protections["ADAUSDT"].SLOrderID
+	b.Mu.Unlock()
+	if !repaired.Load() || statusAfterRepair != model.ProtectionAcked || idAfterRepair != 5002 {
+		t.Fatalf("expected RepairFailedProtections to restore SL 5002, got repaired=%v status=%s id=%d", repaired.Load(), statusAfterRepair, idAfterRepair)
+	}
+}
+
+func TestLiveBroker_ReserveEntryIntentAndSubmitReservedEntry(t *testing.T) {
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:        3,
+		AccountLeverage: 8.0,
+		EntryOrderType:  "MARKET",
+	})
+	b.HandleAccountUpdateEvent(model.AccountUpdateEvent{
+		WalletBalance: decimal.NewFromFloat(1000.0), AvailableBalance: decimal.NewFromFloat(1000.0),
+		EventTime: time.Now().UTC(), IsFullSnapshot: true,
+	})
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		return 7777, nil
+	}
+	b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+		// Simulate fast MARKET fill WS update arriving BEFORE PlaceEntryFn returns
+		b.HandleUserDataOrderUpdateDetailed(model.OrderTradeUpdateEvent{
+			ClientOrderID: intent.ClientOrderID, ExchangeOrderID: 6001, Symbol: intent.Symbol,
+			Status: model.StatusFilled, CumFilledQty: intent.Qty, LastFilledQty: intent.Qty,
+			AvgPrice: intent.LimitPrice, HasFillMeta: true, IsMaker: false,
+		})
+		return 6001, nil
+	}
+
+	intent := model.OrderIntent{
+		ClientOrderID: "RSV_MKT_1", Symbol: "BTCUSDT", Side: model.SideLong,
+		Qty: decimal.NewFromFloat(1.0), LimitPrice: decimal.NewFromFloat(800.0),
+		SLPrice: decimal.NewFromFloat(760.0), TPPrice: decimal.NewFromFloat(880.0),
+		ATRAtEntry: decimal.NewFromFloat(10.0), CreatedAt: time.Now().UTC(),
+	}
+	prep, err := b.PreparePreSubmitIntent(intent)
+	if err != nil {
+		t.Fatalf("PreparePreSubmitIntent failed: %v", err)
+	}
+	ok, err := b.ReserveEntryIntent(prep)
+	if !ok || err != nil {
+		t.Fatalf("ReserveEntryIntent failed: ok=%v err=%v", ok, err)
+	}
+
+	b.Mu.Lock()
+	rec := b.OrdersByClient["RSV_MKT_1"]
+	rsvMargin := b.ReservedEntryMargins["RSV_MKT_1"]
+	b.Mu.Unlock()
+	if rec == nil || !rec.LimitPrice.Equal(decimal.NewFromFloat(800.0)) || !rsvMargin.Equal(decimal.NewFromFloat(100.0)) {
+		t.Fatalf("expected LimitPrice=800 and reserved margin=100 immediately on reserve, got rec=%+v rsv=%s", rec, rsvMargin)
+	}
+
+	okSub, errSub := b.SubmitReservedEntry(prep)
+	if !okSub || errSub != nil {
+		t.Fatalf("SubmitReservedEntry failed: ok=%v err=%v", okSub, errSub)
+	}
+	b.Close()
+
+	b.Mu.Lock()
+	leakedMargin := len(b.ReservedEntryMargins)
+	b.Mu.Unlock()
+	if leakedMargin != 0 {
+		t.Fatalf("expected ReservedEntryMargins empty when WS FILLED raced PlaceEntryFn, got %d entries", leakedMargin)
+	}
+}
+
+func TestLiveBroker_DynamicSLFailThrottleAndImmediateTrigger2021(t *testing.T) {
+	// Subcase A: H5 throttle after dynamic SL failure prevents @bookTicker API storm
+	b1 := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:              3,
+		AccountLeverage:       8.0,
+		Tier1BEEnabled:        true,
+		Tier1BETriggerLongATR: 0.70,
+		MinBreakEvenOffsetPct: 0.0010,
+	})
+	now := time.Now().UTC()
+	b1.Mu.Lock()
+	b1.ActivePositions["BTCUSDT"] = decimal.NewFromFloat(1.0)
+	b1.PositionSides["BTCUSDT"] = model.SideLong
+	b1.PositionEntryPrices["BTCUSDT"] = decimal.NewFromFloat(100.0)
+	b1.PositionOpenTimes["BTCUSDT"] = now.Add(-1 * time.Minute)
+	b1.ATRAtEntry["BTCUSDT"] = decimal.NewFromFloat(2.0)
+	b1.Protections["BTCUSDT"] = &model.LivePositionProtection{
+		Symbol: "BTCUSDT", Side: model.SideLong, PlanGeneration: 1,
+		ProtectedQty: decimal.NewFromFloat(1.0), SLOrderID: 8001, SLClientAlgoID: "SL_INIT",
+		SLStatus: model.ProtectionAcked, SLPrice: decimal.NewFromFloat(95.0),
+	}
+	b1.Mu.Unlock()
+
+	var slCalls1 atomic.Int32
+	b1.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		slCalls1.Add(1)
+		return 0, fmt.Errorf("exchange: API returned HTTP 400 (code=-2021, msg=Order would immediately trigger.)")
+	}
+	for i := 0; i < 5; i++ {
+		b1.OnRealtimeTick("BTCUSDT", 101.9, 102.1, 102.0, 0, 0, false, now.Add(time.Duration(i)*time.Millisecond))
+		time.Sleep(10 * time.Millisecond)
+	}
+	b1.Close()
+	if slCalls1.Load() != 1 {
+		t.Fatalf("expected 5s cooldown after failed dynamic SL upgrade to limit calls to 1, got %d", slCalls1.Load())
+	}
+
+	// Subcase B: H13 -2021 on BE SL breaks immediately and preserves old SLPrice
+	b2 := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:              3,
+		AccountLeverage:       8.0,
+		PartialTPEnabled:      true,
+		PartialTP1Ratio:       0.50,
+		MinBreakEvenOffsetPct: 0.0010,
+	})
+	b2.Mu.Lock()
+	b2.ActivePositions["ETHUSDT"] = decimal.NewFromFloat(2.0)
+	b2.InitialQtys["ETHUSDT"] = decimal.NewFromFloat(2.0)
+	b2.PositionSides["ETHUSDT"] = model.SideLong
+	b2.PositionEntryPrices["ETHUSDT"] = decimal.NewFromFloat(100.0)
+	b2.PositionOpenTimes["ETHUSDT"] = now.Add(-1 * time.Minute)
+	b2.ATRAtEntry["ETHUSDT"] = decimal.NewFromFloat(2.0)
+	b2.TP1Prices["ETHUSDT"] = decimal.NewFromFloat(105.0)
+	b2.Protections["ETHUSDT"] = &model.LivePositionProtection{
+		Symbol: "ETHUSDT", Side: model.SideLong, PlanGeneration: 1,
+		ProtectedQty: decimal.NewFromFloat(2.0), SLOrderID: 9001, SLClientAlgoID: "SL_INIT_ETH",
+		SLStatus: model.ProtectionAcked, SLPrice: decimal.NewFromFloat(95.0),
+	}
+	b2.Mu.Unlock()
+
+	var slCalls2 atomic.Int32
+	b2.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		slCalls2.Add(1)
+		return 0, fmt.Errorf("exchange: API returned HTTP 400 (code=-2021, msg=Order would immediately trigger.)")
+	}
+	b2.processTP1Executed("ETHUSDT", decimal.NewFromFloat(1.0), decimal.NewFromFloat(105.0), "ALGO_TP1_ETH", true)
+	b2.Close()
+
+	if slCalls2.Load() != 1 {
+		t.Fatalf("expected -2021 immediate trigger to break out of retries after 1 attempt, got %d", slCalls2.Load())
+	}
+	b2.Mu.Lock()
+	retainedProt := b2.Protections["ETHUSDT"]
+	b2.Mu.Unlock()
+	if retainedProt == nil || retainedProt.SLOrderID != 9001 || !retainedProt.SLPrice.Equal(decimal.NewFromFloat(95.0)) || retainedProt.SLStatus != model.ProtectionAcked {
+		t.Fatalf("expected old SL 9001 @ 95.0 retained on -2021 BE SL failure, got %+v", retainedProt)
+	}
+}
+
+func TestDryRunBroker_PartialFillMargin_PureEquityAfterTP1_And_LiveDashboardDTO(t *testing.T) {
+	// 1. DryRun partial fill margin & pure realized equity after TP1
+	d := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+		MaxSlots:          3,
+		AccountLeverage:   10.0,
+		MakerFeeRate:      0.0002,
+		TakerFeeRate:      0.0005,
+		PartialTPEnabled:  true,
+		PartialTP1Ratio:   0.50,
+		MaxDailyDrawdownPct: -0.05,
+	})
+	defer d.Close()
+
+	now := time.Now().UTC()
+	d.Mu.Lock()
+	// Simulate partially filled pending order: Qty=2.0, FilledQty=1.0 @ 100.0 (notional=100, margin=10)
+	// OpenPosition holds the filled 1.0 @ 100.0 (margin=10); PendingOrder holds remaining 1.0 @ 100.0 (margin=10)
+	d.OpenPositions["BTCUSDT"] = &VirtualOpenPosition{
+		ClientOrderID:  "DR_PART_1",
+		Symbol:         "BTCUSDT",
+		Side:           model.SideLong,
+		Qty:            decimal.NewFromFloat(1.0),
+		InitialQty:     decimal.NewFromFloat(1.0),
+		EntryPrice:     decimal.NewFromFloat(100.0),
+		EntryFee:       decimal.NewFromFloat(0.02),
+		CurrentSLPrice: decimal.NewFromFloat(95.0),
+		InitialSLPrice: decimal.NewFromFloat(95.0),
+		TPPrice:        decimal.NewFromFloat(110.0),
+		TP1Price:       decimal.NewFromFloat(105.0),
+		LastMarkPrice:  decimal.NewFromFloat(100.0),
+		OpenTime:       now,
+	}
+	d.PendingOrders["BTCUSDT"] = &VirtualPendingOrder{
+		Intent: model.OrderIntent{
+			ClientOrderID: "DR_PART_1",
+			Symbol:        "BTCUSDT",
+			Side:          model.SideLong,
+			Qty:           decimal.NewFromFloat(2.0),
+			LimitPrice:    decimal.NewFromFloat(100.0),
+		},
+		FilledQty: decimal.NewFromFloat(1.0),
+	}
+	d.Mu.Unlock()
+
+	// Total used margin should be 10 (open 1.0) + 10 (remaining pending 1.0) = 20, NOT 10 + 20 = 30
+	avail := d.GetAvailableBalanceUSDT()
+	if !avail.Equal(decimal.NewFromFloat(980.0)) {
+		t.Fatalf("expected available balance 980.0 (no double-counted partial fill margin), got %s", avail)
+	}
+
+	// Simulate position of Qty=2.0 where TP1 closed 1.0 (half), leaving Qty=1.0, InitialQty=2.0, EntryFee=0.04
+	d.Mu.Lock()
+	delete(d.PendingOrders, "BTCUSDT")
+	// Suppose initial equity was 1000.0, EntryFee=0.04 was deducted -> RealizedEquity=999.96.
+	// Then TP1 closed half for +5.00 gross - 0.01 exit fee = +4.99 -> RealizedEquity=1004.95.
+	// Closed trade net PnL for TP1 = 5.00 - 0.02 (half entry fee) - 0.01 = +4.97 -> pure closed equity = 1004.97.
+	d.RealizedEquityUSDT = decimal.NewFromFloat(1004.95)
+	d.OpenPositions["BTCUSDT"].InitialQty = decimal.NewFromFloat(2.0)
+	d.OpenPositions["BTCUSDT"].Qty = decimal.NewFromFloat(1.0)
+	d.OpenPositions["BTCUSDT"].EntryFee = decimal.NewFromFloat(0.04)
+	d.Mu.Unlock()
+
+	pureEq := d.GetPureRealizedEquityClosedTradesUSDT()
+	if !pureEq.Equal(decimal.NewFromFloat(1004.97)) {
+		t.Fatalf("expected pure realized equity 1004.97 (adding back only remaining runner half of entry fee 0.02), got %s", pureEq)
+	}
+
+	// 2. Live GetActivePositions mark-based uPnL/ROE consistency and ProtectionTier>=1 IsBreakEven badge
+	lb := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:        3,
+		AccountLeverage: 8.0,
+	})
+	defer lb.Close()
+	lb.Mu.Lock()
+	lb.ActivePositions["SOLUSDT"] = decimal.NewFromFloat(10.0)
+	lb.PositionSides["SOLUSDT"] = model.SideLong
+	lb.PositionEntryPrices["SOLUSDT"] = decimal.NewFromFloat(100.0)
+	lb.PositionOpenTimes["SOLUSDT"] = now.Add(-2 * time.Minute)
+	// Stale WS uPnL says -5.0, while live mark price is 101.0 (+10.0 uPnL, +8.0% ROE)
+	lb.PositionUnrealizedPnLs["SOLUSDT"] = decimal.NewFromFloat(-5.0)
+	lb.LastMarkPrices["SOLUSDT"] = decimal.NewFromFloat(101.0)
+	// Post-TP1 cushion BE: ProtectionTier=1, SL slightly below entry (99.80) due to RUNNER_BE_CUSHION_ATR
+	lb.ProtectionTiers["SOLUSDT"] = 1
+	lb.Protections["SOLUSDT"] = &model.LivePositionProtection{
+		Symbol:  "SOLUSDT",
+		Side:    model.SideLong,
+		SLPrice: decimal.NewFromFloat(99.80),
+		TPPrice: decimal.NewFromFloat(108.00),
+	}
+	lb.Mu.Unlock()
+
+	dtos := lb.GetActivePositions()
+	if len(dtos) != 1 {
+		t.Fatalf("expected 1 active position DTO, got %d", len(dtos))
+	}
+	if dtos[0].UnrealizedPnL != 10.0 || dtos[0].UnrealizedROEPct <= 0 {
+		t.Fatalf("expected consistent positive UnrealizedPnL=10.0 and ROE>0 from live MarkPrice=101, got pnl=%f roe=%f", dtos[0].UnrealizedPnL, dtos[0].UnrealizedROEPct)
+	}
+	if !dtos[0].IsBreakEven {
+		t.Fatalf("expected IsBreakEven=true when ProtectionTier >= 1 (even with cushion BE SL < Entry)")
+	}
+}
