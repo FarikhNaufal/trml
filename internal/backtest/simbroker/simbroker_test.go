@@ -848,8 +848,10 @@ func TestSimBroker_GTXRepegAndDriftAbort(t *testing.T) {
 	})
 
 	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	// Case 1: LONG limit 100.00, bar gaps DOWN to 99.50 (-0.5% <= 1% drift -> crosses spread!)
+	// Repeg shifts bid down to 99.49; Low drops to 99.40 -> fills at 99.49!
 	_, _ = b.SubmitLimitEntry(model.OrderIntent{
-		ClientOrderID: "REPEG_1",
+		ClientOrderID: "REPEG_LONG_CROSS",
 		Symbol:        "SOLUSDT",
 		Side:          model.SideLong,
 		LimitPrice:    decimal.NewFromFloat(100.0),
@@ -858,11 +860,9 @@ func TestSimBroker_GTXRepegAndDriftAbort(t *testing.T) {
 		TPPrice:       decimal.NewFromFloat(110.0),
 		CreatedAt:     now,
 	})
-
-	// Bar 0: Open moves to 100.50 (+0.5% <= 1% drift), Low drops to 100.40 (< repegged 100.49) -> fills via repeg!
 	b.ProcessCandle(data.HistoricalCandle{
 		OpenTime: now, CloseTime: now.Add(5 * time.Minute),
-		Symbol: "SOLUSDT", Open: 100.50, High: 101.00, Low: 100.40, Close: 100.80,
+		Symbol: "SOLUSDT", Open: 99.50, High: 99.90, Low: 99.40, Close: 99.70,
 	}, 0)
 
 	if b.Stats.Repegged != 1 {
@@ -870,14 +870,14 @@ func TestSimBroker_GTXRepegAndDriftAbort(t *testing.T) {
 	}
 	pos := b.OpenPositions["SOLUSDT"]
 	if pos == nil {
-		t.Fatalf("expected repegged order to fill on bar 0")
+		t.Fatalf("expected repegged LONG order to fill on bar 0")
 	}
-	if !pos.EntryPrice.Equal(decimal.NewFromFloat(100.49)) {
-		t.Fatalf("expected repegged limit 100.49, got %s", pos.EntryPrice)
+	if !pos.EntryPrice.Equal(decimal.NewFromFloat(99.49)) {
+		t.Fatalf("expected repegged limit 99.49, got %s", pos.EntryPrice)
 	}
 
-	// Second case: drift exceeds MaxEntryRepegDriftPct -> RepegAborted and order cancelled
-	b.ForceClosePosition("SOLUSDT", decimal.NewFromFloat(100.50), "CLEANUP", now.Add(5*time.Minute), 1)
+	// Case 2: LONG limit 100.00, bar gaps DOWN deeply to 97.00 (-3% > 1% drift) -> RepegAborted
+	b.ForceClosePosition("SOLUSDT", decimal.NewFromFloat(99.50), "CLEANUP", now.Add(5*time.Minute), 1)
 	_, _ = b.SubmitLimitEntry(model.OrderIntent{
 		ClientOrderID: "REPEG_ABORT",
 		Symbol:        "SOLUSDT",
@@ -890,7 +890,7 @@ func TestSimBroker_GTXRepegAndDriftAbort(t *testing.T) {
 	})
 	b.ProcessCandle(data.HistoricalCandle{
 		OpenTime: now.Add(5 * time.Minute), CloseTime: now.Add(10 * time.Minute),
-		Symbol: "SOLUSDT", Open: 103.00, High: 103.50, Low: 102.50, Close: 103.00,
+		Symbol: "SOLUSDT", Open: 97.00, High: 97.50, Low: 96.50, Close: 97.00,
 	}, 1)
 
 	if b.Stats.RepegAborted != 1 {
@@ -898,6 +898,50 @@ func TestSimBroker_GTXRepegAndDriftAbort(t *testing.T) {
 	}
 	if _, stillPending := b.PendingOrders["SOLUSDT"]; stillPending {
 		t.Fatalf("expected pending order cancelled on drift abort")
+	}
+
+	// Case 3: LONG limit 100.00, bar opens HIGHER at 103.00 -> passive order (no cross), remains resting until pullback!
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "PASSIVE_RESTING",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0),
+		SLPrice:       decimal.NewFromFloat(95.0),
+		TPPrice:       decimal.NewFromFloat(110.0),
+		CreatedAt:     now.Add(10 * time.Minute),
+	})
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now.Add(10 * time.Minute), CloseTime: now.Add(15 * time.Minute),
+		Symbol: "SOLUSDT", Open: 103.00, High: 103.50, Low: 100.50, Close: 102.00,
+	}, 2)
+	if b.Stats.RepegAborted != 1 {
+		t.Fatalf("expected passive LONG order NOT aborted when open moves higher, got RepegAborted=%d", b.Stats.RepegAborted)
+	}
+	if _, stillPending := b.PendingOrders["SOLUSDT"]; !stillPending {
+		t.Fatalf("expected passive LONG order to keep resting until timeout or pullback")
+	}
+
+	// Case 4: SHORT limit 100.00, bar opens HIGHER at 100.50 (+0.5% <= 1% -> crosses bid!) -> repegs UP to 100.51 and fills
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "REPEG_SHORT_CROSS",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideShort,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(2.0),
+		SLPrice:       decimal.NewFromFloat(105.0),
+		TPPrice:       decimal.NewFromFloat(90.0),
+		CreatedAt:     now.Add(15 * time.Minute),
+	})
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime: now.Add(15 * time.Minute), CloseTime: now.Add(20 * time.Minute),
+		Symbol: "ETHUSDT", Open: 100.50, High: 100.60, Low: 100.10, Close: 100.20,
+	}, 3)
+	if b.Stats.Repegged != 2 {
+		t.Fatalf("expected Repegged=2 after SHORT cross, got %+v", b.Stats)
+	}
+	if ethPos := b.OpenPositions["ETHUSDT"]; ethPos == nil || !ethPos.EntryPrice.Equal(decimal.NewFromFloat(100.51)) {
+		t.Fatalf("expected SHORT repegged fill at 100.51, got %+v", ethPos)
 	}
 }
 

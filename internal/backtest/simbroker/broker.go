@@ -225,21 +225,39 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 				s.Stats.Filled++
 				s.Stats.MarketFilled++
 			} else {
-				// Opsional: Simulasi GTX Repeg di harga pembukaan bar bila pasar membuka menjauh dari limit
+				// Validasi Post-Only GTX saat pembukaan bar pertama menggunakan SSOT protection.WouldCrossMakerBook / RepegLimitEntryIntent
+				// (hanya repeg ketika order menyeberang spread; jika harga menjauh/tetap pasif, biarkan resting hingga terisi atau timeout).
 				shouldEvalFill := true
-				if s.Cfg.MaxEntryRepegAttempts > 0 && pending.RepegAttempts < s.Cfg.MaxEntryRepegAttempts && openDec.GreaterThan(decimal.Zero) {
-					movedAway := (pending.Intent.Side == model.SideLong && openDec.GreaterThan(pending.Intent.LimitPrice)) ||
-						(pending.Intent.Side == model.SideShort && openDec.LessThan(pending.Intent.LimitPrice))
-					if movedAway {
-						if repegged, okRepeg := s.tryRepegPendingLocked(pending, openDec, filter); okRepeg {
-							pending.Intent = repegged
-							pending.RepegAttempts++
-							s.Stats.Repegged++
+				if !pending.GTXValidated && openDec.GreaterThan(decimal.Zero) {
+					gappedThrough := (pending.Intent.Side == model.SideLong && openDec.LessThan(pending.Intent.LimitPrice)) ||
+						(pending.Intent.Side == model.SideShort && openDec.GreaterThan(pending.Intent.LimitPrice))
+					if gappedThrough {
+						openBidF, openAskF := syntheticBarOpenBBO(pending.Intent.Side, openDec, filter.TickSize)
+						if protection.WouldCrossMakerBook(pending.Intent.Side, pending.Intent.LimitPrice, openBidF, openAskF) {
+							maxRepegs, maxDrift := resolveSimRepegSettings(s.Cfg.MaxEntryRepegAttempts, s.Cfg.MaxEntryRepegDriftPct)
+							if pending.RepegAttempts < maxRepegs {
+								if repegged, okRepeg, _ := protection.RepegLimitEntryIntent(
+									pending.Intent, pending.OrigLimitPrice, openBidF, openAskF, filter, maxDrift,
+								); okRepeg {
+									pending.Intent = repegged
+									pending.RepegAttempts++
+									pending.GTXValidated = true
+									s.Stats.Repegged++
+								} else {
+									delete(s.PendingOrders, c.Symbol)
+									s.Stats.RepegAborted++
+									shouldEvalFill = false
+								}
+							} else {
+								delete(s.PendingOrders, c.Symbol)
+								s.Stats.RepegAborted++
+								shouldEvalFill = false
+							}
 						} else {
-							delete(s.PendingOrders, c.Symbol)
-							s.Stats.RepegAborted++
-							shouldEvalFill = false
+							pending.GTXValidated = true
 						}
+					} else {
+						pending.GTXValidated = true
 					}
 				}
 
@@ -406,29 +424,10 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 
 	// B. Eksekusi Partial TP1 (Scale-Out + Pindahkan SL ke BE)
 	if tp1Touched && s.Cfg.PartialTPEnabled && !pos.IsTP1Hit {
-		closeRatio := decimal.NewFromFloat(s.Cfg.PartialTP1Ratio)
-		closeQty := pos.InitialQty.Mul(closeRatio)
-		if filter.StepSize.GreaterThan(decimal.Zero) {
-			if qQty, err := model.QuantizeQtyFloor(closeQty, filter.StepSize); err == nil {
-				closeQty = qQty
-			}
-		}
-
-		minNotional := filter.MinNotional
-		if minNotional.LessThanOrEqual(decimal.Zero) {
-			minNotional = decimal.NewFromFloat(5.0)
-		}
-		minQty := filter.MinQty
-		remQty := pos.Qty.Sub(closeQty)
-		splitPossible := closeQty.GreaterThan(decimal.Zero) &&
-			closeQty.LessThan(pos.Qty) &&
-			(minQty.IsZero() || (closeQty.GreaterThanOrEqual(minQty) && remQty.GreaterThanOrEqual(minQty))) &&
-			closeQty.Mul(pos.TP1Price).GreaterThanOrEqual(minNotional) &&
-			remQty.Mul(pos.TP1Price).GreaterThanOrEqual(minNotional)
-
-		if splitPossible {
-			s.recordClosedTradeLocked(pos, closeQty, pos.TP1Price, "PARTIAL_TAKE_PROFIT", c.CloseTime, int(barIndex-pos.OpenBarIndex))
-			pos.Qty = remQty
+		splitPlan := protection.PlanPartialTP1Split(pos.InitialQty, pos.Qty, decimal.Zero, pos.TP1Price, s.Cfg.PartialTP1Ratio, filter)
+		if splitPlan.SplitPossible {
+			s.recordClosedTradeLocked(pos, splitPlan.CloseQty, pos.TP1Price, "PARTIAL_TAKE_PROFIT", c.CloseTime, int(barIndex-pos.OpenBarIndex))
+			pos.Qty = splitPlan.RemainingQty
 			pos.IsTP1Hit = true
 
 			// Geser SL ke Break-Even (+ Runner Cushion jika ada) via Unified Protection Engine
@@ -751,81 +750,35 @@ func (s *SimBroker) newSimPositionLocked(
 	}
 }
 
-func (s *SimBroker) tryRepegPendingLocked(pending *SimPendingOrder, openDec decimal.Decimal, filter model.ExchangeFilter) (model.OrderIntent, bool) {
-	orig := pending.OrigLimitPrice
-	if orig.LessThanOrEqual(decimal.Zero) {
-		orig = pending.Intent.LimitPrice
+func resolveSimRepegSettings(maxAttempts int, maxDriftPct float64) (int, float64) {
+	if maxAttempts <= 0 {
+		if maxDriftPct <= 0 {
+			maxDriftPct = protection.DefaultMaxEntryRepegDriftPct
+		}
+		return 0, maxDriftPct
 	}
-	maxDrift := s.Cfg.MaxEntryRepegDriftPct
-	if maxDrift <= 0 {
-		maxDrift = 0.0005
-	}
+	return protection.ResolveEntryRepegSettings(maxAttempts, maxDriftPct)
+}
 
-	target := openDec
-	tick := filter.TickSize
-	if tick.GreaterThan(decimal.Zero) {
-		roundUp := pending.Intent.Side == model.SideShort
-		if q, err := model.QuantizePrice(openDec, tick, roundUp); err == nil && q.GreaterThan(decimal.Zero) {
-			if pending.Intent.Side == model.SideLong {
-				// Place resting maker bid strictly below open to preserve GTX post-only semantics.
-				if q.GreaterThanOrEqual(openDec) {
-					q = q.Sub(tick)
-				}
-			} else {
-				if q.LessThanOrEqual(openDec) {
-					q = q.Add(tick)
-				}
-			}
-			if q.GreaterThan(decimal.Zero) {
-				target = q
-			}
+func syntheticBarOpenBBO(side model.Side, openDec, tick decimal.Decimal) (float64, float64) {
+	spreadStep := tick
+	if spreadStep.LessThanOrEqual(decimal.Zero) {
+		spreadStep = openDec.Mul(decimal.NewFromFloat(0.0001))
+	}
+	var bidDec, askDec decimal.Decimal
+	if side == model.SideLong {
+		askDec = openDec
+		bidDec = openDec.Sub(spreadStep)
+		if bidDec.LessThanOrEqual(decimal.Zero) {
+			bidDec = openDec
 		}
+	} else {
+		bidDec = openDec
+		askDec = openDec.Add(spreadStep)
 	}
-
-	diff := target.Sub(orig).Abs()
-	maxDist := orig.Mul(decimal.NewFromFloat(maxDrift))
-	if filter.TickSize.GreaterThan(decimal.Zero) {
-		minTick := filter.TickSize.Mul(decimal.NewFromFloat(1.5))
-		if minTick.GreaterThan(maxDist) {
-			maxDist = minTick
-		}
-	}
-	if diff.GreaterThan(maxDist) {
-		return pending.Intent, false
-	}
-	if pending.Intent.ATRAtEntry.GreaterThan(decimal.Zero) && diff.GreaterThan(pending.Intent.ATRAtEntry.Mul(decimal.NewFromFloat(0.25))) {
-		return pending.Intent, false
-	}
-
-	delta := target.Sub(pending.Intent.LimitPrice)
-	updated := pending.Intent
-	updated.LimitPrice = target
-	isShort := updated.Side == model.SideShort
-	if updated.SLPrice.GreaterThan(decimal.Zero) {
-		if q, err := model.QuantizePrice(updated.SLPrice.Add(delta), filter.TickSize, isShort); err == nil {
-			updated.SLPrice = q
-		} else {
-			updated.SLPrice = updated.SLPrice.Add(delta)
-		}
-	}
-	if updated.TPPrice.GreaterThan(decimal.Zero) {
-		if q, err := model.QuantizePrice(updated.TPPrice.Add(delta), filter.TickSize, !isShort); err == nil {
-			updated.TPPrice = q
-		} else {
-			updated.TPPrice = updated.TPPrice.Add(delta)
-		}
-	}
-	if updated.TP1Price.GreaterThan(decimal.Zero) {
-		if q, err := model.QuantizePrice(updated.TP1Price.Add(delta), filter.TickSize, !isShort); err == nil {
-			updated.TP1Price = q
-		} else {
-			updated.TP1Price = updated.TP1Price.Add(delta)
-		}
-	}
-	if filter.MinNotional.GreaterThan(decimal.Zero) && updated.Qty.Mul(updated.LimitPrice).LessThan(filter.MinNotional) {
-		return pending.Intent, false
-	}
-	return updated, true
+	bidF, _ := bidDec.Float64()
+	askF, _ := askDec.Float64()
+	return bidF, askF
 }
 
 func (pos *SimPosition) toSnapshot(tickSize decimal.Decimal) protection.PositionSnapshot {

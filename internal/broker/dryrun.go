@@ -47,6 +47,8 @@ type VirtualOpenPosition struct {
 	MaxMAE           float64
 	MaxMFE           float64
 	PeakPrice        decimal.Decimal
+	FundingPaid      decimal.Decimal
+	LastFundingEpoch int64
 }
 
 type DryRunConfig struct {
@@ -74,6 +76,7 @@ type DryRunConfig struct {
 	MakerFeeRate             float64
 	TakerFeeRate             float64
 	SlippageRate             float64
+	SLGapFillEnabled         bool
 	EntryOrderType           string
 	MaxEntryRepegAttempts    int
 	MaxEntryRepegDriftPct    float64
@@ -137,13 +140,22 @@ type DryRunBroker struct {
 
 	eventChan        chan PositionEvent
 	eventWg          sync.WaitGroup
+	asyncWg          sync.WaitGroup
 	eventMu          sync.Mutex
 	isClosed         bool
 	lastPeriodicSync time.Time
 }
 
+func (d *DryRunBroker) goAsync(fn func()) {
+	d.asyncWg.Add(1)
+	go func() {
+		defer d.asyncWg.Done()
+		fn()
+	}()
+}
+
 // RestoreOpenPosition memulihkan posisi virtual dari database ke memory saat startup
-// dan menyesuaikan saldo realized equity dengan entryFee posisi agar akuntansi presisi
+// dan menyesuaikan saldo realized equity dengan entryFee serta funding posisi agar akuntansi presisi
 func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
@@ -153,8 +165,11 @@ func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 	if pos.PeakPrice.IsZero() {
 		pos.PeakPrice = pos.EntryPrice
 	}
+	if pos.LastFundingEpoch == 0 && !pos.OpenTime.IsZero() {
+		pos.LastFundingEpoch = pos.OpenTime.UTC().Unix() / 28800
+	}
 	if _, exists := d.OpenPositions[pos.Symbol]; !exists {
-		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(pos.EntryFee)
+		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(pos.EntryFee).Sub(pos.FundingPaid)
 	}
 	d.OpenPositions[pos.Symbol] = pos
 }
@@ -189,6 +204,8 @@ func (d *DryRunBroker) dispatchPositionEvent(evt PositionEvent) {
 }
 
 func (d *DryRunBroker) Close() {
+	d.asyncWg.Wait()
+
 	d.eventMu.Lock()
 	if d.isClosed {
 		d.eventMu.Unlock()
@@ -208,10 +225,10 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 		cfg.MaxSlots = 3
 	}
 	if cfg.MaxDailyDrawdownPct == 0 {
-		cfg.MaxDailyDrawdownPct = -0.03
+		cfg.MaxDailyDrawdownPct = -0.05
 	}
 	if cfg.AccountLeverage <= 0 {
-		cfg.AccountLeverage = 5.0
+		cfg.AccountLeverage = 8.0
 	}
 	if cfg.BreakEvenTriggerATR <= 0 {
 		cfg.BreakEvenTriggerATR = 1.15
@@ -223,7 +240,7 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 		cfg.LimitOrderTimeout = defaultLimitOrderTimeout
 	}
 	if cfg.MaxHoldingDuration <= 0 {
-		cfg.MaxHoldingDuration = 8 * time.Hour
+		cfg.MaxHoldingDuration = 4 * time.Hour
 	}
 	if cfg.MaxMarkStaleness <= 0 {
 		cfg.MaxMarkStaleness = 15 * time.Second
@@ -341,6 +358,7 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			IsBreakEvenMoved: false,
 			SignalAuditID:    intent.SignalAuditID,
 			PeakPrice:        fillPrice,
+			LastFundingEpoch: now.UTC().Unix() / 28800,
 		}
 		d.OpenPositions[intent.Symbol] = pos
 
@@ -599,49 +617,6 @@ func (d *DryRunBroker) OnRealtimeTick(
 			}
 		}
 
-		trailActivateATR := d.Cfg.TrailingActivateATR
-		if trailActivateATR <= 0 {
-			trailActivateATR = 2.00
-		}
-		trailDistATR := d.Cfg.TrailingDistanceATR
-		if trailDistATR <= 0 {
-			trailDistATR = 0.80
-		}
-
-		t1LongTriggerATR := d.Cfg.Tier1BETriggerLongATR
-		if t1LongTriggerATR <= 0 {
-			t1LongTriggerATR = d.Cfg.BreakEvenTriggerATR
-		}
-		if t1LongTriggerATR <= 0 {
-			t1LongTriggerATR = 0.70
-		}
-
-		t1ShortTriggerATR := d.Cfg.Tier1BETriggerShortATR
-		if t1ShortTriggerATR <= 0 {
-			t1ShortTriggerATR = d.Cfg.BreakEvenTriggerATR
-		}
-		if t1ShortTriggerATR <= 0 {
-			t1ShortTriggerATR = 0.90
-		}
-
-		t2TriggerATR := d.Cfg.Tier2ProfitLockATR
-		if t2TriggerATR <= 0 {
-			t2TriggerATR = 1.80
-		}
-
-		t2OffsetATR := d.Cfg.Tier2ProfitLockOffsetATR
-		if t2OffsetATR <= 0 {
-			t2OffsetATR = 0.90
-		}
-
-		beOffsetRate := decimal.NewFromFloat(math.Max(d.Cfg.MinBreakEvenOffsetPct, 2.0*d.Cfg.TakerFeeRate+d.Cfg.SlippageRate))
-
-		if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
-			closedRecs = append(closedRecs, d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
-			delete(d.PendingOrders, symbol)
-			return
-		}
-
 		chartPriceDec := decimal.Zero
 		if tradePrice > 0 {
 			chartPriceDec = decimal.NewFromFloat(tradePrice)
@@ -651,73 +626,61 @@ func (d *DryRunBroker) OnRealtimeTick(
 			chartPriceDec = decimal.NewFromFloat(bestAsk)
 		}
 
+		slTouched := false
+		tp1Touched := false
+		tpFullTouched := false
 		if pos.Side == model.SideLong {
-			isTPHit := triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) ||
-				(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
-			if isTPHit && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
-				closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
-				delete(d.PendingOrders, symbol)
-				return
-			}
-
-			if triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice) {
-				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
-				exitReason := "STOP_LOSS"
-				if pos.ProtectionTier == 3 {
-					exitReason = "TRAILING_STOP"
-				} else if pos.ProtectionTier == 2 {
-					exitReason = "PROFIT_LOCK"
-				} else if pos.IsBreakEvenMoved {
-					exitReason = "BREAK_EVEN"
-				}
-				closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason))
-				delete(d.PendingOrders, symbol)
-				return
-			}
-
-			// Partial Take Profit (Scale-Out Phase 2) - Eksekusi Maker Limit
-			if d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
-				isTP1Hit := triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) ||
-					(!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price))
-				if isTP1Hit {
-					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.MakerFeeRate, beOffsetRate)
-				}
-			}
+			slTouched = triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice)
+			tp1Touched = triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price))
+			tpFullTouched = triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice))
 		} else {
-			isTPHit := triggerRefPrice.LessThanOrEqual(pos.TPPrice) ||
-				(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
-			if isTPHit && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
-				closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
-				delete(d.PendingOrders, symbol)
-				return
-			}
-
-			if triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice) {
-				exitPrice := pos.CurrentSLPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
-				exitReason := "STOP_LOSS"
-				if pos.ProtectionTier == 3 {
-					exitReason = "TRAILING_STOP"
-				} else if pos.ProtectionTier == 2 {
-					exitReason = "PROFIT_LOCK"
-				} else if pos.IsBreakEvenMoved {
-					exitReason = "BREAK_EVEN"
-				}
-				closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason))
-				delete(d.PendingOrders, symbol)
-				return
-			}
-
-			// Partial Take Profit (Scale-Out Phase 2) - Eksekusi Maker Limit
-			if d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
-				isTP1Hit := triggerRefPrice.LessThanOrEqual(pos.TP1Price) ||
-					(!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price))
-				if isTP1Hit {
-					d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.MakerFeeRate, beOffsetRate)
-				}
-			}
+			slTouched = triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice)
+			tp1Touched = triggerRefPrice.LessThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price))
+			tpFullTouched = triggerRefPrice.LessThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice))
 		}
 
-		// Unified Position Protection Engine (Tier 1 Early BE, Tier 2 Profit Lock, Tier 3 Trailing Ratchet)
+		// 1. Stop Loss FIRST (pessimistic intrabar conflict parity with SimBroker, plus SL Gap-Fill support)
+		if slTouched {
+			baseSL := pos.CurrentSLPrice
+			if d.Cfg.SLGapFillEnabled {
+				if pos.Side == model.SideLong && triggerRefPrice.LessThan(baseSL) {
+					baseSL = triggerRefPrice
+				} else if pos.Side == model.SideShort && triggerRefPrice.GreaterThan(baseSL) {
+					baseSL = triggerRefPrice
+				}
+			}
+			var exitPrice decimal.Decimal
+			if pos.Side == model.SideLong {
+				exitPrice = baseSL.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
+			} else {
+				exitPrice = baseSL.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
+			}
+			exitReason := "STOP_LOSS"
+			if pos.ProtectionTier == 3 {
+				exitReason = "TRAILING_STOP"
+			} else if pos.ProtectionTier == 2 {
+				exitReason = "PROFIT_LOCK"
+			} else if pos.IsBreakEvenMoved {
+				exitReason = "BREAK_EVEN"
+			}
+			closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, exitReason))
+			delete(d.PendingOrders, symbol)
+			return
+		}
+
+		// 2. Partial Take Profit (Scale-Out) - Maker Limit execution
+		if tp1Touched && d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
+			d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.MakerFeeRate)
+		}
+
+		// 3. Full Take Profit
+		if tpFullTouched && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
+			closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
+			delete(d.PendingOrders, symbol)
+			return
+		}
+
+		// 4. Unified Position Protection Engine (Tier 1 Early BE, Tier 2 Profit Lock, Tier 3 Trailing Ratchet)
 		var tickSize decimal.Decimal
 		if d.GetExchangeFilterFn != nil {
 			if f, ok := d.GetExchangeFilterFn(symbol); ok {
@@ -737,7 +700,62 @@ func (d *DryRunBroker) OnRealtimeTick(
 				"symbol", symbol, "tier", protDec.NewTier, "reason", protDec.TriggerReason,
 				"newSL", protDec.NewSLPrice, "peakPrice", pos.PeakPrice, "triggerPrice", triggerRefPrice)
 		}
+
+		// 5. Time-Stop Max Holding (termasuk SlippageRate agar paritas dengan market close & SimBroker)
+		if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
+			exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
+			closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
+			delete(d.PendingOrders, symbol)
+			return
+		}
 	}
+}
+
+func (d *DryRunBroker) applyMarketExitSlippage(side model.Side, refPrice decimal.Decimal) decimal.Decimal {
+	if d.Cfg.SlippageRate <= 0 {
+		return refPrice
+	}
+	if side == model.SideLong {
+		return refPrice.Mul(decimal.NewFromFloat(1.0 - d.Cfg.SlippageRate))
+	}
+	return refPrice.Mul(decimal.NewFromFloat(1.0 + d.Cfg.SlippageRate))
+}
+
+// ApplyFundingTick memproses settlement biaya pendanaan tiap batas 8 jam UTC (00:00, 08:00, 16:00).
+func (d *DryRunBroker) ApplyFundingTick(symbol string, markPrice, fundingRate float64, now time.Time) {
+	if markPrice <= 0 || math.IsNaN(markPrice) || math.IsNaN(fundingRate) || math.IsInf(fundingRate, 0) {
+		return
+	}
+	currEpoch := now.UTC().Unix() / 28800
+
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+
+	pos, exists := d.OpenPositions[symbol]
+	if !exists || pos == nil || pos.Qty.LessThanOrEqual(decimal.Zero) {
+		return
+	}
+	if pos.LastFundingEpoch == 0 {
+		pos.LastFundingEpoch = currEpoch
+		return
+	}
+	if currEpoch <= pos.LastFundingEpoch {
+		return
+	}
+
+	fundingFee := pos.Qty.Mul(decimal.NewFromFloat(markPrice)).Mul(decimal.NewFromFloat(fundingRate))
+	if pos.Side == model.SideLong {
+		pos.FundingPaid = pos.FundingPaid.Add(fundingFee)
+		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(fundingFee)
+	} else {
+		pos.FundingPaid = pos.FundingPaid.Sub(fundingFee)
+		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Add(fundingFee)
+	}
+	pos.LastFundingEpoch = currEpoch
+	d.enqueuePositionEvent(PositionEvent{
+		Type: PositionEventSave,
+		Pos:  *pos,
+	})
 }
 
 func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOrder, fillChunk, chunkFee decimal.Decimal, now time.Time) {
@@ -771,6 +789,7 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 			IsBreakEvenMoved: false,
 			SignalAuditID:    ord.Intent.SignalAuditID,
 			PeakPrice:        ord.Intent.LimitPrice,
+			LastFundingEpoch: now.UTC().Unix() / 28800,
 		}
 		d.OpenPositions[ord.Intent.Symbol] = pos
 	} else {
@@ -786,61 +805,23 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 	})
 }
 
-func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64, beOffsetRate decimal.Decimal) {
+func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPrice decimal.Decimal, feeRate float64) {
 	// Batalkan antrean pending entry yang masih tersisa agar tidak terisi setelah TP1 milestone tercapai
 	if pending, exists := d.PendingOrders[pos.Symbol]; exists {
 		slog.Info("dryrun: canceling remaining pending entry order upon TP1 hit", "symbol", pos.Symbol, "clientOrderID", pending.Intent.ClientOrderID)
 		delete(d.PendingOrders, pos.Symbol)
 	}
 
-	ratio := d.Cfg.PartialTP1Ratio
-	if ratio <= 0.05 || ratio >= 0.95 {
-		ratio = 0.50
-	}
-	initialQty := pos.InitialQty
-	if initialQty.IsZero() {
-		initialQty = pos.Qty
-	}
-	closeQty := initialQty.Mul(decimal.NewFromFloat(ratio))
+	var ef model.ExchangeFilter
 	if d.GetExchangeFilterFn != nil {
-		if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok && f.StepSize.GreaterThan(decimal.Zero) {
-			if qQty, err := model.QuantizeQtyFloor(closeQty, f.StepSize); err == nil {
-				closeQty = qQty
-			}
-		}
+		ef, _ = d.GetExchangeFilterFn(pos.Symbol)
 	}
-
-	// [H-04] Validasi MinNotional dan MinQty agar paritas dengan batas eksekusi bursa
-	splitPossible := closeQty.GreaterThan(decimal.Zero) && closeQty.LessThan(pos.Qty)
-	if splitPossible {
-		minNotional := decimal.NewFromFloat(5.0)
-		if d.GetExchangeFilterFn != nil {
-			if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok {
-				if f.MinNotional.GreaterThan(decimal.Zero) {
-					minNotional = f.MinNotional
-				}
-				if f.MinQty.GreaterThan(decimal.Zero) && (closeQty.LessThan(f.MinQty) || pos.Qty.Sub(closeQty).LessThan(f.MinQty)) {
-					splitPossible = false
-				}
-			}
-		}
-		remQty := pos.Qty.Sub(closeQty)
-		if closeQty.Mul(exitPrice).LessThan(minNotional) || remQty.Mul(exitPrice).LessThan(minNotional) {
-			splitPossible = false
-		}
-	}
-
-	if !splitPossible {
+	splitPlan := protection.PlanPartialTP1Split(pos.InitialQty, pos.Qty, decimal.Zero, exitPrice, d.Cfg.PartialTP1Ratio, ef)
+	if !splitPlan.SplitPossible {
 		// Ukuran posisi terlalu kecil untuk dipecah (atau MinNotional < 5 USDT).
 		// Anggap TP1 milestone tercapai: tandai IsTP1Hit, geser SL ke BE, biarkan 100% posisi berjalan sebagai runner.
 		pos.IsTP1Hit = true
-		var tickSize decimal.Decimal
-		if d.GetExchangeFilterFn != nil {
-			if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok {
-				tickSize = f.TickSize
-			}
-		}
-		newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(tickSize), d.toProtectionConfig())
+		newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(ef.TickSize), d.toProtectionConfig())
 		if pos.Side == model.SideLong {
 			if newSL.GreaterThan(pos.CurrentSLPrice) {
 				pos.CurrentSLPrice = newSL
@@ -862,6 +843,7 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		})
 		return
 	}
+	closeQty := splitPlan.CloseQty
 
 	var grossPnL decimal.Decimal
 	if pos.Side == model.SideLong {
@@ -876,21 +858,22 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		initQty = pos.Qty
 	}
 	entryFeePortion := pos.EntryFee.Mul(closeQty).Div(initQty)
-	netPnL := grossPnL.Sub(entryFeePortion).Sub(exitFee)
 
-	// Saldo akun saat entry sudah didebet pos.EntryFee, maka penambahan saat exit adalah: grossPnL - exitFee
+	var fundingLeg decimal.Decimal
+	if pos.Qty.GreaterThan(decimal.Zero) && !pos.FundingPaid.IsZero() {
+		fundingLeg = pos.FundingPaid.Mul(closeQty).Div(pos.Qty)
+	}
+	pos.FundingPaid = pos.FundingPaid.Sub(fundingLeg)
+
+	netPnL := grossPnL.Sub(entryFeePortion).Sub(exitFee).Sub(fundingLeg)
+
+	// Saldo akun saat entry sudah didebet pos.EntryFee (dan funding saat epoch), maka penambahan saat exit adalah: grossPnL - exitFee
 	d.RealizedEquityUSDT = d.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
 	pos.Qty = pos.Qty.Sub(closeQty)
 	pos.IsTP1Hit = true
 
 	// Pindahkan SL ke Break-Even via Unified Protection Engine
-	var tickSize decimal.Decimal
-	if d.GetExchangeFilterFn != nil {
-		if f, ok := d.GetExchangeFilterFn(pos.Symbol); ok {
-			tickSize = f.TickSize
-		}
-	}
-	newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(tickSize), d.toProtectionConfig())
+	newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(ef.TickSize), d.toProtectionConfig())
 	if pos.Side == model.SideLong {
 		if newSL.GreaterThan(pos.CurrentSLPrice) {
 			pos.CurrentSLPrice = newSL
@@ -936,7 +919,8 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 			ClosedAt:      now,
 			SignalAuditID: pos.SignalAuditID,
 		}
-		go d.OnTradeClosedFn(tradeRec)
+		cb := d.OnTradeClosedFn
+		d.goAsync(func() { cb(tradeRec) })
 	}
 
 	slog.Info("dryrun: TP1 Partial Take Profit filled",
@@ -962,9 +946,12 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	if !pos.InitialQty.IsZero() && pos.InitialQty.GreaterThan(pos.Qty) {
 		entryFeePortion = pos.EntryFee.Mul(pos.Qty).Div(pos.InitialQty)
 	}
-	// Round-Trip True Net PnL = Gross PnL - Entry Fee - Exit Fee
-	netPnL := grossPnL.Sub(entryFeePortion).Sub(exitFee)
-	// Saldo akun saat entry sudah didebet pos.EntryFee, maka penambahan saat exit adalah: grossPnL - exitFee
+	fundingLeg := pos.FundingPaid
+	pos.FundingPaid = decimal.Zero
+
+	// Round-Trip True Net PnL = Gross PnL - Entry Fee - Exit Fee - Funding Paid
+	netPnL := grossPnL.Sub(entryFeePortion).Sub(exitFee).Sub(fundingLeg)
+	// Saldo akun saat entry sudah didebet pos.EntryFee (dan funding saat epoch), maka penambahan saat exit adalah: grossPnL - exitFee
 	d.RealizedEquityUSDT = d.RealizedEquityUSDT.Add(grossPnL.Sub(exitFee))
 
 	now := time.Now().UTC()
@@ -1005,7 +992,8 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	})
 
 	if d.OnTradeClosedFn != nil {
-		go d.OnTradeClosedFn(rec)
+		cb := d.OnTradeClosedFn
+		d.goAsync(func() { cb(rec) })
 	}
 	return rec
 }
@@ -1038,14 +1026,14 @@ func (d *DryRunBroker) GetRealizedEquityUSDT() decimal.Decimal {
 }
 
 // GetPureRealizedEquityClosedTradesUSDT mengembalikan realized equity murni dari seluruh trade yang telah ditutup
-// (RealizedEquityUSDT ditambah kembali seluruh entry fee dari posisi yang masih terbuka) agar tidak terjadi
-// double-deduction fee atau distorsi floating PnL saat state dipulihkan setelah restart.
+// (RealizedEquityUSDT ditambah kembali entry fee dan funding posisi terbuka) agar tidak terjadi
+// double-deduction saat state dipulihkan setelah restart.
 func (d *DryRunBroker) GetPureRealizedEquityClosedTradesUSDT() decimal.Decimal {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
 	pure := d.RealizedEquityUSDT
 	for _, pos := range d.OpenPositions {
-		pure = pure.Add(pos.EntryFee)
+		pure = pure.Add(pos.EntryFee).Add(pos.FundingPaid)
 	}
 	return pure
 }
@@ -1171,7 +1159,8 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 			if now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
 				triggerRefPrice := pos.LastMarkPrice
 				if triggerRefPrice.GreaterThan(decimal.Zero) {
-					closedRecs = append(closedRecs, d.closePositionLocked(pos, triggerRefPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
+					exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
+					closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
 					delete(d.PendingOrders, sym)
 				}
 			}

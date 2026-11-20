@@ -62,16 +62,21 @@ type CommonOptions struct {
 // RunOptions configures a single full backtest run (optionally with knockout/override flags).
 type RunOptions struct {
 	CommonOptions
-	RandomSeed          int64
-	RandomProb          float64
-	KnockoutDelta       bool
-	KnockoutBTC         bool
-	KnockoutRVOL        bool
-	KnockoutNATR        bool
-	BTCGateShortOnly    bool
-	Tier1EarlyBE        bool
-	SLGapFill           bool
-	DeductPendingMargin bool
+	RandomSeed                  int64
+	RandomProb                  float64
+	KnockoutDelta               bool
+	KnockoutBTC                 bool
+	KnockoutRVOL                bool
+	KnockoutNATR                bool
+	BTCGateShortOnly            bool
+	Tier1EarlyBE                bool
+	SLGapFill                   bool
+	DeductPendingMargin         bool
+	OverrideBTCGateShortOnly    *bool
+	OverrideTier1EarlyBE        *bool
+	OverrideSLGapFill           *bool
+	OverrideDeductPendingMargin *bool
+	OverrideCompounding         *bool
 }
 
 // WalkForwardOptions configures rolling Walk-Forward validation.
@@ -422,22 +427,24 @@ func ExecuteStress(ctx context.Context, ds *LoadedDataset, opts StressOptions) (
 // BuildEngineConfigs translates dataset & run flags into aligned EvaluatorConfig, SimBrokerConfig, and ReplayConfig.
 func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorConfig, simbroker.SimBrokerConfig, replay.ReplayConfig) {
 	evalCfg := BuildDefaultEvaluatorConfig(opts.EnvPath)
-	if ds.AppCfg != nil {
-		if ds.AppCfg.Sweep.Enabled {
-			evalCfg.Sweep = strategy.FromAppConfig(ds.AppCfg).Sweep
+	if ds.AppCfg != nil && (opts.EnvPath == "" || ds.AppCfg.Sweep.Enabled || len(ds.AppCfg.BlockedUTCHours) > 0 || ds.AppCfg.BTCChopBlockShort || ds.AppCfg.BTCChopRiskMult != 1.0 || ds.AppCfg.MaxSlots > 0) {
+		appEval := strategy.FromAppConfig(ds.AppCfg)
+		if appEval.Sweep.Enabled {
+			evalCfg.Sweep = appEval.Sweep
 		}
-		if len(ds.AppCfg.BlockedUTCHours) > 0 {
-			evalCfg.BlockedUTCHours = ds.AppCfg.BlockedUTCHours
+		if len(appEval.BlockedUTCHours) > 0 {
+			evalCfg.BlockedUTCHours = appEval.BlockedUTCHours
 		}
-		if ds.AppCfg.BTCChopBlockShort {
+		if appEval.BTCChopBlockShort {
 			evalCfg.BTCChopBlockShort = true
 		}
-		if ds.AppCfg.BTCChopRiskMult > 0 && ds.AppCfg.BTCChopRiskMult < 1.0 {
-			evalCfg.BTCChopRiskMult = ds.AppCfg.BTCChopRiskMult
+		if appEval.BTCChopRiskMult > 0 && appEval.BTCChopRiskMult < 1.0 {
+			evalCfg.BTCChopRiskMult = appEval.BTCChopRiskMult
 		}
-		if ds.AppCfg.MaxSlots > 0 {
-			evalCfg.MaxSlots = ds.AppCfg.MaxSlots
+		if appEval.MaxSlots > 0 {
+			evalCfg.MaxSlots = appEval.MaxSlots
 		}
+		evalCfg.BTCGateShortOnly = appEval.BTCGateShortOnly
 	}
 	evalCfg.CandleDuration = ds.CandleDur
 	evalCfg.DisableOIFilter = ds.OIMode == replay.OIModeOff
@@ -466,19 +473,29 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		evalCfg.MinNATRLongPct = 0.0
 		evalCfg.MaxNATRPct = 999.0
 	}
-	evalCfg.BTCGateShortOnly = opts.BTCGateShortOnly
+	if opts.OverrideBTCGateShortOnly != nil {
+		evalCfg.BTCGateShortOnly = *opts.OverrideBTCGateShortOnly
+	} else if ds.AppCfg == nil && opts.BTCGateShortOnly {
+		evalCfg.BTCGateShortOnly = true
+	}
 
 	brokerCfg := BuildSimBrokerConfig(opts.EnvPath, ds.InitialEquity)
 	if ds.AppCfg != nil && ds.AppCfg.MaxSlots > 0 {
 		brokerCfg.MaxSlots = ds.AppCfg.MaxSlots
 	}
-	if opts.Compounding || (ds.AppCfg != nil && ds.AppCfg.EquityModeCompounding) {
+	if opts.OverrideCompounding != nil {
+		brokerCfg.EquityModeCompounding = *opts.OverrideCompounding
+	} else if opts.Compounding || (ds.AppCfg != nil && ds.AppCfg.EquityModeCompounding) {
 		brokerCfg.EquityModeCompounding = true
 	}
-	if opts.Tier1EarlyBE {
+	if opts.OverrideTier1EarlyBE != nil {
+		brokerCfg.Tier1BEEnabled = *opts.OverrideTier1EarlyBE
+	} else if opts.Tier1EarlyBE {
 		brokerCfg.Tier1BEEnabled = true
 	}
-	if opts.SLGapFill || (ds.AppCfg != nil && ds.AppCfg.SLGapFillEnabled) {
+	if opts.OverrideSLGapFill != nil {
+		brokerCfg.SLGapFillEnabled = *opts.OverrideSLGapFill
+	} else if opts.SLGapFill || (ds.AppCfg != nil && ds.AppCfg.SLGapFillEnabled) {
 		brokerCfg.SLGapFillEnabled = true
 	}
 	if opts.Unconstrained {
@@ -499,6 +516,11 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		scanInterval = ds.AppCfg.ScannerInterval
 	}
 
+	deductPending := opts.DeductPendingMargin || (ds.AppCfg != nil && ds.AppCfg.DeductPendingMargin)
+	if opts.OverrideDeductPendingMargin != nil {
+		deductPending = *opts.OverrideDeductPendingMargin
+	}
+
 	replayCfg := replay.ReplayConfig{
 		WarmupBars:            warmup,
 		SpreadPct:             evalCfg.MaxSpreadPct,
@@ -512,7 +534,7 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		ScannerInterval:       scanInterval,
 		ScannerCfg:            ds.ScannerCfg,
 		UnconstrainedMode:     opts.Unconstrained,
-		DeductPendingMargin:   opts.DeductPendingMargin || (ds.AppCfg != nil && ds.AppCfg.DeductPendingMargin),
+		DeductPendingMargin:   deductPending,
 		EquityModeCompounding: brokerCfg.EquityModeCompounding,
 	}
 	return evalCfg, brokerCfg, replayCfg
@@ -976,6 +998,7 @@ func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 			Tier1BEEnabled:           true,
 			Tier1BETriggerLongATR:    0.70,
 			Tier1BETriggerShortATR:   0.90,
+			MinBreakEvenOffsetPct:    0.0010,
 			Tier2ProfitLockATR:       1.55,
 			Tier2ProfitLockOffsetATR: 0.75,
 			TrailingEnabled:          true,
@@ -1062,6 +1085,7 @@ func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 		Tier1BEEnabled:           cfg.Tier1BEEnabled,
 		Tier1BETriggerLongATR:    cfg.Tier1BETriggerLongATR,
 		Tier1BETriggerShortATR:   cfg.Tier1BETriggerShortATR,
+		MinBreakEvenOffsetPct:    0.0010,
 		Tier2ProfitLockEnabled:   cfg.Tier2ProfitLockEnabled,
 		Tier2ProfitLockATR:       cfg.Tier2ProfitLockATR,
 		Tier2ProfitLockOffsetATR: cfg.Tier2ProfitLockOffsetATR,

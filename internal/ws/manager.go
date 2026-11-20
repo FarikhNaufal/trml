@@ -21,14 +21,16 @@ import (
 )
 
 type EventHandlers struct {
-	OnBookTicker       func(symbol string, bestBid, bestAsk float64, now time.Time)
-	OnAggTrade         func(symbol string, price, qty float64, isBuyerMaker bool, now time.Time)
-	OnMarkPrice        func(symbol string, markPrice, fundingRate float64, now time.Time)
-	OnKline5m          func(symbol string, candle model.Candle, isClosed bool)
-	OnKlineClosed      func(symbol string, candle model.Candle, isClosed bool)
-	OnOrderTradeUpdate func(clientOrderID string, exchangeOrderID int64, symbol string, status model.OrderLifecycleStatus, cumFilledQty, avgPrice, realizedProfit decimal.Decimal)
-	OnAccountUpdate    func(walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, eventTime time.Time)
-	OnListenKeyExpired func()
+	OnBookTicker               func(symbol string, bestBid, bestAsk float64, now time.Time)
+	OnAggTrade                 func(symbol string, price, qty float64, isBuyerMaker bool, now time.Time)
+	OnMarkPrice                func(symbol string, markPrice, fundingRate float64, now time.Time)
+	OnKline5m                  func(symbol string, candle model.Candle, isClosed bool)
+	OnKlineClosed              func(symbol string, candle model.Candle, isClosed bool)
+	OnOrderTradeUpdate         func(clientOrderID string, exchangeOrderID int64, symbol string, status model.OrderLifecycleStatus, cumFilledQty, avgPrice, realizedProfit decimal.Decimal)
+	OnOrderTradeUpdateDetailed func(evt model.OrderTradeUpdateEvent)
+	OnAccountUpdate            func(walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, eventTime time.Time)
+	OnAccountUpdateEvent       func(evt model.AccountUpdateEvent)
+	OnListenKeyExpired         func()
 }
 
 type StreamManager struct {
@@ -737,22 +739,31 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 				ExchangeOrderID int64  `json:"i"`
 				Status          string `json:"X"`
 				CumFilledQty    string `json:"z"`
+				LastFilledQty   string `json:"l"`
 				AvgPrice        string `json:"ap"`
 				LastPrice       string `json:"L"`
 				RealizedProfit  string `json:"rp"`
+				Commission      string `json:"n"`
+				CommissionAsset string `json:"N"`
+				IsMaker         bool   `json:"m"`
 			} `json:"o"`
 		}
-		if err := sonic.Unmarshal(payload, &otu); err == nil && m.Handlers.OnOrderTradeUpdate != nil {
+		if err := sonic.Unmarshal(payload, &otu); err == nil && (m.Handlers.OnOrderTradeUpdate != nil || m.Handlers.OnOrderTradeUpdateDetailed != nil) {
 			cumQty, err := decimal.NewFromString(otu.Order.CumFilledQty)
 			if err != nil {
 				slog.Error("ws: failed to parse cumFilledQty in ORDER_TRADE_UPDATE", "raw", otu.Order.CumFilledQty, "err", err)
 				cumQty = decimal.Zero
+			}
+			lastQty, err := decimal.NewFromString(otu.Order.LastFilledQty)
+			if err != nil {
+				lastQty = decimal.Zero
 			}
 			avgPrice, err := decimal.NewFromString(otu.Order.AvgPrice)
 			if err != nil || avgPrice.IsZero() {
 				avgPrice, _ = decimal.NewFromString(otu.Order.LastPrice)
 			}
 			realizedProfit, _ := decimal.NewFromString(otu.Order.RealizedProfit)
+			commission, _ := decimal.NewFromString(otu.Order.Commission)
 
 			var status model.OrderLifecycleStatus
 			switch otu.Order.Status {
@@ -771,7 +782,25 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 			default:
 				status = model.OrderLifecycleStatus(otu.Order.Status)
 			}
-			m.Handlers.OnOrderTradeUpdate(otu.Order.ClientOrderID, otu.Order.ExchangeOrderID, otu.Order.Symbol, status, cumQty, avgPrice, realizedProfit)
+			if m.Handlers.OnOrderTradeUpdateDetailed != nil {
+				m.Handlers.OnOrderTradeUpdateDetailed(model.OrderTradeUpdateEvent{
+					ClientOrderID:   otu.Order.ClientOrderID,
+					ExchangeOrderID: otu.Order.ExchangeOrderID,
+					Symbol:          otu.Order.Symbol,
+					Status:          status,
+					CumFilledQty:    cumQty,
+					LastFilledQty:   lastQty,
+					AvgPrice:        avgPrice,
+					RealizedProfit:  realizedProfit,
+					Commission:      commission,
+					CommissionAsset: otu.Order.CommissionAsset,
+					IsMaker:         otu.Order.IsMaker,
+					HasFillMeta:     true,
+				})
+			}
+			if m.Handlers.OnOrderTradeUpdate != nil {
+				m.Handlers.OnOrderTradeUpdate(otu.Order.ClientOrderID, otu.Order.ExchangeOrderID, otu.Order.Symbol, status, cumQty, avgPrice, realizedProfit)
+			}
 		}
 
 	case "ACCOUNT_UPDATE":
@@ -790,8 +819,8 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 				} `json:"P"`
 			} `json:"a"`
 		}
-		if err := sonic.Unmarshal(payload, &au); err == nil && m.Handlers.OnAccountUpdate != nil {
-			var walletBal, unRealizedTotal, availBal decimal.Decimal
+		if err := sonic.Unmarshal(payload, &au); err == nil && (m.Handlers.OnAccountUpdate != nil || m.Handlers.OnAccountUpdateEvent != nil) {
+			var walletBal, unRealizedTotal, crossWallet decimal.Decimal
 			positions := make(map[string]model.LivePosition)
 
 			for _, b := range au.Account.Balances {
@@ -800,7 +829,7 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 						walletBal = wb
 					}
 					if cw, err := decimal.NewFromString(b.CrossWallet); err == nil {
-						availBal = cw
+						crossWallet = cw
 					}
 				}
 			}
@@ -828,7 +857,19 @@ func (m *StreamManager) ProcessMessage(msg []byte) {
 
 			// Gunakan timestamp penerimaan lokal UTC agar tidak terjadi false stale rejection akibat clock skew jam bursa vs jam lokal
 			eventTime := time.Now().UTC()
-			m.Handlers.OnAccountUpdate(walletBal, unRealizedTotal, availBal, positions, eventTime)
+			if m.Handlers.OnAccountUpdateEvent != nil {
+				m.Handlers.OnAccountUpdateEvent(model.AccountUpdateEvent{
+					WalletBalance:  walletBal,
+					CrossWallet:    crossWallet,
+					UnrealizedPnL:  unRealizedTotal,
+					Positions:      positions,
+					EventTime:      eventTime,
+					IsFullSnapshot: false,
+				})
+			}
+			if m.Handlers.OnAccountUpdate != nil {
+				m.Handlers.OnAccountUpdate(walletBal, unRealizedTotal, crossWallet, positions, eventTime)
+			}
 		}
 
 	case "listenKeyExpired":

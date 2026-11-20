@@ -35,6 +35,8 @@ type StoredDryRunPosition struct {
 	MaxMAE           float64
 	MaxMFE           float64
 	PeakPrice        decimal.Decimal
+	FundingPaid      decimal.Decimal
+	LastFundingEpoch int64
 }
 
 type StoredLivePosition struct {
@@ -73,6 +75,9 @@ type Repository interface {
 	SaveDailyState(ctx context.Context, epochDay int64, sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool) error
 	GetDailyState(ctx context.Context, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
 	GetLatestDailyState(ctx context.Context) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error)
+	SaveDailyStateForMode(ctx context.Context, mode string, epochDay int64, sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool) error
+	GetDailyStateForMode(ctx context.Context, mode string, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
+	GetLatestDailyStateForMode(ctx context.Context, mode string) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error)
 	LogTrade(ctx context.Context, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64, strategyID ...string) error
 	LogSignalAudit(ctx context.Context, candleOpenTime time.Time, symbol, side string, closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64, decision, rejectReason, rejectSubReason string, strategyID ...string) (int64, error)
 	PruneOldSignalAuditLogs(ctx context.Context, olderThanDays int) (int64, error)
@@ -195,6 +200,129 @@ func (r *SQLiteRepository) GetLatestDailyState(
 		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: corrupt realized equity: %w", err)
 	}
 
+	return startDec, realDec, breakerInt == 1, epDay, true, nil
+}
+
+func normalizeDailyStateMode(mode string) string {
+	m := strings.ToUpper(strings.TrimSpace(mode))
+	if m == "LIVE" {
+		return "LIVE"
+	}
+	return "DRY_RUN"
+}
+
+func (r *SQLiteRepository) SaveDailyStateForMode(
+	ctx context.Context,
+	mode string,
+	epochDay int64,
+	sessionStartEquity, realizedEquity decimal.Decimal,
+	breakerTripped bool,
+) error {
+	normMode := normalizeDailyStateMode(mode)
+	query := `
+	INSERT INTO account_daily_state_by_mode (
+		mode, epoch_day_utc, session_start_equity, realized_equity, circuit_breaker_hit, updated_at_utc
+	) VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(mode, epoch_day_utc) DO UPDATE SET
+		realized_equity = excluded.realized_equity,
+		circuit_breaker_hit = excluded.circuit_breaker_hit,
+		updated_at_utc = excluded.updated_at_utc;
+	`
+	breakerInt := 0
+	if breakerTripped {
+		breakerInt = 1
+	}
+
+	_, err := r.db.conn.ExecContext(
+		ctx,
+		query,
+		normMode,
+		epochDay,
+		sessionStartEquity.String(),
+		realizedEquity.String(),
+		breakerInt,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("storage: failed to save daily state for mode %s: %w", normMode, err)
+	}
+	if normMode == "DRY_RUN" {
+		_ = r.SaveDailyState(ctx, epochDay, sessionStartEquity, realizedEquity, breakerTripped)
+	}
+	return nil
+}
+
+func (r *SQLiteRepository) GetDailyStateForMode(
+	ctx context.Context,
+	mode string,
+	epochDay int64,
+) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error) {
+	normMode := normalizeDailyStateMode(mode)
+	query := `
+	SELECT session_start_equity, realized_equity, circuit_breaker_hit
+	FROM account_daily_state_by_mode
+	WHERE mode = ? AND epoch_day_utc = ?;
+	`
+	row := r.db.conn.QueryRowContext(ctx, query, normMode, epochDay)
+
+	var startStr, realStr string
+	var breakerInt int
+	if err := row.Scan(&startStr, &realStr, &breakerInt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if normMode == "DRY_RUN" {
+				return r.GetDailyState(ctx, epochDay)
+			}
+			return decimal.Zero, decimal.Zero, false, false, nil
+		}
+		return decimal.Zero, decimal.Zero, false, false, fmt.Errorf("storage: failed to query daily state for mode %s: %w", normMode, err)
+	}
+
+	startDec, err := decimal.NewFromString(startStr)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, false, false, fmt.Errorf("storage: corrupt start equity: %w", err)
+	}
+	realDec, err := decimal.NewFromString(realStr)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, false, false, fmt.Errorf("storage: corrupt realized equity: %w", err)
+	}
+	return startDec, realDec, breakerInt == 1, true, nil
+}
+
+func (r *SQLiteRepository) GetLatestDailyStateForMode(
+	ctx context.Context,
+	mode string,
+) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error) {
+	normMode := normalizeDailyStateMode(mode)
+	query := `
+	SELECT epoch_day_utc, session_start_equity, realized_equity, circuit_breaker_hit
+	FROM account_daily_state_by_mode
+	WHERE mode = ?
+	ORDER BY epoch_day_utc DESC
+	LIMIT 1;
+	`
+	row := r.db.conn.QueryRowContext(ctx, query, normMode)
+
+	var startStr, realStr string
+	var breakerInt int
+	var epDay int64
+	if err := row.Scan(&epDay, &startStr, &realStr, &breakerInt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if normMode == "DRY_RUN" {
+				return r.GetLatestDailyState(ctx)
+			}
+			return decimal.Zero, decimal.Zero, false, 0, false, nil
+		}
+		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: failed to query latest daily state for mode %s: %w", normMode, err)
+	}
+
+	startDec, err := decimal.NewFromString(startStr)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: corrupt start equity: %w", err)
+	}
+	realDec, err := decimal.NewFromString(realStr)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, false, 0, false, fmt.Errorf("storage: corrupt realized equity: %w", err)
+	}
 	return startDec, realDec, breakerInt == 1, epDay, true, nil
 }
 
@@ -339,8 +467,8 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		client_order_id, symbol, side, strategy_id, qty, initial_qty, entry_price, entry_fee,
 		current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 		mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
-		signal_audit_id, max_mae, max_mfe, peak_price
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		signal_audit_id, max_mae, max_mfe, peak_price, funding_paid, last_funding_epoch
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
 		strategy_id = excluded.strategy_id,
 		qty = excluded.qty,
@@ -357,7 +485,9 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		protection_tier = excluded.protection_tier,
 		max_mae = excluded.max_mae,
 		max_mfe = excluded.max_mfe,
-		peak_price = excluded.peak_price;
+		peak_price = excluded.peak_price,
+		funding_paid = excluded.funding_paid,
+		last_funding_epoch = excluded.last_funding_epoch;
 	`
 	beInt := 0
 	if pos.IsBreakEvenMoved {
@@ -418,6 +548,8 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		pos.MaxMAE,
 		pos.MaxMFE,
 		peakStr,
+		pos.FundingPaid.String(),
+		pos.LastFundingEpoch,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: failed to save dry-run position %s (%s): %w", pos.Symbol, pos.ClientOrderID, err)
@@ -441,7 +573,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	SELECT symbol, client_order_id, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), qty, initial_qty, entry_price, entry_fee,
 	       current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 	       mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
-	       signal_audit_id, max_mae, max_mfe, peak_price
+	       signal_audit_id, max_mae, max_mfe, peak_price, funding_paid, last_funding_epoch
 	FROM dryrun_open_positions;
 	`
 	rows, err := r.db.conn.QueryContext(ctx, query)
@@ -453,7 +585,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 	var results []StoredDryRunPosition
 	for rows.Next() {
 		var p StoredDryRunPosition
-		var qtyStr, initQtyStr, entryStr, feeStr, slStr, initSLStr, tpStr, tp1Str, atrStr, markStr, peakStr string
+		var qtyStr, initQtyStr, entryStr, feeStr, slStr, initSLStr, tpStr, tp1Str, atrStr, markStr, peakStr, fundingStr string
 		var markTimeStr, openTimeStr string
 		var beInt, tpHitInt int
 
@@ -481,6 +613,8 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 			&p.MaxMAE,
 			&p.MaxMFE,
 			&peakStr,
+			&fundingStr,
+			&p.LastFundingEpoch,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("storage: failed to scan dry-run position: %w", err)
@@ -530,6 +664,9 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 		}
 		if p.PeakPrice.IsZero() {
 			p.PeakPrice = p.EntryPrice
+		}
+		if p.FundingPaid, parseErr = parseDecimalOptional(fundingStr, decimal.Zero, "FundingPaid", p.Symbol); parseErr != nil {
+			return nil, parseErr
 		}
 
 		if t, err := time.Parse(time.RFC3339Nano, markTimeStr); err == nil {

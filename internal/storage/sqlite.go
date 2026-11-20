@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS account_daily_state (
     updated_at_utc       TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS account_daily_state_by_mode (
+    mode                 TEXT NOT NULL,
+    epoch_day_utc        INTEGER NOT NULL,
+    session_start_equity TEXT NOT NULL,
+    realized_equity      TEXT NOT NULL,
+    circuit_breaker_hit  INTEGER NOT NULL DEFAULT 0,
+    updated_at_utc       TEXT NOT NULL,
+    PRIMARY KEY (mode, epoch_day_utc)
+);
+
 CREATE TABLE IF NOT EXISTS trade_ledger (
     client_order_id      TEXT PRIMARY KEY,
     symbol               TEXT NOT NULL,
@@ -97,7 +107,9 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
     signal_audit_id      INTEGER NOT NULL DEFAULT 0,
     max_mae              REAL NOT NULL DEFAULT 0.0,
     max_mfe              REAL NOT NULL DEFAULT 0.0,
-    peak_price           TEXT NOT NULL DEFAULT ''
+    peak_price           TEXT NOT NULL DEFAULT '',
+    funding_paid         TEXT NOT NULL DEFAULT '0',
+    last_funding_epoch   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS live_open_positions (
@@ -236,6 +248,18 @@ func OpenDB(dbPath string) (*DB, error) {
 	if err := ensureColumn("live_open_positions", "atr_at_entry", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("failed to migrate live_open_positions schema: %w", err)
+	}
+
+	// Migrasi kolom funding pada dryrun_open_positions
+	dryRunFundingCols := []struct{ col, def string }{
+		{"funding_paid", "TEXT NOT NULL DEFAULT '0'"},
+		{"last_funding_epoch", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, dc := range dryRunFundingCols {
+		if err := ensureColumn("dryrun_open_positions", dc.col, dc.def); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to migrate dryrun_open_positions schema: %w", err)
+		}
 	}
 
 	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_trade_ledger_signal_id ON trade_ledger (signal_audit_id);`); err != nil {

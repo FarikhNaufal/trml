@@ -63,6 +63,9 @@ type BotEngine struct {
 	oiPollRunning   atomic.Bool
 	oiBootMu        sync.Mutex
 	oiBootAttemptAt map[string]time.Time
+
+	evalSubmitMu sync.Mutex
+	evalWg       sync.WaitGroup
 }
 
 func main() {
@@ -174,15 +177,17 @@ func main() {
 
 		now := time.Now().UTC()
 		epochDay := now.Unix() / 86400
-		startEq, realEq, tripped, found, _ := repo.GetDailyState(ctx, epochDay)
+		startEq, realEq, tripped, found, _ := repo.GetDailyStateForMode(ctx, "DRY_RUN", epochDay)
 		if found && startEq.GreaterThan(decimal.Zero) {
-			slog.Info("recovered daily state from database", "startEquity", startEq, "realizedEquity", realEq, "breakerTripped", tripped)
-			initialEquity = realEq
+			slog.Info("recovered daily state from database", "mode", "DRY_RUN", "startEquity", startEq, "realizedEquity", realEq, "breakerTripped", tripped)
+			if realEq.GreaterThan(decimal.Zero) {
+				initialEquity = realEq
+			}
 		} else {
-			// [C-05] Jika hari baru belum memiliki record, warisi realized equity dari sesi terakhir agar akumulasi profit tidak reset
-			_, lastRealEq, _, _, latestFound, _ := repo.GetLatestDailyState(ctx)
+			// [C-05] Jika hari baru belum memiliki record DRY_RUN, warisi realized equity DRY_RUN dari sesi terakhir agar akumulasi profit tidak reset
+			_, lastRealEq, _, _, latestFound, _ := repo.GetLatestDailyStateForMode(ctx, "DRY_RUN")
 			if latestFound && lastRealEq.GreaterThan(decimal.Zero) {
-				slog.Info("recovered daily state from previous session", "realizedEquity", lastRealEq)
+				slog.Info("recovered daily state from previous session", "mode", "DRY_RUN", "realizedEquity", lastRealEq)
 				initialEquity = lastRealEq
 			}
 		}
@@ -216,6 +221,7 @@ func main() {
 			MakerFeeRate:             makerFeeFloat,
 			TakerFeeRate:             takerFeeFloat,
 			SlippageRate:             slippageFloat,
+			SLGapFillEnabled:         cfg.SLGapFillEnabled,
 			EntryOrderType:           cfg.EntryOrderType,
 			MaxEntryRepegAttempts:    resolveBrokerRepegAttempts(cfg.EntryRepegMaxAttempts),
 			MaxEntryRepegDriftPct:    cfg.EntryRepegMaxDriftPct,
@@ -228,14 +234,13 @@ func main() {
 		engine.dryRunBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "strategyID", rec.StrategyID, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID, rec.StrategyID)
-			engine.recordSymbolExit(rec.Symbol, rec.ClosedAt, rec.ExitReason)
 			pureRealEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
 			epochDay := time.Now().UTC().Unix() / 86400
 			engine.dryRunBroker.Mu.Lock()
 			startEq := engine.dryRunBroker.SessionStartEquity
 			breakerHit := engine.dryRunBroker.CircuitBreakerTripped
 			engine.dryRunBroker.Mu.Unlock()
-			_ = repo.SaveDailyState(context.Background(), epochDay, startEq, pureRealEq, breakerHit)
+			_ = repo.SaveDailyStateForMode(context.Background(), "DRY_RUN", epochDay, startEq, pureRealEq, breakerHit)
 		}
 
 		engine.dryRunBroker.OnPositionSavedFn = func(pos broker.VirtualOpenPosition) {
@@ -248,6 +253,8 @@ func main() {
 				InitialQty:       pos.InitialQty,
 				EntryPrice:       pos.EntryPrice,
 				EntryFee:         pos.EntryFee,
+				FundingPaid:      pos.FundingPaid,
+				LastFundingEpoch: pos.LastFundingEpoch,
 				CurrentSLPrice:   pos.CurrentSLPrice,
 				InitialSLPrice:   pos.InitialSLPrice,
 				TPPrice:          pos.TPPrice,
@@ -298,6 +305,8 @@ func main() {
 					LastMarkPrice:    sp.LastMarkPrice,
 					MarkUpdatedAt:    sp.MarkUpdatedAt,
 					OpenTime:         sp.OpenedAt,
+					FundingPaid:      sp.FundingPaid,
+					LastFundingEpoch: sp.LastFundingEpoch,
 					IsBreakEvenMoved: sp.IsBreakEvenMoved,
 					ProtectionTier:   sp.ProtectionTier,
 					SignalAuditID:    sp.SignalAuditID,
@@ -317,6 +326,7 @@ func main() {
 		slog.Info("initializing Binance Live Execution Broker")
 		liveCfg := broker.LiveBrokerConfig{
 			MaxSlots:                 cfg.MaxSlots,
+			AccountLeverage:          cfg.Leverage,
 			MaxDailyDrawdownPct:      cfg.MaxDailyDrawdown,
 			MaxAccountStaleness:      cfg.MaxAccountStale,
 			LimitOrderTimeout:        cfg.LimitOrderTimeout,
@@ -420,7 +430,6 @@ func main() {
 		engine.liveBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
 			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "strategyID", rec.StrategyID, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
 			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID, rec.StrategyID)
-			engine.recordSymbolExit(rec.Symbol, rec.ClosedAt, rec.ExitReason)
 		}
 		engine.broker = engine.liveBroker
 	}
@@ -432,11 +441,15 @@ func main() {
 		slog.Info("server time synced successfully", "timeOffsetMs", client.TimeOffset)
 	}
 
+	stateMode := "LIVE"
+	if cfg.DryRun {
+		stateMode = "DRY_RUN"
+	}
 	todayEpochDay := time.Now().UTC().Unix() / 86400
-	startEq, realEq, breakerHit, found, err := repo.GetDailyState(ctx, todayEpochDay)
+	startEq, realEq, breakerHit, found, err := repo.GetDailyStateForMode(ctx, stateMode, todayEpochDay)
 	if err == nil && found {
 		slog.Info("recovered today's daily state from storage",
-			"epochDay", todayEpochDay, "sessionStartEquity", startEq, "realizedEquity", realEq, "breakerHit", breakerHit)
+			"mode", stateMode, "epochDay", todayEpochDay, "sessionStartEquity", startEq, "realizedEquity", realEq, "breakerHit", breakerHit)
 		if engine.liveBroker != nil {
 			engine.liveBroker.Mu.Lock()
 			engine.liveBroker.SessionStartEpochDay = todayEpochDay
@@ -450,33 +463,25 @@ func main() {
 			engine.dryRunBroker.CircuitBreakerTripped = breakerHit
 			engine.dryRunBroker.Mu.Unlock()
 		}
-	} else if err == nil && !found {
-		// [C-05] Hari baru tanpa record: warisi realized equity hari sebelumnya sebagai sessionStartEquity hari ini
-		_, lastRealEq, _, _, latestFound, errLatest := repo.GetLatestDailyState(ctx)
+	} else if err == nil && !found && engine.dryRunBroker != nil {
+		// [C-05] Hari baru tanpa record DRY_RUN: warisi realized equity hari sebelumnya sebagai sessionStartEquity hari ini
+		_, lastRealEq, _, _, latestFound, errLatest := repo.GetLatestDailyStateForMode(ctx, "DRY_RUN")
 		if errLatest == nil && latestFound && lastRealEq.GreaterThan(decimal.Zero) {
 			slog.Info("starting new daily session inheriting previous day's equity",
-				"epochDay", todayEpochDay, "sessionStartEquity", lastRealEq)
-			_ = repo.SaveDailyState(ctx, todayEpochDay, lastRealEq, lastRealEq, false)
-			if engine.liveBroker != nil {
-				engine.liveBroker.Mu.Lock()
-				engine.liveBroker.SessionStartEpochDay = todayEpochDay
-				engine.liveBroker.SessionStartEquityUSDT = lastRealEq
-				engine.liveBroker.CircuitBreakerTripped = false
-				engine.liveBroker.Mu.Unlock()
-			} else if engine.dryRunBroker != nil {
-				engine.dryRunBroker.Mu.Lock()
-				engine.dryRunBroker.SessionDayEpochUTC = todayEpochDay
-				engine.dryRunBroker.SessionStartEquity = lastRealEq
-				engine.dryRunBroker.CircuitBreakerTripped = false
-				engine.dryRunBroker.Mu.Unlock()
-			}
-		} else if engine.dryRunBroker != nil {
+				"mode", "DRY_RUN", "epochDay", todayEpochDay, "sessionStartEquity", lastRealEq)
+			_ = repo.SaveDailyStateForMode(ctx, "DRY_RUN", todayEpochDay, lastRealEq, lastRealEq, false)
+			engine.dryRunBroker.Mu.Lock()
+			engine.dryRunBroker.SessionDayEpochUTC = todayEpochDay
+			engine.dryRunBroker.SessionStartEquity = lastRealEq
+			engine.dryRunBroker.CircuitBreakerTripped = false
+			engine.dryRunBroker.Mu.Unlock()
+		} else {
 			engine.dryRunBroker.Mu.Lock()
 			engine.dryRunBroker.SessionDayEpochUTC = todayEpochDay
 			startEqInit := engine.dryRunBroker.SessionStartEquity
 			realEqInit := engine.dryRunBroker.RealizedEquityUSDT
 			engine.dryRunBroker.Mu.Unlock()
-			_ = repo.SaveDailyState(ctx, todayEpochDay, startEqInit, realEqInit, false)
+			_ = repo.SaveDailyStateForMode(ctx, "DRY_RUN", todayEpochDay, startEqInit, realEqInit, false)
 		}
 	}
 
@@ -498,7 +503,7 @@ func main() {
 			breaker := engine.liveBroker.CircuitBreakerTripped
 			engine.liveBroker.Mu.Unlock()
 			if sDay > 0 && sEq.GreaterThan(decimal.Zero) {
-				_ = repo.SaveDailyState(ctx, sDay, sEq, effEq, breaker)
+				_ = repo.SaveDailyStateForMode(ctx, "LIVE", sDay, sEq, effEq, breaker)
 			}
 		}
 		initCancel()
@@ -959,6 +964,7 @@ func main() {
 	engine.streamMu.Unlock()
 
 	wg.Wait()
+	engine.evalWg.Wait()
 	slog.Info("bot terminated gracefully")
 }
 
@@ -1586,6 +1592,9 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 				st.Mu.Unlock()
 			}
 			e.broker.OnRealtimeTick(symbol, bestBid, bestAsk, markPrice, 0, 0, false, now)
+			if e.dryRunBroker != nil {
+				e.dryRunBroker.ApplyFundingTick(symbol, markPrice, fundingRate, now)
+			}
 		},
 		OnKlineClosed: func(symbol string, candle model.Candle, isClosed bool) {
 			if !isClosed {
@@ -1614,7 +1623,11 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 			}
 
 			// Lepas evaluasi sinyal dan penulisan SQLite audit log dari read-loop WebSocket
-			go e.evaluateAndLogClosedCandle(candle, st)
+			e.evalWg.Add(1)
+			go func(c model.Candle, s *model.SymbolState) {
+				defer e.evalWg.Done()
+				e.evaluateAndLogClosedCandle(c, s)
+			}(candle, st)
 		},
 	}
 	handlers.OnKline5m = handlers.OnKlineClosed
@@ -1746,15 +1759,6 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		}
 	}
 
-	// Evaluasi Sinyal
-	activeSlots := e.broker.GetActiveSlotCount()
-	availBal := e.broker.GetAvailableBalanceUSDT()
-	totEq := e.broker.GetEffectiveTotalEquityUSDT()
-
-	// C3 & M1 FIX: Evaluasi sinyal dengan equity, available balance, status drawdown, dan active symbol riil
-	isDailyBreached := e.broker.IsCircuitBreakerTripped() || (e.broker.GetDailyTotalDrawdownPct() <= e.cfg.MaxDailyDrawdown)
-	hasActiveSymbol := e.broker.HasActiveOrderOrPosition(snap.Symbol)
-
 	var btcSnap *model.MarketSnapshot
 	if e.cfg.BTCGateEnabled || e.cfg.BTCChopBlockLong || e.cfg.BTCChopBlockShort || (e.cfg.BTCChopRiskMult > 0 && e.cfg.BTCChopRiskMult < 1.0) {
 		e.statesMu.RLock()
@@ -1777,6 +1781,20 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 	}
 	e.statesMu.RUnlock()
 
+	// Serialisasi evaluasi sinyal + reservasi order agar tidak terjadi race condition slot/balance/active-symbol
+	e.evalSubmitMu.Lock()
+	activeSlots := e.broker.GetActiveSlotCount()
+	availBal := e.broker.GetAvailableBalanceUSDT()
+	totEq := e.broker.GetEffectiveTotalEquityUSDT()
+	sizingEquity := totEq
+	if e.cfg != nil && !e.cfg.EquityModeCompounding && e.cfg.InitialEquity.GreaterThan(decimal.Zero) {
+		sizingEquity = e.cfg.InitialEquity
+	}
+
+	// C3 & M1 FIX: Evaluasi sinyal dengan equity, available balance, status drawdown, dan active symbol riil
+	isDailyBreached := e.broker.IsCircuitBreakerTripped() || (e.broker.GetDailyTotalDrawdownPct() <= e.cfg.MaxDailyDrawdown)
+	hasActiveSymbol := e.broker.HasActiveOrderOrPosition(snap.Symbol)
+
 	var intent model.OrderIntent
 	var ok bool
 	var reason, subReason string
@@ -1791,7 +1809,7 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 			activeSlots,
 			isDailyBreached,
 			hasActiveSymbol,
-			totEq,
+			sizingEquity,
 			availBal,
 			scope,
 			e.evaluatorCfg,
@@ -1803,22 +1821,21 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		strategyID = dec.StrategyID
 	}
 
-	// Eksekusi submission order segera tanpa menunggu kalkulasi metrik & penulisan audit SQLite agar tidak terkena adverse selection GTX.
-	var resolvedAuditID atomic.Int64
 	if ok && reason == "SIGNAL_APPROVED" {
-		slog.Info("SIGNAL APPROVED! Spawning immediate async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "strategyID", strategyID, "qty", intent.Qty, "price", intent.LimitPrice)
-		go func(targetIntent model.OrderIntent) {
-			reserved, submitErr := e.broker.SubmitLimitEntry(targetIntent)
-			if reserved && submitErr == nil {
-				if sid := resolvedAuditID.Load(); sid > 0 {
-					e.attachSignalAuditID(targetIntent.Symbol, targetIntent.ClientOrderID, sid)
-				}
-				slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", targetIntent.Symbol, "clientOrderID", targetIntent.ClientOrderID)
-			} else {
-				slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", targetIntent.Symbol, "err", submitErr)
+		slog.Info("SIGNAL APPROVED! Submitting limit entry to broker...", "symbol", intent.Symbol, "side", intent.Side, "strategyID", strategyID, "qty", intent.Qty, "price", intent.LimitPrice)
+		reserved, submitErr := e.broker.SubmitLimitEntry(intent)
+		if reserved && submitErr == nil {
+			slog.Info("ENTRY ORDER ACCEPTED BY BROKER", "symbol", intent.Symbol, "clientOrderID", intent.ClientOrderID)
+		} else {
+			slog.Warn("ENTRY ORDER REJECTED BY BROKER", "symbol", intent.Symbol, "err", submitErr)
+			ok = false
+			reason = "BROKER_REJECTED"
+			if submitErr != nil {
+				subReason = submitErr.Error()
 			}
-		}(intent)
+		}
 	}
+	e.evalSubmitMu.Unlock()
 
 	// Simpan audit log lengkap dengan metrik analitik riil
 	decision := "REJECT"
@@ -1938,7 +1955,6 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 	}
 
 	if ok && reason == "SIGNAL_APPROVED" && sigID > 0 {
-		resolvedAuditID.Store(sigID)
 		e.attachSignalAuditID(intent.Symbol, intent.ClientOrderID, sigID)
 	}
 }
@@ -1992,27 +2008,30 @@ func (e *BotEngine) runUserDataStreamSupervisor(ctx context.Context) {
 		// C7 & 2026 Spec: Gunakan query param listenKey & events untuk Mainnet, fallback ke legacy path untuk Testnet
 		userStreamURL := ws.BuildUserDataStreamURL(e.cfg.WSPrivateBaseURL, listenKey, e.cfg.Env == config.EnvMainnet)
 		handlers := ws.EventHandlers{
-			OnOrderTradeUpdate: func(clientOrderID string, exchangeOrderID int64, symbol string, status model.OrderLifecycleStatus, cumFilledQty, avgPrice, realizedProfit decimal.Decimal) {
-				slog.Info("USER ORDER UPDATE", "symbol", symbol, "orderID", exchangeOrderID, "status", status, "cumQty", cumFilledQty, "avgPrice", avgPrice, "realizedProfit", realizedProfit)
+			OnOrderTradeUpdateDetailed: func(evt model.OrderTradeUpdateEvent) {
+				slog.Info("USER ORDER UPDATE", "symbol", evt.Symbol, "orderID", evt.ExchangeOrderID, "status", evt.Status, "cumQty", evt.CumFilledQty, "avgPrice", evt.AvgPrice, "realizedProfit", evt.RealizedProfit, "fee", evt.Commission, "feeAsset", evt.CommissionAsset, "isMaker", evt.IsMaker)
 				if e.liveBroker != nil {
-					e.liveBroker.HandleUserDataOrderUpdate(clientOrderID, exchangeOrderID, symbol, status, cumFilledQty, avgPrice, realizedProfit)
+					e.liveBroker.HandleUserDataOrderUpdateDetailed(evt)
 				}
 			},
-			OnAccountUpdate: func(walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, eventTime time.Time) {
-				slog.Debug("USER ACCOUNT UPDATE", "wallet", walletBal, "unrealizedPnL", unrealizedPnL, "avail", availBal)
+			OnAccountUpdateEvent: func(evt model.AccountUpdateEvent) {
+				slog.Debug("USER ACCOUNT UPDATE", "wallet", evt.WalletBalance, "unrealizedPnL", evt.UnrealizedPnL, "avail", evt.AvailableBalance, "positionsCount", len(evt.Positions))
 				var breakerTripped bool
-				startEquity := walletBal.Add(unrealizedPnL)
+				effEq := evt.WalletBalance.Add(evt.UnrealizedPnL)
+				startEquity := effEq
 				if e.liveBroker != nil {
-					e.liveBroker.HandleAccountUpdate(walletBal, unrealizedPnL, availBal, positions, eventTime)
+					e.liveBroker.HandleAccountUpdateEvent(evt)
 					e.liveBroker.Mu.Lock()
 					breakerTripped = e.liveBroker.CircuitBreakerTripped
+					effEq = e.liveBroker.WalletBalanceUSDT.Add(e.liveBroker.UnrealizedPnLUSDT)
+					startEquity = effEq
 					if e.liveBroker.SessionStartEquityUSDT.GreaterThan(decimal.Zero) {
 						startEquity = e.liveBroker.SessionStartEquityUSDT
 					}
 					e.liveBroker.Mu.Unlock()
 				}
-				epochDay := eventTime.Unix() / 86400
-				_ = e.repo.SaveDailyState(ctx, epochDay, startEquity, walletBal.Add(unrealizedPnL), breakerTripped)
+				epochDay := evt.EventTime.UTC().Unix() / 86400
+				_ = e.repo.SaveDailyStateForMode(ctx, "LIVE", epochDay, startEquity, effEq, breakerTripped)
 			},
 			OnListenKeyExpired: func() {
 				slog.Warn("user data stream received listenKeyExpired, restarting session with fresh key")

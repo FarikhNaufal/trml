@@ -93,6 +93,7 @@ type SimPendingOrder struct {
 	PlacedTime     time.Time
 	TimeoutTime    time.Time
 	RepegAttempts  int
+	GTXValidated   bool
 }
 
 type SimPosition struct {

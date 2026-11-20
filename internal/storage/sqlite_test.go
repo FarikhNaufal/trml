@@ -412,3 +412,83 @@ func TestCorruptDecimalFailClosed(t *testing.T) {
 		t.Fatalf("expected error loading positions with corrupt optional decimal, got nil")
 	}
 }
+
+func TestModeIsolatedDailyStateAndFundingPersistence(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	repo := NewRepository(db)
+	ctx := context.Background()
+	epochDay := int64(20800)
+
+	// Legacy row written for DRY_RUN
+	if err := repo.SaveDailyState(ctx, epochDay-1, decimal.NewFromFloat(140.0), decimal.NewFromFloat(145.0), false); err != nil {
+		t.Fatalf("legacy SaveDailyState failed: %v", err)
+	}
+
+	// LIVE must NOT inherit legacy/DRY_RUN state
+	if _, _, _, found, err := repo.GetDailyStateForMode(ctx, "LIVE", epochDay-1); err != nil || found {
+		t.Fatalf("expected LIVE mode to stay isolated from legacy DRY_RUN row, got found=%v err=%v", found, err)
+	}
+	if _, _, _, _, found, err := repo.GetLatestDailyStateForMode(ctx, "LIVE"); err != nil || found {
+		t.Fatalf("expected LIVE latest state to stay isolated from legacy DRY_RUN row, got found=%v err=%v", found, err)
+	}
+
+	// DRY_RUN should seamlessly fall back to legacy row
+	startDR, realDR, _, foundDR, err := repo.GetDailyStateForMode(ctx, "DRY_RUN", epochDay-1)
+	if err != nil || !foundDR || !startDR.Equal(decimal.NewFromFloat(140.0)) || !realDR.Equal(decimal.NewFromFloat(145.0)) {
+		t.Fatalf("expected DRY_RUN legacy fallback 140/145, got start=%s real=%s found=%v err=%v", startDR, realDR, foundDR, err)
+	}
+
+	// Writing both modes for the same epochDay stays completely independent
+	if err := repo.SaveDailyStateForMode(ctx, "DRY_RUN", epochDay, decimal.NewFromFloat(150.0), decimal.NewFromFloat(152.0), false); err != nil {
+		t.Fatalf("SaveDailyStateForMode DRY_RUN failed: %v", err)
+	}
+	if err := repo.SaveDailyStateForMode(ctx, "LIVE", epochDay, decimal.NewFromFloat(500.0), decimal.NewFromFloat(490.0), true); err != nil {
+		t.Fatalf("SaveDailyStateForMode LIVE failed: %v", err)
+	}
+
+	sDR, rDR, bDR, okDR, _ := repo.GetDailyStateForMode(ctx, "DRY_RUN", epochDay)
+	sLV, rLV, bLV, okLV, _ := repo.GetDailyStateForMode(ctx, "LIVE", epochDay)
+	if !okDR || !okLV || !sDR.Equal(decimal.NewFromFloat(150.0)) || !rDR.Equal(decimal.NewFromFloat(152.0)) || bDR {
+		t.Fatalf("unexpected DRY_RUN state: start=%s real=%s breaker=%v ok=%v", sDR, rDR, bDR, okDR)
+	}
+	if !sLV.Equal(decimal.NewFromFloat(500.0)) || !rLV.Equal(decimal.NewFromFloat(490.0)) || !bLV {
+		t.Fatalf("unexpected LIVE state: start=%s real=%s breaker=%v", sLV, rLV, bLV)
+	}
+
+	// DryRun position funding round-trip
+	now := time.Now().UTC()
+	if err := repo.SaveDryRunPosition(ctx, StoredDryRunPosition{
+		ClientOrderID:    "SIM-FUND-1",
+		Symbol:           "SOLUSDT",
+		Side:             "LONG",
+		StrategyID:       "VWAP_PULLBACK",
+		Qty:              decimal.NewFromFloat(2.0),
+		InitialQty:       decimal.NewFromFloat(2.0),
+		EntryPrice:       decimal.NewFromFloat(100.0),
+		EntryFee:         decimal.NewFromFloat(0.04),
+		CurrentSLPrice:   decimal.NewFromFloat(97.0),
+		InitialSLPrice:   decimal.NewFromFloat(97.0),
+		TPPrice:          decimal.NewFromFloat(106.0),
+		ATRAtEntry:       decimal.NewFromFloat(1.5),
+		LastMarkPrice:    decimal.NewFromFloat(101.0),
+		PeakPrice:        decimal.NewFromFloat(101.5),
+		MarkUpdatedAt:    now,
+		OpenedAt:         now,
+		FundingPaid:      decimal.NewFromFloat(0.1234),
+		LastFundingEpoch: 60000,
+	}); err != nil {
+		t.Fatalf("SaveDryRunPosition failed: %v", err)
+	}
+	loaded, err := repo.GetAllDryRunPositions(ctx)
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("GetAllDryRunPositions failed: len=%d err=%v", len(loaded), err)
+	}
+	if !loaded[0].FundingPaid.Equal(decimal.NewFromFloat(0.1234)) || loaded[0].LastFundingEpoch != 60000 {
+		t.Fatalf("funding persistence mismatch: got FundingPaid=%s LastFundingEpoch=%d", loaded[0].FundingPaid, loaded[0].LastFundingEpoch)
+	}
+}

@@ -352,6 +352,10 @@ func handleRunCommand(args []string) {
 	flagSLGapFill := fs.Bool("flag-sl-gap-fill", false, "Force enable SL gap fill at candle open + slippage")
 	flagDeductPendingMargin := fs.Bool("flag-deduct-pending-margin", false, "Deduct available margin intra-bar upon limit submit")
 	_ = fs.Parse(args)
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
 
 	ctx := context.Background()
 	common := cf.toRunnerOptions()
@@ -363,8 +367,7 @@ func handleRunCommand(args []string) {
 	}
 	defer ds.Close()
 
-	start := time.Now()
-	out, err := runner.ExecuteRun(ctx, ds, runner.RunOptions{
+	runOpts := runner.RunOptions{
 		CommonOptions:       common,
 		RandomSeed:          *randomSeedFlag,
 		RandomProb:          *randomProbFlag,
@@ -376,7 +379,25 @@ func handleRunCommand(args []string) {
 		Tier1EarlyBE:        *flagTier1EarlyBE,
 		SLGapFill:           *flagSLGapFill,
 		DeductPendingMargin: *flagDeductPendingMargin,
-	})
+	}
+	if visited["flag-btc-gate-short-only"] {
+		runOpts.OverrideBTCGateShortOnly = flagBTCGateShortOnly
+	}
+	if visited["flag-tier1-early-be"] {
+		runOpts.OverrideTier1EarlyBE = flagTier1EarlyBE
+	}
+	if visited["flag-sl-gap-fill"] {
+		runOpts.OverrideSLGapFill = flagSLGapFill
+	}
+	if visited["flag-deduct-pending-margin"] {
+		runOpts.OverrideDeductPendingMargin = flagDeductPendingMargin
+	}
+	if visited["compounding"] {
+		runOpts.OverrideCompounding = cf.compounding
+	}
+
+	start := time.Now()
+	out, err := runner.ExecuteRun(ctx, ds, runOpts)
 	if err != nil {
 		slog.Error("Replay gagal", "err", err)
 		os.Exit(1)

@@ -561,3 +561,49 @@ func TestKlineClosed_RejectsInvalidOHLCAndNegativeTBQ(t *testing.T) {
 		t.Fatalf("expected 1 valid kline accepted, got %d", accepted.Load())
 	}
 }
+
+func TestWebSocketDetailedUserDataEvents(t *testing.T) {
+	var gotOrderEvt model.OrderTradeUpdateEvent
+	var gotAcctEvt model.AccountUpdateEvent
+	var orderCalled, acctCalled atomic.Int32
+
+	mgr := NewStreamManager(EventHandlers{
+		OnOrderTradeUpdateDetailed: func(evt model.OrderTradeUpdateEvent) {
+			gotOrderEvt = evt
+			orderCalled.Add(1)
+		},
+		OnAccountUpdateEvent: func(evt model.AccountUpdateEvent) {
+			gotAcctEvt = evt
+			acctCalled.Add(1)
+		},
+	})
+
+	rawOTU := []byte(`{"e":"ORDER_TRADE_UPDATE","E":1700000000000,"T":1700000000000,"o":{"s":"ETHUSDT","c":"ORD_DET_1","S":"SELL","o":"LIMIT","f":"GTX","q":"2.0","p":"3000.0","ap":"3000.0","sp":"0","x":"TRADE","X":"PARTIALLY_FILLED","i":888777,"l":"0.75","z":"0.75","L":"3000.0","N":"USDT","n":"0.45","T":1700000000000,"t":1,"b":"0","a":"0","m":true,"R":false,"wt":"CONTRACT_PRICE","ot":"LIMIT","ps":"BOTH","cp":false,"rp":"12.50","pP":false,"si":0,"ss":0}}`)
+	mgr.ProcessMessage(rawOTU)
+
+	if orderCalled.Load() != 1 {
+		t.Fatalf("expected OnOrderTradeUpdateDetailed to fire once")
+	}
+	if !gotOrderEvt.HasFillMeta || !gotOrderEvt.IsMaker || gotOrderEvt.CommissionAsset != "USDT" {
+		t.Fatalf("unexpected order metadata: %+v", gotOrderEvt)
+	}
+	if !gotOrderEvt.LastFilledQty.Equal(decimal.NewFromFloat(0.75)) || !gotOrderEvt.Commission.Equal(decimal.NewFromFloat(0.45)) || !gotOrderEvt.RealizedProfit.Equal(decimal.NewFromFloat(12.50)) {
+		t.Fatalf("unexpected order quantities/commission: %+v", gotOrderEvt)
+	}
+
+	rawAU := []byte(`{"e":"ACCOUNT_UPDATE","E":1700000000000,"T":1700000000000,"a":{"m":"ORDER","B":[{"a":"USDT","wb":"500.0","cw":"420.0","bc":"0"}],"P":[{"s":"ETHUSDT","pa":"0.75","ep":"3000.0","cr":"0","up":"15.25","mt":"isolated","iw":"0","ps":"BOTH"}]}}`)
+	mgr.ProcessMessage(rawAU)
+
+	if acctCalled.Load() != 1 {
+		t.Fatalf("expected OnAccountUpdateEvent to fire once")
+	}
+	if gotAcctEvt.IsFullSnapshot {
+		t.Fatalf("expected WebSocket ACCOUNT_UPDATE IsFullSnapshot=false")
+	}
+	if !gotAcctEvt.WalletBalance.Equal(decimal.NewFromFloat(500.0)) || !gotAcctEvt.CrossWallet.Equal(decimal.NewFromFloat(420.0)) {
+		t.Fatalf("unexpected balances: %+v", gotAcctEvt)
+	}
+	if pos, ok := gotAcctEvt.Positions["ETHUSDT"]; !ok || !pos.UnrealizedPnL.Equal(decimal.NewFromFloat(15.25)) {
+		t.Fatalf("expected ETHUSDT position in account event, got %+v", gotAcctEvt.Positions)
+	}
+}

@@ -141,6 +141,33 @@ type LivePosition struct {
 	UnrealizedPnL decimal.Decimal
 }
 
+// OrderTradeUpdateEvent carries full parsed execution metadata from Binance ORDER_TRADE_UPDATE stream.
+type OrderTradeUpdateEvent struct {
+	ClientOrderID   string
+	ExchangeOrderID int64
+	Symbol          string
+	Status          OrderLifecycleStatus
+	CumFilledQty    decimal.Decimal
+	LastFilledQty   decimal.Decimal
+	AvgPrice        decimal.Decimal
+	RealizedProfit  decimal.Decimal
+	Commission      decimal.Decimal
+	CommissionAsset string
+	IsMaker         bool
+	HasFillMeta     bool
+}
+
+// AccountUpdateEvent distinguishes partial WebSocket ACCOUNT_UPDATE deltas from full REST snapshots.
+type AccountUpdateEvent struct {
+	WalletBalance    decimal.Decimal
+	AvailableBalance decimal.Decimal // Only authoritative when IsFullSnapshot == true
+	CrossWallet      decimal.Decimal
+	UnrealizedPnL    decimal.Decimal
+	Positions        map[string]LivePosition
+	EventTime        time.Time
+	IsFullSnapshot   bool
+}
+
 var clientOrderNonce uint64
 
 const MaxBinanceClientOrderIDLen = 36
