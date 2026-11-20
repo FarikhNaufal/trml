@@ -365,3 +365,16 @@ func TestFromAppConfig_PropagatesSweepAndCore(t *testing.T) {
 		t.Fatalf("FromAppConfig failed to propagate Sweep config: %+v", evalCfg.Sweep)
 	}
 }
+
+func TestEvaluatePortfolio_SameScanSweepRejectionAttribution(t *testing.T) {
+	now := time.Date(2026, 10, 15, 12, 5, 0, 0, time.UTC)
+	snap, cfg := makeValidSweepSnapshot(now)
+
+	// Mutate delta so Sweep rejects on WEAK_DELTA_ZSCORE while Primary rejects on ENTRY_TOO_FAR_FROM_VWAP
+	// under DefaultSymbolScope (SameScan 1B: AllowPrimary=true, AllowSweep=true).
+	snap.ClosedBarDeltasUSDT[len(snap.ClosedBarDeltasUSDT)-1] = 80.0
+	dec := EvaluatePortfolio(snap, nil, 0, false, false, decimal.NewFromFloat(500), decimal.NewFromFloat(500), DefaultSymbolScope(), cfg)
+	if dec.Approved || dec.StrategyID != StrategyIDLiquiditySweep || dec.Reason != "SWEEP_CONDITIONS_NOT_MET" {
+		t.Fatalf("expected SameScan bearish sweep-zone rejection attributed to %s, got %+v", StrategyIDLiquiditySweep, dec)
+	}
+}

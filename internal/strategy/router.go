@@ -3,6 +3,7 @@ package strategy
 import (
 	"fmt"
 	"hash/fnv"
+	"strings"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
@@ -114,6 +115,14 @@ func EvaluatePortfolio(
 		}
 	}
 
+	if sweepReason != "" && shouldAttributeRejectionToSweep(scope, ctx, primReason, sweepReason, sweepSubReason) {
+		return PortfolioDecision{
+			Approved:   false,
+			StrategyID: StrategyIDLiquiditySweep,
+			Reason:     sweepReason,
+			SubReason:  sweepSubReason,
+		}
+	}
 	if scope.AllowPrimary && primReason != "" {
 		return PortfolioDecision{
 			Approved:   false,
@@ -136,6 +145,32 @@ func EvaluatePortfolio(
 		Reason:     "CONDITIONS_NOT_MET",
 		SubReason:  "",
 	}
+}
+
+// shouldAttributeRejectionToSweep determines when a dual-rejected candle on a shared watchlist symbol
+// should be logged under LIQUIDITY_SWEEP_SHORT in signal_audit_log for dashboard observability.
+func shouldAttributeRejectionToSweep(
+	scope SymbolScope,
+	ctx sharedMarketContext,
+	primReason, sweepReason, sweepSubReason string,
+) bool {
+	if !scope.AllowPrimary {
+		return true
+	}
+	// Only attribute to SHORT-ONLY sweep when price is in the bearish macro zone (below EMA200 & VWAP).
+	if ctx.Latest.Close >= ctx.EMA200 || ctx.Latest.Close > ctx.VWAP {
+		return false
+	}
+	// 1. Primary VWAP Pullback disqualified by distance from VWAP/EMA200, so Sweep is the active alpha on this bar.
+	if primReason == "ENTRY_TOO_FAR_FROM_VWAP" || primReason == "ENTRY_TOO_FAR_FROM_EMA200" {
+		return true
+	}
+	// 2. Candle actively swept and reclaimed the N-bar high (or passed Sweep and hit a post-filter),
+	// so reporting the specific Sweep rejection reason is more informative than generic pullback failure.
+	if sweepReason != "SWEEP_CONDITIONS_NOT_MET" || !strings.Contains(sweepSubReason, "NO_HIGH_SWEEP_RECLAIM") {
+		return true
+	}
+	return false
 }
 
 func evaluateRandomBenchmark(
