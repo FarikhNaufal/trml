@@ -104,6 +104,16 @@ func TestReportV2_MarkdownSectionsAndCSVJSONExporters(t *testing.T) {
 		CI95UpperUSDT:      0.35,
 		MTMMaxDrawdownPct:  4.50,
 		MTMMaxDrawdownUSDT: 45.0,
+		Segmentation: metrics.SegmentationReport{
+			NATRSegments: []metrics.SegmentStats{
+				{Name: "NATR < 0.80%", TotalTrades: 100, Wins: 60, Losses: 40, WinRatePct: 60.0, TotalNetPnL: 20.0, AvgPnLUSDT: 0.2, ProfitFactor: 1.50, NetProfitFactor: 1.35},
+			},
+			SessionSegments: []metrics.SegmentStats{},
+			SideSegments:    []metrics.SegmentStats{},
+			StrategySegments: []metrics.SegmentStats{
+				{Name: "LIQUIDITY_SWEEP_SHORT", TotalTrades: 50, Wins: 35, Losses: 15, WinRatePct: 70.0, TotalNetPnL: 15.0, AvgPnLUSDT: 0.3, ProfitFactor: 1.90, NetProfitFactor: 1.70},
+			},
+		},
 		ExecutionAudit:     &metrics.ExecutionAudit{OICoveragePct: 92.3},
 		ScannerAudit:       &metrics.ScannerAudit{CyclesRun: 12, AvgSelectedCoins: 6.5},
 	}
@@ -123,7 +133,7 @@ func TestReportV2_MarkdownSectionsAndCSVJSONExporters(t *testing.T) {
 		},
 	}
 	md := GenerateMarkdownReport(summary, meta, map[string]int64{"LOW_OI_DELTA": 10})
-	for _, want := range []string{"MTM Max Drawdown", "Monte Carlo p95 / p99 DD", "Walk-Forward Validation", "Friction & Slippage Stress Matrix", "Audit Mikrostruktur Eksekusi"} {
+	for _, want := range []string{"MTM Max Drawdown", "Monte Carlo p95 / p99 DD", "Walk-Forward Validation", "Friction & Slippage Stress Matrix", "Audit Mikrostruktur Eksekusi", "Net PF (Gross)", "1.70 (1.90)", "1.25 (1.40)"} {
 		if !strings.Contains(md, want) {
 			t.Fatalf("expected %q in v2 markdown report", want)
 		}

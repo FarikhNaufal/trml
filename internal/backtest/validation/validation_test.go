@@ -112,6 +112,14 @@ func TestRunWalkForwardAndFrictionStressMatrix(t *testing.T) {
 	if len(wfa.Folds) < 2 {
 		t.Fatalf("expected >= 2 WFA folds over 18d with 6/4/4 schedule, got %d", len(wfa.Folds))
 	}
+	for _, f := range wfa.Folds {
+		if f.OOSSummary.InitialEquity != 1000.0 {
+			t.Fatalf("expected non-compounding OOS fold InitialEquity=1000.0, got %.2f in fold %d", f.OOSSummary.InitialEquity, f.FoldIndex)
+		}
+	}
+	if wfa.StitchedOOSSummary.ExecutionAudit == nil {
+		t.Fatalf("expected aggregated ExecutionAudit on stitched WFA summary")
+	}
 
 	stress, err := RunFrictionStressMatrix(context.Background(), StressConfig{
 		BaseReplayCfg: replay.ReplayConfig{WarmupBars: 25, OIMode: replay.OIModeOff, BenchmarkSym: "SOLUSDT"},

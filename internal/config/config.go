@@ -123,6 +123,7 @@ type Config struct {
 	SLATRMultiplierLong        float64
 	MinNATRLongPct             float64
 	BTCChopBlockLong           bool
+	BTCChopBlockShort          bool
 	DisablePanicDumpFrenzyLong bool
 	BTCTier2LongSymmetric      bool
 
@@ -157,6 +158,20 @@ type Config struct {
 	BTCGateShortOnly    bool
 	SLGapFillEnabled    bool
 	DeductPendingMargin bool
+
+	// Strategi Sekunder: 1-Bar Liquidity Sweep SHORT-ONLY (Additive, default: disabled)
+	Sweep SweepStrategyConfig
+}
+
+// SweepStrategyConfig memuat parameter strategi sekunder 1-Bar Liquidity Sweep SHORT-ONLY.
+type SweepStrategyConfig struct {
+	Enabled                  bool
+	LookbackBars             int
+	MinUpperWickRatio        float64
+	MaxLowerWickRatio        float64
+	MaxDeltaZScore           float64
+	ScannerAllowExtendedVWAP bool
+	ScannerMaxExtraCoins     int
 }
 
 // loadDotEnvWithOverwrite membaca file .env secara otomatis ke environment variable proses.
@@ -793,6 +808,11 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, err
 	}
 
+	btcChopBlockShort, err := parseBoolEnvStrict("BTC_CHOP_BLOCK_SHORT", getEnv("BTC_CHOP_BLOCK_SHORT", "false"))
+	if err != nil {
+		return nil, err
+	}
+
 	disablePanicDumpFrenzyLong, err := parseBoolEnvStrict("DISABLE_PANIC_DUMP_FRENZY_LONG", getEnv("DISABLE_PANIC_DUMP_FRENZY_LONG", "false"))
 	if err != nil {
 		return nil, err
@@ -842,6 +862,40 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	maxOIInterval := candleDur * 2
 	if maxOIInterval < 8*time.Minute {
 		maxOIInterval = 8 * time.Minute
+	}
+
+	sweepEnabled, err := parseBoolEnvStrict("SWEEP_STRATEGY_ENABLED", getEnv("SWEEP_STRATEGY_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	sweepLookbackStr := getEnv("SWEEP_LOOKBACK_BARS", "12")
+	sweepLookback, err := strconv.Atoi(sweepLookbackStr)
+	if err != nil || sweepLookback < 3 || sweepLookback > 50 {
+		return nil, fmt.Errorf("config: invalid SWEEP_LOOKBACK_BARS '%s' (must be integer between 3 and 50)", sweepLookbackStr)
+	}
+	sweepMinUpperWickStr := getEnv("SWEEP_MIN_UPPER_WICK_RATIO", "0.25")
+	sweepMinUpperWick, err := parseFloatEnv(sweepMinUpperWickStr)
+	if err != nil || sweepMinUpperWick < 0.05 || sweepMinUpperWick > 0.90 {
+		return nil, fmt.Errorf("config: invalid SWEEP_MIN_UPPER_WICK_RATIO '%s' (must be float between 0.05 and 0.90)", sweepMinUpperWickStr)
+	}
+	sweepMaxLowerWickStr := getEnv("SWEEP_MAX_LOWER_WICK_RATIO", "0.45")
+	sweepMaxLowerWick, err := parseFloatEnv(sweepMaxLowerWickStr)
+	if err != nil || sweepMaxLowerWick < 0.05 || sweepMaxLowerWick > 0.95 {
+		return nil, fmt.Errorf("config: invalid SWEEP_MAX_LOWER_WICK_RATIO '%s' (must be float between 0.05 and 0.95)", sweepMaxLowerWickStr)
+	}
+	sweepMaxDeltaZStr := getEnv("SWEEP_MAX_DELTA_ZSCORE", "-0.25")
+	sweepMaxDeltaZ, err := parseFloatEnv(sweepMaxDeltaZStr)
+	if err != nil || sweepMaxDeltaZ < -5.0 || sweepMaxDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid SWEEP_MAX_DELTA_ZSCORE '%s' (must be float between -5.0 and 5.0)", sweepMaxDeltaZStr)
+	}
+	sweepAllowExtVWAP, err := parseBoolEnvStrict("SWEEP_SCANNER_ALLOW_EXTENDED_VWAP", getEnv("SWEEP_SCANNER_ALLOW_EXTENDED_VWAP", "false"))
+	if err != nil {
+		return nil, err
+	}
+	sweepMaxExtraStr := getEnv("SWEEP_SCANNER_MAX_EXTRA_COINS", "15")
+	sweepMaxExtra, err := strconv.Atoi(sweepMaxExtraStr)
+	if err != nil || sweepMaxExtra < 0 || sweepMaxExtra > 50 {
+		return nil, fmt.Errorf("config: invalid SWEEP_SCANNER_MAX_EXTRA_COINS '%s' (must be integer between 0 and 50)", sweepMaxExtraStr)
 	}
 
 	return &Config{
@@ -934,6 +988,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		SLATRMultiplierLong:        slMultLong,
 		MinNATRLongPct:             minNATRLong,
 		BTCChopBlockLong:           btcChopBlockLong,
+		BTCChopBlockShort:          btcChopBlockShort,
 		DisablePanicDumpFrenzyLong: disablePanicDumpFrenzyLong,
 		BTCTier2LongSymmetric:      btcTier2LongSymmetric,
 
@@ -964,6 +1019,16 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		BTCGateShortOnly:    btcGateShortOnly,
 		SLGapFillEnabled:    slGapFillEnabled,
 		DeductPendingMargin: deductPendingMargin,
+
+		Sweep: SweepStrategyConfig{
+			Enabled:                  sweepEnabled,
+			LookbackBars:             sweepLookback,
+			MinUpperWickRatio:        sweepMinUpperWick,
+			MaxLowerWickRatio:        sweepMaxLowerWick,
+			MaxDeltaZScore:           sweepMaxDeltaZ,
+			ScannerAllowExtendedVWAP: sweepAllowExtVWAP,
+			ScannerMaxExtraCoins:     sweepMaxExtra,
+		},
 	}, nil
 }
 

@@ -79,9 +79,39 @@ func TestSQLiteRepository(t *testing.T) {
 	}
 
 	var sigAuditID int64
-	err = db.conn.QueryRowContext(ctx, "SELECT signal_audit_id FROM trade_ledger WHERE client_order_id = 'ORDER_BTC_1'").Scan(&sigAuditID)
-	if err != nil || sigAuditID != 101 {
-		t.Fatalf("expected signal_audit_id=101, got %d, err=%v", sigAuditID, err)
+	var tradeStratID string
+	err = db.conn.QueryRowContext(ctx, "SELECT signal_audit_id, strategy_id FROM trade_ledger WHERE client_order_id = 'ORDER_BTC_1'").Scan(&sigAuditID, &tradeStratID)
+	if err != nil || sigAuditID != 101 || tradeStratID != "VWAP_PULLBACK" {
+		t.Fatalf("expected signal_audit_id=101 strategy_id=VWAP_PULLBACK, got %d %q, err=%v", sigAuditID, tradeStratID, err)
+	}
+
+	// Verify explicit strategy_id persistence on LogTrade
+	err = repo.LogTrade(
+		ctx,
+		"ORDER_SWEEP_1",
+		"AVAXUSDT",
+		"SHORT",
+		decimal.NewFromFloat(5.0),
+		decimal.NewFromFloat(180.0),
+		decimal.NewFromFloat(175.0),
+		decimal.NewFromFloat(183.0),
+		decimal.NewFromFloat(172.0),
+		decimal.NewFromFloat(25.0),
+		"TAKE_PROFIT",
+		now.Add(-15*time.Minute),
+		now,
+		-0.002,
+		0.028,
+		102,
+		"LIQUIDITY_SWEEP_SHORT",
+	)
+	if err != nil {
+		t.Fatalf("failed to log sweep trade: %v", err)
+	}
+	var sweepTradeStratID string
+	err = db.conn.QueryRowContext(ctx, "SELECT strategy_id FROM trade_ledger WHERE client_order_id = 'ORDER_SWEEP_1'").Scan(&sweepTradeStratID)
+	if err != nil || sweepTradeStratID != "LIQUIDITY_SWEEP_SHORT" {
+		t.Fatalf("expected sweep trade strategy_id=LIQUIDITY_SWEEP_SHORT, got %q, err=%v", sweepTradeStratID, err)
 	}
 
 	// 3. Test Log Signal Audit
@@ -115,12 +145,45 @@ func TestSQLiteRepository(t *testing.T) {
 	}
 
 	var spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64
-	err = db.conn.QueryRowContext(ctx, "SELECT spread_pct, rvol, impulse_atr_mult, limit_price, sl_price, tp_price FROM signal_audit_log WHERE id = ?", sigID).Scan(&spreadPct, &rvol, &impulseATRMult, &limitPrice, &slPrice, &tpPrice)
+	var sigStratID string
+	err = db.conn.QueryRowContext(ctx, "SELECT spread_pct, rvol, impulse_atr_mult, limit_price, sl_price, tp_price, strategy_id FROM signal_audit_log WHERE id = ?", sigID).Scan(&spreadPct, &rvol, &impulseATRMult, &limitPrice, &slPrice, &tpPrice, &sigStratID)
 	if err != nil {
 		t.Fatalf("failed to query new columns: %v", err)
 	}
-	if spreadPct != 0.025 || rvol != 1.45 || impulseATRMult != 1.20 || limitPrice != 3499.5 || slPrice != 3432.5 || tpPrice != 3633.5 {
-		t.Fatalf("unexpected values: spread=%.4f rvol=%.2f impulse=%.2f limit=%.2f sl=%.2f tp=%.2f", spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice)
+	if spreadPct != 0.025 || rvol != 1.45 || impulseATRMult != 1.20 || limitPrice != 3499.5 || slPrice != 3432.5 || tpPrice != 3633.5 || sigStratID != "VWAP_PULLBACK" {
+		t.Fatalf("unexpected values: spread=%.4f rvol=%.2f impulse=%.2f limit=%.2f sl=%.2f tp=%.2f strat=%q", spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice, sigStratID)
+	}
+
+	sweepSigID, err := repo.LogSignalAudit(
+		ctx,
+		now,
+		"SOLUSDT",
+		"SHORT",
+		180.0,
+		185.0,
+		182.0,
+		1.5,
+		-1.10,
+		0.20,
+		0.0001,
+		0.02,
+		1.25,
+		0.0,
+		179.9,
+		182.0,
+		175.0,
+		"EXECUTED_SHORT",
+		"SIGNAL_APPROVED",
+		"LIQUIDITY_SWEEP_SHORT",
+		"LIQUIDITY_SWEEP_SHORT",
+	)
+	if err != nil {
+		t.Fatalf("failed to log sweep signal audit: %v", err)
+	}
+	var sweepSigStratID string
+	err = db.conn.QueryRowContext(ctx, "SELECT strategy_id FROM signal_audit_log WHERE id = ?", sweepSigID).Scan(&sweepSigStratID)
+	if err != nil || sweepSigStratID != "LIQUIDITY_SWEEP_SHORT" {
+		t.Fatalf("expected sweep signal strategy_id=LIQUIDITY_SWEEP_SHORT, got %q, err=%v", sweepSigStratID, err)
 	}
 
 	// 4. Test PruneOldSignalAuditLogs
@@ -151,6 +214,7 @@ func TestSQLiteRepository(t *testing.T) {
 		ClientOrderID:    "SIM-NEARUSDT-12345",
 		Symbol:           "NEARUSDT",
 		Side:             "SHORT",
+		StrategyID:       "LIQUIDITY_SWEEP_SHORT",
 		Qty:              decimal.NewFromInt(39),
 		EntryPrice:       decimal.NewFromFloat(4.4600),
 		EntryFee:         decimal.NewFromFloat(0.08697),
@@ -178,7 +242,7 @@ func TestSQLiteRepository(t *testing.T) {
 	if len(positions) != 1 {
 		t.Fatalf("expected 1 position, got %d", len(positions))
 	}
-	if positions[0].Symbol != "NEARUSDT" || positions[0].ClientOrderID != "SIM-NEARUSDT-12345" || positions[0].SignalAuditID != 4369 {
+	if positions[0].Symbol != "NEARUSDT" || positions[0].ClientOrderID != "SIM-NEARUSDT-12345" || positions[0].SignalAuditID != 4369 || positions[0].StrategyID != "LIQUIDITY_SWEEP_SHORT" {
 		t.Fatalf("unexpected position data: %+v", positions[0])
 	}
 	if !positions[0].PeakPrice.Equal(decimal.NewFromFloat(4.4200)) {
@@ -215,6 +279,7 @@ func TestSQLiteRepository(t *testing.T) {
 	livePos := StoredLivePosition{
 		Symbol:         "BTCUSDT",
 		Side:           "SHORT",
+		StrategyID:     "LIQUIDITY_SWEEP_SHORT",
 		Qty:            decimal.NewFromFloat(0.05),
 		EntryPrice:     decimal.NewFromFloat(81000.0),
 		SLOrderID:      1234567,
@@ -242,7 +307,7 @@ func TestSQLiteRepository(t *testing.T) {
 	if len(livePositions) != 1 {
 		t.Fatalf("expected 1 live position, got %d", len(livePositions))
 	}
-	if livePositions[0].Symbol != "BTCUSDT" || livePositions[0].SLOrderID != 1234567 || !livePositions[0].SLPrice.Equal(decimal.NewFromFloat(81500.0)) {
+	if livePositions[0].Symbol != "BTCUSDT" || livePositions[0].SLOrderID != 1234567 || !livePositions[0].SLPrice.Equal(decimal.NewFromFloat(81500.0)) || livePositions[0].StrategyID != "LIQUIDITY_SWEEP_SHORT" {
 		t.Fatalf("unexpected live position data: %+v", livePositions[0])
 	}
 	if !livePositions[0].PeakPrice.Equal(decimal.NewFromFloat(80500.0)) {

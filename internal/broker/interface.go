@@ -10,6 +10,7 @@ import (
 type ActivePositionDTO struct {
 	Symbol           string  `json:"symbol"`
 	Side             string  `json:"side"`
+	StrategyID       string  `json:"strategy_id"`
 	Qty              string  `json:"qty"`
 	EntryPrice       float64 `json:"entry_price"`
 	MarkPrice        float64 `json:"mark_price"`

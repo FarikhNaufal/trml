@@ -27,6 +27,7 @@ type VirtualOpenPosition struct {
 	ClientOrderID    string
 	Symbol           string
 	Side             model.Side
+	StrategyID       string
 	Qty              decimal.Decimal
 	InitialQty       decimal.Decimal
 	EntryPrice       decimal.Decimal
@@ -82,6 +83,7 @@ type TradeClosedRecord struct {
 	ClientOrderID string
 	Symbol        string
 	Side          string
+	StrategyID    string
 	Qty           decimal.Decimal
 	EntryPrice    decimal.Decimal
 	ExitPrice     decimal.Decimal
@@ -94,6 +96,14 @@ type TradeClosedRecord struct {
 	OpenedAt      time.Time
 	ClosedAt      time.Time
 	SignalAuditID int64
+}
+
+func normalizeBrokerStrategyID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return "VWAP_PULLBACK"
+	}
+	return trimmed
 }
 
 type PositionEventType int
@@ -315,6 +325,7 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 			ClientOrderID:    intent.ClientOrderID,
 			Symbol:           intent.Symbol,
 			Side:             intent.Side,
+			StrategyID:       normalizeBrokerStrategyID(intent.StrategyID),
 			Qty:              intent.Qty,
 			InitialQty:       intent.Qty,
 			EntryPrice:       fillPrice,
@@ -744,6 +755,7 @@ func (d *DryRunBroker) syncPartialFillToOpenPositionLocked(ord *VirtualPendingOr
 			ClientOrderID:    ord.Intent.ClientOrderID,
 			Symbol:           ord.Intent.Symbol,
 			Side:             ord.Intent.Side,
+			StrategyID:       normalizeBrokerStrategyID(ord.Intent.StrategyID),
 			Qty:              fillChunk,
 			InitialQty:       fillChunk,
 			EntryPrice:       ord.Intent.LimitPrice,
@@ -910,6 +922,7 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 			ClientOrderID: fmt.Sprintf("%s_TP1", pos.ClientOrderID),
 			Symbol:        pos.Symbol,
 			Side:          string(pos.Side),
+			StrategyID:    normalizeBrokerStrategyID(pos.StrategyID),
 			Qty:           closeQty,
 			EntryPrice:    pos.EntryPrice,
 			ExitPrice:     exitPrice,
@@ -969,6 +982,7 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 		ClientOrderID: clientOrderID,
 		Symbol:        pos.Symbol,
 		Side:          string(pos.Side),
+		StrategyID:    normalizeBrokerStrategyID(pos.StrategyID),
 		Qty:           pos.Qty,
 		EntryPrice:    pos.EntryPrice,
 		ExitPrice:     exitPrice,
@@ -1209,6 +1223,7 @@ func (d *DryRunBroker) GetActivePositions() []ActivePositionDTO {
 		result = append(result, ActivePositionDTO{
 			Symbol:           pos.Symbol,
 			Side:             string(pos.Side),
+			StrategyID:       normalizeBrokerStrategyID(pos.StrategyID),
 			Qty:              pos.Qty.String(),
 			EntryPrice:       entryF,
 			MarkPrice:        markF,

@@ -512,3 +512,61 @@ func TestLoadConfig_MinNATRLongPctAndBTCChopBlockLong(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_SweepStrategyDefaultsAndValidation(t *testing.T) {
+	t.Setenv("BINANCE_API_KEY", "test_key")
+	t.Setenv("BINANCE_API_SECRET", "test_sec")
+
+	defCfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig default failed: %v", err)
+	}
+	if defCfg.Sweep.Enabled ||
+		defCfg.Sweep.LookbackBars != 12 ||
+		defCfg.Sweep.MinUpperWickRatio != 0.25 ||
+		defCfg.Sweep.MaxLowerWickRatio != 0.45 ||
+		defCfg.Sweep.MaxDeltaZScore != -0.25 ||
+		defCfg.Sweep.ScannerAllowExtendedVWAP ||
+		defCfg.Sweep.ScannerMaxExtraCoins != 15 {
+		t.Fatalf("unexpected default Sweep config: %+v", defCfg.Sweep)
+	}
+
+	t.Setenv("SWEEP_STRATEGY_ENABLED", "true")
+	t.Setenv("SWEEP_LOOKBACK_BARS", "16")
+	t.Setenv("SWEEP_MIN_UPPER_WICK_RATIO", "0.30")
+	t.Setenv("SWEEP_MAX_LOWER_WICK_RATIO", "0.40")
+	t.Setenv("SWEEP_MAX_DELTA_ZSCORE", "0.0")
+	t.Setenv("SWEEP_SCANNER_ALLOW_EXTENDED_VWAP", "true")
+	t.Setenv("SWEEP_SCANNER_MAX_EXTRA_COINS", "10")
+
+	custom, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig custom sweep failed: %v", err)
+	}
+	if !custom.Sweep.Enabled ||
+		custom.Sweep.LookbackBars != 16 ||
+		custom.Sweep.MinUpperWickRatio != 0.30 ||
+		custom.Sweep.MaxLowerWickRatio != 0.40 ||
+		custom.Sweep.MaxDeltaZScore != 0.0 ||
+		!custom.Sweep.ScannerAllowExtendedVWAP ||
+		custom.Sweep.ScannerMaxExtraCoins != 10 {
+		t.Fatalf("unexpected custom Sweep config: %+v", custom.Sweep)
+	}
+
+	badVars := [][2]string{
+		{"SWEEP_STRATEGY_ENABLED", "maybe"},
+		{"SWEEP_LOOKBACK_BARS", "2"},
+		{"SWEEP_MIN_UPPER_WICK_RATIO", "0.01"},
+		{"SWEEP_MAX_LOWER_WICK_RATIO", "1.20"},
+		{"SWEEP_MAX_DELTA_ZSCORE", "9.0"},
+		{"SWEEP_SCANNER_ALLOW_EXTENDED_VWAP", "yesno"},
+		{"SWEEP_SCANNER_MAX_EXTRA_COINS", "100"},
+	}
+	for _, pair := range badVars {
+		t.Setenv(pair[0], pair[1])
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error for invalid %s=%s", pair[0], pair[1])
+		}
+		_ = os.Unsetenv(pair[0])
+	}
+}
+

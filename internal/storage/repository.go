@@ -15,6 +15,7 @@ type StoredDryRunPosition struct {
 	Symbol           string
 	ClientOrderID    string
 	Side             string
+	StrategyID       string
 	Qty              decimal.Decimal
 	InitialQty       decimal.Decimal
 	EntryPrice       decimal.Decimal
@@ -39,6 +40,7 @@ type StoredDryRunPosition struct {
 type StoredLivePosition struct {
 	Symbol         string
 	Side           string
+	StrategyID     string
 	Qty            decimal.Decimal
 	InitialQty     decimal.Decimal
 	EntryPrice     decimal.Decimal
@@ -71,8 +73,8 @@ type Repository interface {
 	SaveDailyState(ctx context.Context, epochDay int64, sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool) error
 	GetDailyState(ctx context.Context, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
 	GetLatestDailyState(ctx context.Context) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error)
-	LogTrade(ctx context.Context, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64) error
-	LogSignalAudit(ctx context.Context, candleOpenTime time.Time, symbol, side string, closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64, decision, rejectReason, rejectSubReason string) (int64, error)
+	LogTrade(ctx context.Context, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64, strategyID ...string) error
+	LogSignalAudit(ctx context.Context, candleOpenTime time.Time, symbol, side string, closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64, decision, rejectReason, rejectSubReason string, strategyID ...string) (int64, error)
 	PruneOldSignalAuditLogs(ctx context.Context, olderThanDays int) (int64, error)
 	SaveDryRunPosition(ctx context.Context, pos StoredDryRunPosition) error
 	DeleteDryRunPosition(ctx context.Context, symbol string) error
@@ -196,6 +198,15 @@ func (r *SQLiteRepository) GetLatestDailyState(
 	return startDec, realDec, breakerInt == 1, epDay, true, nil
 }
 
+func resolveRepoStrategyID(strategyID ...string) string {
+	if len(strategyID) > 0 {
+		if trimmed := strings.TrimSpace(strategyID[0]); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "VWAP_PULLBACK"
+}
+
 func (r *SQLiteRepository) LogTrade(
 	ctx context.Context,
 	clientOrderID, symbol, side string,
@@ -204,14 +215,17 @@ func (r *SQLiteRepository) LogTrade(
 	openedAt, closedAt time.Time,
 	mae, mfe float64,
 	signalAuditID int64,
+	strategyID ...string,
 ) error {
+	stratID := resolveRepoStrategyID(strategyID...)
 	query := `
 	INSERT INTO trade_ledger (
-		client_order_id, symbol, side, qty, entry_price, exit_price,
+		client_order_id, symbol, side, strategy_id, qty, entry_price, exit_price,
 		sl_price_initial, tp_price_initial, net_pnl_usdt, mae_pct, mfe_pct,
 		exit_reason, opened_at_utc, closed_at_utc, signal_audit_id
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
+		strategy_id = CASE WHEN excluded.strategy_id != '' THEN excluded.strategy_id ELSE trade_ledger.strategy_id END,
 		exit_price = excluded.exit_price,
 		net_pnl_usdt = excluded.net_pnl_usdt,
 		mae_pct = excluded.mae_pct,
@@ -226,6 +240,7 @@ func (r *SQLiteRepository) LogTrade(
 		clientOrderID,
 		symbol,
 		side,
+		stratID,
 		qty.String(),
 		entryPrice.String(),
 		exitPrice.String(),
@@ -251,13 +266,15 @@ func (r *SQLiteRepository) LogSignalAudit(
 	symbol, side string,
 	closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64,
 	decision, rejectReason, rejectSubReason string,
+	strategyID ...string,
 ) (int64, error) {
+	stratID := resolveRepoStrategyID(strategyID...)
 	query := `
 	INSERT INTO signal_audit_log (
-		candle_open_time_utc, symbol, side, close_price, ema200, session_vwap,
+		candle_open_time_utc, symbol, side, strategy_id, close_price, ema200, session_vwap,
 		atr14, bar_delta_zscore, oi_delta_pct, funding_rate, spread_pct, rvol, impulse_atr_mult,
 		limit_price, sl_price, tp_price, decision, reject_reason_code, reject_sub_reason, created_at_utc
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	res, err := r.db.conn.ExecContext(
 		ctx,
@@ -265,6 +282,7 @@ func (r *SQLiteRepository) LogSignalAudit(
 		candleOpenTime.UTC().Format(time.RFC3339Nano),
 		symbol,
 		side,
+		stratID,
 		closePrice,
 		ema200,
 		sessionVwap,
@@ -315,14 +333,16 @@ func (r *SQLiteRepository) PruneOldSignalAuditLogs(ctx context.Context, olderTha
 
 // SaveDryRunPosition menyimpan atau memperbarui posisi virtual dry-run ke SQLite agar tahan restart
 func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDryRunPosition) error {
+	stratID := resolveRepoStrategyID(pos.StrategyID)
 	query := `
 	INSERT INTO dryrun_open_positions (
-		client_order_id, symbol, side, qty, initial_qty, entry_price, entry_fee,
+		client_order_id, symbol, side, strategy_id, qty, initial_qty, entry_price, entry_fee,
 		current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 		mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
 		signal_audit_id, max_mae, max_mfe, peak_price
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
+		strategy_id = excluded.strategy_id,
 		qty = excluded.qty,
 		initial_qty = excluded.initial_qty,
 		entry_price = excluded.entry_price,
@@ -378,6 +398,7 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		pos.ClientOrderID,
 		pos.Symbol,
 		pos.Side,
+		stratID,
 		pos.Qty.String(),
 		initQtyStr,
 		pos.EntryPrice.String(),
@@ -417,7 +438,7 @@ func (r *SQLiteRepository) DeleteDryRunPosition(ctx context.Context, clientOrder
 // GetAllDryRunPositions mengambil seluruh posisi terbuka yang tersimpan saat startup bot
 func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredDryRunPosition, error) {
 	query := `
-	SELECT symbol, client_order_id, side, qty, initial_qty, entry_price, entry_fee,
+	SELECT symbol, client_order_id, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), qty, initial_qty, entry_price, entry_fee,
 	       current_sl_price, initial_sl_price, tp_price, tp1_price, is_tp1_hit, atr_at_entry, last_mark_price,
 	       mark_updated_at_utc, opened_at_utc, is_breakeven_moved, protection_tier,
 	       signal_audit_id, max_mae, max_mfe, peak_price
@@ -440,6 +461,7 @@ func (r *SQLiteRepository) GetAllDryRunPositions(ctx context.Context) ([]StoredD
 			&p.Symbol,
 			&p.ClientOrderID,
 			&p.Side,
+			&p.StrategyID,
 			&qtyStr,
 			&initQtyStr,
 			&entryStr,
@@ -625,14 +647,16 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 
 // SaveLivePosition menyimpan atau memperbarui posisi live ke SQLite agar tahan restart (TD-01)
 func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLivePosition) error {
+	stratID := resolveRepoStrategyID(pos.StrategyID)
 	query := `
 	INSERT INTO live_open_positions (
-		symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
+		symbol, side, strategy_id, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
 		sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
 		atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc, peak_price
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(symbol) DO UPDATE SET
 		side = excluded.side,
+		strategy_id = excluded.strategy_id,
 		qty = excluded.qty,
 		initial_qty = excluded.initial_qty,
 		entry_price = excluded.entry_price,
@@ -685,6 +709,7 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		query,
 		pos.Symbol,
 		pos.Side,
+		stratID,
 		pos.Qty.String(),
 		initQtyStr,
 		pos.EntryPrice.String(),
@@ -725,7 +750,7 @@ func (r *SQLiteRepository) DeleteLivePosition(ctx context.Context, symbol string
 // GetAllLivePositions mengambil seluruh posisi live terbuka yang tersimpan saat startup bot
 func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLivePosition, error) {
 	query := `
-	SELECT symbol, side, qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
+	SELECT symbol, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), qty, initial_qty, entry_price, sl_order_id, sl_client_algo_id,
 	       sl_price, initial_sl_price, tp_order_id, tp_client_algo_id, tp_price, tp1_price, is_tp1_hit,
 	       atr_at_entry, protection_tier, signal_audit_id, opened_at_utc, max_mae, max_mfe, updated_at_utc, peak_price
 	FROM live_open_positions;
@@ -745,6 +770,7 @@ func (r *SQLiteRepository) GetAllLivePositions(ctx context.Context) ([]StoredLiv
 		err := rows.Scan(
 			&p.Symbol,
 			&p.Side,
+			&p.StrategyID,
 			&qtyStr,
 			&initQtyStr,
 			&entryStr,

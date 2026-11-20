@@ -26,7 +26,7 @@ func WriteTradesCSV(path string, trades []simbroker.SimTradeRecord) error {
 	if err := w.Write([]string{
 		"ID", "Symbol", "Side", "EntryTime", "ExitTime", "EntryPrice", "ExitPrice",
 		"Qty", "InitialQty", "SLPrice", "TPPrice", "TP1Price", "GrossPnL", "NetPnL",
-		"FeeTotal", "FundingTotal", "ExitReason", "MAE", "MFE", "HoldingBars", "ATRAtEntry",
+		"FeeTotal", "FundingTotal", "ExitReason", "MAE", "MFE", "HoldingBars", "ATRAtEntry", "StrategyID",
 	}); err != nil {
 		return err
 	}
@@ -53,6 +53,7 @@ func WriteTradesCSV(path string, trades []simbroker.SimTradeRecord) error {
 			fmt.Sprintf("%.4f", tr.MFE),
 			strconv.Itoa(tr.HoldingBars),
 			tr.ATRAtEntry.String(),
+			tr.StrategyID,
 		}); err != nil {
 			return err
 		}

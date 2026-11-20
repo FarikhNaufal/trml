@@ -60,6 +60,7 @@ type SimTradeRecord struct {
 	ID            string          `json:"id"`
 	Symbol        string          `json:"symbol"`
 	Side          model.Side      `json:"side"`
+	StrategyID    string          `json:"strategy_id,omitempty"`
 	EntryTime     time.Time       `json:"entry_time"`
 	ExitTime      time.Time       `json:"exit_time"`
 	EntryPrice    decimal.Decimal `json:"entry_price"`
@@ -97,6 +98,7 @@ type SimPendingOrder struct {
 type SimPosition struct {
 	Symbol           string
 	Side             model.Side
+	StrategyID       string
 	Qty              decimal.Decimal
 	InitialQty       decimal.Decimal
 	EntryPrice       decimal.Decimal

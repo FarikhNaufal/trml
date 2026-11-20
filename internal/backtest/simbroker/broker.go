@@ -525,11 +525,17 @@ func (s *SimBroker) recordClosedTradeLocked(
 		entryMode = "GTX_REPEG"
 	}
 
+	stratID := strings.TrimSpace(pos.StrategyID)
+	if stratID == "" {
+		stratID = "VWAP_PULLBACK"
+	}
+
 	tradeID := fmt.Sprintf("SIM_%s_%d", pos.Symbol, closedAt.UnixNano())
 	rec := SimTradeRecord{
 		ID:            tradeID,
 		Symbol:        pos.Symbol,
 		Side:          pos.Side,
+		StrategyID:    stratID,
 		EntryTime:     pos.OpenTime,
 		ExitTime:      closedAt,
 		EntryPrice:    pos.EntryPrice,
@@ -717,9 +723,14 @@ func (s *SimBroker) newSimPositionLocked(
 	wasMaker bool,
 	barIndex int64,
 ) *SimPosition {
+	stratID := strings.TrimSpace(pending.Intent.StrategyID)
+	if stratID == "" {
+		stratID = "VWAP_PULLBACK"
+	}
 	return &SimPosition{
 		Symbol:         c.Symbol,
 		Side:           pending.Intent.Side,
+		StrategyID:     stratID,
 		Qty:            pending.Intent.Qty,
 		InitialQty:     pending.Intent.Qty,
 		EntryPrice:     fillPrice,

@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS trade_ledger (
     client_order_id      TEXT PRIMARY KEY,
     symbol               TEXT NOT NULL,
     side                 TEXT NOT NULL,
+    strategy_id          TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
     qty                  TEXT NOT NULL,
     entry_price          TEXT NOT NULL,
     exit_price           TEXT NOT NULL,
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS signal_audit_log (
     candle_open_time_utc TEXT NOT NULL,
     symbol               TEXT NOT NULL,
     side                 TEXT NOT NULL DEFAULT 'NONE',
+    strategy_id          TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
     close_price          REAL NOT NULL,
     ema200               REAL NOT NULL,
     session_vwap         REAL NOT NULL,
@@ -76,6 +78,7 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
     client_order_id      TEXT PRIMARY KEY,
     symbol               TEXT NOT NULL,
     side                 TEXT NOT NULL,
+    strategy_id          TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
     qty                  TEXT NOT NULL,
     entry_price          TEXT NOT NULL,
     entry_fee            TEXT NOT NULL,
@@ -100,6 +103,7 @@ CREATE TABLE IF NOT EXISTS dryrun_open_positions (
 CREATE TABLE IF NOT EXISTS live_open_positions (
     symbol               TEXT PRIMARY KEY,
     side                 TEXT NOT NULL,
+    strategy_id          TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
     qty                  TEXT NOT NULL,
     initial_qty          TEXT NOT NULL DEFAULT '',
     entry_price          TEXT NOT NULL,
@@ -186,6 +190,7 @@ func OpenDB(dbPath string) (*DB, error) {
 		{"limit_price", "REAL NOT NULL DEFAULT 0.0"},
 		{"sl_price", "REAL NOT NULL DEFAULT 0.0"},
 		{"tp_price", "REAL NOT NULL DEFAULT 0.0"},
+		{"strategy_id", "TEXT NOT NULL DEFAULT 'VWAP_PULLBACK'"},
 	}
 	for _, ac := range auditCols {
 		if err := ensureColumn("signal_audit_log", ac.col, ac.def); err != nil {
@@ -198,6 +203,7 @@ func OpenDB(dbPath string) (*DB, error) {
 	ledgerCols := []struct{ col, def string }{
 		{"signal_audit_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"ai_autopsy", "TEXT NOT NULL DEFAULT ''"},
+		{"strategy_id", "TEXT NOT NULL DEFAULT 'VWAP_PULLBACK'"},
 	}
 	for _, lc := range ledgerCols {
 		if err := ensureColumn("trade_ledger", lc.col, lc.def); err != nil {
@@ -215,6 +221,7 @@ func OpenDB(dbPath string) (*DB, error) {
 		{"is_tp1_hit", "INTEGER NOT NULL DEFAULT 0"},
 		{"initial_sl_price", "TEXT NOT NULL DEFAULT ''"},
 		{"peak_price", "TEXT NOT NULL DEFAULT ''"},
+		{"strategy_id", "TEXT NOT NULL DEFAULT 'VWAP_PULLBACK'"},
 	}
 	for _, tbl := range posTables {
 		for _, pc := range posCols {

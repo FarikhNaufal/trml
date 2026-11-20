@@ -2444,3 +2444,47 @@ func TestEvaluateSignal_MinNATRLongPctAndBTCChopBlockLong(t *testing.T) {
 	}
 }
 
+func TestEvaluateSignal_BTCChopBlockShortOptionalDefaultOff(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 15, 0, 0, time.UTC)
+
+	btcChop := make([]model.Candle, 60)
+	for i := range btcChop {
+		p := 50000.0
+		if i%2 == 0 {
+			p = 50700.0
+		}
+		btcChop[i] = model.Candle{
+			OpenTime:  now.Add(time.Duration(i-60) * 5 * time.Minute),
+			CloseTime: now.Add(time.Duration(i-59) * 5 * time.Minute),
+			Open:      p,
+			High:      p * 1.015,
+			Low:       p * 0.985,
+			Close:     p,
+		}
+	}
+	btcSnap := &model.MarketSnapshot{
+		Symbol:             "BTCUSDT",
+		Now:                now,
+		ClosedCandles:      btcChop,
+		CurrentSessionVWAP: 50350.0,
+	}
+
+	// Default (BTCChopBlockShort=false): SHORT must remain unaffected during BTC chop
+	snapDefault, cfgDefault := helperCreateValidShortSnapshot(now)
+	cfgDefault.BTCGateEnabled = false
+	cfgDefault.BTCChopBlockLong = true
+	_, ok, reason, _ := EvaluateSignal(snapDefault, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgDefault)
+	if !ok || reason != "SIGNAL_APPROVED" {
+		t.Fatalf("expected SHORT unaffected when BTCChopBlockShort=false, got ok=%v reason=%s", ok, reason)
+	}
+
+	// Enabled (BTCChopBlockShort=true): SHORT must be vetoed with BTC_CHOP_SHORT_VETO
+	snapBlocked, cfgBlocked := helperCreateValidShortSnapshot(now)
+	cfgBlocked.BTCGateEnabled = false
+	cfgBlocked.BTCChopBlockShort = true
+	_, ok, reason, _ = EvaluateSignal(snapBlocked, btcSnap, 0, false, false, decimal.NewFromFloat(1000), decimal.NewFromFloat(1000), cfgBlocked)
+	if ok || reason != "BTC_CHOP_SHORT_VETO" {
+		t.Fatalf("expected SHORT vetoed with BTC_CHOP_SHORT_VETO when BTCChopBlockShort=true, got ok=%v reason=%s", ok, reason)
+	}
+}
+

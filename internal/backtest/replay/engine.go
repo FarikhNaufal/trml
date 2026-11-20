@@ -145,6 +145,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 	var lastScanTime time.Time
 	watchedSymbols := make(map[string]bool)
+	sweepExtraSymbols := make(map[string]bool)
 	lastClosedTradeIdx := 0
 	var prevSimTime time.Time
 
@@ -171,7 +172,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 			// B. Prepare BTC macro snapshot and evaluate signals on active/watched symbols
 			btcSnap := r.buildBTCMacro(simTime, rollingCandles, rollingDeltas)
-			r.evaluateSignalsAtBar(simTime, sortedSymbols, watchedSymbols, rollingCandles, rollingDeltas, btcSnap)
+			r.evaluateSignalsAtBar(simTime, sortedSymbols, watchedSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, btcSnap)
 		}
 
 		// C. Post-bar dynamic scan cadence: new watchlist activates on subsequent closed bars
@@ -179,7 +180,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		if r.cfg.DynamicScannerEnabled && barIdx >= r.cfg.WarmupBars-1 &&
 			(lastScanTime.IsZero() || simTime.Sub(lastScanTime) >= r.cfg.ScannerInterval) {
 			lastScanTime = simTime
-			watchedSymbols = scanSim.RunCycle(sortedSymbols, rollingCandles, simTime)
+			watchedSymbols, sweepExtraSymbols = scanSim.RunCyclePartitioned(sortedSymbols, rollingCandles, simTime)
 		}
 
 		prevSimTime = simTime
@@ -331,7 +332,8 @@ func (r *ReplayEngine) buildBTCMacro(
 	rollingCandles map[string][]model.Candle,
 	rollingDeltas map[string][]float64,
 ) *model.MarketSnapshot {
-	if !r.evaluatorCfg.BTCGateEnabled {
+	if !r.evaluatorCfg.BTCGateEnabled && !r.evaluatorCfg.BTCChopBlockLong && !r.evaluatorCfg.BTCChopBlockShort &&
+		(r.evaluatorCfg.BTCChopRiskMult <= 0 || r.evaluatorCfg.BTCChopRiskMult >= 1.0) {
 		return nil
 	}
 	return BuildBTCMacroSnapshot(
@@ -347,6 +349,7 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 	simTime time.Time,
 	sortedSymbols []string,
 	watchedSymbols map[string]bool,
+	sweepExtraSymbols map[string]bool,
 	rollingCandles map[string][]model.Candle,
 	rollingDeltas map[string][]float64,
 	btcSnap *model.MarketSnapshot,
@@ -370,14 +373,16 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		if sym == r.cfg.BenchmarkSym && !r.isSymbolTarget(sym) {
 			continue
 		}
-		if r.cfg.DynamicScannerEnabled && !watchedSymbols[sym] && !r.broker.HasActiveOrderOrPosition(sym) {
+		hasActive := r.broker.HasActiveOrderOrPosition(sym)
+		inPrimary := !r.cfg.DynamicScannerEnabled || watchedSymbols[sym]
+		inSweepExtra := r.cfg.DynamicScannerEnabled && sweepExtraSymbols[sym]
+		if r.cfg.DynamicScannerEnabled && !inPrimary && !inSweepExtra && !hasActive {
 			continue
 		}
 		if len(cList) < r.evaluatorCfg.EMAPeriod {
 			continue
 		}
 
-		hasActive := r.broker.HasActiveOrderOrPosition(sym)
 		exitInfo := r.lastExits[sym]
 		if r.cfg.UnconstrainedMode {
 			exitInfo = lastExitInfo{}
@@ -405,7 +410,11 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		}
 
 		r.TotalSignalsEvaluated++
-		intent, approved, reason, _ := strategy.EvaluateSignal(
+		scope := strategy.SymbolScope{
+			AllowPrimary: inPrimary || (!inSweepExtra && hasActive),
+			AllowSweep:   inPrimary || inSweepExtra,
+		}
+		dec := strategy.EvaluatePortfolio(
 			snap,
 			btcSnap,
 			activeSlots,
@@ -413,19 +422,20 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 			hasActive,
 			totEq,
 			availBal,
+			scope,
 			evalCfg,
 		)
 
-		if approved {
+		if dec.Approved {
 			r.SignalsApproved++
-			_, _ = r.broker.SubmitLimitEntry(intent)
+			_, _ = r.broker.SubmitLimitEntry(dec.Intent)
 			activeSlots = r.broker.GetActiveSlotCount()
 			if r.cfg.DeductPendingMargin {
 				availBal = r.broker.GetAvailableBalanceUSDT()
 			}
 		} else {
 			r.SignalsRejected++
-			r.RejectReasons[reason]++
+			r.RejectReasons[dec.Reason]++
 		}
 	}
 }

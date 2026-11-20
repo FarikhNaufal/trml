@@ -7,17 +7,20 @@ import (
 )
 
 type SegmentStats struct {
-	Name         string  `json:"name"`
-	TotalTrades  int     `json:"total_trades"`
-	Wins         int     `json:"wins"`
-	Losses       int     `json:"losses"`
-	BreakEven    int     `json:"break_even"`
-	WinRatePct   float64 `json:"win_rate_pct"`
-	TotalNetPnL  float64 `json:"total_net_pnl"`
-	AvgPnLUSDT   float64 `json:"avg_pnl_usdt"`
-	GrossProfit  float64 `json:"gross_profit"`
-	GrossLoss    float64 `json:"gross_loss"`
-	ProfitFactor float64 `json:"profit_factor"`
+	Name            string  `json:"name"`
+	TotalTrades     int     `json:"total_trades"`
+	Wins            int     `json:"wins"`
+	Losses          int     `json:"losses"`
+	BreakEven       int     `json:"break_even"`
+	WinRatePct      float64 `json:"win_rate_pct"`
+	TotalNetPnL     float64 `json:"total_net_pnl"`
+	AvgPnLUSDT      float64 `json:"avg_pnl_usdt"`
+	GrossProfit     float64 `json:"gross_profit"`
+	GrossLoss       float64 `json:"gross_loss"`
+	ProfitFactor    float64 `json:"profit_factor"`
+	NetProfit       float64 `json:"net_profit"`
+	NetLoss         float64 `json:"net_loss"`
+	NetProfitFactor float64 `json:"net_profit_factor"`
 }
 
 // SymbolAttribution summarizes net profit/loss contribution by trading pair.
@@ -36,6 +39,7 @@ type SegmentationReport struct {
 	SideSegments      []SegmentStats `json:"side_segments"`
 	HoldingSegments   []SegmentStats `json:"holding_segments,omitempty"`
 	EntryTypeSegments []SegmentStats `json:"entry_type_segments,omitempty"`
+	StrategySegments  []SegmentStats `json:"strategy_segments,omitempty"`
 }
 
 // CalculateSegmentation mengelompokkan trade ke dalam bucket statistik bebas path-dependency.
@@ -60,7 +64,20 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 	entryRepegged := newSegment("GTX Repeg")
 	entryMarket := newSegment("Market Fill")
 
+	byStrategy := make(map[string]*segmentAccumulator)
+
 	for _, t := range trades {
+		stratKey := t.StrategyID
+		if stratKey == "" {
+			stratKey = "VWAP_PULLBACK"
+		}
+		stratSeg, exists := byStrategy[stratKey]
+		if !exists {
+			stratSeg = newSegment(stratKey)
+			byStrategy[stratKey] = stratSeg
+		}
+		stratSeg.addTrade(t)
+
 		if t.NATRPct < 0.80 {
 			natrLow.addTrade(t)
 		} else {
@@ -106,6 +123,16 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 		}
 	}
 
+	stratKeys := make([]string, 0, len(byStrategy))
+	for k := range byStrategy {
+		stratKeys = append(stratKeys, k)
+	}
+	sort.Strings(stratKeys)
+	stratSegments := make([]SegmentStats, 0, len(stratKeys))
+	for _, k := range stratKeys {
+		stratSegments = append(stratSegments, byStrategy[k].finalize())
+	}
+
 	return SegmentationReport{
 		NATRSegments: []SegmentStats{
 			natrLow.finalize(),
@@ -132,6 +159,7 @@ func CalculateSegmentation(trades []AggregatedTrade) SegmentationReport {
 			entryRepegged.finalize(),
 			entryMarket.finalize(),
 		},
+		StrategySegments: stratSegments,
 	}
 }
 
@@ -214,8 +242,10 @@ func (s *segmentAccumulator) addTrade(t AggregatedTrade) {
 
 	if t.NetPnL > 0.0001 {
 		s.stat.Wins++
+		s.stat.NetProfit += t.NetPnL
 	} else if t.NetPnL < -0.0001 {
 		s.stat.Losses++
+		s.stat.NetLoss += math.Abs(t.NetPnL)
 	} else {
 		s.stat.BreakEven++
 	}
@@ -232,6 +262,13 @@ func (s *segmentAccumulator) finalize() SegmentStats {
 		s.stat.ProfitFactor = 99.0
 	} else {
 		s.stat.ProfitFactor = 0.0
+	}
+	if s.stat.NetLoss > 0 {
+		s.stat.NetProfitFactor = s.stat.NetProfit / s.stat.NetLoss
+	} else if s.stat.NetProfit > 0 {
+		s.stat.NetProfitFactor = 99.0
+	} else {
+		s.stat.NetProfitFactor = 0.0
 	}
 	return s.stat
 }

@@ -9,6 +9,7 @@ const state = {
     page: 1,
     limit: 10,
     filter: 'ALL',
+    strategy: 'ALL',
     totalPages: 1,
     total: 0
   },
@@ -17,6 +18,7 @@ const state = {
     limit: 15,
     decision: 'ALL',
     symbol: 'ALL',
+    strategy: 'ALL',
     totalPages: 1,
     total: 0
   },
@@ -113,6 +115,17 @@ function formatDuration(sec) {
   const h = Math.floor(m / 60);
   const remM = m % 60;
   return `${h}h ${remM}m`;
+}
+
+function renderStrategyBadge(strategyID) {
+  const raw = (strategyID || '').trim().toUpperCase();
+  if (raw === 'LIQUIDITY_SWEEP_SHORT') {
+    return '<span class="badge badge-strat-sweep" title="LIQUIDITY_SWEEP_SHORT">SWEEP</span>';
+  }
+  if (!raw || raw === 'VWAP_PULLBACK') {
+    return '<span class="badge badge-strat-vwap" title="VWAP_PULLBACK">VWAP</span>';
+  }
+  return `<span class="badge badge-time" title="${escapeHtml(raw)}">${escapeHtml(raw)}</span>`;
 }
 
 function updateConnectionStatus(isOnline) {
@@ -240,6 +253,34 @@ function renderSummary(data) {
     elOutcomesSub.textContent = `Pure WR: ${adjWR}% • Profit Factor: ${pf}`;
   }
 
+  // Render Strategy Attribution Strip
+  const stratStrip = document.getElementById('strategy-attribution-strip');
+  if (stratStrip) {
+    const stratStats = Array.isArray(data.strategy_stats) ? data.strategy_stats : [];
+    if (stratStats.length === 0) {
+      stratStrip.classList.add('hidden');
+      stratStrip.innerHTML = '';
+    } else {
+      stratStrip.classList.remove('hidden');
+      stratStrip.innerHTML = stratStats.map((st) => {
+        const pnlCls = st.total_net_pnl_usdt > 0 ? 'val-green' : (st.total_net_pnl_usdt < 0 ? 'val-red' : '');
+        const wr = (st.adjusted_win_rate_pct > 0 ? st.adjusted_win_rate_pct : (st.win_rate_pct || 0)).toFixed(1);
+        const pf = typeof st.profit_factor === 'number' ? st.profit_factor.toFixed(2) : '0.00';
+        return `
+          <div class="strategy-chip">
+            ${renderStrategyBadge(st.strategy_id)}
+            <div class="strategy-chip-metrics">
+              <span><strong>${st.total_trades || 0}</strong> trades</span>
+              <span>WR <strong>${wr}%</strong></span>
+              <span>Net PF <strong>${pf}</strong></span>
+              <span class="${pnlCls}"><strong>${formatSignedUSD(st.total_net_pnl_usdt || 0)}</strong></span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+  }
+
   // Render Active Positions
   renderActivePositions(data.positions || []);
 }
@@ -294,6 +335,7 @@ function renderActivePositions(positions) {
           <div class="pos-symbol">
             <span>${escapeHtml(pos.symbol)}</span>
             <span class="pos-side-pill ${sideClass}">${escapeHtml(pos.side)}</span>
+            ${renderStrategyBadge(pos.strategy_id)}
             ${beBadge}
           </div>
           <div style="display:flex; align-items:center; gap:8px;">
@@ -439,7 +481,8 @@ async function fetchTrades() {
     const params = new URLSearchParams({
       page: state.trades.page,
       limit: state.trades.limit,
-      status: state.trades.filter
+      status: state.trades.filter,
+      strategy: state.trades.strategy
     });
     const res = await authFetch(`/api/trades?${params.toString()}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -468,7 +511,7 @@ function renderTrades(trades) {
   if (!trades || trades.length === 0) {
     const emptyRow = `
       <tr>
-        <td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 24px;">
+        <td colspan="12" style="text-align: center; color: var(--text-secondary); padding: 24px;">
           No trade records match current filter.
         </td>
       </tr>
@@ -510,6 +553,7 @@ function renderTrades(trades) {
         <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(t.symbol)}</strong></td>
         <td>${formatTimeUTC(t.closed_at_utc)}</td>
         <td><span class="pos-side-pill ${sideClass}">${escapeHtml(t.side)}</span></td>
+        <td>${renderStrategyBadge(t.strategy_id)}</td>
         <td>${escapeHtml(t.qty)}</td>
         <td>${escapeHtml(t.entry_price)}</td>
         <td>${escapeHtml(t.exit_price)}</td>
@@ -538,6 +582,7 @@ function renderTrades(trades) {
           <div style="display:flex; align-items:center; gap:6px;">
             <strong>${escapeHtml(t.symbol)}</strong>
             <span class="pos-side-pill ${sideClass}">${escapeHtml(t.side)}</span>
+            ${renderStrategyBadge(t.strategy_id)}
           </div>
           <div style="display:flex; align-items:center; gap:8px;">
             ${reasonBadge}
@@ -586,7 +631,8 @@ async function fetchSignals() {
       page: state.signals.page,
       limit: state.signals.limit,
       decision: state.signals.decision,
-      symbol: state.signals.symbol
+      symbol: state.signals.symbol,
+      strategy: state.signals.strategy
     });
     const res = await authFetch(`/api/signals?${params.toString()}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -599,13 +645,17 @@ async function fetchSignals() {
   }
 }
 
-function formatAuditReason(decision, code, subReason) {
+function formatAuditReason(decision, code, subReason, strategyID) {
   const isApp = decision === 'APPROVE' || decision === 'APPROVED';
   if (isApp) {
+    const stratNorm = (strategyID || '').trim().toUpperCase();
+    const appText = stratNorm === 'LIQUIDITY_SWEEP_SHORT'
+      ? 'Sweep &amp; Delta Validated'
+      : 'Retest &amp; Delta Validated';
     return `
       <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
         <span class="badge badge-approved" style="font-size:11px;">✓ CRITERIA MET</span>
-        <span class="audit-pill audit-pill-app">Retest &amp; Delta Validated</span>
+        <span class="audit-pill audit-pill-app">${appText}</span>
       </div>
     `;
   }
@@ -626,7 +676,10 @@ function formatAuditReason(decision, code, subReason) {
     'CLOSE_ABOVE_VWAP': 'Close Above VWAP',
     'CLOSE_BELOW_VWAP': 'Close Below VWAP',
     'BTC_GATE_VETO': 'BTC Macro Veto Active',
-    'SLOTS_FULL': 'Slots Full (3/3)',
+    'BTC_CHOP_LONG_VETO': 'BTC High-Vol Chop (Long Veto)',
+    'BTC_CHOP_SHORT_VETO': 'BTC High-Vol Chop (Short Veto)',
+    'UTC_HOUR_BLOCKED': 'Blocked UTC Whipsaw Hour',
+    'SLOTS_FULL': 'Slots Full',
     'SYMBOL_ALREADY_ACTIVE': 'Symbol Already Active',
     'NATR_OUT_OF_BOUNDS': 'NATR Out of Bounds',
     'SPREAD_EXCEEDED': 'Spread Exceeded',
@@ -634,7 +687,15 @@ function formatAuditReason(decision, code, subReason) {
     'ENTRY_TOO_FAR_FROM_EMA200': 'Entry Too Far From EMA200 (Overextended)',
     'STALE_MARK_PRICE_FEED': 'Stale Mark Price Feed',
     'INVALID_OI_INTERVAL': 'Invalid OI Interval',
-    'MISSING_OI_DATA': 'Missing OI Data'
+    'MISSING_OI_DATA': 'Missing OI Data',
+    'SWEEP_CONDITIONS_NOT_MET': 'Sweep Criteria Not Met',
+    'SWEEP_INSUFFICIENT_HISTORY': 'Sweep Insufficient History',
+    'NO_HIGH_SWEEP_RECLAIM': 'No 12-Bar High Sweep & Reclaim',
+    'WEAK_REJECTION_CANDLE': 'Weak Bearish Rejection Wick',
+    'NO_SWEEP_HIGH': 'No 12-Bar High Sweep',
+    'SWEEP_REJECTION_WICK': 'Weak Sweep Rejection Wick',
+    'EMA200_CHOP_ZONE': 'Too Close To EMA200',
+    'TREND_ABOVE_EMA200': 'Above EMA200 (Short Disabled)'
   };
 
   if (cleaned.includes('|')) {
@@ -693,7 +754,7 @@ function renderSignals(signals) {
   if (!signals || signals.length === 0) {
     const emptyRow = `
       <tr>
-        <td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 24px;">
+        <td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 24px;">
           No signals match current filter.
         </td>
       </tr>
@@ -716,7 +777,7 @@ function renderSignals(signals) {
     const sideClass = s.side === 'LONG' ? 'pos-side-long' : 'pos-side-short';
     const zScoreClass = Math.abs(s.bar_delta_zscore) >= 1.5 ? 'val-green' : '';
 
-    const reasonHtml = formatAuditReason(s.decision, s.reject_reason_code, s.reject_sub_reason);
+    const reasonHtml = formatAuditReason(s.decision, s.reject_reason_code, s.reject_sub_reason, s.strategy_id);
 
     // Also populate known symbols
     if (s.symbol && !state.knownSymbols.has(s.symbol)) {
@@ -730,6 +791,7 @@ function renderSignals(signals) {
         <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(s.symbol)}</strong></td>
         <td>${formatTimeUTC(s.candle_open_time_utc)}</td>
         <td><span class="pos-side-pill ${sideClass}">${escapeHtml(s.side)}</span></td>
+        <td>${renderStrategyBadge(s.strategy_id)}</td>
         <td>${s.close_price ? s.close_price.toFixed(4) : '--'}</td>
         <td>${s.session_vwap ? s.session_vwap.toFixed(4) : '--'}</td>
         <td class="${zScoreClass}">${s.bar_delta_zscore ? s.bar_delta_zscore.toFixed(2) : '--'}</td>
@@ -747,6 +809,7 @@ function renderSignals(signals) {
           <div style="display:flex; align-items:center; gap:6px;">
             <strong style="font-size:15px;">${escapeHtml(s.symbol)}</strong>
             <span class="pos-side-pill ${sideClass}">${escapeHtml(s.side)}</span>
+            ${renderStrategyBadge(s.strategy_id)}
           </div>
           <div>${decBadge}</div>
         </div>
@@ -808,6 +871,16 @@ function setupEvents() {
     });
   });
 
+  // Trade Strategy Dropdown
+  const tradeStrategySelect = document.getElementById('trade-strategy-select');
+  if (tradeStrategySelect) {
+    tradeStrategySelect.addEventListener('change', (e) => {
+      state.trades.strategy = e.target.value;
+      state.trades.page = 1;
+      fetchTrades();
+    });
+  }
+
   // Trade Limit
   const tradeLimitSelect = document.getElementById('trade-limit-select');
   if (tradeLimitSelect) {
@@ -854,6 +927,16 @@ function setupEvents() {
   if (signalSymbolSelect) {
     signalSymbolSelect.addEventListener('change', (e) => {
       state.signals.symbol = e.target.value;
+      state.signals.page = 1;
+      fetchSignals();
+    });
+  }
+
+  // Signal Strategy Dropdown
+  const signalStrategySelect = document.getElementById('signal-strategy-select');
+  if (signalStrategySelect) {
+    signalStrategySelect.addEventListener('change', (e) => {
+      state.signals.strategy = e.target.value;
       state.signals.page = 1;
       fetchSignals();
     });

@@ -9,7 +9,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css?v=4">
+  <link rel="stylesheet" href="/style.css?v=5">
 </head>
 <body>
   <!-- Header -->
@@ -107,6 +107,9 @@
 
     </section>
 
+    <!-- Strategy Attribution Strip -->
+    <div id="strategy-attribution-strip" class="strategy-strip hidden"></div>
+
     <!-- Active Positions Section -->
     <section class="panel">
       <div class="panel-header">
@@ -181,11 +184,18 @@
             <button class="filter-pill" data-filter-trade="BREAK_EVEN">BE</button>
             <button class="filter-pill" data-filter-trade="STOP_LOSS">SL</button>
           </div>
-          <select id="trade-limit-select" class="select-input" title="Rows per page">
-            <option value="10" selected>10 / page</option>
-            <option value="25">25 / page</option>
-            <option value="50">50 / page</option>
-          </select>
+          <div class="panel-selects-group">
+            <select id="trade-strategy-select" class="select-input" title="Filter by Strategy">
+              <option value="ALL">All Strategies</option>
+              <option value="VWAP_PULLBACK">VWAP</option>
+              <option value="LIQUIDITY_SWEEP_SHORT">SWEEP</option>
+            </select>
+            <select id="trade-limit-select" class="select-input" title="Rows per page">
+              <option value="10" selected>10 / page</option>
+              <option value="25">25 / page</option>
+              <option value="50">50 / page</option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -197,6 +207,7 @@
               <th class="col-sticky-symbol sticky-col">Symbol</th>
               <th>Closed At (UTC)</th>
               <th>Side</th>
+              <th>Strategy</th>
               <th>Qty</th>
               <th>Entry Price</th>
               <th>Exit Price</th>
@@ -209,7 +220,7 @@
           </thead>
           <tbody id="trades-tbody">
             <tr>
-              <td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading trades...</td>
+              <td colspan="12" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading trades...</td>
             </tr>
           </tbody>
         </table>
@@ -244,6 +255,11 @@
             <button class="filter-pill" data-filter-signal="REJECT">REJECTED</button>
           </div>
           <div class="panel-selects-group">
+            <select id="signal-strategy-select" class="select-input" title="Filter by Strategy">
+              <option value="ALL">All Strategies</option>
+              <option value="VWAP_PULLBACK">VWAP</option>
+              <option value="LIQUIDITY_SWEEP_SHORT">SWEEP</option>
+            </select>
             <select id="signal-symbol-select" class="select-input" title="Filter by Symbol">
               <option value="ALL">All Symbols</option>
             </select>
@@ -264,6 +280,7 @@
               <th class="col-sticky-symbol sticky-col">Symbol</th>
               <th>Candle Time (UTC)</th>
               <th>Side</th>
+              <th>Strategy</th>
               <th>Close Price</th>
               <th>Session VWAP</th>
               <th>Delta Z-Score</th>
@@ -276,7 +293,7 @@
           <tbody id="signals-tbody">
 
             <tr>
-              <td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading signal audit log...</td>
+              <td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading signal audit log...</td>
             </tr>
           </tbody>
         </table>
@@ -378,6 +395,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=4"></script>
+  <script src="/app.js?v=5"></script>
 </body>
 </html>

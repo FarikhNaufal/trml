@@ -38,9 +38,11 @@ type BotEngine struct {
 	dryRunBroker *broker.DryRunBroker
 	liveBroker   *broker.BinanceLiveBroker
 
-	statesMu     sync.RWMutex
-	activeStates map[string]*model.SymbolState
-	watchedCoins []string
+	statesMu             sync.RWMutex
+	activeStates         map[string]*model.SymbolState
+	watchedCoins         []string
+	primaryWatchedSet    map[string]bool
+	sweepExtraWatchedSet map[string]bool
 
 	filtersMu       sync.RWMutex
 	exchangeFilters map[string]model.ExchangeFilter
@@ -131,88 +133,18 @@ func main() {
 		client.RecvWindow = cfg.RecvWindowMS
 	}
 	engine := &BotEngine{
-		cfg:             cfg,
-		repo:            repo,
-		client:          client,
-		activeStates:    make(map[string]*model.SymbolState),
-		exchangeFilters: make(map[string]model.ExchangeFilter),
-		cooldownExits:   make(map[string]storage.RecentExitRecord),
-		verifiedSymbols: make(map[string]bool),
-		oiBootAttemptAt: make(map[string]time.Time),
-		evaluatorCfg: strategy.EvaluatorConfig{
-			CandleDuration:           cfg.CandleDuration,
-			MaxSlots:                 cfg.MaxSlots,
-			MaxBookStaleness:         cfg.MaxBookStaleness,
-			MaxMarkStaleness:         cfg.MaxMarkStaleness,
-			MaxDataStaleness:         cfg.MaxDataStaleness,
-			MinOIInterval:            cfg.MinOIInterval,
-			MaxOIInterval:            cfg.MaxOIInterval,
-			MaxOIStaleness:           cfg.MaxOIStaleness,
-			MaxSpreadPct:             cfg.MaxSpreadPct,
-			MinNATRPct:               cfg.MinNATRPct,
-			MaxNATRPct:               cfg.MaxNATRPct,
-			EMAPeriod:                cfg.EMAPeriod,
-			ATRPeriod:                14,
-			DeltaZScoreWindow:        50,
-			MinBarDeltaZScore:        cfg.MinBounceZScore,
-			MinOIDeltaPct:            cfg.MinOIDeltaPct,
-			MinOIDeltaLongPct:        cfg.MinOIDeltaLongPct,
-			MinOIDeltaShortPct:       cfg.MinOIDeltaShortPct,
-			MaxAdverseFundingRate:    0.0005,
-			PullbackToleranceATR:     cfg.PullbackToleranceATR,
-			MinBounceZScore:          cfg.MinBounceZScore,
-			MinBounceZScoreLong:      cfg.MinBounceZScoreLong,
-			MinBounceZScoreShort:     cfg.MinBounceZScoreShort,
-			MinEMA200DistanceATR:     cfg.MinEMA200DistanceATR,
-			MaxEMA200DistanceATR:     cfg.MaxEMA200DistanceATR,
-			LookbackImpulseBars:      cfg.LookbackImpulseBars,
-			RetestLookbackBars:       cfg.RetestLookbackBars,
-			MinImpulseATR:            cfg.MinImpulseATR,
-			MaxEntryDistanceATR:      cfg.MaxEntryDistanceATR,
-			EntryOrderType:           cfg.EntryOrderType,
-			MinCandleBodyRatioLong:   cfg.MinCandleBodyRatioLong,
-			MaxPullbackRVOLLong:      cfg.MaxPullbackRVOLLong,
-			MinImpulseATRLong:        cfg.MinImpulseATRLong,
-			MinEMASlopeLong:          cfg.MinEMASlopeLong,
-			RequireCleanPullbackLong: cfg.RequireCleanPullbackLong,
-			MinNATRLongPct:             cfg.MinNATRLongPct,
-			BTCChopBlockLong:           cfg.BTCChopBlockLong,
-			DisablePanicDumpFrenzyLong: cfg.DisablePanicDumpFrenzyLong,
-			BTCTier2LongSymmetric:      cfg.BTCTier2LongSymmetric,
-			BTCGateEnabled:           cfg.BTCGateEnabled,
-			BTCGateShortOnly:         cfg.BTCGateShortOnly,
-			BTCMax5mDumpPct:          cfg.BTCMax5mDumpPct,
-			BTCMax5mPumpPct:          cfg.BTCMax5mPumpPct,
-			BTCGatePersistenceBars:   cfg.BTCGatePersistenceBars,
-			BTCCounterMomentumPct:    cfg.BTCCounterMomentumPct,
-			BTCChopRiskMult:          cfg.BTCChopRiskMult,
-			AllowedSide:              cfg.AllowedSide,
-			MaxFrenzyRVOL:            cfg.MaxFrenzyRVOL,
-			MaxCounterImpulseATR:     cfg.MaxCounterImpulseATR,
-			MinSignalRVOL:            cfg.MinSignalRVOL,
-			CooldownAfterExitMinutes: cfg.CooldownAfterExitMinutes,
-			CooldownLossMinutes:      cfg.CooldownLossMinutes,
-			CooldownProfitMinutes:    cfg.CooldownProfitMinutes,
-			VWAPSessionWarmupMinutes: cfg.VWAPSessionWarmupMinutes,
-			BlockedUTCHours:          cfg.BlockedUTCHours,
-			Sizing: strategy.SizingConfig{
-				RiskPerTradePct:                cfg.RiskPerTradePct,
-				MaxSlotMarginFraction:          cfg.MaxSlotMarginFrac,
-				AvailableBalanceBufferFraction: cfg.MaxMarginAvailFrac,
-				AccountLeverage:                cfg.Leverage,
-				SLMultiplier:                   cfg.SLATRMultiplier,
-				SLMultiplierLong:               cfg.SLATRMultiplierLong,
-				TPMultiplier:                   cfg.TPATRMultiplier,
-				TP1Multiplier:                  cfg.PartialTP1ATRMult,
-				TP1MultiplierLong:              cfg.PartialTP1ATRMultLong,
-				MinSLDistancePct:               cfg.MinSLDistancePct,
-				MakerFeeRate:                   cfg.MakerFeeRate,
-				TakerFeeRate:                   cfg.TakerFeeRate,
-				SlippageRate:                   cfg.SlippageRate,
-				EntryOrderType:                 cfg.EntryOrderType,
-			},
-		},
-		scannerCfg: scanner.FromAppConfig(cfg, 1000),
+		cfg:                  cfg,
+		repo:                 repo,
+		client:               client,
+		activeStates:         make(map[string]*model.SymbolState),
+		primaryWatchedSet:    make(map[string]bool),
+		sweepExtraWatchedSet: make(map[string]bool),
+		exchangeFilters:      make(map[string]model.ExchangeFilter),
+		cooldownExits:        make(map[string]storage.RecentExitRecord),
+		verifiedSymbols:      make(map[string]bool),
+		oiBootAttemptAt:      make(map[string]time.Time),
+		evaluatorCfg:         strategy.FromAppConfig(cfg),
+		scannerCfg:           scanner.FromAppConfig(cfg, 1000),
 	}
 
 	// [COOLDOWN-PERSISTENCE] Hydrate cooldown state dari trade_ledger untuk mencegah amnesia saat restart
@@ -294,8 +226,8 @@ func main() {
 			engine.recordSymbolExit(symbol, closedAt, exitReason)
 		}
 		engine.dryRunBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
-			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
-			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
+			slog.Info("TRADE CLOSED (DRY-RUN)", "symbol", rec.Symbol, "side", rec.Side, "strategyID", rec.StrategyID, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
+			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID, rec.StrategyID)
 			engine.recordSymbolExit(rec.Symbol, rec.ClosedAt, rec.ExitReason)
 			pureRealEq := engine.dryRunBroker.GetPureRealizedEquityClosedTradesUSDT()
 			epochDay := time.Now().UTC().Unix() / 86400
@@ -311,6 +243,7 @@ func main() {
 				ClientOrderID:    pos.ClientOrderID,
 				Symbol:           pos.Symbol,
 				Side:             string(pos.Side),
+				StrategyID:       pos.StrategyID,
 				Qty:              pos.Qty,
 				InitialQty:       pos.InitialQty,
 				EntryPrice:       pos.EntryPrice,
@@ -351,6 +284,7 @@ func main() {
 					ClientOrderID:    sp.ClientOrderID,
 					Symbol:           sp.Symbol,
 					Side:             model.Side(sp.Side),
+					StrategyID:       sp.StrategyID,
 					Qty:              sp.Qty,
 					InitialQty:       sp.InitialQty,
 					EntryPrice:       sp.EntryPrice,
@@ -454,6 +388,7 @@ func main() {
 			_ = repo.SaveLivePosition(context.Background(), storage.StoredLivePosition{
 				Symbol:         pos.Symbol,
 				Side:           string(pos.Side),
+				StrategyID:     pos.StrategyID,
 				Qty:            pos.Qty,
 				InitialQty:     pos.InitialQty,
 				EntryPrice:     pos.EntryPrice,
@@ -483,8 +418,8 @@ func main() {
 			engine.recordSymbolExit(symbol, closedAt, exitReason)
 		}
 		engine.liveBroker.OnTradeClosedFn = func(rec broker.TradeClosedRecord) {
-			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
-			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID)
+			slog.Info("TRADE CLOSED (LIVE)", "symbol", rec.Symbol, "side", rec.Side, "strategyID", rec.StrategyID, "pnl", rec.NetPnL, "reason", rec.ExitReason, "maePct", rec.MAE, "mfePct", rec.MFE, "signalAuditID", rec.SignalAuditID)
+			_ = repo.LogTrade(context.Background(), rec.ClientOrderID, rec.Symbol, rec.Side, rec.Qty, rec.EntryPrice, rec.ExitPrice, rec.SLPrice, rec.TPPrice, rec.NetPnL, rec.ExitReason, rec.OpenedAt, rec.ClosedAt, rec.MAE, rec.MFE, rec.SignalAuditID, rec.StrategyID)
 			engine.recordSymbolExit(rec.Symbol, rec.ClosedAt, rec.ExitReason)
 		}
 		engine.broker = engine.liveBroker
@@ -581,6 +516,7 @@ func main() {
 				engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
 					Symbol:         sp.Symbol,
 					Side:           model.Side(sp.Side),
+					StrategyID:     sp.StrategyID,
 					Qty:            sp.Qty,
 					InitialQty:     sp.InitialQty,
 					EntryPrice:     sp.EntryPrice,
@@ -703,6 +639,7 @@ func main() {
 					engine.liveBroker.RestoreOpenPosition(&broker.LiveOpenPosition{
 						Symbol:         sp.Symbol,
 						Side:           model.Side(sp.Side),
+						StrategyID:     sp.StrategyID,
 						Qty:            ep.PositionAmt.Abs(),
 						InitialQty:     sp.InitialQty,
 						EntryPrice:     ep.EntryPrice,
@@ -1150,6 +1087,8 @@ func (e *BotEngine) verifyLiveWatchlist(ctx context.Context, candidates []string
 				slog.Warn("symbol setup failed; excluding unverified symbol from live trading", "symbol", sym, "err", err)
 				e.statesMu.Lock()
 				delete(e.activeStates, sym)
+				delete(e.primaryWatchedSet, sym)
+				delete(e.sweepExtraWatchedSet, sym)
 				e.statesMu.Unlock()
 			}
 		} else {
@@ -1215,7 +1154,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	}
 	e.statesMu.RUnlock()
 
-	selected, scanStats := scanner.RunBulkMarketScannerWithStats(
+	scanRes := scanner.RunBulkMarketScannerPartitioned(
 		e.scannerCfg,
 		localStates,
 		filters,
@@ -1224,6 +1163,7 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		fetchKlinesFn,
 		serverTime,
 	)
+	scanStats := scanRes.Stats
 
 	slog.Info("scanner diagnostics",
 		"totalPerpUSDT", scanStats.TotalPerpUSDT,
@@ -1239,11 +1179,12 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		"primaryPassed", scanStats.PrimaryPassed,
 		"fallbackUsed", scanStats.FallbackUsed,
 		"selectedCount", scanStats.SelectedCount,
+		"sweepExtraCount", scanStats.SweepExtraCount,
 		"rankingMode", e.scannerCfg.RankingMode,
 	)
 
 	if scanCtx.Err() != nil && hadPriorWatchlist {
-		slog.Warn("market scan did not finish cleanly before context ended; retaining prior watchlist", "err", scanCtx.Err(), "partialSelected", len(selected))
+		slog.Warn("market scan did not finish cleanly before context ended; retaining prior watchlist", "err", scanCtx.Err(), "partialSelected", len(scanRes.Primary)+len(scanRes.SweepExtra))
 		return
 	}
 
@@ -1268,8 +1209,21 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		}
 	}
 	// Pertahankan simbol yang sedang memiliki posisi terbuka atau order aktif agar stream feed tidak putus
-	finalWatched := make([]string, 0, len(selected)+3)
-	finalWatched = append(finalWatched, selected...)
+	primarySet := make(map[string]bool, len(scanRes.Primary))
+	sweepExtraSet := make(map[string]bool, len(scanRes.SweepExtra))
+	finalWatched := make([]string, 0, len(scanRes.Primary)+len(scanRes.SweepExtra)+3)
+	for _, sym := range scanRes.Primary {
+		if !primarySet[sym] {
+			primarySet[sym] = true
+			finalWatched = append(finalWatched, sym)
+		}
+	}
+	for _, sym := range scanRes.SweepExtra {
+		if !primarySet[sym] && !sweepExtraSet[sym] {
+			sweepExtraSet[sym] = true
+			finalWatched = append(finalWatched, sym)
+		}
+	}
 	if e.broker != nil {
 		for _, sym := range e.broker.GetMonitoredSymbols() {
 			if !slices.Contains(finalWatched, sym) {
@@ -1281,6 +1235,8 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	var prunedSymbols []string
 	if len(finalWatched) > 0 {
 		e.watchedCoins = finalWatched
+		e.primaryWatchedSet = primarySet
+		e.sweepExtraWatchedSet = sweepExtraSet
 		// M3 FIX: Pangkas simbol lama dari activeStates yang sudah tidak di-watch dan tidak memiliki posisi/order aktif
 		watchedSet := make(map[string]bool, len(finalWatched)+1)
 		for _, sym := range finalWatched {
@@ -1800,7 +1756,7 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 	hasActiveSymbol := e.broker.HasActiveOrderOrPosition(snap.Symbol)
 
 	var btcSnap *model.MarketSnapshot
-	if e.cfg.BTCGateEnabled {
+	if e.cfg.BTCGateEnabled || e.cfg.BTCChopBlockLong || e.cfg.BTCChopBlockShort || (e.cfg.BTCChopRiskMult > 0 && e.cfg.BTCChopRiskMult < 1.0) {
 		e.statesMu.RLock()
 		if btcSt := e.activeStates[BenchmarkSymbol]; btcSt != nil {
 			s := btcSt.Snapshot(now)
@@ -1809,14 +1765,27 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		e.statesMu.RUnlock()
 	}
 
+	scope := strategy.DefaultSymbolScope()
+	e.statesMu.RLock()
+	if len(e.primaryWatchedSet) > 0 || len(e.sweepExtraWatchedSet) > 0 {
+		inSweepExtra := e.sweepExtraWatchedSet[snap.Symbol]
+		inPrimary := e.primaryWatchedSet[snap.Symbol] || !inSweepExtra
+		scope = strategy.SymbolScope{
+			AllowPrimary: inPrimary,
+			AllowSweep:   inPrimary || inSweepExtra,
+		}
+	}
+	e.statesMu.RUnlock()
+
 	var intent model.OrderIntent
 	var ok bool
 	var reason, subReason string
+	strategyID := strategy.StrategyIDVWAPPullback
 	if accountStale {
 		reason = "STALE_ACCOUNT_FEED"
 		subReason = "LIVE_ACCOUNT_SNAPSHOT_EXPIRED"
 	} else {
-		intent, ok, reason, subReason = strategy.EvaluateSignal(
+		dec := strategy.EvaluatePortfolio(
 			snap,
 			btcSnap,
 			activeSlots,
@@ -1824,14 +1793,20 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 			hasActiveSymbol,
 			totEq,
 			availBal,
+			scope,
 			e.evaluatorCfg,
 		)
+		intent = dec.Intent
+		ok = dec.Approved
+		reason = dec.Reason
+		subReason = dec.SubReason
+		strategyID = dec.StrategyID
 	}
 
 	// Eksekusi submission order segera tanpa menunggu kalkulasi metrik & penulisan audit SQLite agar tidak terkena adverse selection GTX.
 	var resolvedAuditID atomic.Int64
 	if ok && reason == "SIGNAL_APPROVED" {
-		slog.Info("SIGNAL APPROVED! Spawning immediate async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "qty", intent.Qty, "price", intent.LimitPrice)
+		slog.Info("SIGNAL APPROVED! Spawning immediate async broker submission...", "symbol", intent.Symbol, "side", intent.Side, "strategyID", strategyID, "qty", intent.Qty, "price", intent.LimitPrice)
 		go func(targetIntent model.OrderIntent) {
 			reserved, submitErr := e.broker.SubmitLimitEntry(targetIntent)
 			if reserved && submitErr == nil {
@@ -1919,12 +1894,14 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 	evaluatedSide := "NONE"
 	if ok {
 		evaluatedSide = string(intent.Side)
+	} else if strategyID == strategy.StrategyIDLiquiditySweep {
+		evaluatedSide = "SHORT"
 	} else if candle.Close > ema200 {
 		evaluatedSide = "LONG"
 	} else if candle.Close < ema200 {
 		evaluatedSide = "SHORT"
 	}
-	slog.Info("signal evaluated", "symbol", snap.Symbol, "side", evaluatedSide, "decision", decision, "reason", reason, "subReason", subReason, "oiBootstrapped", snap.IsOIBootstrapped)
+	slog.Info("signal evaluated", "symbol", snap.Symbol, "side", evaluatedSide, "strategyID", strategyID, "decision", decision, "reason", reason, "subReason", subReason, "oiBootstrapped", snap.IsOIBootstrapped)
 
 	var limitPriceFloat, slPriceFloat, tpPriceFloat float64
 	if ok {
@@ -1954,6 +1931,7 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		decision,
 		reason,
 		subReason,
+		strategyID,
 	)
 	if err != nil {
 		slog.Error("failed to log signal audit", "symbol", snap.Symbol, "err", err)

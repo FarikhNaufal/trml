@@ -47,6 +47,7 @@ type LiveBrokerConfig struct {
 type LiveOpenPosition struct {
 	Symbol         string
 	Side           model.Side
+	StrategyID     string
 	Qty            decimal.Decimal
 	InitialQty     decimal.Decimal
 	EntryPrice     decimal.Decimal
@@ -109,6 +110,7 @@ type BinanceLiveBroker struct {
 	PeakPrices          map[string]decimal.Decimal // symbol -> highest (long) or lowest (short) mark price
 
 	PositionClientOrderIDs map[string]string // symbol -> clientOrderID of original entry
+	PositionStrategyIDs    map[string]string // symbol -> strategyID of original entry
 	ClosingReason          map[string]string // symbol -> reason for closing (e.g. TIME_STOP_MAX_HOLDING)
 
 	PlaceEntryFn           func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
@@ -191,6 +193,7 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		ATRAtEntry:             make(map[string]decimal.Decimal),
 		PeakPrices:             make(map[string]decimal.Decimal),
 		PositionClientOrderIDs: make(map[string]string),
+		PositionStrategyIDs:    make(map[string]string),
 		ClosingReason:          make(map[string]string),
 		eventChan:              make(chan LivePositionEvent, 500),
 	}
@@ -252,6 +255,7 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 
 	b.ActivePositions[pos.Symbol] = pos.Qty
 	b.PositionSides[pos.Symbol] = pos.Side
+	b.PositionStrategyIDs[pos.Symbol] = normalizeBrokerStrategyID(pos.StrategyID)
 	b.PositionEntryPrices[pos.Symbol] = pos.EntryPrice
 	b.PositionOpenTimes[pos.Symbol] = pos.OpenTime
 	b.ActiveMAE[pos.Symbol] = pos.MaxMAE
@@ -395,6 +399,7 @@ func (b *BinanceLiveBroker) notifyPositionSavedLocked(symbol string) {
 	savedPos := LiveOpenPosition{
 		Symbol:         symbol,
 		Side:           prot.Side,
+		StrategyID:     normalizeBrokerStrategyID(b.PositionStrategyIDs[symbol]),
 		Qty:            qty,
 		InitialQty:     initialQty,
 		EntryPrice:     b.PositionEntryPrices[symbol],
@@ -491,6 +496,7 @@ func (b *BinanceLiveBroker) ReserveEntryIntent(intent model.OrderIntent) (bool, 
 		ClientOrderID:       intent.ClientOrderID,
 		Symbol:              intent.Symbol,
 		Side:                intent.Side,
+		StrategyID:          normalizeBrokerStrategyID(intent.StrategyID),
 		IsEntry:             true,
 		IsAlgo:              false,
 		Status:              model.StatusPendingNew,
@@ -510,6 +516,7 @@ func (b *BinanceLiveBroker) ReserveEntryIntent(intent model.OrderIntent) (bool, 
 	b.TP1Prices[intent.Symbol] = intent.TP1Price
 	b.IsTP1Hits[intent.Symbol] = false
 	b.PositionClientOrderIDs[intent.Symbol] = intent.ClientOrderID
+	b.PositionStrategyIDs[intent.Symbol] = normalizeBrokerStrategyID(intent.StrategyID)
 	return true, nil
 }
 
@@ -712,6 +719,7 @@ func (b *BinanceLiveBroker) cleanupClosedPositionLocked(symbol string) []model.L
 	delete(b.PositionOpenTimes, symbol)
 	delete(b.PositionEntryPrices, symbol)
 	delete(b.PositionClientOrderIDs, symbol)
+	delete(b.PositionStrategyIDs, symbol)
 	delete(b.ActiveMAE, symbol)
 	delete(b.ActiveMFE, symbol)
 	delete(b.Protections, symbol)
@@ -757,6 +765,7 @@ func (b *BinanceLiveBroker) rollbackReservedEntryLocked(symbol, clientOrderID st
 		delete(b.IsTP1Hits, symbol)
 		if b.PositionClientOrderIDs[symbol] == clientOrderID {
 			delete(b.PositionClientOrderIDs, symbol)
+			delete(b.PositionStrategyIDs, symbol)
 		}
 	}
 }
@@ -905,6 +914,12 @@ func (b *BinanceLiveBroker) applyEntryFillLocked(
 	symbol := rec.Symbol
 	b.ActivePositions[symbol] = filledQty
 	b.PositionSides[symbol] = rec.Side
+	if b.PositionStrategyIDs == nil {
+		b.PositionStrategyIDs = make(map[string]string)
+	}
+	if b.PositionStrategyIDs[symbol] == "" {
+		b.PositionStrategyIDs[symbol] = normalizeBrokerStrategyID(rec.StrategyID)
+	}
 	if avgPrice.GreaterThan(decimal.Zero) {
 		b.PositionEntryPrices[symbol] = avgPrice
 	}
@@ -941,6 +956,7 @@ func (b *BinanceLiveBroker) clearSymbolStateLocked(symbol string) {
 	delete(b.ATRAtEntry, symbol)
 	delete(b.PeakPrices, symbol)
 	delete(b.PositionClientOrderIDs, symbol)
+	delete(b.PositionStrategyIDs, symbol)
 	delete(b.ActiveMAE, symbol)
 	delete(b.ActiveMFE, symbol)
 	delete(b.Protections, symbol)
@@ -998,6 +1014,7 @@ func (b *BinanceLiveBroker) HandleAccountUpdate(
 			delete(b.ActiveMAE, sym)
 			delete(b.ActiveMFE, sym)
 			delete(b.PositionClientOrderIDs, sym)
+			delete(b.PositionStrategyIDs, sym)
 			delete(b.ClosingReason, sym)
 		}
 	}
@@ -1324,6 +1341,7 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 				ClientOrderID: clientOrderIDForRec,
 				Symbol:        symbol,
 				Side:          string(prot.Side),
+				StrategyID:    normalizeBrokerStrategyID(b.PositionStrategyIDs[symbol]),
 				Qty:           rec.TargetQty,
 				EntryPrice:    entryPrice,
 				ExitPrice:     exitPrice,
@@ -1338,6 +1356,7 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdate(
 				SignalAuditID: prot.SignalAuditID,
 			}
 			delete(b.PositionClientOrderIDs, symbol)
+			delete(b.PositionStrategyIDs, symbol)
 			delete(b.ActiveMAE, symbol)
 			delete(b.ActiveMFE, symbol)
 			delete(b.Protections, symbol)
@@ -2413,6 +2432,7 @@ func (b *BinanceLiveBroker) buildTP1TradeRecordLocked(
 		ClientOrderID: clientOrderID,
 		Symbol:        symbol,
 		Side:          string(side),
+		StrategyID:    normalizeBrokerStrategyID(b.PositionStrategyIDs[symbol]),
 		Qty:           closedQty,
 		EntryPrice:    ePrice,
 		ExitPrice:     exitPrice,
@@ -3300,6 +3320,7 @@ func (b *BinanceLiveBroker) GetActivePositions() []ActivePositionDTO {
 		result = append(result, ActivePositionDTO{
 			Symbol:         sym,
 			Side:           string(side),
+			StrategyID:     normalizeBrokerStrategyID(b.PositionStrategyIDs[sym]),
 			Qty:            qty.String(),
 			EntryPrice:     entryF,
 			SLPrice:        slF,

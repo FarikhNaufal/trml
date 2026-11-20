@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ type TradeItem struct {
 	ClientOrderID  string  `json:"client_order_id"`
 	Symbol         string  `json:"symbol"`
 	Side           string  `json:"side"`
+	StrategyID     string  `json:"strategy_id"`
 	Qty            string  `json:"qty"`
 	EntryPrice     string  `json:"entry_price"`
 	ExitPrice      string  `json:"exit_price"`
@@ -42,6 +44,7 @@ type SignalItem struct {
 	CandleOpenTimeUTC string  `json:"candle_open_time_utc"`
 	Symbol            string  `json:"symbol"`
 	Side              string  `json:"side"`
+	StrategyID        string  `json:"strategy_id"`
 	ClosePrice        float64 `json:"close_price"`
 	EMA200            float64 `json:"ema200"`
 	SessionVWAP       float64 `json:"session_vwap"`
@@ -73,6 +76,18 @@ type StatsItem struct {
 	AvgLossUSDT        float64 `json:"avg_loss_usdt"`
 	RealizedRR         float64 `json:"realized_rr"`
 	BlendedRR          float64 `json:"blended_rr"`
+	ProfitFactor       float64 `json:"profit_factor"`
+}
+
+type StrategyStatsItem struct {
+	StrategyID         string  `json:"strategy_id"`
+	TotalTrades        int     `json:"total_trades"`
+	WinsCount          int     `json:"wins_count"`
+	LossesCount        int     `json:"losses_count"`
+	BreakEvenCount     int     `json:"break_even_count"`
+	TotalNetPnLUSDT    float64 `json:"total_net_pnl_usdt"`
+	WinRatePct         float64 `json:"win_rate_pct"`
+	AdjustedWinRatePct float64 `json:"adjusted_win_rate_pct"`
 	ProfitFactor       float64 `json:"profit_factor"`
 }
 
@@ -125,7 +140,7 @@ func (r *WebReader) Close() error {
 	return nil
 }
 
-func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, statusFilter string) ([]TradeItem, int, error) {
+func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, statusFilter string, strategyFilter ...string) ([]TradeItem, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -152,6 +167,14 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		}
 	}
 
+	if len(strategyFilter) > 0 {
+		strat := strings.ToUpper(strings.TrimSpace(strategyFilter[0]))
+		if strat != "" && strat != "ALL" {
+			whereClauses = append(whereClauses, "COALESCE(NULLIF(strategy_id, ''), 'VWAP_PULLBACK') = ?")
+			args = append(args, strat)
+		}
+	}
+
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = " WHERE " + strings.Join(whereClauses, " AND ")
@@ -164,7 +187,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 	}
 
 	query := `
-		SELECT client_order_id, symbol, side, qty, entry_price, exit_price,
+		SELECT client_order_id, symbol, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), qty, entry_price, exit_price,
 		       COALESCE(sl_price_initial, ''), COALESCE(tp_price_initial, ''),
 		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
 		       COALESCE(ai_autopsy, '')
@@ -184,7 +207,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		var it TradeItem
 		var pnlStr string
 		err := rows.Scan(
-			&it.ClientOrderID, &it.Symbol, &it.Side, &it.Qty, &it.EntryPrice, &it.ExitPrice,
+			&it.ClientOrderID, &it.Symbol, &it.Side, &it.StrategyID, &it.Qty, &it.EntryPrice, &it.ExitPrice,
 			&it.SLPriceInitial, &it.TPPriceInitial,
 			&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
 			&it.AIAutopsy,
@@ -247,7 +270,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 // GetTradeByClientOrderID mencari 1 data trade berdasarkan client_order_id
 func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID string) (*TradeItem, error) {
 	query := `
-		SELECT client_order_id, symbol, side, qty, entry_price, exit_price,
+		SELECT client_order_id, symbol, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), qty, entry_price, exit_price,
 		       COALESCE(sl_price_initial, ''), COALESCE(tp_price_initial, ''),
 		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
 		       COALESCE(ai_autopsy, '')
@@ -258,7 +281,7 @@ func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID s
 	var it TradeItem
 	var pnlStr string
 	err := r.db.QueryRowContext(ctx, query, clientOrderID).Scan(
-		&it.ClientOrderID, &it.Symbol, &it.Side, &it.Qty, &it.EntryPrice, &it.ExitPrice,
+		&it.ClientOrderID, &it.Symbol, &it.Side, &it.StrategyID, &it.Qty, &it.EntryPrice, &it.ExitPrice,
 		&it.SLPriceInitial, &it.TPPriceInitial,
 		&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
 		&it.AIAutopsy,
@@ -318,7 +341,7 @@ func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID s
 	return &it, nil
 }
 
-func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, decisionFilter, symbolFilter string) ([]SignalItem, int, error) {
+func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, decisionFilter, symbolFilter string, strategyFilter ...string) ([]SignalItem, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -348,6 +371,14 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 		args = append(args, symbolFilter)
 	}
 
+	if len(strategyFilter) > 0 {
+		strat := strings.ToUpper(strings.TrimSpace(strategyFilter[0]))
+		if strat != "" && strat != "ALL" {
+			whereClauses = append(whereClauses, "COALESCE(NULLIF(strategy_id, ''), 'VWAP_PULLBACK') = ?")
+			args = append(args, strat)
+		}
+	}
+
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = " WHERE " + strings.Join(whereClauses, " AND ")
@@ -360,7 +391,7 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 	}
 
 	query := `
-		SELECT id, candle_open_time_utc, symbol, side, close_price, ema200, session_vwap, 
+		SELECT id, candle_open_time_utc, symbol, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), close_price, ema200, session_vwap, 
 		       atr14, bar_delta_zscore, oi_delta_pct, funding_rate, spread_pct, rvol, 
 		       impulse_atr_mult, decision, reject_reason_code, reject_sub_reason, created_at_utc
 		FROM signal_audit_log` + whereSQL + `
@@ -378,7 +409,7 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 	for rows.Next() {
 		var it SignalItem
 		err := rows.Scan(
-			&it.ID, &it.CandleOpenTimeUTC, &it.Symbol, &it.Side, &it.ClosePrice, &it.EMA200, &it.SessionVWAP,
+			&it.ID, &it.CandleOpenTimeUTC, &it.Symbol, &it.Side, &it.StrategyID, &it.ClosePrice, &it.EMA200, &it.SessionVWAP,
 			&it.ATR14, &it.BarDeltaZScore, &it.OIDeltaPct, &it.FundingRate, &it.SpreadPct, &it.RVOL,
 			&it.ImpulseATRMult, &it.Decision, &it.RejectReasonCode, &it.RejectSubReason, &it.CreatedAtUTC,
 		)
@@ -483,6 +514,97 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 	}
 
 	return stats, nil
+}
+
+// GetStrategyStats mengagregasi statistik setup (WR & Net PF) per strategy_id dari trade_ledger.
+func (r *WebReader) GetStrategyStats(ctx context.Context) ([]StrategyStatsItem, error) {
+	if r.db == nil {
+		return nil, errors.New("reader: database not available")
+	}
+
+	query := `
+		SELECT
+			CASE
+				WHEN signal_audit_id > 0 THEN 'SIG_' || CAST(signal_audit_id AS TEXT)
+				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
+				WHEN client_order_id LIKE 'ALGO_TP1_%' THEN 'ALGO_LIVE_' || SUBSTR(client_order_id, 10)
+				ELSE client_order_id
+			END AS setup_id,
+			COALESCE(MAX(NULLIF(strategy_id, '')), 'VWAP_PULLBACK') AS strategy_id,
+			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
+			MAX(CASE WHEN exit_reason = 'PARTIAL_TAKE_PROFIT' THEN 1 ELSE 0 END) AS has_tp1,
+			MAX(CASE WHEN exit_reason IN ('TAKE_PROFIT', 'TRAILING_STOP', 'PROFIT_LOCK') THEN 1 ELSE 0 END) AS has_runner_win,
+			MAX(CASE WHEN exit_reason = 'BREAK_EVEN' THEN 1 ELSE 0 END) AS has_be,
+			MAX(CASE WHEN exit_reason = 'STOP_LOSS' THEN 1 ELSE 0 END) AS has_sl
+		FROM trade_ledger
+		GROUP BY setup_id;
+	`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query strategy stats: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type accum struct {
+		item     StrategyStatsItem
+		winSum   float64
+		lossSum  float64
+	}
+	byStrat := make(map[string]*accum)
+
+	for rows.Next() {
+		var setupID, stratID string
+		var pnl float64
+		var hasTP1, hasRunnerWin, hasBE, hasSL int
+		if err := rows.Scan(&setupID, &stratID, &pnl, &hasTP1, &hasRunnerWin, &hasBE, &hasSL); err != nil {
+			continue
+		}
+		a, exists := byStrat[stratID]
+		if !exists {
+			a = &accum{item: StrategyStatsItem{StrategyID: stratID}}
+			byStrat[stratID] = a
+		}
+		a.item.TotalTrades++
+		a.item.TotalNetPnLUSDT += pnl
+
+		if hasRunnerWin == 1 || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
+			a.item.WinsCount++
+			a.winSum += pnl
+		} else if hasTP1 == 1 && (hasBE == 1 || pnl > 0.005) {
+			a.item.WinsCount++
+			a.winSum += pnl
+		} else if (hasBE == 1 || (hasSL == 0 && math.Abs(pnl) <= 0.05)) && hasTP1 == 0 {
+			a.item.BreakEvenCount++
+		} else {
+			a.item.LossesCount++
+			a.lossSum += math.Abs(pnl)
+		}
+	}
+
+	keys := make([]string, 0, len(byStrat))
+	for k := range byStrat {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	out := make([]StrategyStatsItem, 0, len(keys))
+	for _, k := range keys {
+		a := byStrat[k]
+		if a.item.TotalTrades > 0 {
+			a.item.WinRatePct = (float64(a.item.WinsCount) / float64(a.item.TotalTrades)) * 100.0
+		}
+		decisive := a.item.WinsCount + a.item.LossesCount
+		if decisive > 0 {
+			a.item.AdjustedWinRatePct = (float64(a.item.WinsCount) / float64(decisive)) * 100.0
+		}
+		if a.lossSum > 0 {
+			a.item.ProfitFactor = a.winSum / a.lossSum
+		} else if a.winSum > 0 {
+			a.item.ProfitFactor = 99.0
+		}
+		out = append(out, a.item)
+	}
+	return out, nil
 }
 
 // GetSignalAuditSummary mengagregasi seluruh log evaluasi sinyal secara akurat

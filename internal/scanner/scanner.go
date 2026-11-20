@@ -61,6 +61,8 @@ type ScannerConfig struct {
 	Timeframe             string
 	CandleDuration        time.Duration
 	RankingMode           string
+	SweepExtendedVWAP     bool
+	SweepMaxExtraCoins    int
 }
 
 // FromAppConfig builds a ScannerConfig from application config while applying safe defaults.
@@ -127,6 +129,8 @@ func FromAppConfig(cfg *config.Config, bootstrapCount int) ScannerConfig {
 		Timeframe:             timeframe,
 		CandleDuration:        candleDuration,
 		RankingMode:           rankingMode,
+		SweepExtendedVWAP:     cfg.Sweep.Enabled && cfg.Sweep.ScannerAllowExtendedVWAP,
+		SweepMaxExtraCoins:    cfg.Sweep.ScannerMaxExtraCoins,
 	}
 }
 
@@ -145,6 +149,14 @@ type ScanStats struct {
 	PrimaryPassed     int
 	FallbackUsed      int
 	SelectedCount     int
+	SweepExtraCount   int
+}
+
+// PartitionedScanResult separates primary VWAP pullback symbols from extended-VWAP liquidity-sweep extras.
+type PartitionedScanResult struct {
+	Primary    []string
+	SweepExtra []string
+	Stats      ScanStats
 }
 
 type scanRejectKind uint8
@@ -167,7 +179,7 @@ func RunBulkMarketScanner(
 	fetchKlinesFn func(symbol string, limit int) []model.Candle,
 	serverTime time.Time,
 ) []string {
-	selected, _ := RunBulkMarketScannerWithStats(
+	return RunBulkMarketScannerPartitioned(
 		cfg,
 		activeStates,
 		perpetualFilters,
@@ -175,8 +187,14 @@ func RunBulkMarketScanner(
 		bookMap,
 		fetchKlinesFn,
 		serverTime,
-	)
-	return selected
+	).Primary
+}
+
+func computeLiquidityLogBonus(vol24h, minVol float64) float64 {
+	if vol24h > 0 && minVol > 0 && vol24h >= minVol {
+		return math.Min(math.Log10(vol24h/minVol)/liquidityLogScaleFactor, 1.0)
+	}
+	return 0.0
 }
 
 func computePullbackScore(cfg ScannerConfig, rvol, distVWAPATR, natrPct, vol24h float64) float64 {
@@ -210,10 +228,7 @@ func computePullbackScore(cfg ScannerConfig, rvol, distVWAPATR, natrPct, vol24h 
 		natrQuality = 1.0 - natrRangePenaltySlope*ratio
 	}
 
-	liqBonus := 0.0
-	if vol24h > 0 && cfg.MinVolume24hUSDT > 0 && vol24h >= cfg.MinVolume24hUSDT {
-		liqBonus = math.Min(math.Log10(vol24h/cfg.MinVolume24hUSDT)/liquidityLogScaleFactor, 1.0)
-	}
+	liqBonus := computeLiquidityLogBonus(vol24h, cfg.MinVolume24hUSDT)
 
 	return pullbackWeightVWAP*vwapNorm +
 		pullbackWeightRVOL*rvolScore +
@@ -221,7 +236,7 @@ func computePullbackScore(cfg ScannerConfig, rvol, distVWAPATR, natrPct, vol24h 
 		pullbackWeightLiquidity*liqBonus
 }
 
-// RunBulkMarketScannerWithStats runs the market scanner and returns both selected symbols and per-stage diagnostics.
+// RunBulkMarketScannerWithStats runs the market scanner and returns primary selected symbols and per-stage diagnostics.
 func RunBulkMarketScannerWithStats(
 	cfg ScannerConfig,
 	activeStates map[string]*model.SymbolState,
@@ -231,6 +246,29 @@ func RunBulkMarketScannerWithStats(
 	fetchKlinesFn func(symbol string, limit int) []model.Candle,
 	serverTime time.Time,
 ) ([]string, ScanStats) {
+	res := RunBulkMarketScannerPartitioned(
+		cfg,
+		activeStates,
+		perpetualFilters,
+		vol24hMap,
+		bookMap,
+		fetchKlinesFn,
+		serverTime,
+	)
+	return res.Primary, res.Stats
+}
+
+// RunBulkMarketScannerPartitioned runs a single-pass bulk scan and returns both the primary watchlist
+// (unchanged L1 VWAP Pullback criteria) and optional extended-VWAP downtrend candidates for liquidity sweep.
+func RunBulkMarketScannerPartitioned(
+	cfg ScannerConfig,
+	activeStates map[string]*model.SymbolState,
+	perpetualFilters map[string]model.ExchangeFilter,
+	vol24hMap map[string]float64,
+	bookMap map[string]model.BookQuote,
+	fetchKlinesFn func(symbol string, limit int) []model.Candle,
+	serverTime time.Time,
+) PartitionedScanResult {
 	type Candidate struct {
 		Symbol    string
 		RVOL      float64
@@ -241,6 +279,7 @@ func RunBulkMarketScannerWithStats(
 	var stats ScanStats
 	var passed []Candidate
 	var candidates []Candidate
+	var sweepCandidates []Candidate
 	rankMode := strings.ToLower(strings.TrimSpace(cfg.RankingMode))
 
 	var symbolsToScan []string
@@ -286,8 +325,9 @@ func RunBulkMarketScannerWithStats(
 	}
 
 	type scanResult struct {
-		cand   Candidate
-		reject scanRejectKind
+		cand      Candidate
+		sweepCand *Candidate
+		reject    scanRejectKind
 	}
 
 	resultsChan := make(chan scanResult, len(symbolsToScan))
@@ -352,7 +392,23 @@ func RunBulkMarketScannerWithStats(
 				}
 				distVWAPATR = math.Abs(lastClose-sessionVWAP) / atr14
 				if cfg.MaxScannerVWAPDistATR > 0 && distVWAPATR > cfg.MaxScannerVWAPDistATR {
-					resultsChan <- scanResult{reject: scanRejectVWAPDist}
+					var extra *Candidate
+					if cfg.SweepExtendedVWAP && lastClose <= sessionVWAP {
+						ema200 := indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
+						if !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0 && lastClose < ema200 {
+							rvolExt := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
+							if !math.IsNaN(rvolExt) && !math.IsInf(rvolExt, 0) {
+								liqB := computeLiquidityLogBonus(vol24hMap[symbol], cfg.MinVolume24hUSDT)
+								extra = &Candidate{
+									Symbol:  symbol,
+									RVOL:    rvolExt,
+									Score:   0.50*liqB + 0.25*math.Min(rvolExt, 2.0),
+									Candles: validKlines,
+								}
+							}
+						}
+					}
+					resultsChan <- scanResult{reject: scanRejectVWAPDist, sweepCand: extra}
 					return
 				}
 			}
@@ -397,6 +453,9 @@ func RunBulkMarketScannerWithStats(
 			stats.NATRRejected++
 		case scanRejectVWAPDist:
 			stats.VWAPDistRejected++
+			if res.sweepCand != nil {
+				sweepCandidates = append(sweepCandidates, *res.sweepCand)
+			}
 		case scanValid:
 			stats.CandidatesValid++
 			candidates = append(candidates, res.cand)
@@ -407,9 +466,9 @@ func RunBulkMarketScannerWithStats(
 		}
 	}
 
-	sortCandidates := func(list []Candidate) {
+	sortByMode := func(list []Candidate, mode string) {
 		sort.SliceStable(list, func(i, j int) bool {
-			if rankMode == "pullback" {
+			if mode == "pullback" {
 				if list[i].Score != list[j].Score {
 					return list[i].Score > list[j].Score
 				}
@@ -429,7 +488,7 @@ func RunBulkMarketScannerWithStats(
 				passed = append(passed, cand)
 			}
 		}
-		sortCandidates(passed)
+		sortByMode(passed, rankMode)
 	} else {
 		// Jika jumlah koin lolos (RVOL >= MinRVOL) belum mencapai MaxWatchedCoins,
 		// lengkapi sisa slot dari kandidat lain yang memenuhi MinFallbackRVOL
@@ -438,7 +497,7 @@ func RunBulkMarketScannerWithStats(
 			for _, p := range passed {
 				alreadyPassed[p.Symbol] = true
 			}
-			sortCandidates(candidates)
+			sortByMode(candidates, rankMode)
 			for _, cand := range candidates {
 				if len(passed) >= cfg.MaxWatchedCoins {
 					break
@@ -449,12 +508,10 @@ func RunBulkMarketScannerWithStats(
 				}
 			}
 		}
-		sortCandidates(passed)
+		sortByMode(passed, rankMode)
 	}
 
-	var selected []string
-	for i := 0; i < len(passed) && len(selected) < cfg.MaxWatchedCoins; i++ {
-		cand := passed[i]
+	bootstrapCand := func(cand Candidate) bool {
 		st, exists := activeStates[cand.Symbol]
 		if !exists {
 			st = model.NewSymbolState(cand.Symbol, perpetualFilters[cand.Symbol], cfg.BootstrapCount, cfg.DeltaWindow+1)
@@ -462,16 +519,52 @@ func RunBulkMarketScannerWithStats(
 		}
 		if err := BootstrapSymbolState(st, cand.Candles, serverTime, cfg.BootstrapCount, cfg.DeltaWindow+1, cfg.CandleDuration); err != nil {
 			slog.Warn("scanner: failed to bootstrap symbol state, skipping symbol", "symbol", cand.Symbol, "err", err)
-			continue
+			return false
 		}
 		if !exists {
 			activeStates[cand.Symbol] = st
+		}
+		return true
+	}
+
+	var selected []string
+	selectedSet := make(map[string]bool, cfg.MaxWatchedCoins)
+	for i := 0; i < len(passed) && len(selected) < cfg.MaxWatchedCoins; i++ {
+		cand := passed[i]
+		if !bootstrapCand(cand) {
+			continue
 		}
 		if !cand.IsPrimary {
 			stats.FallbackUsed++
 		}
 		selected = append(selected, cand.Symbol)
+		selectedSet[cand.Symbol] = true
 	}
 	stats.SelectedCount = len(selected)
-	return selected, stats
+
+	var sweepSelected []string
+	if cfg.SweepExtendedVWAP && len(sweepCandidates) > 0 {
+		var eligible []Candidate
+		for _, cand := range sweepCandidates {
+			if !selectedSet[cand.Symbol] && cand.RVOL >= fallbackFloor {
+				eligible = append(eligible, cand)
+			}
+		}
+		sortByMode(eligible, "pullback")
+		for i := 0; i < len(eligible); i++ {
+			if cfg.SweepMaxExtraCoins > 0 && len(sweepSelected) >= cfg.SweepMaxExtraCoins {
+				break
+			}
+			if bootstrapCand(eligible[i]) {
+				sweepSelected = append(sweepSelected, eligible[i].Symbol)
+			}
+		}
+	}
+	stats.SweepExtraCount = len(sweepSelected)
+
+	return PartitionedScanResult{
+		Primary:    selected,
+		SweepExtra: sweepSelected,
+		Stats:      stats,
+	}
 }

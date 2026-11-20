@@ -203,6 +203,15 @@ func TestCalculateMetricsV2_MTMDrawdownRegimeAndAttribution(t *testing.T) {
 		summary.Segmentation.EntryTypeSegments[1].TotalTrades != 1 {
 		t.Fatalf("expected 1 Clean Limit + 1 GTX Repeg segment, got %+v", summary.Segmentation.EntryTypeSegments)
 	}
+
+	// Verify NetProfitFactor (24/5 = 4.80) vs Gross ProfitFactor (25/4 = 6.25) on LONG side segment
+	longSeg := summary.Segmentation.SideSegments[0]
+	if longSeg.ProfitFactor < 6.24 || longSeg.ProfitFactor > 6.26 {
+		t.Fatalf("expected gross ProfitFactor 6.25, got %.4f", longSeg.ProfitFactor)
+	}
+	if longSeg.NetProfitFactor < 4.79 || longSeg.NetProfitFactor > 4.81 {
+		t.Fatalf("expected NetProfitFactor 4.80, got %.4f", longSeg.NetProfitFactor)
+	}
 }
 
 

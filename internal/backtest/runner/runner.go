@@ -284,7 +284,7 @@ func ExecuteRun(ctx context.Context, ds *LoadedDataset, opts RunOptions) (*RunOu
 	}
 
 	if opts.SaveToDB && ds.Store != nil {
-		if err := persistRunResult(ctx, ds.Store, runID, "run", ds, opts.CommonOptions, summary, sim.ClosedTrades, sim.EquityCurve, nil); err != nil {
+		if err := persistRunResult(ctx, ds.Store, runID, "run", ds, opts.CommonOptions, brokerCfg.SLGapFillEnabled, replayCfg.DeductPendingMargin, summary, sim.ClosedTrades, sim.EquityCurve, nil); err != nil {
 			slog.Warn("gagal menyimpan run ke backtest.db", "run_id", runID, "err", err)
 		}
 	}
@@ -351,7 +351,7 @@ func ExecuteWalkForward(ctx context.Context, ds *LoadedDataset, opts WalkForward
 		})
 	}
 	if opts.SaveToDB && ds.Store != nil {
-		if err := persistRunResult(ctx, ds.Store, runID, "walkforward", ds, opts.CommonOptions, wfaRes.StitchedOOSSummary, nil, wfaRes.StitchedOOSCurve, storedFolds); err != nil {
+		if err := persistRunResult(ctx, ds.Store, runID, "walkforward", ds, opts.CommonOptions, brokerCfg.SLGapFillEnabled, replayCfg.DeductPendingMargin, wfaRes.StitchedOOSSummary, nil, wfaRes.StitchedOOSCurve, storedFolds); err != nil {
 			slog.Warn("gagal menyimpan walkforward run ke backtest.db", "run_id", runID, "err", err)
 		}
 	}
@@ -422,6 +422,23 @@ func ExecuteStress(ctx context.Context, ds *LoadedDataset, opts StressOptions) (
 // BuildEngineConfigs translates dataset & run flags into aligned EvaluatorConfig, SimBrokerConfig, and ReplayConfig.
 func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorConfig, simbroker.SimBrokerConfig, replay.ReplayConfig) {
 	evalCfg := BuildDefaultEvaluatorConfig(opts.EnvPath)
+	if ds.AppCfg != nil {
+		if ds.AppCfg.Sweep.Enabled {
+			evalCfg.Sweep = strategy.FromAppConfig(ds.AppCfg).Sweep
+		}
+		if len(ds.AppCfg.BlockedUTCHours) > 0 {
+			evalCfg.BlockedUTCHours = ds.AppCfg.BlockedUTCHours
+		}
+		if ds.AppCfg.BTCChopBlockShort {
+			evalCfg.BTCChopBlockShort = true
+		}
+		if ds.AppCfg.BTCChopRiskMult > 0 && ds.AppCfg.BTCChopRiskMult < 1.0 {
+			evalCfg.BTCChopRiskMult = ds.AppCfg.BTCChopRiskMult
+		}
+		if ds.AppCfg.MaxSlots > 0 {
+			evalCfg.MaxSlots = ds.AppCfg.MaxSlots
+		}
+	}
 	evalCfg.CandleDuration = ds.CandleDur
 	evalCfg.DisableOIFilter = ds.OIMode == replay.OIModeOff
 
@@ -437,6 +454,8 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 	if opts.KnockoutBTC {
 		evalCfg.BTCGateEnabled = false
 		evalCfg.BTCChopBlockLong = false
+		evalCfg.BTCChopBlockShort = false
+		evalCfg.BTCChopRiskMult = 1.0
 	}
 	if opts.KnockoutRVOL {
 		evalCfg.MinSignalRVOL = 0.0
@@ -450,13 +469,16 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 	evalCfg.BTCGateShortOnly = opts.BTCGateShortOnly
 
 	brokerCfg := BuildSimBrokerConfig(opts.EnvPath, ds.InitialEquity)
+	if ds.AppCfg != nil && ds.AppCfg.MaxSlots > 0 {
+		brokerCfg.MaxSlots = ds.AppCfg.MaxSlots
+	}
 	if opts.Compounding || (ds.AppCfg != nil && ds.AppCfg.EquityModeCompounding) {
 		brokerCfg.EquityModeCompounding = true
 	}
 	if opts.Tier1EarlyBE {
 		brokerCfg.Tier1BEEnabled = true
 	}
-	if opts.SLGapFill {
+	if opts.SLGapFill || (ds.AppCfg != nil && ds.AppCfg.SLGapFillEnabled) {
 		brokerCfg.SLGapFillEnabled = true
 	}
 	if opts.Unconstrained {
@@ -590,18 +612,41 @@ func persistRunResult(
 	runID, mode string,
 	ds *LoadedDataset,
 	opts CommonOptions,
+	slGapFill, deductPendingMargin bool,
 	summary metrics.BacktestSummary,
 	trades []simbroker.SimTradeRecord,
 	curve []simbroker.EquityPoint,
 	folds []data.WalkForwardFoldRecord,
 ) error {
+	maxSlots := 0
+	btcChopBlockShort := false
+	btcChopRiskMult := 1.0
+	var blockedUTCHours []int
+	if ds.AppCfg != nil {
+		maxSlots = ds.AppCfg.MaxSlots
+		btcChopBlockShort = ds.AppCfg.BTCChopBlockShort
+		btcChopRiskMult = ds.AppCfg.BTCChopRiskMult
+		for h := 0; h < 24; h++ {
+			if ds.AppCfg.BlockedUTCHours[h] {
+				blockedUTCHours = append(blockedUTCHours, h)
+			}
+		}
+	}
 	cfgBytes, _ := json.Marshal(map[string]any{
-		"interval":    ds.Interval,
-		"exec_tf":     ds.ExecTF,
-		"oi_mode":     ds.OIMode,
-		"universe":    opts.UniverseMode,
-		"compounding": opts.Compounding,
-		"symbols_cnt": len(ds.Symbols),
+		"interval":              ds.Interval,
+		"exec_tf":               ds.ExecTF,
+		"oi_mode":               ds.OIMode,
+		"universe":              opts.UniverseMode,
+		"compounding":           opts.Compounding,
+		"symbols_cnt":           len(ds.Symbols),
+		"max_slots":             maxSlots,
+		"sweep_enabled":         ds.AppCfg != nil && ds.AppCfg.Sweep.Enabled,
+		"sweep_ext_vwap":        ds.AppCfg != nil && ds.AppCfg.Sweep.ScannerAllowExtendedVWAP,
+		"blocked_utc_hours":     blockedUTCHours,
+		"btc_chop_block_short":  btcChopBlockShort,
+		"btc_chop_risk_mult":    btcChopRiskMult,
+		"sl_gap_fill":           slGapFill,
+		"deduct_pending_margin": deductPendingMargin,
 	})
 	oiCov := 0.0
 	if summary.ExecutionAudit != nil {
@@ -1084,98 +1129,23 @@ func BuildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 		}
 	}
 
+	evalCfg := strategy.FromAppConfig(cfg)
 	maxDD := cfg.MaxDailyDrawdown
 	if maxDD >= 0 {
 		maxDD = -0.05
 	}
-	var randomSeed int64
+	evalCfg.MaxDailyDrawdownPct = maxDD
+
 	if seedStr := os.Getenv("RANDOM_ENTRY_SEED"); seedStr != "" {
 		if s, err := strconv.ParseInt(seedStr, 10, 64); err == nil {
-			randomSeed = s
+			evalCfg.RandomEntrySeed = s
 		}
 	}
-	var randomProb float64
 	if probStr := os.Getenv("RANDOM_ENTRY_PROB"); probStr != "" {
 		if p, err := strconv.ParseFloat(probStr, 64); err == nil {
-			randomProb = p
+			evalCfg.RandomEntryProb = p
 		}
 	}
 
-	return strategy.EvaluatorConfig{
-		CandleDuration:           cfg.CandleDuration,
-		RandomEntrySeed:          randomSeed,
-		RandomEntryProb:          randomProb,
-		MaxDailyDrawdownPct:      maxDD,
-		MaxSlots:                 cfg.MaxSlots,
-		MaxBookStaleness:         cfg.MaxBookStaleness,
-		MaxMarkStaleness:         cfg.MaxMarkStaleness,
-		MaxDataStaleness:         cfg.MaxDataStaleness,
-		MinOIInterval:            cfg.MinOIInterval,
-		MaxOIInterval:            cfg.MaxOIInterval,
-		MaxOIStaleness:           cfg.MaxOIStaleness,
-		MaxSpreadPct:             cfg.MaxSpreadPct,
-		MinNATRPct:               cfg.MinNATRPct,
-		MaxNATRPct:               cfg.MaxNATRPct,
-		EMAPeriod:                cfg.EMAPeriod,
-		ATRPeriod:                14,
-		DeltaZScoreWindow:        50,
-		MinBarDeltaZScore:        cfg.MinBounceZScore,
-		MinOIDeltaPct:            cfg.MinOIDeltaPct,
-		MinOIDeltaLongPct:        cfg.MinOIDeltaLongPct,
-		MinOIDeltaShortPct:       cfg.MinOIDeltaShortPct,
-		DisableOIFilter:          false,
-		MaxAdverseFundingRate:    0.0005,
-		PullbackToleranceATR:     cfg.PullbackToleranceATR,
-		MinBounceZScore:          cfg.MinBounceZScore,
-		MinBounceZScoreLong:      cfg.MinBounceZScoreLong,
-		MinBounceZScoreShort:     cfg.MinBounceZScoreShort,
-		MinEMA200DistanceATR:     cfg.MinEMA200DistanceATR,
-		MaxEMA200DistanceATR:     cfg.MaxEMA200DistanceATR,
-		LookbackImpulseBars:      cfg.LookbackImpulseBars,
-		RetestLookbackBars:       cfg.RetestLookbackBars,
-		MinImpulseATR:            cfg.MinImpulseATR,
-		MaxEntryDistanceATR:      cfg.MaxEntryDistanceATR,
-		EntryOrderType:           cfg.EntryOrderType,
-		MinCandleBodyRatioLong:   cfg.MinCandleBodyRatioLong,
-		MaxPullbackRVOLLong:      cfg.MaxPullbackRVOLLong,
-		MinImpulseATRLong:        cfg.MinImpulseATRLong,
-		MinEMASlopeLong:          cfg.MinEMASlopeLong,
-		RequireCleanPullbackLong: cfg.RequireCleanPullbackLong,
-		MinNATRLongPct:             cfg.MinNATRLongPct,
-		BTCChopBlockLong:           cfg.BTCChopBlockLong,
-		DisablePanicDumpFrenzyLong: cfg.DisablePanicDumpFrenzyLong,
-		BTCTier2LongSymmetric:      cfg.BTCTier2LongSymmetric,
-		BTCGateEnabled:           cfg.BTCGateEnabled,
-		BTCGateShortOnly:         cfg.BTCGateShortOnly,
-		BTCMax5mDumpPct:          cfg.BTCMax5mDumpPct,
-		BTCMax5mPumpPct:          cfg.BTCMax5mPumpPct,
-		BTCGatePersistenceBars:   cfg.BTCGatePersistenceBars,
-		BTCCounterMomentumPct:    cfg.BTCCounterMomentumPct,
-		BTCChopRiskMult:          cfg.BTCChopRiskMult,
-		AllowedSide:              cfg.AllowedSide,
-		MaxFrenzyRVOL:            cfg.MaxFrenzyRVOL,
-		MaxCounterImpulseATR:     cfg.MaxCounterImpulseATR,
-		MinSignalRVOL:            cfg.MinSignalRVOL,
-		CooldownAfterExitMinutes: cfg.CooldownAfterExitMinutes,
-		CooldownLossMinutes:      cfg.CooldownLossMinutes,
-		CooldownProfitMinutes:    cfg.CooldownProfitMinutes,
-		VWAPSessionWarmupMinutes: cfg.VWAPSessionWarmupMinutes,
-		BlockedUTCHours:          cfg.BlockedUTCHours,
-		Sizing: strategy.SizingConfig{
-			RiskPerTradePct:                cfg.RiskPerTradePct,
-			MaxSlotMarginFraction:          cfg.MaxSlotMarginFrac,
-			AvailableBalanceBufferFraction: cfg.MaxMarginAvailFrac,
-			AccountLeverage:                cfg.Leverage,
-			SLMultiplier:                   cfg.SLATRMultiplier,
-			SLMultiplierLong:               cfg.SLATRMultiplierLong,
-			TPMultiplier:                   cfg.TPATRMultiplier,
-			TP1Multiplier:                  cfg.PartialTP1ATRMult,
-			TP1MultiplierLong:              cfg.PartialTP1ATRMultLong,
-			MinSLDistancePct:               cfg.MinSLDistancePct,
-			MakerFeeRate:                   cfg.MakerFeeRate,
-			TakerFeeRate:                   cfg.TakerFeeRate,
-			SlippageRate:                   cfg.SlippageRate,
-			EntryOrderType:                 cfg.EntryOrderType,
-		},
-	}
+	return evalCfg
 }

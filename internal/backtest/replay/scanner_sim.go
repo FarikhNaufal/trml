@@ -50,12 +50,23 @@ func NewScannerSimulator(
 	}
 }
 
-// RunCycle evaluates the rolling universe at simTime using only closed rollingCandles up to simTime.
+// RunCycle evaluates the rolling universe at simTime and returns the primary watchlist.
 func (s *ScannerSimulator) RunCycle(
 	sortedSymbols []string,
 	rollingCandles map[string][]model.Candle,
 	simTime time.Time,
 ) map[string]bool {
+	primaryWatch, _ := s.RunCyclePartitioned(sortedSymbols, rollingCandles, simTime)
+	return primaryWatch
+}
+
+// RunCyclePartitioned evaluates the rolling universe at simTime using a single scanner pass,
+// returning disjoint primary (VWAP Pullback) and sweep-extra (extended-VWAP SHORT sweep) watchlists.
+func (s *ScannerSimulator) RunCyclePartitioned(
+	sortedSymbols []string,
+	rollingCandles map[string][]model.Candle,
+	simTime time.Time,
+) (map[string]bool, map[string]bool) {
 	vol24hMap := make(map[string]float64, len(rollingCandles))
 	bookMap := make(map[string]model.BookQuote, len(rollingCandles))
 	activeStates := make(map[string]*model.SymbolState)
@@ -103,7 +114,7 @@ func (s *ScannerSimulator) RunCycle(
 		return cList[start:]
 	}
 
-	selectedSyms, cycleStats := scanner.RunBulkMarketScannerWithStats(
+	scanRes := scanner.RunBulkMarketScannerPartitioned(
 		s.cfg,
 		activeStates,
 		s.filters,
@@ -113,14 +124,18 @@ func (s *ScannerSimulator) RunCycle(
 		simTime,
 	)
 
-	nextWatch := make(map[string]bool, len(selectedSyms))
-	for _, sym := range selectedSyms {
+	nextWatch := make(map[string]bool, len(scanRes.Primary))
+	for _, sym := range scanRes.Primary {
 		nextWatch[sym] = true
 	}
+	nextSweepExtra := make(map[string]bool, len(scanRes.SweepExtra))
+	for _, sym := range scanRes.SweepExtra {
+		nextSweepExtra[sym] = true
+	}
 
-	s.recordCycleStats(cycleStats, nextWatch)
+	s.recordCycleStats(scanRes.Stats, nextWatch)
 	s.lastWatchlist = nextWatch
-	return nextWatch
+	return nextWatch, nextSweepExtra
 }
 
 func (s *ScannerSimulator) recordCycleStats(st scanner.ScanStats, nextWatch map[string]bool) {

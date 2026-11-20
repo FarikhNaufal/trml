@@ -152,6 +152,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stats, _ := s.cfg.Reader.GetOverallStats(ctx)
+	strategyStats, _ := s.cfg.Reader.GetStrategyStats(ctx)
 
 	circuitBreaker := false
 	if s.cfg.IsCircuitBreaker != nil {
@@ -169,6 +170,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"circuit_breaker":        circuitBreaker,
 		"positions":              positions,
 		"stats":                  stats,
+		"strategy_stats":         strategyStats,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -203,11 +205,12 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(q.Get("page"))
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	status := q.Get("status")
+	strategyFilter := q.Get("strategy")
 
 	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
 	defer cancel()
 
-	trades, total, err := s.cfg.Reader.GetTradesPaginated(ctx, page, limit, status)
+	trades, total, err := s.cfg.Reader.GetTradesPaginated(ctx, page, limit, status, strategyFilter)
 	if err != nil {
 		slog.Error("web server: failed to get trades", "err", err)
 		http.Error(w, `{"error":"failed to query trades"}`, http.StatusInternalServerError)
@@ -244,11 +247,12 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	decision := q.Get("decision")
 	symbol := q.Get("symbol")
+	strategyFilter := q.Get("strategy")
 
 	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
 	defer cancel()
 
-	signals, total, err := s.cfg.Reader.GetSignalsPaginated(ctx, page, limit, decision, symbol)
+	signals, total, err := s.cfg.Reader.GetSignalsPaginated(ctx, page, limit, decision, symbol, strategyFilter)
 	if err != nil {
 		slog.Error("web server: failed to get signals", "err", err)
 		http.Error(w, `{"error":"failed to query signals"}`, http.StatusInternalServerError)

@@ -2,12 +2,12 @@ package strategy
 
 import (
 	"fmt"
-	"hash/fnv"
 	"math"
 	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/config"
 	"trml/internal/indicator"
 	"trml/internal/model"
 )
@@ -49,13 +49,14 @@ type EvaluatorConfig struct {
 	EntryOrderType       string
 
 	// Option C: Optimasi Seleksi Entry Sisi LONG
-	MinCandleBodyRatioLong   float64
-	MaxPullbackRVOLLong      float64
-	MinImpulseATRLong        float64
-	MinEMASlopeLong          float64
+	MinCandleBodyRatioLong     float64
+	MaxPullbackRVOLLong        float64
+	MinImpulseATRLong          float64
+	MinEMASlopeLong            float64
 	RequireCleanPullbackLong   bool
 	MinNATRLongPct             float64
 	BTCChopBlockLong           bool
+	BTCChopBlockShort          bool
 	DisablePanicDumpFrenzyLong bool
 	BTCTier2LongSymmetric      bool
 
@@ -82,179 +83,115 @@ type EvaluatorConfig struct {
 	RandomEntrySeed int64
 	RandomEntryProb float64
 
+	// Secondary Strategy: 1-Bar Liquidity Sweep SHORT-ONLY
+	Sweep SweepConfig
+
 	Sizing SizingConfig
 }
 
-func isWinningExit(reason string) bool {
-	switch strings.ToUpper(strings.TrimSpace(reason)) {
-	case "TAKE_PROFIT", "TRAILING_STOP", "PROFIT_LOCK":
-		return true
-	default:
-		return false
+// FromAppConfig builds a unified EvaluatorConfig from application Config (SSOT for cmd/bot & runner).
+func FromAppConfig(cfg *config.Config) EvaluatorConfig {
+	if cfg == nil {
+		return EvaluatorConfig{}
+	}
+	return EvaluatorConfig{
+		CandleDuration:             cfg.CandleDuration,
+		MaxDailyDrawdownPct:        cfg.MaxDailyDrawdown,
+		MaxSlots:                   cfg.MaxSlots,
+		MaxBookStaleness:           cfg.MaxBookStaleness,
+		MaxMarkStaleness:           cfg.MaxMarkStaleness,
+		MaxDataStaleness:           cfg.MaxDataStaleness,
+		MinOIInterval:              cfg.MinOIInterval,
+		MaxOIInterval:              cfg.MaxOIInterval,
+		MaxOIStaleness:             cfg.MaxOIStaleness,
+		MaxSpreadPct:               cfg.MaxSpreadPct,
+		MinNATRPct:                 cfg.MinNATRPct,
+		MaxNATRPct:                 cfg.MaxNATRPct,
+		EMAPeriod:                  cfg.EMAPeriod,
+		ATRPeriod:                  14,
+		DeltaZScoreWindow:          50,
+		MinBarDeltaZScore:          cfg.MinBounceZScore,
+		MinOIDeltaPct:              cfg.MinOIDeltaPct,
+		MinOIDeltaLongPct:          cfg.MinOIDeltaLongPct,
+		MinOIDeltaShortPct:         cfg.MinOIDeltaShortPct,
+		MaxAdverseFundingRate:      0.0005,
+		PullbackToleranceATR:       cfg.PullbackToleranceATR,
+		MinBounceZScore:            cfg.MinBounceZScore,
+		MinBounceZScoreLong:        cfg.MinBounceZScoreLong,
+		MinBounceZScoreShort:       cfg.MinBounceZScoreShort,
+		MinEMA200DistanceATR:       cfg.MinEMA200DistanceATR,
+		MaxEMA200DistanceATR:       cfg.MaxEMA200DistanceATR,
+		LookbackImpulseBars:        cfg.LookbackImpulseBars,
+		RetestLookbackBars:         cfg.RetestLookbackBars,
+		MinImpulseATR:              cfg.MinImpulseATR,
+		MaxEntryDistanceATR:        cfg.MaxEntryDistanceATR,
+		EntryOrderType:             cfg.EntryOrderType,
+		MinCandleBodyRatioLong:     cfg.MinCandleBodyRatioLong,
+		MaxPullbackRVOLLong:        cfg.MaxPullbackRVOLLong,
+		MinImpulseATRLong:          cfg.MinImpulseATRLong,
+		MinEMASlopeLong:            cfg.MinEMASlopeLong,
+		RequireCleanPullbackLong:   cfg.RequireCleanPullbackLong,
+		MinNATRLongPct:             cfg.MinNATRLongPct,
+		BTCChopBlockLong:           cfg.BTCChopBlockLong,
+		BTCChopBlockShort:          cfg.BTCChopBlockShort,
+		DisablePanicDumpFrenzyLong: cfg.DisablePanicDumpFrenzyLong,
+		BTCTier2LongSymmetric:      cfg.BTCTier2LongSymmetric,
+		BTCGateEnabled:             cfg.BTCGateEnabled,
+		BTCGateShortOnly:           cfg.BTCGateShortOnly,
+		BTCMax5mDumpPct:            cfg.BTCMax5mDumpPct,
+		BTCMax5mPumpPct:            cfg.BTCMax5mPumpPct,
+		BTCGatePersistenceBars:     cfg.BTCGatePersistenceBars,
+		BTCCounterMomentumPct:      cfg.BTCCounterMomentumPct,
+		BTCChopRiskMult:            cfg.BTCChopRiskMult,
+		AllowedSide:                cfg.AllowedSide,
+		MaxFrenzyRVOL:              cfg.MaxFrenzyRVOL,
+		MaxCounterImpulseATR:       cfg.MaxCounterImpulseATR,
+		MinSignalRVOL:              cfg.MinSignalRVOL,
+		CooldownAfterExitMinutes:   cfg.CooldownAfterExitMinutes,
+		CooldownLossMinutes:        cfg.CooldownLossMinutes,
+		CooldownProfitMinutes:      cfg.CooldownProfitMinutes,
+		VWAPSessionWarmupMinutes:   cfg.VWAPSessionWarmupMinutes,
+		BlockedUTCHours:            cfg.BlockedUTCHours,
+		Sweep: SweepConfig{
+			Enabled:           cfg.Sweep.Enabled,
+			LookbackBars:      cfg.Sweep.LookbackBars,
+			MinUpperWickRatio: cfg.Sweep.MinUpperWickRatio,
+			MaxLowerWickRatio: cfg.Sweep.MaxLowerWickRatio,
+			MaxDeltaZScore:    cfg.Sweep.MaxDeltaZScore,
+		},
+		Sizing: SizingConfig{
+			RiskPerTradePct:                cfg.RiskPerTradePct,
+			MaxSlotMarginFraction:          cfg.MaxSlotMarginFrac,
+			AvailableBalanceBufferFraction: cfg.MaxMarginAvailFrac,
+			AccountLeverage:                cfg.Leverage,
+			SLMultiplier:                   cfg.SLATRMultiplier,
+			SLMultiplierLong:               cfg.SLATRMultiplierLong,
+			TPMultiplier:                   cfg.TPATRMultiplier,
+			TP1Multiplier:                  cfg.PartialTP1ATRMult,
+			TP1MultiplierLong:              cfg.PartialTP1ATRMultLong,
+			MinSLDistancePct:               cfg.MinSLDistancePct,
+			MakerFeeRate:                   cfg.MakerFeeRate,
+			TakerFeeRate:                   cfg.TakerFeeRate,
+			SlippageRate:                   cfg.SlippageRate,
+			EntryOrderType:                 cfg.EntryOrderType,
+		},
 	}
 }
 
-// EvaluateSignal mengevaluasi seluruh gatekeeper risiko dan 5 konfirmasi VWAP Pullback/Retest
-// Mengembalikan (intent, valid, rejectReason, rejectSubReason) untuk observabilitas audit SQLite.
-func EvaluateSignal(
-	snap model.MarketSnapshot,
-	btcSnap *model.MarketSnapshot,
-	activeSlots int,
-	isDailyBreached bool,
-	hasActiveSymbol bool,
-	effectiveEquity, availBal decimal.Decimal,
-	cfg EvaluatorConfig,
-) (model.OrderIntent, bool, string, string) {
-	// Gatekeeper 1: Circuit Breaker, Slot Cap, Active Symbol, Cooldown
-	if isDailyBreached {
-		return model.OrderIntent{}, false, "CIRCUIT_BREAKER_ACTIVE", ""
-	}
-	if activeSlots >= cfg.MaxSlots {
-		return model.OrderIntent{}, false, "SLOTS_FULL", ""
-	}
-	if hasActiveSymbol {
-		return model.OrderIntent{}, false, "SYMBOL_ALREADY_ACTIVE", ""
-	}
-	if !snap.LastExitTime.IsZero() {
-		cooldownMins := cfg.CooldownAfterExitMinutes
-		if isWinningExit(snap.LastExitReason) {
-			if cfg.CooldownProfitMinutes > 0 {
-				cooldownMins = cfg.CooldownProfitMinutes
-			}
-		} else {
-			if cfg.CooldownLossMinutes > 0 {
-				cooldownMins = cfg.CooldownLossMinutes
-			}
-		}
+// VWAPPullbackAlpha implements the primary 5m VWAP Pullback / Retest with Orderflow Bounce strategy (L1).
+type VWAPPullbackAlpha struct{}
 
-		if cooldownMins > 0 {
-			cooldownDuration := time.Duration(cooldownMins) * time.Minute
-			if snap.Now.Sub(snap.LastExitTime) < cooldownDuration {
-				remainingSec := int(cooldownDuration.Seconds() - snap.Now.Sub(snap.LastExitTime).Seconds())
-				return model.OrderIntent{}, false, "SYMBOL_IN_COOLDOWN", fmt.Sprintf("COOLDOWN_ACTIVE_%ds_REMAINING", remainingSec)
-			}
-		}
-	}
+// ID returns the canonical identifier of the primary VWAP Pullback strategy.
+func (VWAPPullbackAlpha) ID() string {
+	return StrategyIDVWAPPullback
+}
 
-	// Gatekeeper 2: Validasi Kesegaran BBO, Mark Price, Funding
-	if snap.BookUpdatedAt.IsZero() || snap.Now.Sub(snap.BookUpdatedAt) > cfg.MaxBookStaleness {
-		return model.OrderIntent{}, false, "STALE_BBO_FEED", ""
-	}
-	if snap.MarkPriceUpdatedAt.IsZero() || snap.Now.Sub(snap.MarkPriceUpdatedAt) > cfg.MaxMarkStaleness {
-		return model.OrderIntent{}, false, "STALE_MARK_PRICE_FEED", ""
-	}
-	if snap.FundingUpdatedAt.IsZero() || snap.Now.Sub(snap.FundingUpdatedAt) > cfg.MaxDataStaleness {
-		return model.OrderIntent{}, false, "STALE_FUNDING_FEED", ""
-	}
-	if snap.BestBid <= 0 || snap.BestAsk <= snap.BestBid || math.IsNaN(snap.BestBid) || math.IsNaN(snap.BestAsk) || math.IsInf(snap.BestBid, 0) || math.IsInf(snap.BestAsk, 0) {
-		return model.OrderIntent{}, false, "INVALID_BID_ASK", ""
-	}
-	spreadPct := ((snap.BestAsk - snap.BestBid) / snap.BestBid) * 100.0
-	if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) || spreadPct > cfg.MaxSpreadPct {
-		return model.OrderIntent{}, false, "SPREAD_EXCEEDED", fmt.Sprintf("SPREAD_%.3f%%_MAX_%.3f%%", spreadPct, cfg.MaxSpreadPct)
-	}
-
-	// Gatekeeper 3: Validasi Jarak Waktu Sampel Delta Open Interest (Solusi P1-6)
-	if !cfg.DisableOIFilter {
-		if snap.PrevOpenInterest <= 0 || snap.CurrOpenInterest <= 0 ||
-			math.IsNaN(snap.PrevOpenInterest) || math.IsInf(snap.PrevOpenInterest, 0) ||
-			math.IsNaN(snap.CurrOpenInterest) || math.IsInf(snap.CurrOpenInterest, 0) ||
-			snap.PrevOIUpdatedAt.IsZero() {
-			return model.OrderIntent{}, false, "MISSING_OI_DATA", "OI_WARMING_UP"
-		}
-		if snap.CurrOIUpdatedAt.IsZero() || snap.Now.Sub(snap.CurrOIUpdatedAt) > cfg.MaxOIStaleness {
-			return model.OrderIntent{}, false, "STALE_OI_SAMPLE", ""
-		}
-		oiInterval := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt)
-		if oiInterval < cfg.MinOIInterval || oiInterval > cfg.MaxOIInterval {
-			return model.OrderIntent{}, false, "INVALID_OI_INTERVAL", fmt.Sprintf("INTERVAL_%s_OUTSIDE_%s_%s", oiInterval, cfg.MinOIInterval, cfg.MaxOIInterval)
-		}
-	}
-
-	if len(snap.ClosedCandles) < cfg.EMAPeriod {
-		return model.OrderIntent{}, false, "INSUFFICIENT_CANDLE_HISTORY", ""
-	}
-	latest := snap.ClosedCandles[len(snap.ClosedCandles)-1]
-
-	// KONFIRMASI 1: Filter Tren Makro (EMA 200 mature)
-	ema200 := indicator.CalculateEMA(snap.ClosedCandles, cfg.EMAPeriod)
-	if math.IsNaN(ema200) || math.IsInf(ema200, 0) || ema200 <= 0 {
-		return model.OrderIntent{}, false, "INVALID_EMA", ""
-	}
-
-	// ATR14 & NATR
-	atr14 := indicator.CalculateATR(snap.ClosedCandles, cfg.ATRPeriod)
-	if math.IsNaN(atr14) || math.IsInf(atr14, 0) || atr14 <= 0 {
-		return model.OrderIntent{}, false, "INVALID_ATR", ""
-	}
-	natrPct := (atr14 / latest.Close) * 100.0
-	if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) || natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
-		return model.OrderIntent{}, false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("NATR_%.2f%%_OUTSIDE_%.2f%%_%.2f%%", natrPct, cfg.MinNATRPct, cfg.MaxNATRPct)
-	}
-
-	vwap := snap.CurrentSessionVWAP
-	if math.IsNaN(vwap) || math.IsInf(vwap, 0) || vwap <= 0 {
-		return model.OrderIntent{}, false, "INVALID_VWAP", ""
-	}
-
-	// Case C: Random Entry Benchmark Mode
-	if cfg.RandomEntrySeed > 0 {
-		prob := cfg.RandomEntryProb
-		if prob <= 0 {
-			prob = 0.0004
-		}
-		// Hash deterministik berbasis seed, symbol, dan timestamp bar
-		h := fnv.New64a()
-		_, _ = fmt.Fprintf(h, "%d:%s:%d", cfg.RandomEntrySeed, snap.Symbol, latest.CloseTime.Unix())
-		hashVal := h.Sum64()
-		normalized := float64(hashVal%1000000) / 1000000.0
-		if normalized >= prob {
-			return model.OrderIntent{}, false, "RANDOM_ENTRY_NOT_TRIGGERED", ""
-		}
-
-		targetSide := model.SideShort
-		if cfg.AllowedSide == "LONG_ONLY" {
-			targetSide = model.SideLong
-		} else if cfg.AllowedSide == "BOTH" {
-			if (hashVal>>32)%2 == 0 {
-				targetSide = model.SideLong
-			}
-		}
-
-		sizingCfg := cfg.Sizing
-		if sizingCfg.EntryOrderType == "" {
-			sizingCfg.EntryOrderType = cfg.EntryOrderType
-		}
-		intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, latest.Close, atr14, sizingCfg)
-		if !ok {
-			return model.OrderIntent{}, false, "SIZING_FAILED", ""
-		}
-		return intent, true, "SIGNAL_APPROVED", "RANDOM_ENTRY_BENCHMARK"
-	}
-
-	// Early Guard: Filter Arah Eksekusi (ALLOWED_SIDE) berdasarkan bias tren EMA200
-	// agar audit log tidak dipenuhi kegagalan indikator/NATR dari arah yang memang dinonaktifkan konfigurasi.
-	earlyAllowedSide := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
-	if earlyAllowedSide == "SHORT_ONLY" && latest.Close > ema200 {
-		return model.OrderIntent{}, false, "SIDE_DISABLED_SHORT_ONLY", "LONG_DISABLED_BY_CONFIG"
-	}
-	if earlyAllowedSide == "LONG_ONLY" && latest.Close < ema200 {
-		return model.OrderIntent{}, false, "SIDE_DISABLED_LONG_ONLY", "SHORT_DISABLED_BY_CONFIG"
-	}
-
-	// Warmup Guard Pasca-Reset Session VWAP (00:00 - 00:30 UTC): hindari sinyal false pada awal sesi
-	warmupMins := cfg.VWAPSessionWarmupMinutes
-	if warmupMins <= 0 {
-		warmupMins = 30
-	}
-	utcNow := snap.Now.UTC()
-	minsSinceMidnight := utcNow.Hour()*60 + utcNow.Minute()
-	if minsSinceMidnight < warmupMins {
-		return model.OrderIntent{}, false, "VWAP_SESSION_WARMUP", fmt.Sprintf("UTC_%02d:%02d_IN_WARMUP_%dm", utcNow.Hour(), utcNow.Minute(), warmupMins)
-	}
-	if len(cfg.BlockedUTCHours) > 0 && cfg.BlockedUTCHours[utcNow.Hour()] {
-		return model.OrderIntent{}, false, "UTC_HOUR_BLOCKED", fmt.Sprintf("UTC_HOUR_%02d_BLOCKED_BY_CONFIG", utcNow.Hour())
-	}
+// Evaluate checks the 5 primary VWAP Pullback/Retest confirmations using shared context.
+func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnapshot, cfg EvaluatorConfig) AlphaCandidate {
+	latest := ctx.Latest
+	ema200 := ctx.EMA200
+	atr14 := ctx.ATR14
+	vwap := ctx.VWAP
 
 	// Filter Anti-Chasing: Batasi jarak maksimal penutupan candle dari garis VWAP
 	maxEntryDistATR := cfg.MaxEntryDistanceATR
@@ -264,7 +201,10 @@ func EvaluateSignal(
 	distFromVWAP := math.Abs(latest.Close - vwap)
 	if distFromVWAP > maxEntryDistATR*atr14 {
 		distATR := distFromVWAP / atr14
-		return model.OrderIntent{}, false, "ENTRY_TOO_FAR_FROM_VWAP", fmt.Sprintf("DIST_%.2f_ATR_MAX_%.2f_ATR", distATR, maxEntryDistATR)
+		return AlphaCandidate{
+			Reason:    "ENTRY_TOO_FAR_FROM_VWAP",
+			SubReason: fmt.Sprintf("DIST_%.2f_ATR_MAX_%.2f_ATR", distATR, maxEntryDistATR),
+		}
 	}
 
 	// Filter Anti-Overextension: Batasi jarak maksimal penutupan candle dari EMA200 (Anti-Pucuk/Dasar)
@@ -272,7 +212,10 @@ func EvaluateSignal(
 		distFromEMA := math.Abs(latest.Close - ema200)
 		if distFromEMA > cfg.MaxEMA200DistanceATR*atr14 {
 			distATR := distFromEMA / atr14
-			return model.OrderIntent{}, false, "ENTRY_TOO_FAR_FROM_EMA200", fmt.Sprintf("DIST_%.2f_ATR_MAX_%.2f_ATR", distATR, cfg.MaxEMA200DistanceATR)
+			return AlphaCandidate{
+				Reason:    "ENTRY_TOO_FAR_FROM_EMA200",
+				SubReason: fmt.Sprintf("DIST_%.2f_ATR_MAX_%.2f_ATR", distATR, cfg.MaxEMA200DistanceATR),
+			}
 		}
 	}
 
@@ -338,7 +281,6 @@ func EvaluateSignal(
 	}
 
 	// [OP-01] Validasi Invalidation Impulse: Impulse gugur jika terjadi pembalikan rezim (Close bar lawan menembus threshold).
-	// Untuk LONG: Bullish impulse gugur jika setelahnya ada bar yang ditutup di bawah bearish threshold (Close < bearishThreshold).
 	validBullishImpulse := hasPriorBullishImpulse
 	if validBullishImpulse && latestImpulseIdxLong >= 0 {
 		for i := latestImpulseIdxLong + 1; i < endIdx; i++ {
@@ -349,7 +291,6 @@ func EvaluateSignal(
 		}
 	}
 
-	// Untuk SHORT: Bearish impulse gugur jika setelahnya ada bar yang ditutup di atas bullish invalidation threshold (Close > bullishInvalidationThreshold).
 	validBearishImpulse := hasPriorBearishImpulse
 	if validBearishImpulse && latestImpulseIdxShort >= 0 {
 		for i := latestImpulseIdxShort + 1; i < endIdx; i++ {
@@ -361,8 +302,6 @@ func EvaluateSignal(
 	}
 
 	// KONFIRMASI 3: Zona Pullback Retest (Sentuhan Garis VWAP Dua Arah dengan Urutan Kronologis)
-	// Memeriksa apakah dalam N bar terakhir (default 4 bar), harga sempat menguji zona toleransi VWAP
-	// DAN retest terjadi secara kronologis bersamaan atau setelah ekspansi impulse.
 	tolDist := pullbackTol * atr14
 	maxAdverseRetestDist := 0.75 * atr14 // Batas bawah: jangan biarkan pullback anjlok jebol > 0.75 ATR menembus VWAP
 	var longTestedVWAP bool
@@ -407,10 +346,10 @@ func EvaluateSignal(
 	}
 
 	// KONFIRMASI 4: Pantulan Candlestick & Agresi Orderflow
-	barDeltaZScore, zOk := indicator.CalculateBarDeltaZScore(snap.ClosedBarDeltasUSDT, cfg.DeltaZScoreWindow)
-	if !zOk || math.IsNaN(barDeltaZScore) || math.IsInf(barDeltaZScore, 0) {
-		return model.OrderIntent{}, false, "INVALID_ZSCORE_BASELINE", ""
+	if !ctx.DeltaZOK {
+		return AlphaCandidate{Reason: "INVALID_ZSCORE_BASELINE"}
 	}
+	barDeltaZScore := ctx.BarDeltaZScore
 
 	latestRange := latest.High - latest.Low
 	upperWick := latest.High - math.Max(latest.Open, latest.Close)
@@ -433,53 +372,11 @@ func EvaluateSignal(
 	shortBounce := isBearishShape && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
 
 	// KONFIRMASI 5: Posisi Derivatif (OI Delta & Funding Rate)
-	var oiDeltaPct float64
-	if !cfg.DisableOIFilter {
-		basisSec := 300.0
-		if cfg.CandleDuration > 0 {
-			basisSec = cfg.CandleDuration.Seconds()
-		}
-		rawOIDeltaPct := ((snap.CurrOpenInterest - snap.PrevOpenInterest) / snap.PrevOpenInterest) * 100.0
-		if math.IsNaN(rawOIDeltaPct) || math.IsInf(rawOIDeltaPct, 0) {
-			return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
-		}
-		oiDeltaPct = rawOIDeltaPct
-		if !snap.PrevOIUpdatedAt.IsZero() && !snap.CurrOIUpdatedAt.IsZero() {
-			elapsedSec := snap.CurrOIUpdatedAt.Sub(snap.PrevOIUpdatedAt).Seconds()
-			if elapsedSec >= 60.0 && elapsedSec <= (basisSec*2.0) {
-				// Normalisasi laju perubahan Open Interest ke basis standar interval
-				oiDeltaPct = rawOIDeltaPct * (basisSec / elapsedSec)
-				if math.IsNaN(oiDeltaPct) || math.IsInf(oiDeltaPct, 0) {
-					return model.OrderIntent{}, false, "INVALID_OI_DELTA", ""
-				}
-			}
-		}
+	if !ctx.OIDeltaOK {
+		return AlphaCandidate{Reason: "INVALID_OI_DELTA"}
 	}
 
-	minOIDeltaLong := cfg.MinOIDeltaLongPct
-	if minOIDeltaLong == 0 {
-		minOIDeltaLong = cfg.MinOIDeltaPct
-	}
-	minOIDeltaShort := cfg.MinOIDeltaShortPct
-	if minOIDeltaShort == 0 {
-		minOIDeltaShort = cfg.MinOIDeltaPct
-	}
-
-	// Soft OI Bypass dengan Capitulation Floor:
-	// Bypass keterlambatan update API Open Interest HANYA JIKA terdapat konfirmasi orderflow kuat (Z-Score >= 1.20).
-	// Tautologi (natrPct >= 0.70) DIHAPUS karena seluruh koin lolos scanner sudah memiliki NATR >= 0.65%.
-	const minCapitulationOIDeltaShort = -0.10 // Max OI drop -0.10% untuk Short
-	const minCapitulationOIDeltaLong = -0.05  // Max OI drop -0.05% untuk Long
-
-	oiValidLong := cfg.DisableOIFilter ||
-		(oiDeltaPct >= minOIDeltaLong) ||
-		(barDeltaZScore >= 1.20 && oiDeltaPct >= minCapitulationOIDeltaLong)
-	oiValidShort := cfg.DisableOIFilter ||
-		(oiDeltaPct >= minOIDeltaShort) ||
-		(barDeltaZScore <= -1.20 && oiDeltaPct >= minCapitulationOIDeltaShort)
-
-	// Filter Tren Struktural & Anti-Chop EMA200: Jarak Close ke EMA200 minimal MinEMA200DistanceATR
-	// untuk menghindari eksekusi sinyal palsu saat harga sedang bolak-balik menempel di kawat EMA200 yang mendatar.
+	// Filter Tren Struktural & Anti-Chop EMA200
 	minEMADist := cfg.MinEMA200DistanceATR * atr14
 	emaTrendLong := (latest.Close > ema200) && (minEMADist <= 0 || (latest.Close-ema200) >= minEMADist)
 	if emaTrendLong && cfg.MinEMASlopeLong > 0 && len(snap.ClosedCandles) >= cfg.EMAPeriod+20 {
@@ -497,338 +394,110 @@ func EvaluateSignal(
 		validBullishImpulse &&
 		longTestedVWAP &&
 		longBounce &&
-		oiValidLong &&
+		ctx.OIValidLong &&
 		(snap.FundingRate <= cfg.MaxAdverseFundingRate)
 
 	shortValid := emaTrendShort &&
 		validBearishImpulse &&
 		shortTestedVWAP &&
 		shortBounce &&
-		oiValidShort &&
+		ctx.OIValidShort &&
 		(snap.FundingRate >= -cfg.MaxAdverseFundingRate)
 
-	var targetSide model.Side
-	var rawEntryPrice float64
-
-	isMarket := strings.ToUpper(cfg.EntryOrderType) == "MARKET"
-
 	if longValid {
-		targetSide = model.SideLong
-		if isMarket {
-			rawEntryPrice = snap.BestAsk
-		} else {
-			rawEntryPrice = snap.BestBid
-		}
-	} else if shortValid {
-		targetSide = model.SideShort
-		if isMarket {
-			rawEntryPrice = snap.BestBid
-		} else {
-			rawEntryPrice = snap.BestAsk
-		}
-	} else {
-		var longFails []string
-		if latest.Close <= ema200 {
-			longFails = append(longFails, "TREND_BELOW_EMA200")
-		} else if !emaTrendLong {
-			longFails = append(longFails, "EMA200_CHOP_ZONE")
-		}
-		if !validBullishImpulse {
-			longFails = append(longFails, "NO_PRIOR_IMPULSE")
-		}
-		if !longTestedVWAP {
-			longFails = append(longFails, "VWAP_NOT_TESTED")
-		}
-		if !isBullishShape {
-			longFails = append(longFails, "CANDLE_NOT_BULLISH")
-		}
-		if !(latest.Close >= vwap) {
-			longFails = append(longFails, "CLOSE_BELOW_VWAP")
-		}
-		if !(barDeltaZScore >= minBounceZLong) {
-			longFails = append(longFails, "WEAK_DELTA_ZSCORE")
-		}
-		if !oiValidLong {
-			longFails = append(longFails, "LOW_OI_DELTA")
-		}
-		if snap.FundingRate > cfg.MaxAdverseFundingRate {
-			longFails = append(longFails, "ADVERSE_FUNDING")
-		}
-
-		var shortFails []string
-		if latest.Close >= ema200 {
-			shortFails = append(shortFails, "TREND_ABOVE_EMA200")
-		} else if !emaTrendShort {
-			shortFails = append(shortFails, "EMA200_CHOP_ZONE")
-		}
-		if !validBearishImpulse {
-			shortFails = append(shortFails, "NO_PRIOR_IMPULSE")
-		}
-		if !shortTestedVWAP {
-			shortFails = append(shortFails, "VWAP_NOT_TESTED")
-		}
-		if !isBearishShape {
-			shortFails = append(shortFails, "CANDLE_NOT_BEARISH")
-		}
-		if !(latest.Close <= vwap) {
-			shortFails = append(shortFails, "CLOSE_ABOVE_VWAP")
-		}
-		if !(barDeltaZScore <= -minBounceZShort) {
-			shortFails = append(shortFails, "WEAK_DELTA_ZSCORE")
-		}
-		if !oiValidShort {
-			shortFails = append(shortFails, "LOW_OI_DELTA")
-		}
-		if snap.FundingRate < -cfg.MaxAdverseFundingRate {
-			shortFails = append(shortFails, "ADVERSE_FUNDING")
-		}
-
-		var subReason string
-		if latest.Close >= ema200 {
-			subReason = strings.Join(longFails, "|")
-		} else {
-			subReason = strings.Join(shortFails, "|")
-		}
-		return model.OrderIntent{}, false, "CONDITIONS_NOT_MET", subReason
+		return AlphaCandidate{Side: model.SideLong, Approved: true}
+	}
+	if shortValid {
+		return AlphaCandidate{Side: model.SideShort, Approved: true}
 	}
 
-	// KONFIRMASI 5B: Filter Arah Eksekusi (ALLOWED_SIDE)
-	allowedSide := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
-	if allowedSide == "SHORT_ONLY" && targetSide == model.SideLong {
-		return model.OrderIntent{}, false, "SIDE_DISABLED_SHORT_ONLY", "LONG_DISABLED_BY_CONFIG"
+	var longFails []string
+	if latest.Close <= ema200 {
+		longFails = append(longFails, "TREND_BELOW_EMA200")
+	} else if !emaTrendLong {
+		longFails = append(longFails, "EMA200_CHOP_ZONE")
 	}
-	if allowedSide == "LONG_ONLY" && targetSide == model.SideShort {
-		return model.OrderIntent{}, false, "SIDE_DISABLED_LONG_ONLY", "SHORT_DISABLED_BY_CONFIG"
+	if !validBullishImpulse {
+		longFails = append(longFails, "NO_PRIOR_IMPULSE")
 	}
-
-	// Filter volatilitas minimum khusus LONG agar SHORT tetap bisa menangkap koin ber-NATR lebih rendah.
-	if targetSide == model.SideLong && cfg.MinNATRLongPct > 0 && natrPct < cfg.MinNATRLongPct {
-		return model.OrderIntent{}, false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("LONG_NATR_%.2f%%_BELOW_MIN_%.2f%%", natrPct, cfg.MinNATRLongPct)
+	if !longTestedVWAP {
+		longFails = append(longFails, "VWAP_NOT_TESTED")
 	}
-
-	// KONFIRMASI 5C: Proteksi Anti-Frenzy / Explosive Counter-Impulse Filter
-	maxFrenzyRVOL := cfg.MaxFrenzyRVOL
-	if maxFrenzyRVOL <= 0 {
-		maxFrenzyRVOL = 2.50
+	if !isBullishShape {
+		longFails = append(longFails, "CANDLE_NOT_BULLISH")
 	}
-	maxCounterImpulseATR := cfg.MaxCounterImpulseATR
-	if maxCounterImpulseATR <= 0 {
-		maxCounterImpulseATR = 1.50
+	if !(latest.Close >= vwap) {
+		longFails = append(longFails, "CLOSE_BELOW_VWAP")
 	}
-
-	checkLookback := 3
-	if len(snap.ClosedCandles) < checkLookback {
-		checkLookback = len(snap.ClosedCandles)
+	if !(barDeltaZScore >= minBounceZLong) {
+		longFails = append(longFails, "WEAK_DELTA_ZSCORE")
 	}
-	latestRVOL := indicator.CalculateRVOL(snap.ClosedCandles, 20)
-
-	// KONFIRMASI 5D: Filter Volume Minimum Sinyal (Menghindari Dead-Volume / Low-Liquidity Trap)
-	if cfg.MinSignalRVOL > 0 && latestRVOL < cfg.MinSignalRVOL {
-		return model.OrderIntent{}, false, "LOW_SIGNAL_RVOL", fmt.Sprintf("RVOL_%.2f_BELOW_MIN_%.2f", latestRVOL, cfg.MinSignalRVOL)
+	if !ctx.OIValidLong {
+		longFails = append(longFails, "LOW_OI_DELTA")
+	}
+	if snap.FundingRate > cfg.MaxAdverseFundingRate {
+		longFails = append(longFails, "ADVERSE_FUNDING")
 	}
 
-	rvol := latestRVOL
-	hasHighRVOL := rvol >= maxFrenzyRVOL
-	if !hasHighRVOL {
-		for i := len(snap.ClosedCandles) - checkLookback; i < len(snap.ClosedCandles); i++ {
-			if indicator.CalculateRVOL(snap.ClosedCandles[:i+1], 20) >= maxFrenzyRVOL {
-				hasHighRVOL = true
-				rvol = indicator.CalculateRVOL(snap.ClosedCandles[:i+1], 20)
-				break
-			}
-		}
+	var shortFails []string
+	if latest.Close >= ema200 {
+		shortFails = append(shortFails, "TREND_ABOVE_EMA200")
+	} else if !emaTrendShort {
+		shortFails = append(shortFails, "EMA200_CHOP_ZONE")
 	}
-	if hasHighRVOL {
-		for i := len(snap.ClosedCandles) - checkLookback; i < len(snap.ClosedCandles); i++ {
-			c := snap.ClosedCandles[i]
-			barRange := c.High - c.Low
-			if targetSide == model.SideShort && c.Close > c.Open && barRange >= (maxCounterImpulseATR*atr14) {
-				return model.OrderIntent{}, false, "EXPLOSIVE_PUMP_FRENZY", fmt.Sprintf("RVOL_%.2f_AND_EXPANSION_BAR_%.2f_ATR", rvol, barRange/atr14)
-			}
-			if targetSide == model.SideLong && !cfg.DisablePanicDumpFrenzyLong && c.Close < c.Open && barRange >= (maxCounterImpulseATR*atr14) {
-				return model.OrderIntent{}, false, "PANIC_DUMP_FRENZY", fmt.Sprintf("RVOL_%.2f_AND_DUMP_BAR_%.2f_ATR", rvol, barRange/atr14)
-			}
-		}
+	if !validBearishImpulse {
+		shortFails = append(shortFails, "NO_PRIOR_IMPULSE")
 	}
-
-	// KONFIRMASI 6: Gerbang Makro Bitcoin (Two-Tiered Soft Veto & Micro Counter-Momentum Guard)
-	if cfg.BTCGateEnabled && btcSnap != nil && len(btcSnap.ClosedCandles) > 0 && snap.Symbol != "BTCUSDT" {
-		latestBTC := btcSnap.ClosedCandles[len(btcSnap.ClosedCandles)-1]
-		var btc5mChangePct float64
-		if latestBTC.Open > 0 {
-			btc5mChangePct = ((latestBTC.Close - latestBTC.Open) / latestBTC.Open) * 100.0
-		}
-
-		maxDump := cfg.BTCMax5mDumpPct
-		if maxDump <= 0 {
-			maxDump = 0.60
-		}
-		maxPump := cfg.BTCMax5mPumpPct
-		if maxPump <= 0 {
-			maxPump = 0.60
-		}
-
-		// TIER 1: Extreme Flash Crash / Pump Circuit Breaker (Hard Veto pada Anomali Ekstrem)
-		if targetSide == model.SideLong && btc5mChangePct < -maxDump {
-			return model.OrderIntent{}, false, "BTC_FLASH_DUMP", fmt.Sprintf("BTC_5M_DUMP_%.2f%%_MAX_%.2f%%", btc5mChangePct, -maxDump)
-		}
-		if targetSide == model.SideShort && btc5mChangePct > maxPump {
-			return model.OrderIntent{}, false, "BTC_FLASH_PUMP", fmt.Sprintf("BTC_5M_PUMP_%.2f%%_MAX_%.2f%%", btc5mChangePct, maxPump)
-		}
-
-		// TIER 1.5: Micro Counter-Momentum Guard (Mencegah Entry Saat Bar 5m BTC Sedang Memantul Kencang)
-		if cfg.BTCCounterMomentumPct > 0 {
-			if targetSide == model.SideShort && btc5mChangePct >= cfg.BTCCounterMomentumPct {
-				return model.OrderIntent{}, false, "BTC_COUNTER_MOMENTUM_PUMP", fmt.Sprintf("BTC_5M_PUMP_%.2f%%_EXCEEDS_COUNTER_LIMIT_%.2f%%", btc5mChangePct, cfg.BTCCounterMomentumPct)
-			}
-			if targetSide == model.SideLong && btc5mChangePct <= -cfg.BTCCounterMomentumPct {
-				return model.OrderIntent{}, false, "BTC_COUNTER_MOMENTUM_DUMP", fmt.Sprintf("BTC_5M_DUMP_%.2f%%_EXCEEDS_COUNTER_LIMIT_%.2f%%", btc5mChangePct, -cfg.BTCCounterMomentumPct)
-			}
-		}
-
-		// TIER 2: Symmetric Directional Bias (Soft Veto) - Best Practice
-		// Aktif secara default untuk semua arah (AUTO, SHORT_ONLY, LONG_ONLY).
-		// Hanya jika user secara manual mengatur AllowedSide="BOTH", maka Tier 2 di-bypass.
-		// Jika BTCGateShortOnly disetel false, kembali ke paritas lama 9815362 (SHORT_ONLY bypass Tier 2).
-		tier2Applies := (allowedSide != "BOTH")
-		if !cfg.BTCGateShortOnly {
-			tier2Applies = (allowedSide == "AUTO" || allowedSide == "")
-		}
-		if tier2Applies {
-			// 1. Posisi SHORT hanya diizinkan jika tren BTC memang tidak bullish kuat.
-			// Jika BTC berada di atas EMA dan di atas Session VWAP, veto posisi SHORT altcoin!
-			if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
-				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
-				btcVWAP := btcSnap.CurrentSessionVWAP
-				if math.IsNaN(btcEMA) || math.IsInf(btcEMA, 0) || btcEMA <= 0 {
-					return model.OrderIntent{}, false, "INVALID_BTC_EMA", ""
-				}
-				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
-					return model.OrderIntent{}, false, "INVALID_BTC_VWAP", ""
-				}
-				if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
-					return model.OrderIntent{}, false, "BTC_TREND_BULLISH_SHORT_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_ABOVE_EMA_%.1f_AND_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
-				}
-
-				// Multi-Candle Persistence Check: Hindari jebakan 1-candle dip (fake breakdown/whipsaw)
-				// Jika tren BTC sedang bullish kuat lalu muncul 1 bar koreksi sesaat ke bawah EMA,
-				// tahan pembukaan posisi SHORT altcoin hingga minimal persistenceBars terkonfirmasi di bawah EMA.
-				persistenceBars := cfg.BTCGatePersistenceBars
-				if persistenceBars <= 0 {
-					persistenceBars = 3
-				}
-				if len(btcSnap.ClosedCandles) >= persistenceBars {
-					for p := 0; p < persistenceBars; p++ {
-						idx := len(btcSnap.ClosedCandles) - 1 - p
-						c := btcSnap.ClosedCandles[idx]
-						if c.Close > btcEMA && (btcVWAP <= 0 || c.Close > btcVWAP) {
-							return model.OrderIntent{}, false, "BTC_TREND_SHORT_VETO_PERSISTENCE", fmt.Sprintf("BTC_BAR_%d_AGO_CLOSE_%.1f_ABOVE_EMA_%.1f_REQUIRED_%d_BARS", p, c.Close, btcEMA, persistenceBars)
-						}
-					}
-				}
-			}
-
-			// 2. Posisi LONG hanya diizinkan jika tren BTC tidak bearish lemah/menurun.
-			// Jika BTC berada di bawah EMA atau di bawah Session VWAP, veto posisi LONG altcoin!
-			if targetSide == model.SideLong && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
-				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
-				btcVWAP := btcSnap.CurrentSessionVWAP
-				if math.IsNaN(btcEMA) || math.IsInf(btcEMA, 0) || btcEMA <= 0 {
-					return model.OrderIntent{}, false, "INVALID_BTC_EMA", ""
-				}
-				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
-					return model.OrderIntent{}, false, "INVALID_BTC_VWAP", ""
-				}
-				btcBearish := latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP)
-				if cfg.BTCTier2LongSymmetric {
-					btcBearish = latestBTC.Close < btcEMA && (btcVWAP <= 0 || latestBTC.Close < btcVWAP)
-				}
-				if btcBearish {
-					return model.OrderIntent{}, false, "BTC_TREND_BEARISH_LONG_VETO", fmt.Sprintf("BTC_CLOSE_%.1f_BELOW_EMA_%.1f_OR_VWAP_%.1f", latestBTC.Close, btcEMA, btcVWAP)
-				}
-
-				// Multi-Candle Persistence Check: Hindari jebakan 1-candle bounce (fake breakout/whipsaw)
-				persistenceBars := cfg.BTCGatePersistenceBars
-				if persistenceBars <= 0 {
-					persistenceBars = 3
-				}
-				if len(btcSnap.ClosedCandles) >= persistenceBars {
-					for p := 0; p < persistenceBars; p++ {
-						idx := len(btcSnap.ClosedCandles) - 1 - p
-						c := btcSnap.ClosedCandles[idx]
-						barBearish := c.Close < btcEMA
-						if cfg.BTCTier2LongSymmetric {
-							barBearish = c.Close < btcEMA && (btcVWAP <= 0 || c.Close < btcVWAP)
-						}
-						if barBearish {
-							return model.OrderIntent{}, false, "BTC_TREND_LONG_VETO_PERSISTENCE", fmt.Sprintf("BTC_BAR_%d_AGO_CLOSE_%.1f_BELOW_EMA_%.1f_REQUIRED_%d_BARS", p, c.Close, btcEMA, persistenceBars)
-						}
-					}
-				}
-			}
-		}
+	if !shortTestedVWAP {
+		shortFails = append(shortFails, "VWAP_NOT_TESTED")
+	}
+	if !isBearishShape {
+		shortFails = append(shortFails, "CANDLE_NOT_BEARISH")
+	}
+	if !(latest.Close <= vwap) {
+		shortFails = append(shortFails, "CLOSE_ABOVE_VWAP")
+	}
+	if !(barDeltaZScore <= -minBounceZShort) {
+		shortFails = append(shortFails, "WEAK_DELTA_ZSCORE")
+	}
+	if !ctx.OIValidShort {
+		shortFails = append(shortFails, "LOW_OI_DELTA")
+	}
+	if snap.FundingRate < -cfg.MaxAdverseFundingRate {
+		shortFails = append(shortFails, "ADVERSE_FUNDING")
 	}
 
-	if targetSide == model.SideLong && cfg.BTCChopBlockLong && btcSnap != nil && snap.Symbol != "BTCUSDT" &&
-		isBTCChopHighVol(btcSnap.ClosedCandles, cfg.EMAPeriod, cfg.ATRPeriod) {
-		return model.OrderIntent{}, false, "BTC_CHOP_LONG_VETO", "BTC_CHOP_HIGH_VOL_REGIME"
+	subReason := strings.Join(shortFails, "|")
+	if latest.Close >= ema200 {
+		subReason = strings.Join(longFails, "|")
 	}
-
-	sizingCfg := cfg.Sizing
-	if sizingCfg.EntryOrderType == "" {
-		sizingCfg.EntryOrderType = cfg.EntryOrderType
+	return AlphaCandidate{
+		Reason:    "CONDITIONS_NOT_MET",
+		SubReason: subReason,
 	}
-	if cfg.BTCChopRiskMult > 0 && cfg.BTCChopRiskMult < 1.0 && btcSnap != nil &&
-		isBTCChopHighVol(btcSnap.ClosedCandles, cfg.EMAPeriod, cfg.ATRPeriod) {
-		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.BTCChopRiskMult))
-	}
-	intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, rawEntryPrice, atr14, sizingCfg)
-	if !ok {
-		return model.OrderIntent{}, false, "SIZING_FAILED", ""
-	}
-	return intent, true, "SIGNAL_APPROVED", ""
 }
 
-func isBTCChopHighVol(btcCandles []model.Candle, emaPeriod, atrPeriod int) bool {
-	n := len(btcCandles)
-	if n < 30 {
-		return false
-	}
-	lastClose := btcCandles[n-1].Close
-	if lastClose <= 0 {
-		return false
-	}
-	if emaPeriod <= 0 || n < emaPeriod {
-		emaPeriod = n / 2
-	}
-	if atrPeriod <= 0 {
-		atrPeriod = 14
-	}
-	ema := indicator.CalculateEMA(btcCandles, emaPeriod)
-	atr := indicator.CalculateATR(btcCandles, atrPeriod)
-	natrPct := (atr / lastClose) * 100.0
-	if natrPct >= 1.20 {
-		return true
-	}
-	if ema > 0 {
-		emaDistPct := math.Abs((lastClose-ema)/ema) * 100.0
-		if emaDistPct <= 0.15 {
-			return true
-		}
-		if n >= 8 {
-			flips := 0
-			prevAbove := btcCandles[n-7].Close >= ema
-			for i := n - 6; i < n; i++ {
-				curAbove := btcCandles[i].Close >= ema
-				if curAbove != prevAbove {
-					flips++
-					prevAbove = curAbove
-				}
-			}
-			if flips >= 2 {
-				return true
-			}
-		}
-	}
-	return false
+// EvaluateSignal mengevaluasi strategi utama VWAP Pullback/Retest secara terisolasi (backward-compatible).
+// Mengembalikan (intent, valid, rejectReason, rejectSubReason) untuk observabilitas audit SQLite.
+func EvaluateSignal(
+	snap model.MarketSnapshot,
+	btcSnap *model.MarketSnapshot,
+	activeSlots int,
+	isDailyBreached bool,
+	hasActiveSymbol bool,
+	effectiveEquity, availBal decimal.Decimal,
+	cfg EvaluatorConfig,
+) (model.OrderIntent, bool, string, string) {
+	dec := EvaluatePortfolio(
+		snap,
+		btcSnap,
+		activeSlots,
+		isDailyBreached,
+		hasActiveSymbol,
+		effectiveEquity,
+		availBal,
+		SymbolScope{AllowPrimary: true, AllowSweep: false},
+		cfg,
+	)
+	return dec.Intent, dec.Approved, dec.Reason, dec.SubReason
 }

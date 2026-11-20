@@ -52,6 +52,7 @@ type OrderIntent struct {
 	ClientOrderID string
 	Symbol        string
 	Side          Side
+	StrategyID    string
 	Qty           decimal.Decimal
 	LimitPrice    decimal.Decimal
 	SLPrice       decimal.Decimal
@@ -67,6 +68,7 @@ type LiveOrderRecord struct {
 	ExchangeOrderID     int64
 	Symbol              string
 	Side                Side
+	StrategyID          string
 	IsEntry             bool
 	IsAlgo              bool
 	Status              OrderLifecycleStatus

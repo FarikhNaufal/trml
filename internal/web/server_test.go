@@ -36,6 +36,7 @@ func (m *mockBroker) GetActivePositions() []broker.ActivePositionDTO {
 		{
 			Symbol:           "BTCUSDT",
 			Side:             "LONG",
+			StrategyID:       "VWAP_PULLBACK",
 			Qty:              "0.05",
 			EntryPrice:       65000,
 			MarkPrice:        65500,
@@ -61,6 +62,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		client_order_id TEXT PRIMARY KEY,
 		symbol TEXT NOT NULL,
 		side TEXT NOT NULL,
+		strategy_id TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
 		qty TEXT NOT NULL,
 		entry_price TEXT NOT NULL,
 		exit_price TEXT NOT NULL,
@@ -82,6 +84,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		candle_open_time_utc TEXT NOT NULL,
 		symbol TEXT NOT NULL,
 		side TEXT NOT NULL,
+		strategy_id TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
 		close_price REAL NOT NULL,
 		ema200 REAL NOT NULL,
 		session_vwap REAL NOT NULL,
@@ -239,6 +242,9 @@ func TestServerEndpoints(t *testing.T) {
 	if firstTrade["roe_pct"] == nil || firstTrade["price_change_pct"] == nil {
 		t.Errorf("expected roe_pct and price_change_pct to be present, got %v", firstTrade)
 	}
+	if firstTrade["strategy_id"] != "VWAP_PULLBACK" {
+		t.Errorf("expected strategy_id VWAP_PULLBACK, got %v", firstTrade["strategy_id"])
+	}
 
 	// 7. Test Signals Endpoint
 	req = httptest.NewRequest("GET", "/api/signals?page=1&limit=10", nil)
@@ -253,6 +259,14 @@ func TestServerEndpoints(t *testing.T) {
 	}
 	if signalsResp["total"].(float64) != 2 {
 		t.Errorf("expected 2 signals, got %v", signalsResp["total"])
+	}
+	signalsList, ok := signalsResp["signals"].([]any)
+	if !ok || len(signalsList) != 2 {
+		t.Fatalf("expected 2 signal items, got %v", signalsList)
+	}
+	firstSig := signalsList[0].(map[string]any)
+	if firstSig["strategy_id"] != "VWAP_PULLBACK" {
+		t.Errorf("expected signal strategy_id VWAP_PULLBACK, got %v", firstSig["strategy_id"])
 	}
 
 	// 7b. Test Signals Filter by APPROVED
@@ -590,5 +604,103 @@ func TestGetOverallStats_AlgoTP1AndFallbackGrouping(t *testing.T) {
 	}
 	if stats.PartialWinsCount != 1 {
 		t.Errorf("expected 1 partial win, got %d", stats.PartialWinsCount)
+	}
+}
+
+func TestStrategyStatsAndFiltering(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, _ = db.Exec("DELETE FROM trade_ledger;")
+	_, _ = db.Exec("DELETE FROM signal_audit_log;")
+
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO trade_ledger (client_order_id, symbol, side, strategy_id, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id, created_at_utc)
+		VALUES
+		('ORD_VWAP_1', 'BTCUSDT', 'LONG', 'VWAP_PULLBACK', '1', '100', '103', '98', '104', '3.0', 'TAKE_PROFIT', '2026-11-04 10:00:00', '2026-11-04 10:10:00', 201, '2026-11-04 10:10:00'),
+		('ORD_SWEEP_1', 'SOLUSDT', 'SHORT', 'LIQUIDITY_SWEEP_SHORT', '2', '200', '195', '202', '192', '10.0', 'TRAILING_STOP', '2026-11-04 11:00:00', '2026-11-04 11:15:00', 202, '2026-11-04 11:15:00'),
+		('ORD_SWEEP_2', 'ETHUSDT', 'SHORT', 'LIQUIDITY_SWEEP_SHORT', '1', '3000', '3005', '3005', '2980', '-5.0', 'STOP_LOSS', '2026-11-04 12:00:00', '2026-11-04 12:05:00', 203, '2026-11-04 12:05:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed seed trades: %v", err)
+	}
+
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO signal_audit_log (candle_open_time_utc, symbol, side, strategy_id, close_price, ema200, session_vwap, atr14, bar_delta_zscore, oi_delta_pct, funding_rate, spread_pct, rvol, impulse_atr_mult, decision, reject_reason_code, reject_sub_reason, created_at_utc)
+		VALUES
+		('2026-11-04T10:00:00Z', 'BTCUSDT', 'LONG', 'VWAP_PULLBACK', 100, 99, 100, 1, 2.0, 0.1, 0.0001, 0.01, 1.5, 1.0, 'APPROVE', 'SIGNAL_APPROVED', '', '2026-11-04T10:00:00Z'),
+		('2026-11-04T11:00:00Z', 'SOLUSDT', 'SHORT', 'LIQUIDITY_SWEEP_SHORT', 200, 205, 201, 2, -0.8, 0.2, 0.0001, 0.01, 1.8, 0.0, 'APPROVE', 'SIGNAL_APPROVED', 'LIQUIDITY_SWEEP_SHORT', '2026-11-04T11:00:00Z');
+	`)
+	if err != nil {
+		t.Fatalf("failed seed signals: %v", err)
+	}
+
+	reader := &WebReader{db: db, leverage: 8.0}
+	server, err := NewServer(ServerConfig{
+		Port:   "8080",
+		Env:    "DRY-RUN",
+		Reader: reader,
+		Broker: &mockBroker{},
+	})
+	if err != nil {
+		t.Fatalf("failed create server: %v", err)
+	}
+
+	// 1. Verify summary contains strategy_stats for both strategies
+	req := httptest.NewRequest("GET", "/api/summary", nil)
+	rec := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/summary, got %d", rec.Code)
+	}
+	var sumResp struct {
+		StrategyStats []StrategyStatsItem `json:"strategy_stats"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sumResp); err != nil {
+		t.Fatalf("unmarshal summary: %v", err)
+	}
+	if len(sumResp.StrategyStats) != 2 {
+		t.Fatalf("expected 2 strategy_stats entries, got %+v", sumResp.StrategyStats)
+	}
+	sweepStat := sumResp.StrategyStats[0] // LIQUIDITY_SWEEP_SHORT sorts first
+	if sweepStat.StrategyID != "LIQUIDITY_SWEEP_SHORT" || sweepStat.TotalTrades != 2 || math.Abs(sweepStat.TotalNetPnLUSDT-5.0) > 0.01 || math.Abs(sweepStat.ProfitFactor-2.0) > 0.01 {
+		t.Fatalf("unexpected sweep strategy stats: %+v", sweepStat)
+	}
+
+	// 2. Verify /api/trades?strategy=LIQUIDITY_SWEEP_SHORT filters cleanly
+	req = httptest.NewRequest("GET", "/api/trades?page=1&limit=10&strategy=LIQUIDITY_SWEEP_SHORT", nil)
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/trades filter, got %d", rec.Code)
+	}
+	var trResp struct {
+		Total  int         `json:"total"`
+		Trades []TradeItem `json:"trades"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &trResp); err != nil {
+		t.Fatalf("unmarshal trades: %v", err)
+	}
+	if trResp.Total != 2 || len(trResp.Trades) != 2 || trResp.Trades[0].StrategyID != "LIQUIDITY_SWEEP_SHORT" {
+		t.Fatalf("unexpected filtered trades: %+v", trResp)
+	}
+
+	// 3. Verify /api/signals?strategy=LIQUIDITY_SWEEP_SHORT filters cleanly
+	req = httptest.NewRequest("GET", "/api/signals?page=1&limit=10&strategy=LIQUIDITY_SWEEP_SHORT", nil)
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/signals filter, got %d", rec.Code)
+	}
+	var sgResp struct {
+		Total   int          `json:"total"`
+		Signals []SignalItem `json:"signals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sgResp); err != nil {
+		t.Fatalf("unmarshal signals: %v", err)
+	}
+	if sgResp.Total != 1 || len(sgResp.Signals) != 1 || sgResp.Signals[0].StrategyID != "LIQUIDITY_SWEEP_SHORT" {
+		t.Fatalf("unexpected filtered signals: %+v", sgResp)
 	}
 }

@@ -67,6 +67,7 @@ type AggregatedTrade struct {
 	SetupID     string    `json:"setup_id"`
 	Symbol      string    `json:"symbol"`
 	Side        string    `json:"side"`
+	StrategyID  string    `json:"strategy_id,omitempty"`
 	EntryPrice  float64   `json:"entry_price"`
 	InitialQty  float64   `json:"initial_qty"`
 	SLPrice     float64   `json:"sl_price"`
@@ -295,10 +296,15 @@ func aggregateSetupTrades(rawTrades []simbroker.SimTradeRecord) []AggregatedTrad
 			if ePrice > 0 && slPrice > 0 && initQty > 0 {
 				riskUSDT = math.Abs(ePrice-slPrice) * initQty
 			}
+			stratID := strings.TrimSpace(tr.StrategyID)
+			if stratID == "" {
+				stratID = "VWAP_PULLBACK"
+			}
 			agg = &AggregatedTrade{
 				SetupID:     tr.ID,
 				Symbol:      tr.Symbol,
 				Side:        string(tr.Side),
+				StrategyID:  stratID,
 				EntryPrice:  ePrice,
 				InitialQty:  initQty,
 				SLPrice:     slPrice,

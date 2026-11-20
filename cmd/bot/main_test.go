@@ -17,6 +17,7 @@ import (
 	"trml/internal/model"
 	"trml/internal/scanner"
 	"trml/internal/storage"
+	"trml/internal/strategy"
 	"github.com/shopspring/decimal"
 )
 
@@ -522,5 +523,185 @@ func TestBotEngine_RecordSymbolExit_SyncsCooldownAndState(t *testing.T) {
 	eng.recordSymbolExit("SOLUSDT", now.Add(time.Minute), "PARTIAL_TAKE_PROFIT")
 	if eng.cooldownExits["SOLUSDT"].ExitReason != "STOP_LOSS" {
 		t.Fatalf("expected PARTIAL_TAKE_PROFIT ignored for cooldown, got %+v", eng.cooldownExits["SOLUSDT"])
+	}
+}
+
+func TestBotEngine_EvaluateAndLogClosedCandle_PartitionScopeAndStrategyAudit(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	now := time.Now().UTC()
+	count := 80
+	candles := make([]model.Candle, count)
+	deltas := make([]float64, count)
+	for i := 0; i < count; i++ {
+		tClose := now.Add(-time.Duration(count-1-i) * 5 * time.Minute)
+		tOpen := tClose.Add(-5 * time.Minute)
+		closeP := 120.0 - float64(i)*0.20
+		openP := closeP + 0.08
+		candles[i] = model.Candle{
+			OpenTime:        tOpen,
+			CloseTime:       tClose,
+			Open:            openP,
+			High:            openP + 0.15,
+			Low:             closeP - 0.15,
+			Close:           closeP,
+			VolumeBase:      1000.0,
+			QuoteVolumeUSDT: 1000.0 * closeP,
+		}
+		if i%2 == 0 {
+			deltas[i] = 100.0
+		} else {
+			deltas[i] = -100.0
+		}
+	}
+
+	priorHigh := 0.0
+	for i := count - 1 - 12; i < count-1; i++ {
+		if candles[i].High > priorHigh {
+			priorHigh = candles[i].High
+		}
+	}
+	latest := &candles[count-1]
+	latest.Open = priorHigh - 0.30
+	latest.Close = priorHigh - 1.20
+	latest.High = priorHigh + 0.60
+	latest.Low = latest.Close - 0.10
+	deltas[count-1] = -80.0
+
+	filter := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinQty:      decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+
+	buildSweepState := func() *model.SymbolState {
+		st := model.NewSymbolState("SOLUSDT", filter, count+10, count+10)
+		st.IsLeverageIsolatedVerified = true
+		st.BestBid = latest.Close - 0.01
+		st.BestAsk = latest.Close + 0.01
+		st.BookUpdatedAt = time.Now().UTC()
+		st.MarkPrice = latest.Close
+		st.MarkPriceUpdatedAt = time.Now().UTC()
+		st.FundingRate = 0.0001
+		st.FundingUpdatedAt = time.Now().UTC()
+		st.CurrentSessionVWAP = priorHigh + 5.0
+		st.ClosedCandles = append([]model.Candle(nil), candles...)
+		st.ClosedBarDeltasUSDT = append([]float64(nil), deltas...)
+		return st
+	}
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(500.0), broker.DryRunConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.05,
+		AccountLeverage:     8.0,
+	})
+	defer dry.Close()
+
+	evalCfg := strategy.EvaluatorConfig{
+		CandleDuration:        5 * time.Minute,
+		MaxSlots:              3,
+		MaxBookStaleness:      5 * time.Second,
+		MaxMarkStaleness:      15 * time.Second,
+		MaxDataStaleness:      330 * time.Second,
+		MaxSpreadPct:          0.05,
+		MinNATRPct:            0.10,
+		MaxNATRPct:            5.00,
+		EMAPeriod:             50,
+		ATRPeriod:             14,
+		DeltaZScoreWindow:     50,
+		MinBounceZScore:       0.75,
+		MinBounceZScoreLong:   0.50,
+		MinBounceZScoreShort:  0.70,
+		MinEMA200DistanceATR:  0.20,
+		MaxEMA200DistanceATR:  3.80,
+		LookbackImpulseBars:   18,
+		RetestLookbackBars:    5,
+		MinImpulseATR:         0.62,
+		MaxEntryDistanceATR:   1.20,
+		PullbackToleranceATR:  0.38,
+		EntryOrderType:        "LIMIT",
+		DisableOIFilter:       true,
+		MaxAdverseFundingRate: 0.0005,
+		AllowedSide:           "AUTO",
+		MaxFrenzyRVOL:         2.50,
+		MaxCounterImpulseATR:  1.50,
+		Sweep: strategy.SweepConfig{
+			Enabled:           false,
+			LookbackBars:      12,
+			MinUpperWickRatio: 0.25,
+			MaxLowerWickRatio: 0.45,
+			MaxDeltaZScore:    -0.25,
+		},
+		Sizing: strategy.SizingConfig{
+			RiskPerTradePct:                decimal.NewFromFloat(0.015),
+			MaxSlotMarginFraction:          decimal.NewFromFloat(0.20),
+			AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+			AccountLeverage:                8.0,
+			SLMultiplier:                   1.65,
+			TPMultiplier:                   3.60,
+			TP1Multiplier:                  1.25,
+			MinSLDistancePct:               decimal.NewFromFloat(0.01),
+			MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+			TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+			SlippageRate:                   decimal.NewFromFloat(0.0002),
+			EntryOrderType:                 "LIMIT",
+		},
+	}
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:           true,
+			MaxDailyDrawdown: -0.05,
+		},
+		repo:                 repo,
+		broker:               dry,
+		dryRunBroker:         dry,
+		activeStates:         make(map[string]*model.SymbolState),
+		primaryWatchedSet:    map[string]bool{"ETHUSDT": true},
+		sweepExtraWatchedSet: map[string]bool{"SOLUSDT": true},
+		cooldownExits:        make(map[string]storage.RecentExitRecord),
+		verifiedSymbols:      make(map[string]bool),
+		evaluatorCfg:         evalCfg,
+	}
+
+	// 1. Sweep disabled -> SOLUSDT (in sweepExtra only) must NOT trigger sweep
+	eng.evaluateAndLogClosedCandle(*latest, buildSweepState())
+	var dec1, strat1 string
+	if err := db.RawConn().QueryRow("SELECT decision, strategy_id FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&dec1, &strat1); err != nil {
+		t.Fatalf("failed to query signal_audit_log (1): %v", err)
+	}
+	if dec1 != "REJECT" {
+		t.Fatalf("expected REJECT when Sweep.Enabled=false, got decision=%q strategy_id=%q", dec1, strat1)
+	}
+
+	// 2. Sweep enabled -> SOLUSDT (sweepExtra only) approves via LIQUIDITY_SWEEP_SHORT and persists strategy_id
+	eng.evaluatorCfg.Sweep.Enabled = true
+	eng.evaluateAndLogClosedCandle(*latest, buildSweepState())
+
+	// Wait briefly for async SubmitLimitEntry goroutine to settle before dry.Close()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && !dry.HasActiveOrderOrPosition("SOLUSDT") {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	var dec2, reason2, strat2 string
+	if err := db.RawConn().QueryRow("SELECT decision, reject_reason_code, strategy_id FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&dec2, &reason2, &strat2); err != nil {
+		t.Fatalf("failed to query signal_audit_log (2): %v", err)
+	}
+	if dec2 != "APPROVE" || reason2 != "SIGNAL_APPROVED" || strat2 != strategy.StrategyIDLiquiditySweep {
+		t.Fatalf("expected APPROVE SIGNAL_APPROVED %s, got decision=%q reason=%q strategy_id=%q", strategy.StrategyIDLiquiditySweep, dec2, reason2, strat2)
+	}
+
+	dry.Mu.Lock()
+	po := dry.PendingOrders["SOLUSDT"]
+	dry.Mu.Unlock()
+	if po == nil || po.Intent.StrategyID != strategy.StrategyIDLiquiditySweep {
+		t.Fatalf("expected pending order StrategyID=%s, got %+v", strategy.StrategyIDLiquiditySweep, po)
 	}
 }

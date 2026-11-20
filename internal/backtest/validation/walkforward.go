@@ -92,9 +92,13 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 		stitchedTrades    []simbroker.SimTradeRecord
 		stitchedCurve     []simbroker.EquityPoint
 		runningOOSCapital = initEq
+		cumulativeOOSPnL  float64
+		aggAudit          metrics.ExecutionAudit
+		hasAggAudit       bool
 		sumDegrad         float64
 		foldIdx           int
 	)
+	compounding := cfg.BrokerCfg.EquityModeCompounding
 
 	cursor := cfg.From
 	trainDur := time.Duration(cfg.TrainDays) * 24 * time.Hour
@@ -120,7 +124,11 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 		if err != nil {
 			return WalkForwardReport{}, fmt.Errorf("fold %d IS failed: %w", foldIdx, err)
 		}
-		oosSum, oosTrades, oosCurve, err := runWindowedSlice(ctx, cfg, oosFrom, oosTo, warmupLead, warmupBars, runningOOSCapital)
+		foldStartEq := initEq
+		if compounding {
+			foldStartEq = runningOOSCapital
+		}
+		oosSum, oosTrades, oosCurve, err := runWindowedSlice(ctx, cfg, oosFrom, oosTo, warmupLead, warmupBars, foldStartEq)
 		if err != nil {
 			return WalkForwardReport{}, fmt.Errorf("fold %d OOS failed: %w", foldIdx, err)
 		}
@@ -142,11 +150,34 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 		stitchedTrades = append(stitchedTrades, oosTrades...)
 		for _, pt := range oosCurve {
 			if !pt.Time.Before(oosFrom) && !pt.Time.After(oosTo) {
-				stitchedCurve = append(stitchedCurve, pt)
+				shifted := pt
+				if !compounding {
+					shifted.RealizedEquity += cumulativeOOSPnL
+					shifted.EffectiveEquity += cumulativeOOSPnL
+				}
+				stitchedCurve = append(stitchedCurve, shifted)
 			}
 		}
-		if oosSum.FinalEquity > 0 {
+		cumulativeOOSPnL += oosSum.TotalNetPnL
+		if compounding && oosSum.FinalEquity > 0 {
 			runningOOSCapital = oosSum.FinalEquity
+		}
+		if ea := oosSum.ExecutionAudit; ea != nil {
+			hasAggAudit = true
+			aggAudit.Submitted += ea.Submitted
+			aggAudit.Filled += ea.Filled
+			aggAudit.MarketFilled += ea.MarketFilled
+			aggAudit.TimedOut += ea.TimedOut
+			aggAudit.Repegged += ea.Repegged
+			aggAudit.RepegAborted += ea.RepegAborted
+			aggAudit.UnsplittableTP1 += ea.UnsplittableTP1
+			aggAudit.SLFirstConflicts += ea.SLFirstConflicts
+			aggAudit.DelistSettled += ea.DelistSettled
+			aggAudit.SubBarExecCount += ea.SubBarExecCount
+			aggAudit.DelistForceClosed += ea.DelistForceClosed
+			aggAudit.OICoveredCount += ea.OICoveredCount
+			aggAudit.OIFallbackCount += ea.OIFallbackCount
+			aggAudit.OIMissingCount += ea.OIMissingCount
 		}
 
 		runtime.GC()
@@ -161,8 +192,17 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 		)
 	}
 
+	var finalAudit *metrics.ExecutionAudit
+	if hasAggAudit {
+		totalOI := aggAudit.OICoveredCount + aggAudit.OIFallbackCount + aggAudit.OIMissingCount
+		if totalOI > 0 {
+			aggAudit.OICoveragePct = (float64(aggAudit.OICoveredCount) / float64(totalOI)) * 100.0
+		}
+		finalAudit = &aggAudit
+	}
+
 	stitchedSummary := metrics.CalculateMetricsV2(
-		stitchedTrades, stitchedCurve, initEq, cfg.CandleMap[cfg.BenchmarkSym], nil, nil,
+		stitchedTrades, stitchedCurve, initEq, cfg.CandleMap[cfg.BenchmarkSym], nil, finalAudit,
 	)
 	meanDegrad := sumDegrad / float64(len(folds))
 	overallVerdict := classifyOverallWFA(folds, stitchedSummary, meanDegrad)

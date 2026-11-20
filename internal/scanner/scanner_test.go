@@ -462,3 +462,98 @@ func TestRunBulkMarketScanner_PullbackRanking(t *testing.T) {
 		t.Fatalf("pullback ranking expected [PULLUSDT], got %v", pullSelected)
 	}
 }
+
+func TestRunBulkMarketScannerPartitioned_PrimaryInvarianceAndSweepExtra(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 2, 0, 0, time.UTC)
+	baseCfg := ScannerConfig{
+		MinVolume24hUSDT:      15_000_000,
+		MaxSpreadPct:          0.05,
+		MinRVOL:               1.20,
+		MinFallbackRVOL:       0.50,
+		RVOLLookback:          20,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		MaxScannerVWAPDistATR: 2.50,
+		ATRPeriod:             14,
+		EMAPeriod:             50,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        100,
+		DeltaWindow:           50,
+		CandleDuration:        5 * time.Minute,
+		RankingMode:           "pullback",
+		SweepMaxExtraCoins:    1,
+	}
+
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+	filters := map[string]model.ExchangeFilter{
+		"PRIMUSDT":  f,
+		"DOWN1USDT": f,
+		"DOWN2USDT": f,
+		"UPEXTUSDT": f,
+	}
+	volMap := map[string]float64{
+		"PRIMUSDT":  100_000_000,
+		"DOWN1USDT": 300_000_000, // higher liquidity -> should win 1-slot cap over DOWN2USDT
+		"DOWN2USDT": 30_000_000,
+		"UPEXTUSDT": 500_000_000,
+	}
+	bookMap := map[string]model.BookQuote{
+		"PRIMUSDT":  {BestBid: 100.0, BestAsk: 100.01},
+		"DOWN1USDT": {BestBid: 95.0, BestAsk: 95.01},
+		"DOWN2USDT": {BestBid: 95.0, BestAsk: 95.01},
+		"UPEXTUSDT": {BestBid: 105.0, BestAsk: 105.01},
+	}
+
+	primCandles := makeTestCandles(100.0, 80, now, 120.0)
+	// Extended downtrend below VWAP (> 2.5 ATR below session VWAP, and < EMA50) with valid OHLC
+	makeExtendedCandles := func(lastP float64) []model.Candle {
+		cs := makeTestCandles(100.0, 80, now, 120.0)
+		// Gently shift the last bar cleanly with valid OHLC (Open inside [Low, High])
+		cs[len(cs)-1].Open = lastP
+		cs[len(cs)-1].Close = lastP
+		cs[len(cs)-1].High = lastP + 0.2
+		cs[len(cs)-1].Low = lastP - 0.2
+		return cs
+	}
+	down1Candles := makeExtendedCandles(95.0)
+	down2Candles := makeExtendedCandles(95.0)
+	// Extended uptrend above VWAP (> 2.5 ATR above VWAP -> MUST NOT appear in SweepExtra!)
+	upCandles := makeExtendedCandles(105.0)
+
+	fetchFn := func(sym string, limit int) []model.Candle {
+		switch sym {
+		case "PRIMUSDT":
+			return primCandles
+		case "DOWN1USDT":
+			return down1Candles
+		case "DOWN2USDT":
+			return down2Candles
+		case "UPEXTUSDT":
+			return upCandles
+		default:
+			return nil
+		}
+	}
+
+	offRes := RunBulkMarketScannerPartitioned(baseCfg, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if len(offRes.Primary) != 1 || offRes.Primary[0] != "PRIMUSDT" || len(offRes.SweepExtra) != 0 {
+		t.Fatalf("expected Primary=[PRIMUSDT] and SweepExtra=[] when disabled, got %+v", offRes)
+	}
+
+	onCfg := baseCfg
+	onCfg.SweepExtendedVWAP = true
+	onStates := make(map[string]*model.SymbolState)
+	onRes := RunBulkMarketScannerPartitioned(onCfg, onStates, filters, volMap, bookMap, fetchFn, now)
+	if len(onRes.Primary) != 1 || onRes.Primary[0] != "PRIMUSDT" {
+		t.Fatalf("Primary watchlist must remain invariant, got %v", onRes.Primary)
+	}
+	if len(onRes.SweepExtra) != 1 || onRes.SweepExtra[0] != "DOWN1USDT" {
+		t.Fatalf("expected SweepExtra=[DOWN1USDT] (capped at 1, uptrend excluded), got %v", onRes.SweepExtra)
+	}
+	if _, exists := onStates["DOWN1USDT"]; !exists {
+		t.Fatalf("expected DOWN1USDT state bootstrapped into activeStates")
+	}
+	if _, exists := onStates["UPEXTUSDT"]; exists {
+		t.Fatalf("did not expect uptrend extended symbol UPEXTUSDT bootstrapped into activeStates")
+	}
+}

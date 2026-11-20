@@ -205,6 +205,9 @@ func renderRegimeAndSegmentationSection(sb *strings.Builder, summary metrics.Bac
 		renderSegmentTable(sb, "BTC Macro Regime Saat Entry", summary.RegimeSegments)
 	}
 	if hasSeg {
+		if len(summary.Segmentation.StrategySegments) > 0 {
+			renderSegmentTable(sb, "Strategi (Alpha Attribution)", summary.Segmentation.StrategySegments)
+		}
 		renderSegmentTable(sb, "Kategori NATR", summary.Segmentation.NATRSegments)
 		renderSegmentTable(sb, "Sesi Pasar (UTC)", summary.Segmentation.SessionSegments)
 		renderSegmentTable(sb, "Arah Posisi", summary.Segmentation.SideSegments)
@@ -215,11 +218,11 @@ func renderRegimeAndSegmentationSection(sb *strings.Builder, summary metrics.Bac
 }
 
 func renderSegmentTable(sb *strings.Builder, colTitle string, segs []metrics.SegmentStats) {
-	fmt.Fprintf(sb, "| %s | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Profit Factor |\n", colTitle)
+	fmt.Fprintf(sb, "| %s | Total Trade | Win / Loss | Win Rate | Net PnL (USDT) | Avg PnL | Net PF (Gross) |\n", colTitle)
 	sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
 	for _, seg := range segs {
-		fmt.Fprintf(sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s` | `%s` | %.2f |\n",
-			seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, formatSignedUSD(seg.TotalNetPnL), formatSignedUSD(seg.AvgPnLUSDT), seg.ProfitFactor)
+		fmt.Fprintf(sb, "| `%s` | %d | %d W / %d L | %.1f%% | `%s` | `%s` | %.2f (%.2f) |\n",
+			seg.Name, seg.TotalTrades, seg.Wins, seg.Losses, seg.WinRatePct, formatSignedUSD(seg.TotalNetPnL), formatSignedUSD(seg.AvgPnLUSDT), seg.NetProfitFactor, seg.ProfitFactor)
 	}
 	sb.WriteString("\n")
 }
@@ -296,12 +299,12 @@ func renderRejectsAndValidationSection(
 
 	if len(stress) > 0 {
 		sb.WriteString("### 7C. Friction & Slippage Stress Matrix\n\n")
-		sb.WriteString("| Skenario Friksi | Slippage (bps) | Trades | Win Rate | Net PnL | Profit Factor | MTM MaxDD |\n")
+		sb.WriteString("| Skenario Friksi | Slippage (bps) | Trades | Win Rate | Net PnL | Net PF (Gross) | MTM MaxDD |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
 		for _, sc := range stress {
-			fmt.Fprintf(sb, "| `%s` | %.1f bps | %d | %.1f%% | `%s` | %.2f | -%.2f%% |\n",
+			fmt.Fprintf(sb, "| `%s` | %.1f bps | %d | %.1f%% | `%s` | %.2f (%.2f) | -%.2f%% |\n",
 				sc.Label, sc.SlippageBps, sc.Summary.TotalTrades, sc.Summary.WinRatePct,
-				formatSignedUSD(sc.Summary.TotalNetPnL), sc.Summary.ProfitFactor, sc.Summary.MTMMaxDrawdownPct)
+				formatSignedUSD(sc.Summary.TotalNetPnL), sc.Summary.NetProfitFactor, sc.Summary.ProfitFactor, sc.Summary.MTMMaxDrawdownPct)
 		}
 		sb.WriteString("\n")
 	}
