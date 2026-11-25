@@ -108,6 +108,16 @@ body {
   display: none !important;
 }
 
+a[href],
+button:not(:disabled),
+[role='button']:not([aria-disabled='true']),
+[role='tab']:not([aria-disabled='true']),
+[role='menuitem'],
+summary,
+.trml-row-clickable {
+  cursor: pointer;
+}
+
 .trml-mono {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;

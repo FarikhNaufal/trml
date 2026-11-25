@@ -438,16 +438,13 @@ function renderSummary(data) {
     }`;
   }
 
-  // Daily Drawdown Bar (daily_drawdown_pct: negative when loss, positive when profit; max_daily_drawdown_pct e.g. 0.05)
+  // Daily Drawdown Bar (daily_drawdown_pct: negative when loss, positive when profit; max_daily_drawdown_pct e.g. -0.05 or -1.0)
   const ddRawPct = Number(data.daily_drawdown_pct || 0) * 100;
-  const maxDdRaw = Number(data.max_daily_drawdown_pct || 0);
-  const maxDdPct = maxDdRaw > 1 ? maxDdRaw : maxDdRaw * 100;
-  const ddLossPct = ddRawPct < 0 ? Math.abs(ddRawPct) : 0;
-  const ddUtil = maxDdPct > 0 ? Math.min(100, (ddLossPct / maxDdPct) * 100) : 0;
-  const ddProfitBarPct = ddRawPct > 0.005
-    ? Math.min(100, Math.max(8, maxDdPct > 0 ? (ddRawPct / maxDdPct) * 100 : ddRawPct * 10))
-    : 0;
-  const ddBarWidth = ddRawPct < -0.005 ? Math.max(4, ddUtil) : ddProfitBarPct;
+  const maxDdAbs = Math.abs(Number(data.max_daily_drawdown_pct || 0));
+  const maxDdPct = maxDdAbs > 1 ? maxDdAbs : maxDdAbs * 100;
+  const ddAbsPct = Math.abs(ddRawPct);
+  const ddRatioPct = maxDdPct > 0 ? Math.min(100, (ddAbsPct / maxDdPct) * 100) : 0;
+  const ddBarWidth = ddAbsPct > 0.005 ? Math.max(4, ddRatioPct) : 0;
 
   const ddValEl = document.getElementById('kpi-dd-val');
   const ddMaxEl = document.getElementById('kpi-dd-max');
@@ -458,7 +455,7 @@ function renderSummary(data) {
       ddValEl.textContent = `+${ddRawPct.toFixed(2)}%`;
       ddValEl.className = 'trml-mono trml-pos';
     } else if (ddRawPct < -0.005) {
-      ddValEl.textContent = `-${ddLossPct.toFixed(2)}%`;
+      ddValEl.textContent = `-${ddAbsPct.toFixed(2)}%`;
       ddValEl.className = 'trml-mono trml-neg';
     } else {
       ddValEl.textContent = '0.00%';
@@ -933,21 +930,21 @@ function renderTrades(data) {
                   <span class="badge trml-strat-badge" data-variant="secondary" title="${escapeHtml(t.strategy_id)}">${escapeHtml(formatStrategyLabel(t.strategy_id))}</span>
                 </div>
               </td>
-              <td class="num trml-mono">
+              <td class="trml-mono">
                 <div>${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</div>
                 <div class="trml-muted-text">Qty ${escapeHtml(t.qty || '—')}</div>
               </td>
               <td><span class="badge" data-variant="outline">${escapeHtml(t.exit_reason)}</span></td>
-              <td class="num trml-mono trml-muted-text">${Number(t.mae_pct || 0).toFixed(2)}% / ${Number(t.mfe_pct || 0).toFixed(2)}%</td>
-              <td class="num trml-mono">
+              <td class="trml-mono trml-muted-text">${Number(t.mae_pct || 0).toFixed(2)}% / ${Number(t.mfe_pct || 0).toFixed(2)}%</td>
+              <td class="trml-mono">
                 <div class="${rrRealCls}">${rrRealStr}</div>
                 <div class="trml-muted-text">Plan ${rrPlanStr}</div>
               </td>
-              <td class="num trml-mono ${pnlCls}">
+              <td class="trml-mono ${pnlCls}">
                 <strong>${fmtMoney(pnl, true)}</strong>
                 <div class="trml-muted-text">(${fmtPct(roe, 2, true)})</div>
               </td>
-              <td class="num">
+              <td>
                 <button type="button" class="btn" data-variant="${btnVariant}" data-size="xs" onclick="inspectTradeAutopsy('${escapeHtml(t.client_order_id)}', '${escapeHtml(t.symbol)}')">${cachedTag}</button>
               </td>
             </tr>
