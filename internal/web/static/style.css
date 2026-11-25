@@ -88,14 +88,18 @@ html.dark {
   box-sizing: border-box;
 }
 
-html,
+html {
+  font-size: 16px;
+  min-height: 100vh;
+}
+
 body {
   min-height: 100vh;
   background-color: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 0.875rem;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -110,12 +114,12 @@ body {
 }
 
 .trml-text-sm {
-  font-size: 0.78rem;
+  font-size: 0.8125rem;
 }
 
 .trml-muted-text {
   color: var(--muted-foreground);
-  font-size: 0.75rem;
+  font-size: 0.78rem;
 }
 
 .trml-pos {
@@ -159,6 +163,24 @@ body {
   border-color: var(--trml-info-bd);
 }
 
+.trml-badge-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trml-side-badge {
+  min-width: 56px;
+  justify-content: center;
+  text-align: center;
+}
+
+.trml-strat-badge {
+  min-width: 52px;
+  justify-content: center;
+  text-align: center;
+}
+
 /* Topbar */
 .trml-topbar {
   position: sticky;
@@ -172,15 +194,15 @@ body {
 }
 
 .trml-topbar-inner {
-  max-width: 1480px;
-  min-height: 48px;
+  max-width: 1800px;
+  min-height: 52px;
   margin: 0 auto;
-  padding: 6px 16px;
+  padding: 8px clamp(16px, 2vw, 32px);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px 12px;
+  gap: 8px 14px;
 }
 
 .trml-topbar-left,
@@ -300,13 +322,15 @@ body {
 }
 
 .trml-telem-panel {
-  width: 320px;
+  width: 340px;
   max-width: calc(100vw - 24px);
   padding: 12px;
   background: var(--popover);
   color: var(--popover-foreground);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+  z-index: 50;
 }
 
 .trml-telem-panel[aria-hidden='true'] {
@@ -371,12 +395,12 @@ body {
 
 /* Main Container */
 .trml-main {
-  max-width: 1480px;
+  max-width: 1800px;
   margin: 0 auto;
-  padding: 14px 16px 28px;
+  padding: 16px clamp(16px, 2vw, 32px) 32px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 
 .trml-alert-stack {
@@ -600,7 +624,8 @@ body {
   border-color: var(--border);
   box-shadow: none;
   border-radius: var(--radius);
-  padding-bottom: 0 !important;
+  gap: 0 !important;
+  padding-block: 0 !important;
   overflow: hidden;
 }
 
@@ -610,6 +635,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px 12px;
+  padding: 12px 16px !important;
 }
 
 .trml-panel-title-wrap {
@@ -620,7 +646,7 @@ body {
 }
 
 .trml-panel-title-wrap h2 {
-  font-size: 0.86rem;
+  font-size: 0.92rem;
   font-weight: 600;
 }
 
@@ -632,10 +658,10 @@ body {
 }
 
 .trml-filter-input {
-  height: 28px;
-  width: 170px;
-  font-size: 0.76rem;
-  padding-inline: 8px;
+  height: 30px;
+  width: 200px;
+  font-size: 0.8125rem;
+  padding-inline: 10px;
 }
 
 .trml-seg-group .btn[aria-pressed='true'] {
@@ -655,7 +681,7 @@ body {
 .trml-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.77rem;
+  font-size: 0.8125rem;
 }
 
 .trml-table thead th {
@@ -665,15 +691,16 @@ body {
   background: var(--muted);
   color: var(--muted-foreground);
   font-weight: 600;
-  font-size: 0.72rem;
-  padding: 7px 10px;
+  font-size: 0.75rem;
+  text-align: left;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
   height: auto;
 }
 
 .trml-table tbody td {
-  padding: 6px 10px;
+  padding: 8px 14px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
   vertical-align: middle;
@@ -702,17 +729,22 @@ body {
 .trml-table thead th.col-sticky {
   z-index: 4;
   background: var(--muted);
-  border-right: 1px solid var(--border);
 }
 
 .trml-table tbody td.col-sticky {
   background: var(--card);
-  border-right: 1px solid var(--border);
   font-weight: 600;
 }
 
 .trml-table tbody tr:hover td.col-sticky {
   background: var(--muted);
+}
+
+@media (max-width: 1120px) {
+  .trml-table thead th.col-sticky,
+  .trml-table tbody td.col-sticky {
+    border-right: 1px solid var(--border);
+  }
 }
 
 /* SL-TP Visual Micro-Track inside Active Positions */

@@ -1,18 +1,18 @@
-const CACHE_NAME = 'trml-shell-v7';
+const CACHE_NAME = 'trml-shell-v8';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
-  '/style.css?v=7',
-  '/app.js?v=7',
+  '/style.css?v=8',
+  '/app.js?v=8',
   '/manifest.json',
   '/icon.svg',
-  '/vendor/basecoat-mira.cdn.min.css?v=7',
-  '/vendor/basecoat.min.js?v=7',
-  '/vendor/tabs.min.js?v=7',
-  '/vendor/toast.min.js?v=7',
-  '/vendor/popover.min.js?v=7',
-  '/vendor/input-otp.min.js?v=7',
-  '/vendor/command.min.js?v=7'
+  '/vendor/basecoat-mira.cdn.min.css?v=8',
+  '/vendor/basecoat.min.js?v=8',
+  '/vendor/tabs.min.js?v=8',
+  '/vendor/toast.min.js?v=8',
+  '/vendor/popover.min.js?v=8',
+  '/vendor/input-otp.min.js?v=8',
+  '/vendor/command.min.js?v=8'
 ];
 
 self.addEventListener('install', (event) => {

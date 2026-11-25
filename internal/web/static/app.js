@@ -438,22 +438,34 @@ function renderSummary(data) {
     }`;
   }
 
-  // Daily Drawdown Bar (daily_drawdown_pct is negative or 0; max_daily_drawdown_pct e.g. 0.05)
-  const ddAbsPct = Math.abs(Number(data.daily_drawdown_pct || 0)) * 100;
+  // Daily Drawdown Bar (daily_drawdown_pct: negative when loss, positive when profit; max_daily_drawdown_pct e.g. 0.05)
+  const ddRawPct = Number(data.daily_drawdown_pct || 0) * 100;
   const maxDdRaw = Number(data.max_daily_drawdown_pct || 0);
   const maxDdPct = maxDdRaw > 1 ? maxDdRaw : maxDdRaw * 100;
-  const ddUtil = maxDdPct > 0 ? Math.min(100, (ddAbsPct / maxDdPct) * 100) : 0;
+  const ddLossPct = ddRawPct < 0 ? Math.abs(ddRawPct) : 0;
+  const ddUtil = maxDdPct > 0 ? Math.min(100, (ddLossPct / maxDdPct) * 100) : 0;
 
   const ddValEl = document.getElementById('kpi-dd-val');
   const ddMaxEl = document.getElementById('kpi-dd-max');
   const ddBar = document.getElementById('kpi-dd-bar');
   const ddWrap = ddBar?.parentElement;
-  if (ddValEl) ddValEl.textContent = `-${ddAbsPct.toFixed(2)}%`;
+  if (ddValEl) {
+    if (ddRawPct > 0.005) {
+      ddValEl.textContent = `+${ddRawPct.toFixed(2)}%`;
+      ddValEl.className = 'trml-mono trml-pos';
+    } else if (ddRawPct < -0.005) {
+      ddValEl.textContent = `-${ddLossPct.toFixed(2)}%`;
+      ddValEl.className = 'trml-mono trml-neg';
+    } else {
+      ddValEl.textContent = '0.00%';
+      ddValEl.className = 'trml-mono';
+    }
+  }
   if (ddMaxEl && maxDdPct > 0) ddMaxEl.textContent = `/ -${maxDdPct.toFixed(1)}% cap`;
   if (ddBar) ddBar.style.width = `${ddUtil.toFixed(1)}%`;
   if (ddWrap) {
     ddWrap.setAttribute('aria-valuenow', ddUtil.toFixed(0));
-    ddWrap.dataset.tone = ddUtil >= 75 ? 'neg' : ddUtil >= 45 ? 'warn' : 'pos';
+    ddWrap.dataset.tone = ddRawPct >= 0 ? 'pos' : ddUtil >= 75 ? 'neg' : 'warn';
   }
 
   // Slots Bar
@@ -617,6 +629,36 @@ function calcSlTpTrackPct(pos) {
   return { pct, tone };
 }
 
+function calcPlannedRR(entry, sl, tp) {
+  const e = Number(entry || 0);
+  const s = Number(sl || 0);
+  const t = Number(tp || 0);
+  if (e <= 0 || s <= 0 || t <= 0) return null;
+  const risk = Math.abs(e - s);
+  const reward = Math.abs(t - e);
+  if (risk <= 0 || reward <= 0) return null;
+  return reward / risk;
+}
+
+function calcTradeMetricsR(t) {
+  const slPct = Number(t.planned_sl_pct || 0);
+  const tpPct = Number(t.planned_tp_pct || 0);
+  const plannedRR = slPct > 0 && tpPct > 0 ? tpPct / slPct : calcPlannedRR(t.entry_price, t.sl_price_initial, t.tp_price_initial);
+
+  const entry = Number(t.entry_price || 0);
+  const exit = Number(t.exit_price || 0);
+  const slInit = Number(t.sl_price_initial || 0);
+  let realizedR = null;
+  if (entry > 0 && exit > 0 && slInit > 0) {
+    const risk = Math.abs(entry - slInit);
+    if (risk > 0) {
+      const isLong = String(t.side).toUpperCase() === 'LONG';
+      realizedR = isLong ? (exit - entry) / risk : (entry - exit) / risk;
+    }
+  }
+  return { plannedRR, realizedR };
+}
+
 function renderPositions(positions) {
   const countBadge = document.getElementById('positions-count-badge');
   const tableWrap = document.getElementById('positions-table-wrap');
@@ -647,16 +689,21 @@ function renderPositions(positions) {
         const roe = Number(p.unrealized_roe_pct || 0);
         const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
         const track = calcSlTpTrackPct(p);
+        const plannedRR = calcPlannedRR(p.entry_price, p.sl_price, p.tp_price);
+        const rrText = plannedRR !== null ? `1:${plannedRR.toFixed(1)}` : '—';
         const beChip = p.is_break_even ? '<span class="badge trml-badge-info">BE</span>' : '';
+        const tierChip = Number(p.protection_tier || 0) > 0 ? `<span class="badge trml-mono" data-variant="outline">T${Number(p.protection_tier)}</span>` : '';
         const stratShort = formatStrategyLabel(p.strategy_id);
         const hlCls = state.highlightSymbol === p.symbol ? 'trml-row-highlight' : '';
 
         return `
           <tr class="${hlCls}" data-symbol="${escapeHtml(p.symbol)}">
-            <td class="col-sticky trml-mono">${escapeHtml(p.symbol)} ${beChip}</td>
+            <td class="col-sticky trml-mono">${escapeHtml(p.symbol)} ${beChip} ${tierChip}</td>
             <td>
-              <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(p.side)}</span>
-              <span class="badge" data-variant="secondary" title="${escapeHtml(p.strategy_id)}">${escapeHtml(stratShort)}</span>
+              <div class="trml-badge-pair">
+                <span class="badge trml-side-badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(p.side)}</span>
+                <span class="badge trml-strat-badge" data-variant="secondary" title="${escapeHtml(p.strategy_id)}">${escapeHtml(stratShort)}</span>
+              </div>
             </td>
             <td class="num trml-mono">${escapeHtml(p.qty)} @ ${fmtPrice(p.entry_price)}</td>
             <td class="num trml-mono">${fmtPrice(p.mark_price)}</td>
@@ -664,6 +711,7 @@ function renderPositions(positions) {
               <div class="trml-range-track">
                 <div class="trml-range-nums trml-mono">
                   <span class="trml-neg">SL ${fmtPrice(p.sl_price)}</span>
+                  <span class="trml-muted-text">${rrText}</span>
                   <span class="trml-pos">TP ${fmtPrice(p.tp_price)}</span>
                 </div>
                 <div class="progress trml-progress" data-tone="${track.tone}">
@@ -748,6 +796,12 @@ function renderScanner(coins, scannedAtUTC) {
       : `${state.lastScannerCoins.length} coins`;
   }
   if (updatedEl && scannedAtUTC) updatedEl.textContent = `Sync ${fmtUTC(scannedAtUTC)}`;
+  const footerMeta = document.getElementById('scanner-footer-meta');
+  if (footerMeta) {
+    footerMeta.textContent = query
+      ? `Showing ${filtered.length} of ${state.lastScannerCoins.length} watched symbols`
+      : `Showing ${state.lastScannerCoins.length} watched symbols`;
+  }
 
   if (filtered.length === 0) {
     tableWrap?.classList.add('hidden');
@@ -766,14 +820,14 @@ function renderScanner(coins, scannedAtUTC) {
     tbody.innerHTML = filtered
       .map((c) => {
         const dist = Number(c.dist_vwap_pct || 0);
-        const distCls = dist > 0 ? 'trml-pos' : dist < 0 ? 'trml-neg' : '';
+        const distBadgeCls = dist > 0 ? 'trml-badge-pos' : dist < 0 ? 'trml-badge-neg' : '';
         const hlCls = state.highlightSymbol === c.symbol ? 'trml-row-highlight' : '';
         return `
           <tr class="${hlCls}" data-symbol="${escapeHtml(c.symbol)}">
             <td class="col-sticky trml-mono">${escapeHtml(c.symbol)}</td>
+            <td><span class="badge trml-mono ${distBadgeCls}" ${dist === 0 ? 'data-variant="outline"' : ''}>${fmtPct(dist, 2, true)}</span></td>
             <td class="num trml-mono">${fmtPrice(c.mark_price)}</td>
             <td class="num trml-mono trml-muted-text">${fmtPrice(c.session_vwap)}</td>
-            <td class="num trml-mono ${distCls}">${fmtPct(dist, 2, true)}</td>
             <td class="num trml-mono">${Number(c.spread_pct || 0).toFixed(3)}%</td>
             <td class="num trml-mono">${fmtFunding(c.funding_rate)}</td>
             <td class="num trml-mono">${Number(c.natr_pct || 0).toFixed(2)}%</td>
@@ -797,6 +851,8 @@ function renderScanner(coins, scannedAtUTC) {
             </div>
             <div class="trml-mobile-grid trml-mono">
               <div class="trml-mobile-kv"><span>Mark</span><strong>${fmtPrice(c.mark_price)}</strong></div>
+              <div class="trml-mobile-kv"><span>Session VWAP</span><strong>${fmtPrice(c.session_vwap)}</strong></div>
+              <div class="trml-mobile-kv"><span>Spread</span><strong>${Number(c.spread_pct || 0).toFixed(3)}%</strong></div>
               <div class="trml-mobile-kv"><span>NATR / RVOL</span><strong>${Number(c.natr_pct || 0).toFixed(2)}% / ${Number(c.rvol || 0).toFixed(2)}x</strong></div>
               <div class="trml-mobile-kv"><span>Funding</span><strong>${fmtFunding(c.funding_rate)}</strong></div>
             </div>
@@ -851,21 +907,42 @@ function renderTrades(data) {
         .map((t) => {
           const isLong = String(t.side).toUpperCase() === 'LONG';
           const pnl = Number(t.net_pnl_usdt || 0);
+          const roe = Number(t.roe_pct || 0);
           const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
-          const cachedTag = t.has_autopsy ? 'Cached' : 'Autopsy';
-          const btnVariant = t.has_autopsy ? 'secondary' : 'outline';
+          const hasAutopsy = Boolean(t.ai_autopsy && String(t.ai_autopsy).trim());
+          const cachedTag = hasAutopsy ? 'Cached' : 'Autopsy';
+          const btnVariant = hasAutopsy ? 'secondary' : 'outline';
+          const { plannedRR, realizedR } = calcTradeMetricsR(t);
+          const rrPlanStr = plannedRR !== null ? `1:${plannedRR.toFixed(1)}` : '—';
+          const rrRealStr = realizedR !== null ? `${realizedR >= 0 ? '+' : ''}${realizedR.toFixed(2)}R` : '—';
+          const rrRealCls = realizedR > 0 ? 'trml-pos' : realizedR < 0 ? 'trml-neg' : 'trml-muted-text';
           return `
             <tr>
-              <td class="trml-mono trml-muted-text">${fmtUTC(t.closed_at_utc)}</td>
+              <td class="trml-mono trml-muted-text">
+                <div>${fmtUTC(t.closed_at_utc)}</div>
+                <div>${fmtDuration(t.duration_sec)}</div>
+              </td>
               <td class="col-sticky trml-mono">${escapeHtml(t.symbol)}</td>
               <td>
-                <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(t.side)}</span>
-                <span class="badge" data-variant="secondary" title="${escapeHtml(t.strategy_id)}">${escapeHtml(formatStrategyLabel(t.strategy_id))}</span>
+                <div class="trml-badge-pair">
+                  <span class="badge trml-side-badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(t.side)}</span>
+                  <span class="badge trml-strat-badge" data-variant="secondary" title="${escapeHtml(t.strategy_id)}">${escapeHtml(formatStrategyLabel(t.strategy_id))}</span>
+                </div>
               </td>
-              <td class="num trml-mono">${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</td>
+              <td class="num trml-mono">
+                <div>${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</div>
+                <div class="trml-muted-text">Qty ${escapeHtml(t.qty || '—')}</div>
+              </td>
               <td><span class="badge" data-variant="outline">${escapeHtml(t.exit_reason)}</span></td>
               <td class="num trml-mono trml-muted-text">${Number(t.mae_pct || 0).toFixed(2)}% / ${Number(t.mfe_pct || 0).toFixed(2)}%</td>
-              <td class="num trml-mono ${pnlCls}"><strong>${fmtMoney(pnl, true)}</strong></td>
+              <td class="num trml-mono">
+                <div class="${rrRealCls}">${rrRealStr}</div>
+                <div class="trml-muted-text">Plan ${rrPlanStr}</div>
+              </td>
+              <td class="num trml-mono ${pnlCls}">
+                <strong>${fmtMoney(pnl, true)}</strong>
+                <div class="trml-muted-text">(${fmtPct(roe, 2, true)})</div>
+              </td>
               <td class="num">
                 <button type="button" class="btn" data-variant="${btnVariant}" data-size="xs" onclick="inspectTradeAutopsy('${escapeHtml(t.client_order_id)}', '${escapeHtml(t.symbol)}')">${cachedTag}</button>
               </td>
@@ -881,6 +958,9 @@ function renderTrades(data) {
           const isLong = String(t.side).toUpperCase() === 'LONG';
           const pnl = Number(t.net_pnl_usdt || 0);
           const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
+          const hasAutopsy = Boolean(t.ai_autopsy && String(t.ai_autopsy).trim());
+          const { plannedRR, realizedR } = calcTradeMetricsR(t);
+          const rrLabel = `${realizedR !== null ? `${realizedR >= 0 ? '+' : ''}${realizedR.toFixed(2)}R` : '—'} (${plannedRR !== null ? `1:${plannedRR.toFixed(1)}` : '—'})`;
           return `
             <div class="trml-mobile-item">
               <div class="trml-mobile-head">
@@ -894,7 +974,8 @@ function renderTrades(data) {
               <div class="trml-mobile-grid trml-mono">
                 <div class="trml-mobile-kv"><span>Entry → Exit</span><strong>${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</strong></div>
                 <div class="trml-mobile-kv"><span>MAE / MFE</span><strong>${Number(t.mae_pct || 0).toFixed(2)}% / ${Number(t.mfe_pct || 0).toFixed(2)}%</strong></div>
-                <div class="trml-mobile-kv"><span>AI</span><button type="button" class="btn" data-variant="outline" data-size="xs" onclick="inspectTradeAutopsy('${escapeHtml(t.client_order_id)}', '${escapeHtml(t.symbol)}')">${t.has_autopsy ? 'Cached' : 'Autopsy'}</button></div>
+                <div class="trml-mobile-kv"><span>R:R (Real/Plan)</span><strong>${rrLabel}</strong></div>
+                <div class="trml-mobile-kv"><span>AI</span><button type="button" class="btn" data-variant="outline" data-size="xs" onclick="inspectTradeAutopsy('${escapeHtml(t.client_order_id)}', '${escapeHtml(t.symbol)}')">${hasAutopsy ? 'Cached' : 'Autopsy'}</button></div>
               </div>
             </div>
           `;
@@ -912,7 +993,7 @@ function renderTrades(data) {
 async function fetchSignals(page = state.signalsPage) {
   state.signalsPage = Math.max(1, page);
   try {
-    const url = `/api/signals?page=${state.signalsPage}&limit=${state.signalsLimit}&status=${encodeURIComponent(state.signalsFilter)}`;
+    const url = `/api/signals?page=${state.signalsPage}&limit=${state.signalsLimit}&decision=${encodeURIComponent(state.signalsFilter)}`;
     const data = await apiFetch(url);
     renderSignals(data);
   } catch (err) {
@@ -950,18 +1031,22 @@ function renderSignals(data) {
       tbody.innerHTML = signals
         .map((sig) => {
           const isLong = String(sig.side).toUpperCase() === 'LONG';
-          const tokens = parseSignalReasonTokens(sig.reject_reason);
-          const summaryNote = tokens.map((t) => (t.detail ? `${t.label} (${t.detail})` : t.label)).join(' · ') || '—';
+          const isExec = ['APPROVE', 'APPROVED', 'EXECUTED'].includes(String(sig.decision || '').toUpperCase());
+          const rawReason = [sig.reject_reason_code, sig.reject_sub_reason].filter(Boolean).join(': ');
+          const tokens = parseSignalReasonTokens(rawReason);
+          const summaryNote = tokens.map((t) => (t.detail ? `${t.label} (${t.detail})` : t.label)).join(' · ') || (isExec ? 'Passed all gates' : '—');
           return `
             <tr>
               <td class="trml-mono trml-muted-text">${fmtUTC(sig.candle_open_time_utc)}</td>
               <td class="col-sticky trml-mono">${escapeHtml(sig.symbol)}</td>
               <td>
-                <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(sig.side)}</span>
-                <span class="badge" data-variant="secondary">${escapeHtml(formatStrategyLabel(sig.strategy_id))}</span>
+                <div class="trml-badge-pair">
+                  <span class="badge trml-side-badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(sig.side)}</span>
+                  <span class="badge trml-strat-badge" data-variant="secondary" title="${escapeHtml(sig.strategy_id)}">${escapeHtml(formatStrategyLabel(sig.strategy_id))}</span>
+                </div>
               </td>
               <td>
-                <span class="badge ${sig.is_executed ? 'trml-badge-pos' : 'trml-badge-warn'}">${sig.is_executed ? 'EXECUTED' : 'REJECTED'}</span>
+                <span class="badge trml-side-badge ${isExec ? 'trml-badge-pos' : 'trml-badge-warn'}">${isExec ? 'EXECUTED' : 'REJECTED'}</span>
               </td>
               <td><div class="trml-audit-note" title="${escapeHtml(summaryNote)}">${escapeHtml(summaryNote)}</div></td>
               <td class="num">
@@ -977,15 +1062,17 @@ function renderSignals(data) {
       mobileList.innerHTML = signals
         .map((sig) => {
           const isLong = String(sig.side).toUpperCase() === 'LONG';
-          const tokens = parseSignalReasonTokens(sig.reject_reason);
-          const summaryNote = tokens.map((t) => t.label).join(' · ') || '—';
+          const isExec = ['APPROVE', 'APPROVED', 'EXECUTED'].includes(String(sig.decision || '').toUpperCase());
+          const rawReason = [sig.reject_reason_code, sig.reject_sub_reason].filter(Boolean).join(': ');
+          const tokens = parseSignalReasonTokens(rawReason);
+          const summaryNote = tokens.map((t) => t.label).join(' · ') || (isExec ? 'Passed all gates' : '—');
           return `
             <div class="trml-mobile-item">
               <div class="trml-mobile-head">
                 <div class="trml-panel-title-wrap">
                   <strong class="trml-mono">${escapeHtml(sig.symbol)}</strong>
                   <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(sig.side)}</span>
-                  <span class="badge ${sig.is_executed ? 'trml-badge-pos' : 'trml-badge-warn'}">${sig.is_executed ? 'EXEC' : 'REJ'}</span>
+                  <span class="badge ${isExec ? 'trml-badge-pos' : 'trml-badge-warn'}">${isExec ? 'EXEC' : 'REJ'}</span>
                 </div>
                 <button type="button" class="btn" data-variant="outline" data-size="xs" onclick="openSignalInspector('${escapeHtml(String(sig.id))}')">Metrics</button>
               </div>
@@ -1008,14 +1095,17 @@ function openSignalInspector(signalId) {
   const bodyEl = document.getElementById('signal-detail-body');
   if (!sig || !dialog || !bodyEl) return;
 
-  if (titleEl) titleEl.textContent = `${sig.symbol} · ${sig.side} (${formatStrategyLabel(sig.strategy_id)})`;
-  if (subEl) subEl.textContent = `${fmtUTC(sig.candle_open_time_utc)} · ${sig.is_executed ? 'EXECUTED' : 'REJECTED'}`;
+  const isExec = ['APPROVE', 'APPROVED', 'EXECUTED'].includes(String(sig.decision || '').toUpperCase());
+  const rawReason = [sig.reject_reason_code, sig.reject_sub_reason].filter(Boolean).join(': ');
 
-  const tokens = parseSignalReasonTokens(sig.reject_reason);
+  if (titleEl) titleEl.textContent = `${sig.symbol} · ${sig.side} (${formatStrategyLabel(sig.strategy_id)})`;
+  if (subEl) subEl.textContent = `${fmtUTC(sig.candle_open_time_utc)} · ${isExec ? 'EXECUTED' : 'REJECTED'}`;
+
+  const tokens = parseSignalReasonTokens(rawReason);
   const chipsHtml = tokens
     .map((t) => {
       const text = t.detail ? `${t.label}: ${t.detail}` : t.label;
-      return `<span class="badge ${sig.is_executed ? 'trml-badge-pos' : 'trml-badge-warn'}">${escapeHtml(text)}</span>`;
+      return `<span class="badge ${isExec ? 'trml-badge-pos' : 'trml-badge-warn'}">${escapeHtml(text)}</span>`;
     })
     .join('');
 
@@ -1027,6 +1117,9 @@ function openSignalInspector(signalId) {
     ['Bar Delta Z', Number(sig.bar_delta_zscore || 0).toFixed(2)],
     ['OI Delta %', fmtPct(sig.oi_delta_pct, 2, true)],
     ['Funding Rate', fmtFunding(sig.funding_rate)],
+    ['Spread %', Number(sig.spread_pct || 0).toFixed(3) + '%'],
+    ['RVOL', Number(sig.rvol || 0).toFixed(2) + 'x'],
+    ['Impulse ATR', Number(sig.impulse_atr_mult || 0).toFixed(2) + 'x'],
     ['Strategy Module', escapeHtml(sig.strategy_id || 'VWAP_PULLBACK')]
   ];
 

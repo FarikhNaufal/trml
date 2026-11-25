@@ -405,8 +405,8 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 	if decisionFilter != "" && decisionFilter != "ALL" {
 		df := strings.ToUpper(strings.TrimSpace(decisionFilter))
 		switch df {
-		case "APPROVED", "APPROVE":
-			whereClauses = append(whereClauses, "decision IN ('APPROVE', 'APPROVED')")
+		case "APPROVED", "APPROVE", "EXECUTED", "EXEC":
+			whereClauses = append(whereClauses, "decision IN ('APPROVE', 'APPROVED', 'EXECUTED')")
 		case "REJECTED", "REJECT":
 			whereClauses = append(whereClauses, "decision IN ('REJECT', 'REJECTED')")
 		default:
