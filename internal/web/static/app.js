@@ -444,6 +444,10 @@ function renderSummary(data) {
   const maxDdPct = maxDdRaw > 1 ? maxDdRaw : maxDdRaw * 100;
   const ddLossPct = ddRawPct < 0 ? Math.abs(ddRawPct) : 0;
   const ddUtil = maxDdPct > 0 ? Math.min(100, (ddLossPct / maxDdPct) * 100) : 0;
+  const ddProfitBarPct = ddRawPct > 0.005
+    ? Math.min(100, Math.max(8, maxDdPct > 0 ? (ddRawPct / maxDdPct) * 100 : ddRawPct * 10))
+    : 0;
+  const ddBarWidth = ddRawPct < -0.005 ? Math.max(4, ddUtil) : ddProfitBarPct;
 
   const ddValEl = document.getElementById('kpi-dd-val');
   const ddMaxEl = document.getElementById('kpi-dd-max');
@@ -462,10 +466,10 @@ function renderSummary(data) {
     }
   }
   if (ddMaxEl && maxDdPct > 0) ddMaxEl.textContent = `/ -${maxDdPct.toFixed(1)}% cap`;
-  if (ddBar) ddBar.style.width = `${ddUtil.toFixed(1)}%`;
+  if (ddBar) ddBar.style.width = `${ddBarWidth.toFixed(1)}%`;
   if (ddWrap) {
-    ddWrap.setAttribute('aria-valuenow', ddUtil.toFixed(0));
-    ddWrap.dataset.tone = ddRawPct >= 0 ? 'pos' : ddUtil >= 75 ? 'neg' : 'warn';
+    ddWrap.setAttribute('aria-valuenow', ddBarWidth.toFixed(0));
+    ddWrap.dataset.tone = ddRawPct < -0.005 ? 'neg' : 'pos';
   }
 
   // Slots Bar
@@ -1036,7 +1040,7 @@ function renderSignals(data) {
           const tokens = parseSignalReasonTokens(rawReason);
           const summaryNote = tokens.map((t) => (t.detail ? `${t.label} (${t.detail})` : t.label)).join(' · ') || (isExec ? 'Passed all gates' : '—');
           return `
-            <tr>
+            <tr class="trml-row-clickable" onclick="openSignalInspector('${escapeHtml(String(sig.id))}')" title="Click to inspect candle metrics">
               <td class="trml-mono trml-muted-text">${fmtUTC(sig.candle_open_time_utc)}</td>
               <td class="col-sticky trml-mono">${escapeHtml(sig.symbol)}</td>
               <td>
@@ -1048,10 +1052,7 @@ function renderSignals(data) {
               <td>
                 <span class="badge trml-side-badge ${isExec ? 'trml-badge-pos' : 'trml-badge-warn'}">${isExec ? 'EXECUTED' : 'REJECTED'}</span>
               </td>
-              <td><div class="trml-audit-note" title="${escapeHtml(summaryNote)}">${escapeHtml(summaryNote)}</div></td>
-              <td class="num">
-                <button type="button" class="btn" data-variant="outline" data-size="xs" onclick="openSignalInspector('${escapeHtml(String(sig.id))}')">Metrics</button>
-              </td>
+              <td><div class="trml-audit-note">${escapeHtml(summaryNote)}</div></td>
             </tr>
           `;
         })

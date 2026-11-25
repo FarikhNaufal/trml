@@ -767,14 +767,18 @@ body {
   background: var(--trml-info-bg) !important;
 }
 
-/* Audit Note Truncation */
+/* Audit Note Full Wrap (No Truncation) */
 .trml-audit-note {
-  max-width: 320px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
+  min-width: 260px;
   color: var(--muted-foreground);
-  font-size: 0.74rem;
+  font-size: 0.78rem;
+}
+
+.trml-row-clickable {
+  cursor: pointer;
 }
 
 /* Empty & Pagination */
