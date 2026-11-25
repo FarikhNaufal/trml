@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -30,10 +31,18 @@ type ExecutionBroker interface {
 	GetEffectiveTotalEquityUSDT() decimal.Decimal
 	GetAvailableBalanceUSDT() decimal.Decimal
 	GetDailyTotalDrawdownPct() float64
+	GetDrawdownFromPeakPct() float64
 	IsCircuitBreakerTripped() bool
 	GetActiveSlotCount() int
 	HasActiveOrderOrPosition(symbol string) bool
 	GetMonitoredSymbols() []string
 	CheckTimeouts(now time.Time)
 	GetActivePositions() []ActivePositionDTO
+}
+
+func effectiveEntryOrderType(intentType, defaultType string) string {
+	if t := strings.TrimSpace(intentType); t != "" {
+		return t
+	}
+	return strings.TrimSpace(defaultType)
 }

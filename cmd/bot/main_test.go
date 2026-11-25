@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"trml/internal/scanner"
 	"trml/internal/storage"
 	"trml/internal/strategy"
+	"trml/internal/ws"
 	"github.com/shopspring/decimal"
 )
 
@@ -703,5 +705,645 @@ func TestBotEngine_EvaluateAndLogClosedCandle_PartitionScopeAndStrategyAudit(t *
 	dry.Mu.Unlock()
 	if po == nil || po.Intent.StrategyID != strategy.StrategyIDLiquiditySweep {
 		t.Fatalf("expected pending order StrategyID=%s, got %+v", strategy.StrategyIDLiquiditySweep, po)
+	}
+}
+
+func TestBotEngine_ProductionParity_Breadth_Drawdown_ClusterSL_BTCMacro_BarCap(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	now := time.Now().UTC().Truncate(15 * time.Minute)
+	count := 100
+	candles := make([]model.Candle, count)
+	deltas := make([]float64, count)
+	for i := 0; i < count; i++ {
+		tClose := now.Add(-time.Duration(count-1-i) * 15 * time.Minute)
+		tOpen := tClose.Add(-15 * time.Minute)
+		closeP := 120.0 - float64(i)*0.25
+		openP := closeP + 0.10
+		candles[i] = model.Candle{
+			OpenTime:        tOpen,
+			CloseTime:       tClose.Add(-time.Millisecond),
+			Open:            openP,
+			High:            openP + 0.20,
+			Low:             closeP - 0.15,
+			Close:           closeP,
+			VolumeBase:      1000.0,
+			QuoteVolumeUSDT: 1000.0 * closeP,
+		}
+		if i%2 == 0 {
+			deltas[i] = 100.0
+		} else {
+			deltas[i] = -100.0
+		}
+	}
+	priorHigh := 0.0
+	for i := count - 1 - 12; i < count-1; i++ {
+		if candles[i].High > priorHigh {
+			priorHigh = candles[i].High
+		}
+	}
+	latest := &candles[count-1]
+	latest.Open = priorHigh - 0.30
+	latest.Close = priorHigh - 1.50
+	latest.High = priorHigh + 0.60
+	latest.Low = latest.Close - 0.10
+	deltas[count-1] = -90.0
+
+	// BTC 4h (+16 bars on 15m) pumped +4.0% so RS4h strong (0.50x) fires EVEN when BTCGateEnabled=false
+	btcCandles := make([]model.Candle, 40)
+	for i := 0; i < len(btcCandles); i++ {
+		tClose := now.Add(-time.Duration(len(btcCandles)-1-i) * 15 * time.Minute)
+		tOpen := tClose.Add(-15 * time.Minute)
+		p := 50000.0
+		if i >= len(btcCandles)-16 {
+			p = 52000.0 // +4% over last 4h
+		}
+		btcCandles[i] = model.Candle{
+			OpenTime:        tOpen,
+			CloseTime:       tClose.Add(-time.Millisecond),
+			Open:            p,
+			High:            p + 10,
+			Low:             p - 10,
+			Close:           p,
+			VolumeBase:      10,
+			QuoteVolumeUSDT: 10 * p,
+		}
+	}
+	btcSt := model.NewSymbolState(BenchmarkSymbol, model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.1)}, 100, 100)
+	btcSt.BestBid = 51999.0
+	btcSt.BestAsk = 52001.0
+	btcSt.BookUpdatedAt = time.Now().UTC()
+	btcSt.MarkPrice = 52000.0
+	btcSt.MarkPriceUpdatedAt = time.Now().UTC()
+	btcSt.FundingUpdatedAt = time.Now().UTC()
+	btcSt.CurrentSessionVWAP = 51000.0
+	btcSt.ClosedCandles = btcCandles
+
+	filter := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinQty:      decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	makeSymState := func(sym string) *model.SymbolState {
+		st := model.NewSymbolState(sym, filter, 150, 100)
+		st.IsLeverageIsolatedVerified = true
+		st.BestBid = latest.Close - 0.01
+		st.BestAsk = latest.Close + 0.01
+		st.BookUpdatedAt = time.Now().UTC()
+		st.MarkPrice = latest.Close
+		st.MarkPriceUpdatedAt = time.Now().UTC()
+		st.FundingRate = 0.0001
+		st.FundingUpdatedAt = time.Now().UTC()
+		st.CurrentSessionVWAP = priorHigh + 5.0
+		st.ClosedCandles = append([]model.Candle(nil), candles...)
+		st.ClosedBarDeltasUSDT = append([]float64(nil), deltas...)
+		return st
+	}
+
+	buildEngine := func(peakEq float64, maxPerBar int) (*BotEngine, *broker.DryRunBroker) {
+		dry := broker.NewDryRunBroker(decimal.NewFromFloat(500.0), broker.DryRunConfig{
+			MaxSlots:            5,
+			MaxDailyDrawdownPct: -0.50,
+			AccountLeverage:     10.0,
+		})
+		if peakEq > 500.0 {
+			dry.SetPeakEffectiveEquityUSDT(decimal.NewFromFloat(peakEq))
+		}
+		evalCfg := strategy.EvaluatorConfig{
+			CandleDuration:            15 * time.Minute,
+			MaxSlots:                  5,
+			MaxDailyDrawdownPct:       -0.50,
+			MaxBookStaleness:          5 * time.Second,
+			MaxMarkStaleness:          15 * time.Second,
+			MaxDataStaleness:          930 * time.Second,
+			MaxSpreadPct:              0.10,
+			MinNATRPct:                0.10,
+			MaxNATRPct:                5.00,
+			EMAPeriod:                 50,
+			ATRPeriod:                 14,
+			DeltaZScoreWindow:         50,
+			DisableOIFilter:           true,
+			MaxAdverseFundingRate:     0.0005,
+			AllowedSide:               "AUTO",
+			MaxFrenzyRVOL:             2.50,
+			MaxCounterImpulseATR:      1.50,
+			EntryOrderType:            "LIMIT",
+			DisableVWAP:               true,
+			BTCGateEnabled:            false,
+			MarketBreadthLowThreshold: 0.20,
+			MarketBreadthLowRiskMult:  0.40,
+			DDThrottleThresholdPct:    0.15, // 20% DD from 625->500 triggers 0.50x
+			DDThrottleRiskMult:        0.50,
+			RS4hStrongThresholdPct:    2.0,  // BTC +4% while alt drops triggers RS4h 0.50x even with BTCGateEnabled=false
+			RS4hStrongRiskMult:        0.50,
+			Sweep: strategy.SweepConfig{
+				Enabled:           true,
+				LookbackBars:      12,
+				MinUpperWickRatio: 0.25,
+				MaxLowerWickRatio: 0.45,
+				MaxDeltaZScore:    -0.25,
+			},
+			Sizing: strategy.SizingConfig{
+				RiskPerTradePct:                decimal.NewFromFloat(0.025),
+				MaxSlotMarginFraction:          decimal.NewFromFloat(0.50),
+				AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+				AccountLeverage:                10.0,
+				SLMultiplier:                   2.00,
+				TPMultiplier:                   5.00,
+				MinSLDistancePct:               decimal.NewFromFloat(0.01),
+				MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+				TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+				SlippageRate:                   decimal.NewFromFloat(0.0002),
+				EntryOrderType:                 "LIMIT",
+			},
+		}
+		eng := &BotEngine{
+			cfg: &config.Config{
+				DryRun:                true,
+				EquityModeCompounding: true,
+				MaxDailyDrawdown:      -0.50,
+			},
+			repo:                   repo,
+			broker:                 dry,
+			dryRunBroker:           dry,
+			activeStates:           map[string]*model.SymbolState{BenchmarkSymbol: btcSt},
+			primaryWatchedSet:      map[string]bool{"ETHUSDT": true, "ADAUSDT": true},
+			breakoutWatchedSet:     make(map[string]bool),
+			sweepExtraWatchedSet:   make(map[string]bool),
+			cooldownExits:          make(map[string]storage.RecentExitRecord),
+			verifiedSymbols:        make(map[string]bool),
+			marketBreadthPct:       0.10, // <= 0.20 triggers 0.40x breadth throttle
+			marketBreadthValid:     true,
+			marketBreadthUpdatedAt: time.Now().UTC(),
+			clusterSL:              strategy.NewClusterSLTracker(3, 90*time.Minute),
+			barEntries:             strategy.NewBarEntryTracker(maxPerBar),
+			evaluatorCfg:           evalCfg,
+		}
+		return eng, dry
+	}
+
+	// 1. Baseline (no DD throttle, no RS4h) vs Parity (DD=20% + RS4h strong + Breadth=0.10)
+	engBase, dryBase := buildEngine(500.0, 1)
+	engBase.marketBreadthPct = 0.50
+	engBase.evaluatorCfg.RS4hStrongThresholdPct = 0
+	engBase.evaluateAndLogClosedCandle(*latest, makeSymState("ETHUSDT"))
+
+	engThrot, dryThrot := buildEngine(625.0, 1)
+	engThrot.evaluateAndLogClosedCandle(*latest, makeSymState("ETHUSDT"))
+
+	dryBase.Mu.Lock()
+	baseOrd := dryBase.PendingOrders["ETHUSDT"]
+	dryBase.Mu.Unlock()
+	dryThrot.Mu.Lock()
+	throtOrd := dryThrot.PendingOrders["ETHUSDT"]
+	dryThrot.Mu.Unlock()
+	if baseOrd == nil || throtOrd == nil {
+		t.Fatalf("expected both baseline and throttled ETHUSDT orders submitted, got base=%v throt=%v", baseOrd, throtOrd)
+	}
+	if !throtOrd.Intent.Qty.LessThan(baseOrd.Intent.Qty.Mul(decimal.NewFromFloat(0.20))) {
+		t.Fatalf("expected combined Breadth(0.4x)*DD(0.5x)*RS4h(0.5x)=0.1x qty << base qty, got base=%s throt=%s", baseOrd.Intent.Qty, throtOrd.Intent.Qty)
+	}
+
+	// 2. Same bar with MaxNewEntriesPerBar=1 must reject ADAUSDT with BAR_ENTRY_CAP_REACHED
+	engThrot.evaluateAndLogClosedCandle(*latest, makeSymState("ADAUSDT"))
+	var capReason string
+	if err := db.RawConn().QueryRow("SELECT reject_reason_code FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&capReason); err != nil {
+		t.Fatalf("query signal_audit_log failed: %v", err)
+	}
+	if capReason != "BAR_ENTRY_CAP_REACHED" {
+		t.Fatalf("expected BAR_ENTRY_CAP_REACHED for 2nd signal on same bar, got %q", capReason)
+	}
+
+	// 3. 3 STOP_LOSS exits via recordSymbolExit must trigger PORTFOLIO_CLUSTER_SL_COOLDOWN on next bar
+	exitBase := time.Now().UTC()
+	engThrot.recordSymbolExit("X1USDT", exitBase.Add(-20*time.Minute), "STOP_LOSS")
+	engThrot.recordSymbolExit("X2USDT", exitBase.Add(-10*time.Minute), "STOP_LOSS")
+	engThrot.recordSymbolExit("X3USDT", exitBase.Add(-2*time.Minute), "STOP_LOSS")
+	nextBar := *latest
+	nextBar.OpenTime = latest.OpenTime.Add(15 * time.Minute)
+	engThrot.evaluateAndLogClosedCandle(nextBar, makeSymState("ADAUSDT"))
+	var slReason string
+	if err := db.RawConn().QueryRow("SELECT reject_reason_code FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&slReason); err != nil {
+		t.Fatalf("query signal_audit_log failed: %v", err)
+	}
+	if slReason != "PORTFOLIO_CLUSTER_SL_COOLDOWN" {
+		t.Fatalf("expected PORTFOLIO_CLUSTER_SL_COOLDOWN after 3 STOP_LOSS exits, got %q", slReason)
+	}
+
+	dryBase.Close()
+	dryThrot.Close()
+}
+
+func TestMarketStreamShardingUnderBinance200Limit(t *testing.T) {
+	if maxMarketStreamsPerConn <= 0 || maxMarketStreamsPerConn >= 200 {
+		t.Fatalf("maxMarketStreamsPerConn must stay strictly under Binance 200-stream limit, got %d", maxMarketStreamsPerConn)
+	}
+	symbols := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		symbols = append(symbols, fmt.Sprintf("ALT%03dUSDT", i))
+	}
+
+	// Dry-Run includes @aggTrade -> (100+1)*3 = 303 streams
+	_, dryMarketStreams := buildMarketStreamSubscriptions(symbols, "15m", true)
+	if len(dryMarketStreams) != 303 {
+		t.Fatalf("expected 303 dry-run market streams (with BTCUSDT), got %d", len(dryMarketStreams))
+	}
+	drySharded := ws.NewShardedDynamicStream(ws.NewStreamManager(ws.EventHandlers{}), "wss://example.com", dryMarketStreams, maxMarketStreamsPerConn)
+	expectedDryShards := (len(dryMarketStreams) + maxMarketStreamsPerConn - 1) / maxMarketStreamsPerConn
+	if drySharded.ShardCount() != expectedDryShards || drySharded.ShardCount() < 2 {
+		t.Fatalf("expected %d shards (<200 per shard) for %d dry-run streams, got %d", expectedDryShards, len(dryMarketStreams), drySharded.ShardCount())
+	}
+
+	// Live excludes @aggTrade -> (100+1)*2 = 202 streams
+	_, liveMarketStreams := buildMarketStreamSubscriptions(symbols, "15m", false)
+	if len(liveMarketStreams) != 202 {
+		t.Fatalf("expected 202 live market streams (with BTCUSDT), got %d", len(liveMarketStreams))
+	}
+	liveSharded := ws.NewShardedDynamicStream(ws.NewStreamManager(ws.EventHandlers{}), "wss://example.com", liveMarketStreams, maxMarketStreamsPerConn)
+	expectedLiveShards := (len(liveMarketStreams) + maxMarketStreamsPerConn - 1) / maxMarketStreamsPerConn
+	if liveSharded.ShardCount() != expectedLiveShards || liveSharded.ShardCount() < 2 {
+		t.Fatalf("expected %d shards (<200 per shard) for %d live streams, got %d", expectedLiveShards, len(liveMarketStreams), liveSharded.ShardCount())
+	}
+}
+
+func TestBotEngine_WaitForBTCCandleSynchronizesDelayedBTC(t *testing.T) {
+	eng := &BotEngine{}
+	barOpen := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	// 1. BTC update arrives slightly later (35ms) -> waitForBTCCandle waits cleanly and wakes up early
+	go func() {
+		time.Sleep(35 * time.Millisecond)
+		eng.notifyBTCCandleClosed(barOpen)
+	}()
+	start := time.Now()
+	eng.waitForBTCCandle(barOpen, 800*time.Millisecond)
+	elapsed := time.Since(start)
+	if elapsed < 25*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("expected waitForBTCCandle to unblock right after delayed BTC bar (~35ms), took %v", elapsed)
+	}
+
+	// 2. Subsequent BTC never arrives for next bar -> bounded timeout prevents stall
+	nextOpen := barOpen.Add(15 * time.Minute)
+	start2 := time.Now()
+	eng.waitForBTCCandle(nextOpen, 40*time.Millisecond)
+	if elapsed2 := time.Since(start2); elapsed2 < 30*time.Millisecond || elapsed2 > 300*time.Millisecond {
+		t.Fatalf("expected bounded wait timeout (~40ms), took %v", elapsed2)
+	}
+}
+
+func TestBotEngine_BTCFullBootstrapRetryAfterInitialFailure(t *testing.T) {
+	var failBTC atomic.Bool
+	failBTC.Store(true)
+
+	var btcMu sync.Mutex
+	var btcLimits []int
+
+	now := time.Now().UTC().Truncate(15 * time.Minute)
+	makeRows := func(n int) [][]any {
+		rows := make([][]any, 0, n)
+		for i := 0; i < n; i++ {
+			tOpen := now.Add(time.Duration(i-n) * 15 * time.Minute)
+			tClose := tOpen.Add(15*time.Minute - time.Millisecond)
+			rows = append(rows, []any{
+				float64(tOpen.UnixMilli()),
+				"100.0", "101.0", "99.0", "100.2",
+				"500.0",
+				float64(tClose.UnixMilli()),
+				"50000.0",
+				float64(10),
+				"250.0",
+				"25000.0",
+			})
+		}
+		return rows
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/fapi/v1/exchangeInfo":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"symbols": []map[string]any{
+					{
+						"symbol": "BTCUSDT", "contractType": "PERPETUAL", "status": "TRADING",
+						"filters": []map[string]string{
+							{"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+							{"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+							{"filterType": "MIN_NOTIONAL", "notional": "5.0"},
+						},
+					},
+				},
+			})
+		case "/fapi/v1/ticker/24hr":
+			_ = json.NewEncoder(w).Encode([]map[string]string{})
+		case "/fapi/v1/ticker/bookTicker":
+			_ = json.NewEncoder(w).Encode([]map[string]string{})
+		case "/fapi/v1/klines":
+			sym := r.URL.Query().Get("symbol")
+			if sym == "BTCUSDT" {
+				var lim int
+				_, _ = fmt.Sscanf(r.URL.Query().Get("limit"), "%d", &lim)
+				btcMu.Lock()
+				btcLimits = append(btcLimits, lim)
+				btcMu.Unlock()
+				if failBTC.Load() {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(makeRows(lim))
+				return
+			}
+			_ = json.NewEncoder(w).Encode([][]any{})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := exchange.NewClient(ts.URL, "", "")
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:          true,
+			Timeframe:       "15m",
+			CandleDuration:  15 * time.Minute,
+			DisableOIFilter: true,
+			MaxSpreadPct:    0.10,
+		},
+		client:               client,
+		activeStates:         make(map[string]*model.SymbolState),
+		primaryWatchedSet:    make(map[string]bool),
+		breakoutWatchedSet:   make(map[string]bool),
+		sweepExtraWatchedSet: make(map[string]bool),
+		exchangeFilters:      make(map[string]model.ExchangeFilter),
+		cooldownExits:        make(map[string]storage.RecentExitRecord),
+		verifiedSymbols:      make(map[string]bool),
+		oiBootAttemptAt:      make(map[string]time.Time),
+		scannerCfg: scanner.ScannerConfig{
+			Timeframe:      "15m",
+			CandleDuration: 15 * time.Minute,
+			BootstrapCount: 1280,
+			DeltaWindow:    50,
+			EMAPeriod:      200,
+		},
+	}
+
+	// Scan #1: BTCUSDT fails -> BTC state exists with 0 candles
+	eng.runMarketScan(context.Background())
+
+	// Scan #2: BTCUSDT recovers -> must STILL request full BootstrapCount (1280), NOT 100!
+	failBTC.Store(false)
+	eng.runMarketScan(context.Background())
+
+	// Scan #3: BTCUSDT now has 1280 candles -> drops down to incremental 100!
+	eng.runMarketScan(context.Background())
+
+	btcMu.Lock()
+	defer btcMu.Unlock()
+	if len(btcLimits) < 3 {
+		t.Fatalf("expected at least 3 BTCUSDT kline fetch attempts, got %v", btcLimits)
+	}
+	if btcLimits[0] != 1280 || btcLimits[len(btcLimits)-2] != 1280 || btcLimits[len(btcLimits)-1] != 100 {
+		t.Fatalf("expected full retry 1280 after failure then incremental 100 once warmed up, got sequence %v", btcLimits)
+	}
+}
+
+func TestRestartMarketStream_SkipsWhenParentContextCanceled(t *testing.T) {
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:      true,
+			Timeframe:   "15m",
+			WSPublicURL: "wss://invalid.example.test",
+			WSMarketURL: "wss://invalid.example.test",
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	eng.restartMarketStream(ctx, []string{"ETHUSDT"})
+
+	eng.streamMu.Lock()
+	hasPub := eng.publicDynStream != nil
+	hasMkt := eng.marketDynStream != nil
+	hasCancel := eng.streamCancel != nil
+	eng.streamMu.Unlock()
+	if hasPub || hasMkt || hasCancel {
+		t.Fatalf("expected canceled parentCtx not to spawn streams or WaitGroup work")
+	}
+	eng.streamWg.Wait()
+}
+
+func TestRunMarketScan_CleanEmptyWatchlistClearsOldAndKeepsBTCAlive(t *testing.T) {
+	now := time.Now().UTC().Truncate(5 * time.Minute)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/fapi/v1/exchangeInfo":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"symbols": []map[string]any{
+					{"symbol": "ETHUSDT", "contractType": "PERPETUAL", "status": "TRADING", "filters": []map[string]string{{"filterType": "PRICE_FILTER", "tickSize": "0.01"}, {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"}}},
+					{"symbol": "BTCUSDT", "contractType": "PERPETUAL", "status": "TRADING", "filters": []map[string]string{{"filterType": "PRICE_FILTER", "tickSize": "0.1"}, {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"}}},
+				},
+			})
+		case "/fapi/v1/ticker/24hr":
+			_ = json.NewEncoder(w).Encode([]map[string]string{{"symbol": "ETHUSDT", "quoteVolume": "1000"}}) // Below MinVolume -> clean 0-coin watchlist
+		case "/fapi/v1/ticker/bookTicker":
+			_ = json.NewEncoder(w).Encode([]map[string]string{{"symbol": "ETHUSDT", "bidPrice": "100", "askPrice": "100.01"}})
+		case "/fapi/v1/klines":
+			_ = json.NewEncoder(w).Encode([][]any{})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := exchange.NewClient(ts.URL, "", "")
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:          true,
+			Timeframe:       "5m",
+			CandleDuration:  5 * time.Minute,
+			DisableOIFilter: true,
+			MaxSpreadPct:    0.10,
+			WSPublicURL:     "wss://invalid.example.test",
+			WSMarketURL:     "wss://invalid.example.test",
+		},
+		client: client,
+		activeStates: map[string]*model.SymbolState{
+			"OLDUSDT": model.NewSymbolState("OLDUSDT", model.ExchangeFilter{}, 10, 10),
+			"BTCUSDT": model.NewSymbolState("BTCUSDT", model.ExchangeFilter{}, 10, 10),
+		},
+		watchedCoins:         []string{"OLDUSDT"},
+		primaryWatchedSet:    map[string]bool{"OLDUSDT": true},
+		breakoutWatchedSet:   map[string]bool{"OLDUSDT": true},
+		sweepExtraWatchedSet: map[string]bool{"OLDUSDT": true},
+		exchangeFilters:      make(map[string]model.ExchangeFilter),
+		cooldownExits:        make(map[string]storage.RecentExitRecord),
+		verifiedSymbols:      make(map[string]bool),
+		oiBootAttemptAt:      map[string]time.Time{"OLDUSDT": now},
+		scannerCfg: scanner.ScannerConfig{
+			MinVolume24hUSDT: 50_000_000,
+			MaxSpreadPct:     0.10,
+			EMAPeriod:        50,
+			Timeframe:        "5m",
+			CandleDuration:   5 * time.Minute,
+			BootstrapCount:   100,
+			DeltaWindow:      50,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	eng.runMarketScan(ctx)
+
+	eng.statesMu.RLock()
+	watchedLen := len(eng.watchedCoins)
+	_, hasOld := eng.activeStates["OLDUSDT"]
+	_, hasBTC := eng.activeStates["BTCUSDT"]
+	primLen := len(eng.primaryWatchedSet)
+	boLen := len(eng.breakoutWatchedSet)
+	swLen := len(eng.sweepExtraWatchedSet)
+	eng.statesMu.RUnlock()
+
+	eng.streamMu.Lock()
+	hasStreamCancel := eng.streamCancel != nil
+	eng.streamMu.Unlock()
+
+	cancel()
+	if eng.streamCancel != nil {
+		eng.streamCancel()
+	}
+	eng.streamWg.Wait()
+
+	if watchedLen != 0 || primLen != 0 || boLen != 0 || swLen != 0 || hasOld {
+		t.Fatalf("expected clean empty watchlist to clear old watchedCoins/sets/OLDUSDT, got watched=%d prim=%d bo=%d sw=%d hasOld=%v", watchedLen, primLen, boLen, swLen, hasOld)
+	}
+	if !hasBTC || !hasStreamCancel {
+		t.Fatalf("expected BTCUSDT state and WS stream to stay alive on empty alt watchlist, hasBTC=%v hasStreamCancel=%v", hasBTC, hasStreamCancel)
+	}
+}
+
+func TestVerifyLiveWatchlist_NeverDeletesBenchmarkSymbol(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	eng := &BotEngine{
+		cfg:                  &config.Config{DryRun: false, Leverage: 5},
+		client:               exchange.NewClient(ts.URL, "K", "S"),
+		activeStates:         map[string]*model.SymbolState{BenchmarkSymbol: model.NewSymbolState(BenchmarkSymbol, model.ExchangeFilter{}, 10, 10), "ETHUSDT": model.NewSymbolState("ETHUSDT", model.ExchangeFilter{}, 10, 10)},
+		primaryWatchedSet:    map[string]bool{"ETHUSDT": true},
+		breakoutWatchedSet:   make(map[string]bool),
+		sweepExtraWatchedSet: make(map[string]bool),
+		verifiedSymbols:      make(map[string]bool),
+	}
+	eng.verifyLiveWatchlist(context.Background(), []string{BenchmarkSymbol, "ETHUSDT"})
+	eng.statesMu.RLock()
+	_, hasBTC := eng.activeStates[BenchmarkSymbol]
+	_, hasETH := eng.activeStates["ETHUSDT"]
+	eng.statesMu.RUnlock()
+	if !hasBTC || hasETH {
+		t.Fatalf("expected BenchmarkSymbol preserved and failing ETHUSDT pruned, hasBTC=%v hasETH=%v", hasBTC, hasETH)
+	}
+}
+
+func TestHandleGappedClosedCandle_BackfillsMissingBarsAndFailsClosedOnError(t *testing.T) {
+	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	step := 15 * time.Minute
+	var returnErr atomic.Bool
+
+	makeRow := func(idx int) []any {
+		ot := base.Add(time.Duration(idx) * step)
+		ct := ot.Add(step - time.Millisecond)
+		return []any{float64(ot.UnixMilli()), "100.0", "101.0", "99.0", "100.5", "200.0", float64(ct.UnixMilli()), "20000.0", float64(10), "100.0", "10000.0"}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if returnErr.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var rows [][]any
+		for i := 0; i <= 4; i++ {
+			rows = append(rows, makeRow(i))
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+	}))
+	defer ts.Close()
+
+	eng := &BotEngine{
+		cfg:    &config.Config{DryRun: true, Timeframe: "15m", CandleDuration: step},
+		client: exchange.NewClient(ts.URL, "", ""),
+		scannerCfg: scanner.ScannerConfig{
+			Timeframe:      "15m",
+			CandleDuration: step,
+			BootstrapCount: 100,
+			DeltaWindow:    50,
+		},
+	}
+
+	// 1. Fail-closed on REST error: gap trigger candle must NOT be appended
+	returnErr.Store(true)
+	stFail := model.NewSymbolState(BenchmarkSymbol, model.ExchangeFilter{}, 100, 51)
+	c0 := model.Candle{OpenTime: base, CloseTime: base.Add(step - time.Millisecond), Open: 100, High: 101, Low: 99, Close: 100.5, VolumeBase: 200}
+	stFail.ApplyClosedCandleLocked(c0, 100, 51)
+	trigger := model.Candle{OpenTime: base.Add(4 * step), CloseTime: base.Add(5*step - time.Millisecond), Open: 100, High: 101, Low: 99, Close: 100.5, VolumeBase: 200}
+	eng.handleGappedClosedCandle(context.Background(), BenchmarkSymbol, stFail, trigger)
+	if len(stFail.ClosedCandles) != 1 || !stFail.LastProcessedCandleOpenTime.Equal(base) {
+		t.Fatalf("expected fail-closed on backfill error without appending gapped candle, got len=%d last=%v", len(stFail.ClosedCandles), stFail.LastProcessedCandleOpenTime)
+	}
+
+	// 2. Success path: backfills missing bars 1..3 cleanly and wakes BTC notification
+	returnErr.Store(false)
+	eng.handleGappedClosedCandle(context.Background(), BenchmarkSymbol, stFail, trigger)
+	if len(stFail.ClosedCandles) != 5 || !stFail.LastProcessedCandleOpenTime.Equal(trigger.OpenTime) || stFail.HasRecentGapLocked(step) {
+		t.Fatalf("expected contiguous 5 bars after backfill, got len=%d last=%v hasGap=%v", len(stFail.ClosedCandles), stFail.LastProcessedCandleOpenTime, stFail.HasRecentGapLocked(step))
+	}
+}
+
+func TestPollSymbolOpenInterest_Uses15mPeriodAndExchangeClock(t *testing.T) {
+	var seenPeriod string
+	exchangeNow := time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)
+	offsetMs := time.Until(exchangeNow).Milliseconds()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/futures/data/openInterestHist":
+			seenPeriod = r.URL.Query().Get("period")
+			_ = json.NewEncoder(w).Encode([]exchange.OpenInterestHistItem{
+				{Symbol: "ETHUSDT", SumOpenInterest: "1000.0", Timestamp: exchangeNow.Add(-15 * time.Minute).UnixMilli()},
+				{Symbol: "ETHUSDT", SumOpenInterest: "1020.0", Timestamp: exchangeNow.UnixMilli()},
+			})
+		case "/fapi/v1/openInterest":
+			_ = json.NewEncoder(w).Encode(map[string]string{"symbol": "ETHUSDT", "openInterest": "1030.0"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := exchange.NewClient(ts.URL, "", "")
+	client.TimeOffset = offsetMs
+	st := model.NewSymbolState("ETHUSDT", model.ExchangeFilter{}, 10, 10)
+	st.TargetOIInterval = 15 * time.Minute
+	eng := &BotEngine{
+		cfg:             &config.Config{Timeframe: "15m", CandleDuration: 15 * time.Minute, MaxOIInterval: 30 * time.Minute},
+		client:          client,
+		activeStates:    map[string]*model.SymbolState{"ETHUSDT": st},
+		oiBootAttemptAt: make(map[string]time.Time),
+	}
+
+	eng.pollSymbolOpenInterest(context.Background(), "ETHUSDT")
+	if seenPeriod != "15m" {
+		t.Fatalf("expected period=15m sent to openInterestHist, got %q", seenPeriod)
+	}
+	if st.PrevOpenInterest != 1000.0 || st.CurrOpenInterest != 1030.0 {
+		t.Fatalf("expected exchange-clock-aligned OI pair 1000->1030, got prev=%v curr=%v", st.PrevOpenInterest, st.CurrOpenInterest)
 	}
 }

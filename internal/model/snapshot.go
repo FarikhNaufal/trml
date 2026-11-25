@@ -290,6 +290,42 @@ func (s *SymbolState) ApplyClosedCandleLocked(candle Candle, bootstrapCap int, d
 	return true
 }
 
+// HasRecentGapLocked reports whether ClosedCandles contains any non-contiguous candle gap within the recent 24h strict window.
+func (s *SymbolState) HasRecentGapLocked(expectedStep time.Duration) bool {
+	if expectedStep <= 0 || len(s.ClosedCandles) < 2 {
+		return false
+	}
+	strictGapHorizon := 24 * time.Hour
+	if expectedStep > strictGapHorizon {
+		strictGapHorizon = expectedStep
+	}
+	lastOpen := s.ClosedCandles[len(s.ClosedCandles)-1].OpenTime
+	for i := 1; i < len(s.ClosedCandles); i++ {
+		prev := s.ClosedCandles[i-1]
+		cur := s.ClosedCandles[i]
+		if !lastOpen.IsZero() && lastOpen.Sub(cur.OpenTime) <= strictGapHorizon {
+			if cur.OpenTime.Sub(prev.OpenTime) != expectedStep {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ResetAndApplyCandlesLocked clears cached candle/VWAP state and rebuilds cleanly from a validated ascending series.
+func (s *SymbolState) ResetAndApplyCandlesLocked(candles []Candle, bootstrapCap, deltaCap int) {
+	s.LastProcessedCandleOpenTime = time.Time{}
+	s.SessionEpochDayUTC = 0
+	s.CumulativeTypicalPVBase = 0
+	s.CumulativeVolumeBase = 0
+	s.CurrentSessionVWAP = 0
+	s.ClosedCandles = s.ClosedCandles[:0]
+	s.ClosedBarDeltasUSDT = s.ClosedBarDeltasUSDT[:0]
+	for _, c := range candles {
+		s.ApplyClosedCandleLocked(c, bootstrapCap, deltaCap)
+	}
+}
+
 type MarketSnapshot struct {
 	Symbol              string
 	Filter              ExchangeFilter
@@ -310,7 +346,10 @@ type MarketSnapshot struct {
 	ClosedCandles       []Candle
 	ClosedBarDeltasUSDT []float64
 	LastExitTime        time.Time
-	LastExitReason      string
+	LastExitReason       string
+	MarketBreadthPct     float64
+	MarketBreadthValid   bool
+	PortfolioDrawdownPct float64
 }
 
 type BookQuote struct {

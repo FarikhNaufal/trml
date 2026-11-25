@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -349,6 +350,64 @@ func TestBacktestStore_SaveAndListRuns(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].RunID != run.RunID || got[0].MTMMaxDDPct != 4.2 {
 		t.Fatalf("unexpected persisted runs: %+v", got)
+	}
+}
+
+func TestMetricsOI_NoPartialMonthCompactionAndTargetIntervalLookup(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Serve only 2026-09-01; all other days return 404. Offline or incomplete month must NEVER compact 2026-09.bin!
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, _ := zw.Create("BTCUSDT-metrics-2026-09-01.csv")
+	_, _ = w.Write([]byte("create_time,symbol,sum_open_interest,sum_open_interest_value\n2026-09-01 00:00:00,BTCUSDT,1000.0,50000000.0\n"))
+	_ = zw.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "BTCUSDT-metrics-2026-09-01.zip") {
+			_, _ = rw.Write(buf.Bytes())
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer srv.Close()
+
+	oiMgr := NewMetricsOIDownloader(tmpDir, nil, nil)
+	oiMgr.baseURL = srv.URL
+
+	from := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 9, 30, 23, 59, 59, 0, time.UTC)
+	pts, err := oiMgr.FetchOpenInterestRange(context.Background(), "BTCUSDT", from, to)
+	if err != nil || len(pts) != 1 {
+		t.Fatalf("expected 1 point from incomplete month fetch, got len=%d err=%v", len(pts), err)
+	}
+	binPath := filepath.Join(ResolveBacktestDirs(tmpDir).StoreDir, "BTCUSDT", "oi", "2026-09.bin")
+	if _, statErr := os.Stat(binPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected incomplete month NOT compacted to %s", binPath)
+	}
+
+	// Verify targetInterval-aware lookup selects 15m sample over 5m sample.
+	tBase := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	oiMgr.SetSeriesForTesting("ETHUSDT", []OpenInterestPoint{
+		{Symbol: "ETHUSDT", Timestamp: tBase, SumOpenInterest: 1000},
+		{Symbol: "ETHUSDT", Timestamp: tBase.Add(5 * time.Minute), SumOpenInterest: 1050},
+		{Symbol: "ETHUSDT", Timestamp: tBase.Add(10 * time.Minute), SumOpenInterest: 1100},
+		{Symbol: "ETHUSDT", Timestamp: tBase.Add(15 * time.Minute), SumOpenInterest: 1200},
+	})
+	prevOI, currOI, prevT, _, ok := oiMgr.LookupOpenInterestStrictWithTarget(
+		"ETHUSDT", tBase.Add(15*time.Minute), 15*time.Minute, 1*time.Minute, 30*time.Minute, 20*time.Minute,
+	)
+	if !ok || currOI != 1200 || prevOI != 1000 || !prevT.Equal(tBase) {
+		t.Fatalf("expected 15m-target lookup to select prev=1000 at %v, got prev=%.1f at %v (ok=%v)", tBase, prevOI, prevT, ok)
+	}
+
+	// Verify ValidateCandlesWithOI normalizes ...999ms CloseTime.
+	c999 := []HistoricalCandle{
+		{OpenTime: tBase, CloseTime: tBase.Add(5*time.Minute - time.Millisecond), Open: 100, High: 101, Low: 99, Close: 100, Volume: 10},
+		{OpenTime: tBase.Add(5 * time.Minute), CloseTime: tBase.Add(10*time.Minute - time.Millisecond), Open: 100, High: 101, Low: 99, Close: 100, Volume: 10},
+	}
+	rep := ValidateCandlesWithOI("ETHUSDT", c999, 5*time.Minute, oiMgr, 4*time.Minute, 7*time.Minute, 5*time.Minute)
+	if rep.OICoveragePct < 49.0 {
+		t.Fatalf("expected bar 2 (...59.999 normalized to +5m) to match OI timestamp cleanly, cov=%.1f%%", rep.OICoveragePct)
 	}
 }
 

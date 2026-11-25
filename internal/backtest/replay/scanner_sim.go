@@ -29,6 +29,9 @@ type ScannerSimulator struct {
 	spreadFn func([]model.Candle, float64) float64
 
 	lastWatchlist      map[string]bool
+	LastPrimaryOrder   []string
+	LastBreakoutSet    map[string]bool
+	LastBreakoutOrder  []string
 	sumCandidatesValid int64
 	sumSelected        int64
 	sumTurnoverPct     float64
@@ -141,8 +144,16 @@ func (s *ScannerSimulator) RunCyclePartitioned(
 		nextSweepExtra[sym] = true
 	}
 
+	nextBreakout := make(map[string]bool, len(scanRes.Breakout))
+	for _, sym := range scanRes.Breakout {
+		nextBreakout[sym] = true
+	}
+
 	s.recordCycleStats(scanRes.Stats, nextWatch)
 	s.lastWatchlist = nextWatch
+	s.LastPrimaryOrder = append([]string(nil), scanRes.Primary...)
+	s.LastBreakoutSet = nextBreakout
+	s.LastBreakoutOrder = append([]string(nil), scanRes.Breakout...)
 	return nextWatch, nextSweepExtra
 }
 

@@ -7,10 +7,47 @@ import (
 )
 
 type ExchangeFilter struct {
-	TickSize    decimal.Decimal
-	StepSize    decimal.Decimal
-	MinQty      decimal.Decimal
-	MinNotional decimal.Decimal
+	TickSize       decimal.Decimal
+	StepSize       decimal.Decimal
+	MinQty         decimal.Decimal
+	MaxQty         decimal.Decimal
+	MinNotional    decimal.Decimal
+	MarketStepSize decimal.Decimal
+	MarketMinQty   decimal.Decimal
+	MarketMaxQty   decimal.Decimal
+}
+
+// EffectiveStepSize returns the lot step size that satisfies both order entry and market/stop-market exits.
+func (f ExchangeFilter) EffectiveStepSize(isMarket bool) decimal.Decimal {
+	step := f.StepSize
+	if f.MarketStepSize.GreaterThan(decimal.Zero) && (isMarket || f.MarketStepSize.GreaterThan(step)) {
+		return f.MarketStepSize
+	}
+	return step
+}
+
+// EffectiveMinQty returns the minimum order quantity enforced for entry/exit.
+func (f ExchangeFilter) EffectiveMinQty(isMarket bool) decimal.Decimal {
+	minQ := f.MinQty
+	if isMarket && f.MarketMinQty.GreaterThan(minQ) {
+		return f.MarketMinQty
+	}
+	return minQ
+}
+
+// EffectiveMaxQty returns the tightest positive maximum quantity across LOT_SIZE and MARKET_LOT_SIZE.
+func (f ExchangeFilter) EffectiveMaxQty(isMarket bool) decimal.Decimal {
+	_ = isMarket // Even LIMIT entries must stay within MARKET_LOT_SIZE.maxQty so STOP_MARKET / emergency closes succeed.
+	if f.MaxQty.GreaterThan(decimal.Zero) && f.MarketMaxQty.GreaterThan(decimal.Zero) {
+		return decimal.Min(f.MaxQty, f.MarketMaxQty)
+	}
+	if f.MarketMaxQty.GreaterThan(decimal.Zero) {
+		return f.MarketMaxQty
+	}
+	if f.MaxQty.GreaterThan(decimal.Zero) {
+		return f.MaxQty
+	}
+	return decimal.Zero
 }
 
 // QuantizePrice melakukan pembulatan harga bursa secara fail-closed dan kebal off-by-one epsilon (Solusi P1-9 & M6)

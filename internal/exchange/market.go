@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,11 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
+)
+
+const (
+	maxBinanceKlinesPerPage = 1500
+	maxFetchKlinesLimit     = 6000
 )
 
 // FetchExchangeInfo mengambil spesifikasi filter presisi seluruh simbol perpetual
@@ -32,6 +38,7 @@ func (c *Client) FetchExchangeInfo(ctx context.Context) (map[string]model.Exchan
 				TickSize    string `json:"tickSize"`
 				StepSize    string `json:"stepSize"`
 				MinQty      string `json:"minQty"`
+				MaxQty      string `json:"maxQty"`
 				MinNotional string `json:"minNotional"`
 				Notional    string `json:"notional"`
 			} `json:"filters"`
@@ -56,6 +63,11 @@ func (c *Client) FetchExchangeInfo(ctx context.Context) (map[string]model.Exchan
 			case "LOT_SIZE":
 				ef.StepSize, _ = decimal.NewFromString(f.StepSize)
 				ef.MinQty, _ = decimal.NewFromString(f.MinQty)
+				ef.MaxQty, _ = decimal.NewFromString(f.MaxQty)
+			case "MARKET_LOT_SIZE":
+				ef.MarketStepSize, _ = decimal.NewFromString(f.StepSize)
+				ef.MarketMinQty, _ = decimal.NewFromString(f.MinQty)
+				ef.MarketMaxQty, _ = decimal.NewFromString(f.MaxQty)
 			case "MIN_NOTIONAL":
 				if f.MinNotional != "" {
 					ef.MinNotional, _ = decimal.NewFromString(f.MinNotional)
@@ -130,12 +142,14 @@ func (c *Client) FetchBookTickers(ctx context.Context) (map[string]model.BookQuo
 	return bookMap, nil
 }
 
-// FetchKlines mengambil data candle historis (GET /fapi/v1/klines)
-func (c *Client) FetchKlines(ctx context.Context, symbol, interval string, limit int) ([]model.Candle, error) {
+func (c *Client) fetchKlinesPage(ctx context.Context, symbol, interval string, limit int, endTimeMs int64) ([]model.Candle, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	params.Set("interval", interval)
 	params.Set("limit", strconv.Itoa(limit))
+	if endTimeMs > 0 {
+		params.Set("endTime", strconv.FormatInt(endTimeMs, 10))
+	}
 
 	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v1/klines", params, false)
 	if err != nil {
@@ -179,6 +193,68 @@ func (c *Client) FetchKlines(ctx context.Context, symbol, interval string, limit
 	return candles, nil
 }
 
+// FetchKlines mengambil data candle historis (GET /fapi/v1/klines), dengan paginasi mundur otomatis untuk limit > 1500.
+func (c *Client) FetchKlines(ctx context.Context, symbol, interval string, limit int) ([]model.Candle, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if limit > maxFetchKlinesLimit {
+		limit = maxFetchKlinesLimit
+	}
+	if limit <= maxBinanceKlinesPerPage {
+		return c.fetchKlinesPage(ctx, symbol, interval, limit, 0)
+	}
+
+	byOpenMs := make(map[int64]model.Candle, limit)
+	remaining := limit
+	var endTimeMs int64
+	var prevEarliestMs int64
+
+	for remaining > 0 {
+		pageLimit := remaining
+		if pageLimit > maxBinanceKlinesPerPage {
+			pageLimit = maxBinanceKlinesPerPage
+		}
+		page, err := c.fetchKlinesPage(ctx, symbol, interval, pageLimit, endTimeMs)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		earliestMs := page[0].OpenTime.UnixMilli()
+		for _, candle := range page {
+			openMs := candle.OpenTime.UnixMilli()
+			if openMs < earliestMs {
+				earliestMs = openMs
+			}
+			byOpenMs[openMs] = candle
+		}
+		if len(byOpenMs) >= limit || len(page) < pageLimit {
+			break
+		}
+		if prevEarliestMs != 0 && earliestMs >= prevEarliestMs {
+			break
+		}
+		prevEarliestMs = earliestMs
+		endTimeMs = earliestMs - 1
+		remaining = limit - len(byOpenMs)
+	}
+
+	out := make([]model.Candle, 0, len(byOpenMs))
+	for _, candle := range byOpenMs {
+		out = append(out, candle)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].OpenTime.Before(out[j].OpenTime)
+	})
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
+}
+
 // FetchOpenInterest mengambil metrik Open Interest terkini (GET /fapi/v1/openInterest)
 func (c *Client) FetchOpenInterest(ctx context.Context, symbol string) (float64, error) {
 	params := url.Values{}
@@ -213,15 +289,25 @@ type OpenInterestHistItem struct {
 	Timestamp       int64  `json:"timestamp"`
 }
 
-// FetchOpenInterestHist mengambil data historis Open Interest 5-menit (GET /futures/data/openInterestHist)
-// Mengembalikan slice bar historis dengan unit kontrak sumOpenInterest (Pengawal 1)
-func (c *Client) FetchOpenInterestHist(ctx context.Context, symbol string, limit int) ([]OpenInterestHistItem, error) {
+// ResolveOIStatsPeriod memetakan timeframe strategi ke parameter period yang didukung Binance openInterestHist.
+func ResolveOIStatsPeriod(timeframe string) string {
+	switch strings.ToLower(strings.TrimSpace(timeframe)) {
+	case "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d":
+		return strings.ToLower(strings.TrimSpace(timeframe))
+	default:
+		return "5m"
+	}
+}
+
+// FetchOpenInterestHistWithPeriod mengambil data historis Open Interest untuk period Binance tertentu (GET /futures/data/openInterestHist).
+func (c *Client) FetchOpenInterestHistWithPeriod(ctx context.Context, symbol, period string, limit int) ([]OpenInterestHistItem, error) {
 	if limit <= 0 {
 		limit = 3
 	}
+	resolvedPeriod := ResolveOIStatsPeriod(period)
 	params := url.Values{}
 	params.Set("symbol", symbol)
-	params.Set("period", "5m")
+	params.Set("period", resolvedPeriod)
 	params.Set("limit", strconv.Itoa(limit))
 
 	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/futures/data/openInterestHist", params, false)
@@ -235,6 +321,12 @@ func (c *Client) FetchOpenInterestHist(ctx context.Context, symbol string, limit
 	}
 
 	return res, nil
+}
+
+// FetchOpenInterestHist mengambil data historis Open Interest 5-menit (GET /futures/data/openInterestHist)
+// Mengembalikan slice bar historis dengan unit kontrak sumOpenInterest (Pengawal 1)
+func (c *Client) FetchOpenInterestHist(ctx context.Context, symbol string, limit int) ([]OpenInterestHistItem, error) {
+	return c.FetchOpenInterestHistWithPeriod(ctx, symbol, "5m", limit)
 }
 
 // CreateListenKey membuat user data stream listenKey (POST /fapi/v1/listenKey)

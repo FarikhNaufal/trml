@@ -113,6 +113,8 @@ func (m *MetricsOIDownloader) FetchOpenInterestRange(ctx context.Context, symbol
 
 	var allPts []OpenInterestPoint
 	monthlyCompiled := make(map[string]bool)
+	hadErrorByMonth := make(map[string]bool)
+	okDaysByMonth := make(map[string]int)
 
 	for day := startDay; !day.After(endDay); day = day.AddDate(0, 0, 1) {
 		ym := day.Format("2006-01")
@@ -131,6 +133,9 @@ func (m *MetricsOIDownloader) FetchOpenInterestRange(ctx context.Context, symbol
 		pts, err := m.fetchDailyMetrics(ctx, symbol, day, nowUTC)
 		if err == nil && len(pts) > 0 {
 			allPts = append(allPts, pts...)
+			okDaysByMonth[ym]++
+		} else {
+			hadErrorByMonth[ym] = true
 		}
 	}
 
@@ -152,13 +157,20 @@ func (m *MetricsOIDownloader) FetchOpenInterestRange(ctx context.Context, symbol
 		out = append(out, pt)
 	}
 
-	// Only compact finished full calendar months so partial range queries never poison YYYY-MM.bin.
-	m.compactFinishedMonths(ctx, symbol, out, from, to, nowUTC)
+	// Only compact finished full calendar months with 100% day coverage so partial/offline fetches never poison YYYY-MM.bin.
+	m.compactFinishedMonths(ctx, symbol, out, from, to, nowUTC, hadErrorByMonth, okDaysByMonth)
 	return out, nil
 }
 
-func (m *MetricsOIDownloader) compactFinishedMonths(ctx context.Context, symbol string, pts []OpenInterestPoint, reqFrom, reqTo, nowUTC time.Time) {
-	if len(pts) == 0 {
+func (m *MetricsOIDownloader) compactFinishedMonths(
+	ctx context.Context,
+	symbol string,
+	pts []OpenInterestPoint,
+	reqFrom, reqTo, nowUTC time.Time,
+	hadErrorByMonth map[string]bool,
+	okDaysByMonth map[string]int,
+) {
+	if len(pts) == 0 || m.offline {
 		return
 	}
 	byMonth := make(map[string][]OpenInterestPoint)
@@ -170,13 +182,20 @@ func (m *MetricsOIDownloader) compactFinishedMonths(ctx context.Context, symbol 
 		byMonth[ym] = append(byMonth[ym], pt)
 	}
 	for ym, list := range byMonth {
+		if hadErrorByMonth[ym] {
+			continue
+		}
 		mStart, err := time.Parse("2006-01", ym)
 		if err != nil {
 			continue
 		}
 		mEnd := mStart.AddDate(0, 1, 0).Add(-time.Minute)
-		// Require full month request coverage [00:00 day 1 .. 23:55 last day] before sealing into YYYY-MM.bin
+		// Require full month request coverage [00:00 day 1 .. 23:55 last day] AND all calendar days fetched cleanly.
 		if reqFrom.After(mStart) || reqTo.Before(mEnd) {
+			continue
+		}
+		expectedDays := time.Date(mStart.Year(), mStart.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+		if okDaysByMonth[ym] < expectedDays {
 			continue
 		}
 		binPath := filepath.Join(m.dirs.StoreDir, symbol, "oi", ym+".bin")
@@ -318,6 +337,17 @@ func (m *MetricsOIDownloader) LookupOpenInterestStrict(
 	simTime time.Time,
 	minInterval, maxInterval, maxStaleness time.Duration,
 ) (prevOI, currOI float64, prevTime, currTime time.Time, ok bool) {
+	return m.LookupOpenInterestStrictWithTarget(symbol, simTime, 0, minInterval, maxInterval, maxStaleness)
+}
+
+// LookupOpenInterestStrictWithTarget resolves point-in-time (PrevOI, CurrOI) strictly with Timestamp <= simTime.
+// When targetInterval > 0, it selects the earlier sample inside [minInterval, maxInterval] closest to targetInterval
+// (matching Live SymbolState.resolvePrevOpenInterestLocked on 15m/1h timeframes).
+func (m *MetricsOIDownloader) LookupOpenInterestStrictWithTarget(
+	symbol string,
+	simTime time.Time,
+	targetInterval, minInterval, maxInterval, maxStaleness time.Duration,
+) (prevOI, currOI float64, prevTime, currTime time.Time, ok bool) {
 	m.mu.RLock()
 	pts := m.series[symbol]
 	m.mu.RUnlock()
@@ -339,6 +369,9 @@ func (m *MetricsOIDownloader) LookupOpenInterestStrict(
 		return 0, 0, time.Time{}, time.Time{}, false
 	}
 
+	bestIdx := -1
+	bestDiffErr := time.Duration(math.MaxInt64)
+
 	// Search backwards for an earlier sample matching [minInterval, maxInterval] before curr.Timestamp.
 	for j := currIdx - 1; j >= 0; j-- {
 		diff := curr.Timestamp.Sub(pts[j].Timestamp)
@@ -348,7 +381,21 @@ func (m *MetricsOIDownloader) LookupOpenInterestStrict(
 		if maxInterval > 0 && diff > maxInterval {
 			break
 		}
-		return pts[j].SumOpenInterest, curr.SumOpenInterest, pts[j].Timestamp, curr.Timestamp, true
+		if targetInterval <= 0 {
+			return pts[j].SumOpenInterest, curr.SumOpenInterest, pts[j].Timestamp, curr.Timestamp, true
+		}
+		errDist := diff - targetInterval
+		if errDist < 0 {
+			errDist = -errDist
+		}
+		if bestIdx == -1 || errDist < bestDiffErr {
+			bestIdx = j
+			bestDiffErr = errDist
+		}
+	}
+	if bestIdx >= 0 {
+		prev := pts[bestIdx]
+		return prev.SumOpenInterest, curr.SumOpenInterest, prev.Timestamp, curr.Timestamp, true
 	}
 	return 0, 0, time.Time{}, time.Time{}, false
 }

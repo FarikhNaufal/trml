@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sort"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -85,12 +86,17 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 	if warmupBars <= 0 {
 		warmupBars = 200
 	}
-	warmupLead := time.Duration(warmupBars) * barDur
+	leadBars := strategy.CalcRequiredHistoryBars(
+		barDur, warmupBars, cfg.EvalCfg.HTFEMAPeriod, cfg.EvalCfg.MarketBreadthLowThreshold > 0,
+	)
+	warmupLead := time.Duration(leadBars) * barDur
 
 	var (
 		folds             []WalkForwardFold
 		stitchedTrades    []simbroker.SimTradeRecord
 		stitchedCurve     []simbroker.EquityPoint
+		seenCurveMs       = make(map[int64]bool)
+		seenTradeKeys     = make(map[string]bool)
 		runningOOSCapital = initEq
 		cumulativeOOSPnL  float64
 		aggAudit          metrics.ExecutionAudit
@@ -124,13 +130,20 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 		if err != nil {
 			return WalkForwardReport{}, fmt.Errorf("fold %d IS failed: %w", foldIdx, err)
 		}
-		foldStartEq := initEq
-		if compounding {
-			foldStartEq = runningOOSCapital
-		}
-		oosSum, oosTrades, oosCurve, err := runWindowedSlice(ctx, cfg, oosFrom, oosTo, warmupLead, warmupBars, foldStartEq)
-		if err != nil {
-			return WalkForwardReport{}, fmt.Errorf("fold %d OOS failed: %w", foldIdx, err)
+		var oosSum metrics.BacktestSummary
+		var oosTrades []simbroker.SimTradeRecord
+		var oosCurve []simbroker.EquityPoint
+		if compounding && runningOOSCapital <= 0 {
+			oosSum = metrics.BacktestSummary{InitialEquity: 0, FinalEquity: 0, SampleWarning: true}
+		} else {
+			foldStartEq := initEq
+			if compounding {
+				foldStartEq = runningOOSCapital
+			}
+			oosSum, oosTrades, oosCurve, err = runWindowedSlice(ctx, cfg, oosFrom, oosTo, warmupLead, warmupBars, foldStartEq)
+			if err != nil {
+				return WalkForwardReport{}, fmt.Errorf("fold %d OOS failed: %w", foldIdx, err)
+			}
 		}
 
 		degrad, verdict := scoreFoldDegradation(isSum.ExpectancyUSDT, oosSum.ExpectancyUSDT, oosSum.TotalTrades)
@@ -147,9 +160,21 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 			Verdict:        verdict,
 		})
 
-		stitchedTrades = append(stitchedTrades, oosTrades...)
+		for _, tr := range oosTrades {
+			tKey := fmt.Sprintf("%s|%d|%d|%s|%s", tr.Symbol, tr.EntryTime.UnixNano(), tr.ExitTime.UnixNano(), tr.ExitReason, tr.ID)
+			if seenTradeKeys[tKey] {
+				continue
+			}
+			seenTradeKeys[tKey] = true
+			stitchedTrades = append(stitchedTrades, tr)
+		}
 		for _, pt := range oosCurve {
 			if !pt.Time.Before(oosFrom) && !pt.Time.After(oosTo) {
+				tsMs := pt.Time.UnixMilli()
+				if seenCurveMs[tsMs] {
+					continue
+				}
+				seenCurveMs[tsMs] = true
 				shifted := pt
 				if !compounding {
 					shifted.RealizedEquity += cumulativeOOSPnL
@@ -159,8 +184,12 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 			}
 		}
 		cumulativeOOSPnL += oosSum.TotalNetPnL
-		if compounding && oosSum.FinalEquity > 0 {
-			runningOOSCapital = oosSum.FinalEquity
+		if compounding {
+			if oosSum.FinalEquity > 0 {
+				runningOOSCapital = oosSum.FinalEquity
+			} else {
+				runningOOSCapital = 0
+			}
 		}
 		if ea := oosSum.ExecutionAudit; ea != nil {
 			hasAggAudit = true
@@ -173,6 +202,8 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 			aggAudit.UnsplittableTP1 += ea.UnsplittableTP1
 			aggAudit.SLFirstConflicts += ea.SLFirstConflicts
 			aggAudit.DelistSettled += ea.DelistSettled
+			aggAudit.FundingSettlements += ea.FundingSettlements
+			aggAudit.LiquidatedCount += ea.LiquidatedCount
 			aggAudit.SubBarExecCount += ea.SubBarExecCount
 			aggAudit.DelistForceClosed += ea.DelistForceClosed
 			aggAudit.OICoveredCount += ea.OICoveredCount
@@ -201,6 +232,9 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 		finalAudit = &aggAudit
 	}
 
+	sort.Slice(stitchedCurve, func(i, j int) bool {
+		return stitchedCurve[i].Time.Before(stitchedCurve[j].Time)
+	})
 	stitchedSummary := metrics.CalculateMetricsV2(
 		stitchedTrades, stitchedCurve, initEq, cfg.CandleMap[cfg.BenchmarkSym], nil, finalAudit,
 	)
@@ -235,6 +269,7 @@ func runWindowedSlice(
 	rCfg := cfg.ReplayCfg
 	rCfg.WarmupBars = countWarmupBars(winCandles, winFrom, warmupBars)
 	rCfg.ExecCandleMap = winExec
+	rCfg.SettleOpenPositionsAtEnd = true
 
 	bCfg := cfg.BrokerCfg
 	bCfg.InitialEquityUSDT = decimal.NewFromFloat(equity)
@@ -245,11 +280,17 @@ func runWindowedSlice(
 		return metrics.BacktestSummary{}, nil, nil, err
 	}
 
-	// Only attribute trades initiated during the evaluation window [winFrom..winTo] (exclude warm-up leakage).
+	// Only attribute trades and equity curve samples inside [winFrom..winTo] (exclude warm-up leakage).
 	var filteredTrades []simbroker.SimTradeRecord
 	for _, tr := range sim.ClosedTrades {
 		if !tr.EntryTime.Before(winFrom) && !tr.EntryTime.After(winTo) {
 			filteredTrades = append(filteredTrades, tr)
+		}
+	}
+	var filteredCurve []simbroker.EquityPoint
+	for _, pt := range sim.EquityCurve {
+		if !pt.Time.Before(winFrom) && !pt.Time.After(winTo) {
+			filteredCurve = append(filteredCurve, pt)
 		}
 	}
 
@@ -263,9 +304,9 @@ func runWindowedSlice(
 		OICoveragePct:     eng.Stats.OICoveragePct,
 	}
 	summary := metrics.CalculateMetricsV2(
-		filteredTrades, sim.EquityCurve, equity, winCandles[cfg.BenchmarkSym], nil, execAudit,
+		filteredTrades, filteredCurve, equity, winCandles[cfg.BenchmarkSym], nil, execAudit,
 	)
-	return summary, filteredTrades, sim.EquityCurve, nil
+	return summary, filteredTrades, filteredCurve, nil
 }
 
 func sliceCandlesWindow(src map[string][]data.HistoricalCandle, from, to time.Time) map[string][]data.HistoricalCandle {
@@ -289,20 +330,16 @@ func sliceCandlesWindow(src map[string][]data.HistoricalCandle, from, to time.Ti
 }
 
 func countWarmupBars(winCandles map[string][]data.HistoricalCandle, winFrom time.Time, fallbackWarmup int) int {
-	earliestWarm := 0
+	timelineWarm := make(map[int64]struct{})
 	for _, bars := range winCandles {
-		cnt := 0
 		for _, c := range bars {
 			if c.CloseTime.Before(winFrom) {
-				cnt++
+				timelineWarm[c.CloseTime.UnixMilli()] = struct{}{}
 			}
 		}
-		if cnt > earliestWarm {
-			earliestWarm = cnt
-		}
 	}
-	if earliestWarm > 0 {
-		return earliestWarm
+	if len(timelineWarm) > 0 {
+		return len(timelineWarm)
 	}
 	return fallbackWarmup
 }

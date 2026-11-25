@@ -16,6 +16,11 @@ type SimBrokerConfig struct {
 	MakerFeeRate             decimal.Decimal // default 0.0002 (2.0 bps)
 	TakerFeeRate             decimal.Decimal // default 0.0005 (5.0 bps)
 	SlippageRate             decimal.Decimal // default 0.0005 (5.0 bps pada market SL/exit)
+	MakerFeeSet              bool            // true allows explicit 0 MakerFeeRate
+	TakerFeeSet              bool            // true allows explicit 0 TakerFeeRate
+	SlippageSet              bool            // true allows explicit 0 SlippageRate
+	PenetrationTicksSet      bool            // true allows explicit 0 PenetrationTicks
+	CandleDuration           time.Duration   // bar duration fallback for LimitTimeoutBars (default 5m)
 	SLGapFillEnabled         bool            // default false (9815362: nominal SL, true: candle open gap fill)
 	SignalDelayBars          int             // delay bar sebelum limit entry aktif (default 1)
 	LimitTimeoutBars         int             // fallback batas bar bila LimitOrderTimeout <= 0 (default 1)
@@ -39,6 +44,7 @@ type SimBrokerConfig struct {
 	TrailingActivateATR      float64         // default 1.10
 	TrailingDistanceATR      float64         // default 0.55
 	MaxHoldingDuration       time.Duration   // default 4 hours (48 bars 5m)
+	StaleLossExitDuration    time.Duration   // optional early exit for trades still underwater after duration
 	EquityModeCompounding    bool            // true: compounding, false: fixed start equity
 }
 
@@ -54,6 +60,7 @@ type SimExecutionStats struct {
 	SLFirstConflicts    int `json:"sl_first_conflicts"`
 	DelistSettled       int `json:"delist_settled"`
 	FundingSettlements  int `json:"funding_settlements"`
+	LiquidatedCount     int `json:"liquidated_count"`
 }
 
 type SimTradeRecord struct {
@@ -120,5 +127,7 @@ type SimPosition struct {
 	SignalAuditID    int64
 	ProtectionTier   int
 	LastClosePrice   decimal.Decimal
+	LastWorstPrice   decimal.Decimal
+	LastWorstBarIdx  int64
 	RepegCount       int
 }

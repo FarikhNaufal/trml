@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -28,14 +29,14 @@ func TestScannerAndBootstrap(t *testing.T) {
 
 	activeStates := make(map[string]*model.SymbolState)
 	filters := map[string]model.ExchangeFilter{
-		"BTCUSDT": {
+		"ETHUSDT": {
 			TickSize: decimal.NewFromFloat(0.1),
 			StepSize: decimal.NewFromFloat(0.001),
 		},
 	}
-	volMap := map[string]float64{"BTCUSDT": 100_000_000}
+	volMap := map[string]float64{"ETHUSDT": 100_000_000}
 	bookMap := map[string]model.BookQuote{
-		"BTCUSDT": {BestBid: 60000.0, BestAsk: 60005.0}, // Spread 0.008% <= 0.03%
+		"ETHUSDT": {BestBid: 60000.0, BestAsk: 60005.0}, // Spread 0.008% <= 0.03%
 	}
 
 	// Buat 101 candle
@@ -61,13 +62,13 @@ func TestScannerAndBootstrap(t *testing.T) {
 	}
 
 	selected := RunBulkMarketScanner(cfg, activeStates, filters, volMap, bookMap, fetchFn, now)
-	if len(selected) != 1 || selected[0] != "BTCUSDT" {
-		t.Fatalf("expected BTCUSDT selected, got %v", selected)
+	if len(selected) != 1 || selected[0] != "ETHUSDT" {
+		t.Fatalf("expected ETHUSDT selected, got %v", selected)
 	}
 
-	st, exists := activeStates["BTCUSDT"]
+	st, exists := activeStates["ETHUSDT"]
 	if !exists {
-		t.Fatalf("expected active state created for BTCUSDT")
+		t.Fatalf("expected active state created for ETHUSDT")
 	}
 	if len(st.ClosedCandles) < 50 {
 		t.Errorf("expected closed candles populated, got %d", len(st.ClosedCandles))
@@ -92,14 +93,14 @@ func TestScannerFallbackFilter(t *testing.T) {
 	}
 
 	filters := map[string]model.ExchangeFilter{
-		"BTCUSDT": {
+		"ETHUSDT": {
 			TickSize: decimal.NewFromFloat(0.1),
 			StepSize: decimal.NewFromFloat(0.001),
 		},
 	}
-	volMap := map[string]float64{"BTCUSDT": 100_000_000}
+	volMap := map[string]float64{"ETHUSDT": 100_000_000}
 	bookMap := map[string]model.BookQuote{
-		"BTCUSDT": {BestBid: 60000.0, BestAsk: 60005.0},
+		"ETHUSDT": {BestBid: 60000.0, BestAsk: 60005.0},
 	}
 
 	// 1. Kasus koin mati (Volume sangat rendah, RVOL ~ 0.33)
@@ -136,8 +137,8 @@ func TestScannerFallbackFilter(t *testing.T) {
 	selectedMod := RunBulkMarketScanner(cfg, activeStates, filters, volMap, bookMap, func(sym string, limit int) []model.Candle {
 		return candlesModerate
 	}, now)
-	if len(selectedMod) != 1 || selectedMod[0] != "BTCUSDT" {
-		t.Fatalf("expected BTCUSDT selected via fallback, got %v", selectedMod)
+	if len(selectedMod) != 1 || selectedMod[0] != "ETHUSDT" {
+		t.Fatalf("expected ETHUSDT selected via fallback, got %v", selectedMod)
 	}
 }
 
@@ -563,5 +564,395 @@ func TestRunBulkMarketScannerPartitioned_PrimaryInvarianceAndSweepExtra(t *testi
 	zeroRes := RunBulkMarketScannerPartitioned(zeroExtraCfg, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
 	if len(zeroRes.SweepExtra) != 0 {
 		t.Fatalf("expected SweepExtra=[] when SweepMaxExtraCoins=0, got %v", zeroRes.SweepExtra)
+	}
+}
+
+func TestRunBulkMarketScannerPartitioned_ExcludeTopVolRank(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 2, 0, 0, time.UTC)
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1), MinNotional: decimal.NewFromFloat(5)}
+	filters := map[string]model.ExchangeFilter{
+		"BTCUSDT": f,
+		"ETHUSDT": f,
+		"SOLUSDT": f,
+		"MID1USDT": f,
+		"MID2USDT": f,
+	}
+	volMap := map[string]float64{
+		"BTCUSDT":  5_000_000_000,
+		"ETHUSDT":  3_000_000_000,
+		"SOLUSDT":  1_500_000_000,
+		"MID1USDT": 200_000_000,
+		"MID2USDT": 100_000_000,
+	}
+	bookMap := map[string]model.BookQuote{
+		"BTCUSDT":  {BestBid: 100, BestAsk: 100.01},
+		"ETHUSDT":  {BestBid: 100, BestAsk: 100.01},
+		"SOLUSDT":  {BestBid: 100, BestAsk: 100.01},
+		"MID1USDT": {BestBid: 100, BestAsk: 100.01},
+		"MID2USDT": {BestBid: 100, BestAsk: 100.01},
+	}
+	candles := makeTestCandles(100.0, 80, now, 120.0)
+	fetchFn := func(sym string, limit int) []model.Candle { return candles }
+
+	cfg := ScannerConfig{
+		MinVolume24hUSDT:      25_000_000,
+		MaxSpreadPct:          0.06,
+		MinRVOL:               1.2,
+		MinFallbackRVOL:       0.5,
+		RVOLLookback:          20,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.0,
+		MaxScannerVWAPDistATR: 2.5,
+		ATRPeriod:             14,
+		EMAPeriod:             50,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        100,
+		DeltaWindow:           50,
+		Timeframe:             "5m",
+		CandleDuration:        5 * time.Minute,
+		RankingMode:           "pullback",
+		ExcludeTopVolRank:     2, // Exclude ETHUSDT & SOLUSDT (BTCUSDT is ignored for alt volume ranking)
+	}
+
+	res := RunBulkMarketScannerPartitioned(cfg, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	got := make(map[string]bool)
+	for _, s := range res.Primary {
+		got[s] = true
+	}
+	if got["ETHUSDT"] || got["SOLUSDT"] {
+		t.Fatalf("expected Top-2 alts (ETHUSDT, SOLUSDT) excluded, got %v", res.Primary)
+	}
+	if !got["MID1USDT"] || !got["MID2USDT"] {
+		t.Fatalf("expected Rank 3+ alts (MID1USDT, MID2USDT) retained, got %v", res.Primary)
+	}
+}
+
+func TestRunBulkMarketScannerPartitioned_DualBucketBreakoutLabeling(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 2, 0, 0, time.UTC)
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1), MinNotional: decimal.NewFromFloat(5)}
+	filters := map[string]model.ExchangeFilter{
+		"HIGHNATRUSDT": f,
+		"SQUEEZEUSDT":  f,
+	}
+	volMap := map[string]float64{
+		"HIGHNATRUSDT": 20_000_000,
+		"SQUEEZEUSDT":  8_000_000,
+	}
+	bookMap := map[string]model.BookQuote{
+		"HIGHNATRUSDT": {BestBid: 100, BestAsk: 100.01},
+		"SQUEEZEUSDT":  {BestBid: 100, BestAsk: 100.01},
+	}
+
+	makeNATRCandles := func(halfRange float64) []model.Candle {
+		out := make([]model.Candle, 80)
+		for i := 0; i < 80; i++ {
+			tOpen := now.Add(time.Duration(i-80) * 5 * time.Minute)
+			out[i] = model.Candle{
+				OpenTime:        tOpen,
+				CloseTime:       tOpen.Add(5 * time.Minute),
+				Open:            100.0,
+				High:            100.0 + halfRange,
+				Low:             100.0 - halfRange,
+				Close:           100.0,
+				VolumeBase:      100,
+				QuoteVolumeUSDT: 10000,
+			}
+		}
+		return out
+	}
+	// HIGHNATRUSDT: ~1.20% NATR (halfRange 0.6 -> true range 1.2)
+	// SQUEEZEUSDT: ~0.60% NATR (halfRange 0.3 -> true range 0.6), compressed vol
+	highC := makeNATRCandles(0.60)
+	sqC := makeNATRCandles(0.30)
+	fetchFn := func(sym string, limit int) []model.Candle {
+		if sym == "HIGHNATRUSDT" {
+			return highC
+		}
+		return sqC
+	}
+
+	cfgOff := ScannerConfig{
+		MinVolume24hUSDT:      15_000_000,
+		MaxSpreadPct:          0.08,
+		MinRVOL:               1.0,
+		MinFallbackRVOL:       0.5,
+		RVOLLookback:          20,
+		MinNATRPct:            0.95,
+		MaxNATRPct:            1.75,
+		MaxScannerVWAPDistATR: 2.5,
+		ATRPeriod:             14,
+		EMAPeriod:             50,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        100,
+		DeltaWindow:           50,
+		Timeframe:             "5m",
+		CandleDuration:        5 * time.Minute,
+		RankingMode:           "pullback",
+	}
+	resOff := RunBulkMarketScannerPartitioned(cfgOff, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if len(resOff.Breakout) != 0 {
+		t.Fatalf("expected nil/empty Breakout when BreakoutScannerEnabled=false, got %v", resOff.Breakout)
+	}
+	if len(resOff.Primary) != 1 || resOff.Primary[0] != "HIGHNATRUSDT" {
+		t.Fatalf("expected only HIGHNATRUSDT in Primary, got %v", resOff.Primary)
+	}
+
+	cfgOn := cfgOff
+	cfgOn.BreakoutScannerEnabled = true
+	cfgOn.BreakoutMinNATRPct = 0.55
+	cfgOn.BreakoutMinVolume24hUSDT = 6_000_000
+	cfgOn.BreakoutMaxWatchedCoins = 10
+
+	states := make(map[string]*model.SymbolState)
+	resOn := RunBulkMarketScannerPartitioned(cfgOn, states, filters, volMap, bookMap, fetchFn, now)
+	if len(resOn.Primary) != 1 || resOn.Primary[0] != "HIGHNATRUSDT" {
+		t.Fatalf("expected Primary=[HIGHNATRUSDT] untouched, got %v", resOn.Primary)
+	}
+	boGot := make(map[string]bool)
+	for _, s := range resOn.Breakout {
+		boGot[s] = true
+	}
+	if !boGot["HIGHNATRUSDT"] || !boGot["SQUEEZEUSDT"] {
+		t.Fatalf("expected both HIGHNATRUSDT and SQUEEZEUSDT labeled in Breakout, got %v", resOn.Breakout)
+	}
+	if _, ok := states["SQUEEZEUSDT"]; !ok {
+		t.Fatalf("expected breakout-only SQUEEZEUSDT bootstrapped into activeStates")
+	}
+}
+
+func TestRunBulkMarketScannerPartitioned_ComputesMarketBreadthIncludingExcludedAndRejected(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	make15mSeries := func(startPrice, step float64) []model.Candle {
+		const totalBars = 205 * 4
+		out := make([]model.Candle, 0, totalBars)
+		for i := 0; i < totalBars; i++ {
+			ot := now.Add(-time.Duration(totalBars-i) * 15 * time.Minute)
+			ct := ot.Add(15*time.Minute - time.Millisecond)
+			c := startPrice + float64(i)*step
+			out = append(out, model.Candle{
+				OpenTime:        ot,
+				CloseTime:       ct,
+				Open:            c,
+				High:            c * 1.005,
+				Low:             c * 0.995,
+				Close:           c,
+				VolumeBase:      1000,
+				QuoteVolumeUSDT: 1000 * c,
+			})
+		}
+		return out
+	}
+
+	bull := make15mSeries(100.0, 0.2)
+	bear := make15mSeries(500.0, -0.3)
+
+	filters := make(map[string]model.ExchangeFilter)
+	volMap := make(map[string]float64)
+	bookMap := make(map[string]model.BookQuote)
+	klineMap := make(map[string][]model.Candle)
+
+	// 12 liquid coins: 3 bullish (including top-vol excluded ALT0USDT), 9 bearish (including wide-spread ALT11USDT)
+	for i := 0; i < 12; i++ {
+		sym := fmt.Sprintf("ALT%dUSDT", i)
+		filters[sym] = model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1), MinQty: decimal.NewFromFloat(0.1), MinNotional: decimal.NewFromFloat(5)}
+		volMap[sym] = 50_000_000.0 - float64(i)*1_000_000.0
+		if i < 3 {
+			klineMap[sym] = bull
+			px := bull[len(bull)-1].Close
+			bookMap[sym] = model.BookQuote{BestBid: px, BestAsk: px * 1.0002}
+		} else {
+			klineMap[sym] = bear
+			px := bear[len(bear)-1].Close
+			spread := 1.0002
+			if i == 11 {
+				spread = 1.01 // fails spread pre-screen yet must still count toward liquidity breadth
+			}
+			bookMap[sym] = model.BookQuote{BestBid: px, BestAsk: px * spread}
+		}
+	}
+	filters["BTCUSDT"] = model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.1)}
+	volMap["BTCUSDT"] = 999_000_000.0
+	klineMap["BTCUSDT"] = bull
+	bookMap["BTCUSDT"] = model.BookQuote{BestBid: 100, BestAsk: 100.01}
+
+	fetchFn := func(sym string, limit int) []model.Candle {
+		c := klineMap[sym]
+		if limit < len(c) {
+			return c[len(c)-limit:]
+		}
+		return c
+	}
+
+	cfgOff := ScannerConfig{
+		MinVolume24hUSDT:     15_000_000,
+		MaxSpreadPct:         0.10,
+		MinRVOL:              0.50,
+		MinFallbackRVOL:      0.50,
+		RVOLLookback:         20,
+		MinNATRPct:           0.10,
+		MaxNATRPct:           5.00,
+		ATRPeriod:            14,
+		EMAPeriod:            200,
+		MaxWatchedCoins:      10,
+		BootstrapCount:       900,
+		DeltaWindow:          50,
+		Timeframe:            "15m",
+		CandleDuration:       15 * time.Minute,
+		RankingMode:          "pullback",
+		ExcludeTopVolRank:    1,
+		ComputeMarketBreadth: false,
+	}
+	resOff := RunBulkMarketScannerPartitioned(cfgOff, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if resOff.MarketBreadthValid {
+		t.Fatalf("expected MarketBreadthValid=false when ComputeMarketBreadth=false")
+	}
+
+	cfgOn := cfgOff
+	cfgOn.ComputeMarketBreadth = true
+	resOn := RunBulkMarketScannerPartitioned(cfgOn, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if !resOn.MarketBreadthValid || resOn.MarketBreadthTotal != 12 || math.Abs(resOn.MarketBreadthPct-0.25) > 1e-9 {
+		t.Fatalf("expected breadth=0.25 total=12 valid=true, got pct=%f total=%d valid=%v", resOn.MarketBreadthPct, resOn.MarketBreadthTotal, resOn.MarketBreadthValid)
+	}
+	for _, s := range resOn.Primary {
+		if s == "ALT0USDT" || s == "ALT11USDT" {
+			t.Fatalf("expected excluded/wide-spread symbol %s omitted from Primary watchlist", s)
+		}
+	}
+}
+
+func TestRunBulkMarketScannerPartitioned_ExcludesBTCUSDTFromWatchlistAndRefreshesFilter(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	oldFilter := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1), MinQty: decimal.NewFromFloat(0.1)}
+	newFilter := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.001), StepSize: decimal.NewFromFloat(1.0), MinQty: decimal.NewFromFloat(1.0), MaxQty: decimal.NewFromFloat(500)}
+	filters := map[string]model.ExchangeFilter{
+		"BTCUSDT": oldFilter,
+		"ETHUSDT": newFilter,
+	}
+	volMap := map[string]float64{"BTCUSDT": 9_000_000_000, "ETHUSDT": 200_000_000}
+	bookMap := map[string]model.BookQuote{
+		"BTCUSDT": {BestBid: 80000, BestAsk: 80001},
+		"ETHUSDT": {BestBid: 100, BestAsk: 100.01},
+	}
+
+	candles := makeTestCandles(100.0, 90, now, 250.0)
+	var btcFetched int
+	fetchFn := func(sym string, limit int) []model.Candle {
+		if sym == "BTCUSDT" {
+			btcFetched++
+		}
+		return candles
+	}
+
+	existingETH := model.NewSymbolState("ETHUSDT", oldFilter, 200, 51)
+	// Inject a gapped pair inside ETHUSDT's cached state so BootstrapSymbolState repairs it cleanly.
+	existingETH.ApplyClosedCandleLocked(candles[0], 200, 51)
+	existingETH.ApplyClosedCandleLocked(candles[5], 200, 51)
+
+	activeStates := map[string]*model.SymbolState{"ETHUSDT": existingETH}
+	cfg := ScannerConfig{
+		MinVolume24hUSDT:      25_000_000,
+		MaxSpreadPct:          0.08,
+		MinRVOL:               1.20,
+		MinFallbackRVOL:       0.50,
+		RVOLLookback:          20,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		MaxScannerVWAPDistATR: 2.50,
+		ATRPeriod:             14,
+		EMAPeriod:             50,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        100,
+		DeltaWindow:           50,
+		Timeframe:             "5m",
+		CandleDuration:        5 * time.Minute,
+		RankingMode:           "pullback",
+		BreakoutScannerEnabled: true,
+		BreakoutMaxWatchedCoins: 5,
+		SweepExtendedVWAP:     true,
+		SweepMaxExtraCoins:    5,
+	}
+
+	res := RunBulkMarketScannerPartitioned(cfg, activeStates, filters, volMap, bookMap, fetchFn, now)
+	if btcFetched != 0 {
+		t.Fatalf("expected scanner never to fetch BTCUSDT klines, got %d calls", btcFetched)
+	}
+	if len(res.Primary) != 1 || res.Primary[0] != "ETHUSDT" || len(res.Breakout) > 1 && res.Breakout[0] == "BTCUSDT" {
+		t.Fatalf("expected only ETHUSDT selected and BTCUSDT excluded, got %+v", res)
+	}
+	if !existingETH.Filter.TickSize.Equal(newFilter.TickSize) || !existingETH.Filter.StepSize.Equal(newFilter.StepSize) || !existingETH.Filter.MaxQty.Equal(newFilter.MaxQty) {
+		t.Fatalf("expected existing ETHUSDT SymbolState filter refreshed, got %+v", existingETH.Filter)
+	}
+	existingETH.Mu.Lock()
+	hasGap := existingETH.HasRecentGapLocked(5 * time.Minute)
+	existingETH.Mu.Unlock()
+	if hasGap {
+		t.Fatalf("expected BootstrapSymbolState to rebuild & repair prior cached candle gap")
+	}
+}
+
+func TestRunBulkMarketScannerPartitioned_RollingVWAPAndHighKlineLimit(t *testing.T) {
+	now := time.Date(2026, 11, 20, 0, 10, 0, 0, time.UTC) // Just past midnight UTC
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+	filters := map[string]model.ExchangeFilter{"SOLUSDT": f}
+	volMap := map[string]float64{"SOLUSDT": 100_000_000}
+	bookMap := map[string]model.BookQuote{"SOLUSDT": {BestBid: 100, BestAsk: 100.01}}
+
+	// Build 80 15m candles: 78 on previous UTC day at 100, last 2 on current UTC day at 108 -> session VWAP ~108 (dist ~0), rolling VWAP(50) ~100.3 (dist ~8 ATR)
+	candles := make([]model.Candle, 80)
+	step := 15 * time.Minute
+	for i := 0; i < 80; i++ {
+		tOpen := now.Add(time.Duration(i-80) * step)
+		vol := 100.0
+		if i == 79 {
+			vol = 200.0
+		}
+		price := 100.0
+		if i >= 78 {
+			price = 108.0
+		}
+		candles[i] = model.Candle{
+			OpenTime:        tOpen,
+			CloseTime:       tOpen.Add(step - time.Millisecond),
+			Open:            price,
+			High:            price + 0.5,
+			Low:             price - 0.5,
+			Close:           price,
+			VolumeBase:      vol,
+			QuoteVolumeUSDT: vol * price,
+		}
+	}
+
+	var requestedLimit int
+	fetchFn := func(sym string, limit int) []model.Candle {
+		requestedLimit = limit
+		return candles
+	}
+
+	cfg := ScannerConfig{
+		MinVolume24hUSDT:      25_000_000,
+		MaxSpreadPct:          0.08,
+		MinRVOL:               1.20,
+		MinFallbackRVOL:       0.50,
+		RVOLLookback:          20,
+		MinNATRPct:            0.20,
+		MaxNATRPct:            5.00,
+		MaxScannerVWAPDistATR: 2.00,
+		ATRPeriod:             14,
+		EMAPeriod:             50,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        1280,
+		DeltaWindow:           50,
+		Timeframe:             "15m",
+		CandleDuration:        15 * time.Minute,
+		RankingMode:           "pullback",
+		RollingVWAPBars:       50,
+	}
+
+	res := RunBulkMarketScannerPartitioned(cfg, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if requestedLimit != 1281 {
+		t.Fatalf("expected requested scanner kline limit 1281 (above legacy 1000 cap), got %d", requestedLimit)
+	}
+	if len(res.Primary) != 0 || res.Stats.VWAPDistRejected != 1 {
+		t.Fatalf("expected RollingVWAPBars=50 to reject 108 vs ~100.3 rolling VWAP, got %+v", res)
 	}
 }

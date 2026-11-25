@@ -1,9 +1,11 @@
 package simbroker
 
 import (
+	"sort"
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -36,8 +38,10 @@ func (s *SimBroker) RecordTimelineEquity(simTime time.Time) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
+	effDec := s.calculateRealEffectiveEquityLocked()
+	s.PeakEffectiveEquityUSDT, _ = protection.UpdatePeakAndDrawdownPct(s.PeakEffectiveEquityUSDT, effDec)
 	realF, _ := s.RealizedEquityUSDT.Float64()
-	effF, _ := s.calculateRealEffectiveEquityLocked().Float64()
+	effF, _ := effDec.Float64()
 	usedF, _ := s.usedMarginLocked().Float64()
 
 	s.EquityCurve = append(s.EquityCurve, EquityPoint{
@@ -47,6 +51,17 @@ func (s *SimBroker) RecordTimelineEquity(simTime time.Time) {
 		UsedMargin:      usedF,
 		OpenPositions:   len(s.OpenPositions),
 	})
+}
+
+// GetDrawdownFromPeakPct returns the current non-negative drawdown fraction from running HWM equity.
+func (s *SimBroker) GetDrawdownFromPeakPct() float64 {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	eff := s.calculateRealEffectiveEquityLocked()
+	var ddF float64
+	s.PeakEffectiveEquityUSDT, ddF = protection.UpdatePeakAndDrawdownPct(s.PeakEffectiveEquityUSDT, eff)
+	return ddF
 }
 
 // ForceClosePosition settles an open position forcefully (e.g. contract delisted / data stream ended mid-trade).
@@ -83,5 +98,88 @@ func (s *SimBroker) ForceClosePosition(symbol string, fallbackPrice decimal.Deci
 	delete(s.OpenPositions, symbol)
 	delete(s.PendingOrders, symbol)
 	s.Stats.DelistSettled++
+	return true
+}
+
+func positionLiquidationMark(pos *SimPosition, barIdx int64, useWorstWick bool) decimal.Decimal {
+	if useWorstWick && pos.LastWorstBarIdx == barIdx && pos.LastWorstPrice.GreaterThan(decimal.Zero) {
+		return pos.LastWorstPrice
+	}
+	if pos.LastClosePrice.GreaterThan(decimal.Zero) {
+		return pos.LastClosePrice
+	}
+	return pos.EntryPrice
+}
+
+// CheckCrossMarginLiquidation checks whether account-wide mark-to-market equity has fallen
+// to or below maintenance margin across all open positions and liquidates all open exposure.
+func (s *SimBroker) CheckCrossMarginLiquidation(mmr float64, simTime time.Time, barIdx int64) bool {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	if len(s.OpenPositions) == 0 {
+		return false
+	}
+	if mmr <= 0 {
+		mmr = 0.005
+	}
+
+	useWorstWick := s.Cfg.IntrabarConflictSLFirst
+	unrealized := decimal.Zero
+	totalNotional := decimal.Zero
+	symbols := make([]string, 0, len(s.OpenPositions))
+	for sym, pos := range s.OpenPositions {
+		symbols = append(symbols, sym)
+		mark := positionLiquidationMark(pos, barIdx, useWorstWick)
+		if mark.GreaterThan(decimal.Zero) {
+			if pos.Side == model.SideLong {
+				unrealized = unrealized.Add(mark.Sub(pos.EntryPrice).Mul(pos.Qty))
+			} else {
+				unrealized = unrealized.Add(pos.EntryPrice.Sub(mark).Mul(pos.Qty))
+			}
+			totalNotional = totalNotional.Add(mark.Mul(pos.Qty))
+		}
+	}
+	effEq := s.RealizedEquityUSDT.Add(unrealized)
+	maintMargin := totalNotional.Mul(decimal.NewFromFloat(mmr))
+
+	if effEq.GreaterThan(maintMargin) && effEq.GreaterThan(decimal.Zero) {
+		return false
+	}
+
+	sort.Strings(symbols)
+	mmrDec := decimal.NewFromFloat(mmr)
+	slipDec := s.Cfg.SlippageRate
+	if slipDec.LessThan(decimal.Zero) {
+		slipDec = decimal.Zero
+	}
+	penalty := slipDec.Add(mmrDec)
+
+	for _, sym := range symbols {
+		pos := s.OpenPositions[sym]
+		mark := positionLiquidationMark(pos, barIdx, useWorstWick)
+		var exitPrice decimal.Decimal
+		if pos.Side == model.SideLong {
+			exitPrice = mark.Mul(decimal.NewFromFloat(1.0).Sub(penalty))
+		} else {
+			exitPrice = mark.Mul(decimal.NewFromFloat(1.0).Add(penalty))
+		}
+		if exitPrice.LessThan(decimal.Zero) {
+			exitPrice = decimal.Zero
+		}
+		holdingBars := int(barIdx - pos.OpenBarIndex)
+		if holdingBars < 0 {
+			holdingBars = 0
+		}
+		s.recordClosedTradeLocked(pos, pos.Qty, exitPrice, "LIQUIDATION", simTime, holdingBars)
+		delete(s.OpenPositions, sym)
+		s.Stats.LiquidatedCount++
+	}
+
+	s.PendingOrders = make(map[string]*SimPendingOrder)
+	s.CircuitBreakerTripped = true
+	if s.RealizedEquityUSDT.LessThan(decimal.Zero) {
+		s.RealizedEquityUSDT = decimal.Zero
+	}
 	return true
 }

@@ -22,6 +22,7 @@ type SizingConfig struct {
 	SlippageRate                   decimal.Decimal
 	AvailableBalanceBufferFraction decimal.Decimal
 	EntryOrderType                 string
+	DisablePartialTP               bool
 }
 
 // BuildSafeDecimalOrderIntent menghitung ukuran lot presisi dengan proteksi friksi fee, slippage,
@@ -34,7 +35,25 @@ func BuildSafeDecimalOrderIntent(
 	atr14 float64,
 	cfg SizingConfig,
 ) (model.OrderIntent, bool) {
-	if effectiveEquity.LessThanOrEqual(decimal.Zero) || availableBalance.LessThanOrEqual(decimal.Zero) {
+	if effectiveEquity.LessThanOrEqual(decimal.Zero) || availableBalance.LessThanOrEqual(decimal.Zero) ||
+		cfg.RiskPerTradePct.LessThanOrEqual(decimal.Zero) || cfg.MaxSlotMarginFraction.LessThanOrEqual(decimal.Zero) {
+		return model.OrderIntent{}, false
+	}
+
+	slMult := cfg.SLMultiplier
+	if side == model.SideLong && cfg.SLMultiplierLong > 0 {
+		slMult = cfg.SLMultiplierLong
+	}
+	tp1Mult := cfg.TP1Multiplier
+	if side == model.SideLong && cfg.TP1MultiplierLong > 0 {
+		tp1Mult = cfg.TP1MultiplierLong
+	} else if !cfg.DisablePartialTP && tp1Mult <= 0 {
+		tp1Mult = 1.20
+	}
+
+	if !isFinitePositive(rawEntry) || !isFinitePositive(atr14) || !isFinitePositive(slMult) ||
+		!isFinitePositive(cfg.TPMultiplier) || !isFinitePositive(cfg.AccountLeverage) ||
+		(!cfg.DisablePartialTP && !isFinitePositive(tp1Mult)) {
 		return model.OrderIntent{}, false
 	}
 
@@ -44,10 +63,6 @@ func BuildSafeDecimalOrderIntent(
 	}
 
 	atrDec := decimal.NewFromFloat(atr14)
-	slMult := cfg.SLMultiplier
-	if side == model.SideLong && cfg.SLMultiplierLong > 0 {
-		slMult = cfg.SLMultiplierLong
-	}
 	slDist := atrDec.Mul(decimal.NewFromFloat(slMult))
 
 	// Stop Distance Floor: Lindungi SL agar tidak diletakkan di dalam zona noise (< MinSLDistancePct)
@@ -67,17 +82,9 @@ func BuildSafeDecimalOrderIntent(
 		}
 	}
 
-	tp1Mult := cfg.TP1Multiplier
-	if side == model.SideLong && cfg.TP1MultiplierLong > 0 {
-		tp1Mult = cfg.TP1MultiplierLong
-	} else if tp1Mult <= 0 {
-		tp1Mult = 1.20
-	}
 	// TP1 adalah mekanisme de-risking cepat (Scale-Out 50% + Geser SL ke BE).
 	// Jarak TP1 HARUS selalu mengacu murni pada volatilitas alami koin (ATR14)
 	// dan TIDAK BOLEH digelembungkan oleh slDist floor agar selalu realistis disentuh pada swing awal.
-	tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
-
 	var slPrice, tpPrice, tp1Price decimal.Decimal
 	if side == model.SideLong {
 		slPrice, err = model.QuantizePrice(entryPrice.Sub(slDist), snap.Filter.TickSize, false)
@@ -88,9 +95,12 @@ func BuildSafeDecimalOrderIntent(
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
-		tp1Price, err = model.QuantizePrice(entryPrice.Add(tp1Dist), snap.Filter.TickSize, true)
-		if err != nil {
-			return model.OrderIntent{}, false
+		if !cfg.DisablePartialTP {
+			tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
+			tp1Price, err = model.QuantizePrice(entryPrice.Add(tp1Dist), snap.Filter.TickSize, true)
+			if err != nil {
+				return model.OrderIntent{}, false
+			}
 		}
 	} else {
 		slPrice, err = model.QuantizePrice(entryPrice.Add(slDist), snap.Filter.TickSize, true)
@@ -101,35 +111,39 @@ func BuildSafeDecimalOrderIntent(
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
-		tp1Price, err = model.QuantizePrice(entryPrice.Sub(tp1Dist), snap.Filter.TickSize, false)
-		if err != nil {
-			return model.OrderIntent{}, false
+		if !cfg.DisablePartialTP {
+			tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
+			tp1Price, err = model.QuantizePrice(entryPrice.Sub(tp1Dist), snap.Filter.TickSize, false)
+			if err != nil {
+				return model.OrderIntent{}, false
+			}
 		}
 	}
 
-	// Validasi Urutan Harga: TP1 harus berada di antara Entry dan TP2, dan SL harus berada di sisi berlawanan
+	// Validasi Urutan Harga: SL berlawanan sisi, TP searah profit, dan bila PartialTP aktif TP1 di antara Entry & TP2.
 	if side == model.SideLong {
-		if tp1Price.GreaterThanOrEqual(tpPrice) || slPrice.GreaterThanOrEqual(entryPrice) {
+		if slPrice.GreaterThanOrEqual(entryPrice) || tpPrice.LessThanOrEqual(entryPrice) ||
+			(!cfg.DisablePartialTP && tp1Price.GreaterThanOrEqual(tpPrice)) {
 			return model.OrderIntent{}, false
 		}
 	} else {
-		if tp1Price.LessThanOrEqual(tpPrice) || slPrice.LessThanOrEqual(entryPrice) {
+		if slPrice.LessThanOrEqual(entryPrice) || tpPrice.GreaterThanOrEqual(entryPrice) ||
+			(!cfg.DisablePartialTP && tp1Price.LessThanOrEqual(tpPrice)) {
 			return model.OrderIntent{}, false
 		}
 	}
 
 	actualSLDist := entryPrice.Sub(slPrice).Abs()
-	if cfg.AccountLeverage > 0 {
-		// Proteksi Batas Likuidasi: Jarak SL tidak boleh melampaui 80% dari jarak likuidasi teoritis (1 / Leverage)
-		maxSafeSLPct := decimal.NewFromFloat(0.80 / cfg.AccountLeverage)
-		if actualSLDist.Div(entryPrice).GreaterThan(maxSafeSLPct) {
-			return model.OrderIntent{}, false
-		}
+	// Proteksi Batas Likuidasi: Jarak SL tidak boleh melampaui 80% dari jarak likuidasi teoritis (1 / Leverage)
+	maxSafeSLPct := decimal.NewFromFloat(0.80 / cfg.AccountLeverage)
+	if actualSLDist.Div(entryPrice).GreaterThan(maxSafeSLPct) {
+		return model.OrderIntent{}, false
 	}
 
 	// 1. Kerugian Efektif per Unit (termasuk friksi Maker Fee / Taker Fee + Slippage)
+	isMarket := strings.EqualFold(cfg.EntryOrderType, "MARKET")
 	var totalFrictionRate decimal.Decimal
-	if strings.EqualFold(cfg.EntryOrderType, "MARKET") {
+	if isMarket {
 		// Entry Taker + Slippage, Exit Taker + Slippage
 		totalFrictionRate = cfg.TakerFeeRate.Mul(decimal.NewFromInt(2)).Add(cfg.SlippageRate.Mul(decimal.NewFromInt(2)))
 	} else {
@@ -158,14 +172,19 @@ func BuildSafeDecimalOrderIntent(
 	qtyByMargin := maxNotional.Div(entryPrice)
 
 	rawQty := decimal.Min(qtyByRisk, qtyByMargin)
-	finalQty, err := model.QuantizeQtyFloor(rawQty, snap.Filter.StepSize)
+	if effMaxQty := snap.Filter.EffectiveMaxQty(isMarket); effMaxQty.GreaterThan(decimal.Zero) && rawQty.GreaterThan(effMaxQty) {
+		rawQty = effMaxQty
+	}
+	effStep := snap.Filter.EffectiveStepSize(isMarket)
+	finalQty, err := model.QuantizeQtyFloor(rawQty, effStep)
 	if err != nil {
 		return model.OrderIntent{}, false
 	}
 
 	// 3. Validasi Filter Bursa (MinQty & MinNotional)
+	effMinQty := snap.Filter.EffectiveMinQty(isMarket)
 	notional := finalQty.Mul(entryPrice)
-	if finalQty.LessThan(snap.Filter.MinQty) || notional.LessThan(snap.Filter.MinNotional) {
+	if finalQty.LessThan(effMinQty) || notional.LessThan(snap.Filter.MinNotional) {
 		return model.OrderIntent{}, false
 	}
 

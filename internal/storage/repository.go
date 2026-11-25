@@ -81,6 +81,7 @@ type Repository interface {
 	GetDailyStateForMode(ctx context.Context, mode string, epochDay int64) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, found bool, err error)
 	GetLatestDailyStateForMode(ctx context.Context, mode string) (sessionStartEquity, realizedEquity decimal.Decimal, breakerTripped bool, epochDay int64, found bool, err error)
 	LogTrade(ctx context.Context, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64, strategyID ...string) error
+	LogTradeForMode(ctx context.Context, mode, clientOrderID, symbol, side string, qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal, exitReason string, openedAt, closedAt time.Time, mae, mfe float64, signalAuditID int64, strategyID ...string) error
 	LogSignalAudit(ctx context.Context, candleOpenTime time.Time, symbol, side string, closePrice, ema200, sessionVwap, atr14, barDeltaZScore, oiDeltaPct, fundingRate, spreadPct, rvol, impulseATRMult, limitPrice, slPrice, tpPrice float64, decision, rejectReason, rejectSubReason string, strategyID ...string) (int64, error)
 	PruneOldSignalAuditLogs(ctx context.Context, olderThanDays int) (int64, error)
 	SaveDryRunPosition(ctx context.Context, pos StoredDryRunPosition) error
@@ -92,6 +93,16 @@ type Repository interface {
 	UpdateTradeAutopsy(ctx context.Context, clientOrderID, autopsy string) error
 	GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error)
 	GetRecentExits(ctx context.Context, since time.Time) (map[string]RecentExitRecord, error)
+	GetRecentExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error)
+	GetPeakEquityForMode(ctx context.Context, mode string) (decimal.Decimal, bool, error)
+	GetRecentStopLossTimes(ctx context.Context, since time.Time) ([]time.Time, error)
+	GetRecentStopLossTimesForMode(ctx context.Context, mode string, since time.Time) ([]time.Time, error)
+}
+
+const sqliteTimeFormat = "2006-01-02T15:04:05.000000000Z"
+
+func formatSQLiteTime(t time.Time) string {
+	return t.UTC().Format(sqliteTimeFormat)
 }
 
 type SQLiteRepository struct {
@@ -347,14 +358,37 @@ func (r *SQLiteRepository) LogTrade(
 	signalAuditID int64,
 	strategyID ...string,
 ) error {
+	return r.LogTradeForMode(
+		ctx, "", clientOrderID, symbol, side,
+		qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL,
+		exitReason, openedAt, closedAt, mae, mfe, signalAuditID, strategyID...,
+	)
+}
+
+// LogTradeForMode records a closed trade tagged with its execution mode (DRY_RUN or LIVE) for mode-isolated lookups.
+func (r *SQLiteRepository) LogTradeForMode(
+	ctx context.Context,
+	mode, clientOrderID, symbol, side string,
+	qty, entryPrice, exitPrice, slPrice, tpPrice, netPnL decimal.Decimal,
+	exitReason string,
+	openedAt, closedAt time.Time,
+	mae, mfe float64,
+	signalAuditID int64,
+	strategyID ...string,
+) error {
+	normMode := ""
+	if strings.TrimSpace(mode) != "" {
+		normMode = normalizeDailyStateMode(mode)
+	}
 	stratID := resolveRepoStrategyID(strategyID...)
 	query := `
 	INSERT INTO trade_ledger (
-		client_order_id, symbol, side, strategy_id, qty, entry_price, exit_price,
+		client_order_id, mode, symbol, side, strategy_id, qty, entry_price, exit_price,
 		sl_price_initial, tp_price_initial, net_pnl_usdt, mae_pct, mfe_pct,
 		exit_reason, opened_at_utc, closed_at_utc, signal_audit_id
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(client_order_id) DO UPDATE SET
+		mode = CASE WHEN excluded.mode != '' THEN excluded.mode ELSE trade_ledger.mode END,
 		strategy_id = CASE WHEN excluded.strategy_id != '' THEN excluded.strategy_id ELSE trade_ledger.strategy_id END,
 		exit_price = excluded.exit_price,
 		net_pnl_usdt = excluded.net_pnl_usdt,
@@ -368,6 +402,7 @@ func (r *SQLiteRepository) LogTrade(
 		ctx,
 		query,
 		clientOrderID,
+		normMode,
 		symbol,
 		side,
 		stratID,
@@ -380,8 +415,8 @@ func (r *SQLiteRepository) LogTrade(
 		mae,
 		mfe,
 		exitReason,
-		openedAt.UTC().Format(time.RFC3339Nano),
-		closedAt.UTC().Format(time.RFC3339Nano),
+		formatSQLiteTime(openedAt),
+		formatSQLiteTime(closedAt),
 		signalAuditID,
 	)
 	if err != nil {
@@ -409,7 +444,7 @@ func (r *SQLiteRepository) LogSignalAudit(
 	res, err := r.db.conn.ExecContext(
 		ctx,
 		query,
-		candleOpenTime.UTC().Format(time.RFC3339Nano),
+		formatSQLiteTime(candleOpenTime),
 		symbol,
 		side,
 		stratID,
@@ -429,7 +464,7 @@ func (r *SQLiteRepository) LogSignalAudit(
 		decision,
 		rejectReason,
 		rejectSubReason,
-		time.Now().UTC().Format(time.RFC3339Nano),
+		formatSQLiteTime(time.Now()),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("storage: failed to log signal audit: %w", err)
@@ -447,7 +482,7 @@ func (r *SQLiteRepository) PruneOldSignalAuditLogs(ctx context.Context, olderTha
 	if olderThanDays <= 0 {
 		olderThanDays = 7
 	}
-	cutoff := time.Now().UTC().AddDate(0, 0, -olderThanDays).Format(time.RFC3339Nano)
+	cutoff := formatSQLiteTime(time.Now().UTC().AddDate(0, 0, -olderThanDays))
 	query := `
 	DELETE FROM signal_audit_log
 	WHERE decision IN ('REJECT', 'REJECTED')
@@ -501,13 +536,13 @@ func (r *SQLiteRepository) SaveDryRunPosition(ctx context.Context, pos StoredDry
 		tpHitInt = 1
 	}
 
-	markTime := pos.MarkUpdatedAt.UTC().Format(time.RFC3339Nano)
+	markTime := formatSQLiteTime(pos.MarkUpdatedAt)
 	if pos.MarkUpdatedAt.IsZero() {
-		markTime = time.Now().UTC().Format(time.RFC3339Nano)
+		markTime = formatSQLiteTime(time.Now())
 	}
-	openTime := pos.OpenedAt.UTC().Format(time.RFC3339Nano)
+	openTime := formatSQLiteTime(pos.OpenedAt)
 	if pos.OpenedAt.IsZero() {
-		openTime = time.Now().UTC().Format(time.RFC3339Nano)
+		openTime = formatSQLiteTime(time.Now())
 	}
 
 	initQtyStr := pos.InitialQty.String()
@@ -745,17 +780,43 @@ func (r *SQLiteRepository) GetTradeAutopsy(ctx context.Context, clientOrderID st
 // GetRecentExits mengambil record penutupan posisi terakhir untuk tiap simbol sejak waktu 'since'.
 // Mengabaikan PARTIAL_TAKE_PROFIT agar hanya penutupan posisi penuh (SL, full TP, time stop, dsb) yang memicu cooldown.
 func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) (map[string]RecentExitRecord, error) {
-	query := `
-	SELECT t.symbol, t.exit_reason, t.closed_at_utc
-	FROM trade_ledger t
-	INNER JOIN (
-		SELECT symbol, MAX(closed_at_utc) AS max_closed
-		FROM trade_ledger
-		WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND closed_at_utc >= ?
-		GROUP BY symbol
-	) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed;
-	`
-	rows, err := r.db.conn.QueryContext(ctx, query, since.UTC().Format(time.RFC3339Nano))
+	return r.GetRecentExitsForMode(ctx, "", since)
+}
+
+// GetRecentExitsForMode mengambil record penutupan posisi terakhir untuk tiap simbol sejak waktu 'since',
+// terisolasi ke mode ('DRY_RUN' / 'LIVE') bila diisi dan selalu mengabaikan baris PARTIAL_TAKE_PROFIT pada outer join.
+func (r *SQLiteRepository) GetRecentExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error) {
+	sinceStr := formatSQLiteTime(since)
+	var rows *sql.Rows
+	var err error
+	if strings.TrimSpace(mode) != "" {
+		normMode := normalizeDailyStateMode(mode)
+		query := `
+		SELECT t.symbol, t.exit_reason, t.closed_at_utc
+		FROM trade_ledger t
+		INNER JOIN (
+			SELECT symbol, MAX(closed_at_utc) AS max_closed
+			FROM trade_ledger
+			WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND mode = ? AND closed_at_utc >= ?
+			GROUP BY symbol
+		) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed
+		WHERE t.exit_reason != 'PARTIAL_TAKE_PROFIT' AND t.mode = ?;
+		`
+		rows, err = r.db.conn.QueryContext(ctx, query, normMode, sinceStr, normMode)
+	} else {
+		query := `
+		SELECT t.symbol, t.exit_reason, t.closed_at_utc
+		FROM trade_ledger t
+		INNER JOIN (
+			SELECT symbol, MAX(closed_at_utc) AS max_closed
+			FROM trade_ledger
+			WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND closed_at_utc >= ?
+			GROUP BY symbol
+		) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed
+		WHERE t.exit_reason != 'PARTIAL_TAKE_PROFIT';
+		`
+		rows, err = r.db.conn.QueryContext(ctx, query, sinceStr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("storage: failed to query recent exits: %w", err)
 	}
@@ -783,6 +844,106 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 		return nil, fmt.Errorf("storage: error iterating recent exits: %w", err)
 	}
 	return exits, nil
+}
+
+// GetPeakEquityForMode scans stored daily equity snapshots for mode and returns the highest recorded equity.
+func (r *SQLiteRepository) GetPeakEquityForMode(ctx context.Context, mode string) (decimal.Decimal, bool, error) {
+	normMode := normalizeDailyStateMode(mode)
+	scanPeakRows := func(rows *sql.Rows) (decimal.Decimal, bool, error) {
+		defer func() { _ = rows.Close() }()
+		peak := decimal.Zero
+		found := false
+		for rows.Next() {
+			var startStr, realStr string
+			if err := rows.Scan(&startStr, &realStr); err != nil {
+				return decimal.Zero, false, fmt.Errorf("storage: failed to scan peak equity row: %w", err)
+			}
+			for _, raw := range []string{startStr, realStr} {
+				if v, err := decimal.NewFromString(strings.TrimSpace(raw)); err == nil && v.GreaterThan(peak) {
+					peak = v
+					found = true
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return decimal.Zero, false, fmt.Errorf("storage: error iterating peak equity rows: %w", err)
+		}
+		return peak, found, nil
+	}
+
+	rows, err := r.db.conn.QueryContext(
+		ctx,
+		`SELECT session_start_equity, realized_equity FROM account_daily_state_by_mode WHERE mode = ?;`,
+		normMode,
+	)
+	if err != nil {
+		return decimal.Zero, false, fmt.Errorf("storage: failed to query peak equity for mode %s: %w", normMode, err)
+	}
+	peak, found, err := scanPeakRows(rows)
+	if err != nil || found {
+		return peak, found, err
+	}
+	if normMode == "DRY_RUN" {
+		legacyRows, legErr := r.db.conn.QueryContext(
+			ctx,
+			`SELECT session_start_equity, realized_equity FROM account_daily_state;`,
+		)
+		if legErr != nil {
+			return decimal.Zero, false, fmt.Errorf("storage: failed to query legacy peak equity: %w", legErr)
+		}
+		return scanPeakRows(legacyRows)
+	}
+	return decimal.Zero, false, nil
+}
+
+// GetRecentStopLossTimes returns chronological UTC timestamps for STOP_LOSS exits since 'since'.
+func (r *SQLiteRepository) GetRecentStopLossTimes(ctx context.Context, since time.Time) ([]time.Time, error) {
+	return r.GetRecentStopLossTimesForMode(ctx, "", since)
+}
+
+// GetRecentStopLossTimesForMode returns chronological UTC timestamps for STOP_LOSS exits since 'since',
+// scoped to mode (DRY_RUN / LIVE) when non-empty.
+func (r *SQLiteRepository) GetRecentStopLossTimesForMode(ctx context.Context, mode string, since time.Time) ([]time.Time, error) {
+	sinceStr := formatSQLiteTime(since)
+	var rows *sql.Rows
+	var err error
+	if strings.TrimSpace(mode) != "" {
+		normMode := normalizeDailyStateMode(mode)
+		rows, err = r.db.conn.QueryContext(
+			ctx,
+			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND mode = ? AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
+			normMode, sinceStr,
+		)
+	} else {
+		rows, err = r.db.conn.QueryContext(
+			ctx,
+			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
+			sinceStr,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("storage: failed to query recent stop losses: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []time.Time
+	for rows.Next() {
+		var closedAtStr string
+		if err := rows.Scan(&closedAtStr); err != nil {
+			return nil, fmt.Errorf("storage: failed to scan recent stop loss timestamp: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339Nano, closedAtStr)
+		if err != nil {
+			t, err = time.Parse(time.RFC3339, closedAtStr)
+		}
+		if err == nil {
+			out = append(out, t.UTC())
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: error iterating recent stop losses: %w", err)
+	}
+	return out, nil
 }
 
 // SaveLivePosition menyimpan atau memperbarui posisi live ke SQLite agar tahan restart (TD-01)
@@ -815,18 +976,19 @@ func (r *SQLiteRepository) SaveLivePosition(ctx context.Context, pos StoredLiveP
 		atr_at_entry = excluded.atr_at_entry,
 		protection_tier = excluded.protection_tier,
 		signal_audit_id = excluded.signal_audit_id,
+		opened_at_utc = excluded.opened_at_utc,
 		max_mae = excluded.max_mae,
 		max_mfe = excluded.max_mfe,
 		updated_at_utc = excluded.updated_at_utc,
 		peak_price = excluded.peak_price;
 	`
-	openTime := pos.OpenedAt.UTC().Format(time.RFC3339Nano)
+	openTime := formatSQLiteTime(pos.OpenedAt)
 	if pos.OpenedAt.IsZero() {
-		openTime = time.Now().UTC().Format(time.RFC3339Nano)
+		openTime = formatSQLiteTime(time.Now())
 	}
-	updTime := pos.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	updTime := formatSQLiteTime(pos.UpdatedAt)
 	if pos.UpdatedAt.IsZero() {
-		updTime = time.Now().UTC().Format(time.RFC3339Nano)
+		updTime = formatSQLiteTime(time.Now())
 	}
 
 	initQtyStr := pos.InitialQty.String()

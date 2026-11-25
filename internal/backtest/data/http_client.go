@@ -282,7 +282,6 @@ func (c *BacktestHTTPClient) syncServerWeight(serverWeight int) {
 }
 
 func (c *BacktestHTTPClient) tripIPBan(body []byte) {
-	c.ipBanned.Store(true)
 	// Default 5m safety ban if exact expiry timestamp isn't present in payload
 	until := time.Now().UTC().Add(5 * time.Minute)
 	msg := string(body)
@@ -297,7 +296,9 @@ func (c *BacktestHTTPClient) tripIPBan(body []byte) {
 			}
 		}
 	}
+	// Publish deadline before flipping ipBanned so concurrent IsIPBanned() never observes stale expiry.
 	c.bannedUntil.Store(until.UnixNano())
+	c.ipBanned.Store(true)
 }
 
 func parseRetryAfter(val string, fallback time.Duration) time.Duration {

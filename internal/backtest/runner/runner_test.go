@@ -11,6 +11,7 @@ import (
 	"github.com/shopspring/decimal"
 	"trml/internal/backtest/data"
 	"trml/internal/backtest/replay"
+	"trml/internal/config"
 	"trml/internal/model"
 )
 
@@ -122,5 +123,80 @@ func TestRunner_ExecuteRunWalkForwardStressAndPersist(t *testing.T) {
 	}
 	if len(stressRes) != 4 || !strings.Contains(stressMD, "Friction & Slippage Stress Matrix") {
 		t.Fatalf("unexpected stress output: count=%d", len(stressRes))
+	}
+}
+
+func TestResolveBacktestScannerConfig_DisablesRedundantScannerBreadth(t *testing.T) {
+	cfg := &config.Config{
+		Timeframe:                 "15m",
+		CandleDuration:            15 * time.Minute,
+		MarketBreadthLowThreshold: 0.20,
+		MinVolume24hUSDT:          15_000_000,
+	}
+	interval, dur, scanCfg := ResolveBacktestScannerConfig(cfg, "")
+	if interval != "15m" || dur != 15*time.Minute {
+		t.Fatalf("expected 15m interval, got %s %v", interval, dur)
+	}
+	if scanCfg.ComputeMarketBreadth {
+		t.Fatalf("expected backtest ResolveBacktestScannerConfig ComputeMarketBreadth=false to avoid redundant breadth passes")
+	}
+}
+
+func TestBuildEngineConfigs_PreservesAppCfgAndFractionalSpreadAndOverrideCompounding(t *testing.T) {
+	falseVal := false
+	todayCut := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
+	bars := make([]data.HistoricalCandle, 120)
+	start := todayCut.Add(-24 * time.Hour)
+	for i := range bars {
+		bars[i] = data.HistoricalCandle{
+			Symbol:    "SOLUSDT",
+			OpenTime:  start.Add(time.Duration(i) * 15 * time.Minute),
+			CloseTime: start.Add(time.Duration(i+1)*15*time.Minute - time.Millisecond),
+			Open:      100,
+			High:      101,
+			Low:       99,
+			Close:     100.5,
+			Volume:    1000,
+		}
+	}
+
+	ds := &LoadedDataset{
+		AppCfg: &config.Config{
+			Timeframe:             "15m",
+			CandleDuration:        15 * time.Minute,
+			MaxSpreadPct:          0.06,
+			HTFEMAPeriod:          200,
+			EquityModeCompounding: true,
+			EntryOrderType:        "MARKET",
+			VolBreakout:           config.VolBreakoutStrategyConfig{Enabled: true, MaxNATRPct: 2.5},
+		},
+		Interval:      "15m",
+		CandleDur:     15 * time.Minute,
+		TodayStartUTC: todayCut,
+		CandleMap:     map[string][]data.HistoricalCandle{"SOLUSDT": bars},
+		InitialEquity: 500.0,
+	}
+
+	evalCfg, brokerCfg, replayCfg := BuildEngineConfigs(ds, RunOptions{
+		CommonOptions: CommonOptions{
+			TodayMode:           true,
+			OverrideCompounding: &falseVal,
+		},
+	})
+	if !evalCfg.VolBreakout.Enabled || evalCfg.HTFEMAPeriod != 200 {
+		t.Fatalf("expected full AppCfg fields preserved without disk re-read, got VolBreakout=%+v HTF=%d", evalCfg.VolBreakout, evalCfg.HTFEMAPeriod)
+	}
+	if brokerCfg.EntryOrderType != "MARKET" {
+		t.Fatalf("expected EntryOrderType=MARKET from AppCfg, got %s", brokerCfg.EntryOrderType)
+	}
+	if brokerCfg.EquityModeCompounding {
+		t.Fatalf("expected CommonOptions.OverrideCompounding=false to override AppCfg EquityModeCompounding=true")
+	}
+	if replayCfg.SpreadPct < 0.00059 || replayCfg.SpreadPct > 0.00061 {
+		t.Fatalf("expected fractional SpreadPct 0.0006 (not 0.06), got %f", replayCfg.SpreadPct)
+	}
+	// 24h on 15m before todayCut = 96 bars (not hardcoded 288!)
+	if replayCfg.WarmupBars != 96 {
+		t.Fatalf("expected TodayMode WarmupBars=96 pre-today bars on 15m, got %d", replayCfg.WarmupBars)
 	}
 }

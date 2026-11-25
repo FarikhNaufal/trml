@@ -78,6 +78,7 @@ type Config struct {
 	MinOIDeltaPct            float64
 	MinOIDeltaLongPct        float64
 	MinOIDeltaShortPct       float64
+	DisableOIFilter          bool
 	SLATRMultiplier          float64
 	TPATRMultiplier          float64
 	BreakEvenTriggerATR      float64
@@ -109,12 +110,22 @@ type Config struct {
 	MinSignalRVOL            float64
 	CooldownAfterExitMinutes int
 	CooldownLossMinutes      int
+	CooldownLossSet          bool
 	CooldownProfitMinutes    int
+	CooldownProfitSet        bool
 	VWAPSessionWarmupMinutes int
+	VWAPSessionWarmupSet     bool
 	BlockedUTCHours          map[int]bool
+
+	MinOIDeltaLongSet        bool
+	MinOIDeltaShortSet       bool
+	MinEMASlopeLongSet       bool
 
 	// Option C: Optimasi Seleksi Entry & Eksit Sisi LONG
 	MinCandleBodyRatioLong   float64
+	MinCandleBodyRatioShort  float64
+	MaxAdverseRetestATRShort float64
+	MaxEMASlopeShort         float64
 	MaxPullbackRVOLLong      float64
 	MinImpulseATRLong        float64
 	MinEMASlopeLong          float64
@@ -161,6 +172,42 @@ type Config struct {
 
 	// Strategi Sekunder: 1-Bar Liquidity Sweep SHORT-ONLY (Additive, default: disabled)
 	Sweep SweepStrategyConfig
+
+	// Multi-Regime Strategy Suite (all opt-in; VWAPStrategyEnabled defaults to true)
+	VWAPStrategyEnabled          bool
+	RelResidual                  RelResidualStrategyConfig
+	VolBreakout                  VolBreakoutStrategyConfig
+	MacroRouter                  MacroRegimeRouterConfig
+	MaxAdverseFundingRate        float64
+	MinShortFundingRate          float64
+	MaxLongFundingRate           float64
+	RollingVWAPBars              int
+	MaxNewEntriesPerBar          int
+	PortfolioClusterSLCount      int
+	PortfolioClusterCooldownMins int
+	ScannerExcludeTopVolRank     int
+	HTFEMAPeriod                 int
+	MarketBreadthLowThreshold    float64
+	MarketBreadthLowRiskMult     float64
+	StaleLossExitDuration        time.Duration
+	MacroRangeRiskMult           float64
+	BreakoutPriorityFirst        bool
+	HTFEMAMaxRisingSlopePct      float64
+	DDThrottleThresholdPct       float64
+	DDThrottleRiskMult           float64
+	ResetPeakEquityOnBoot        bool
+	MacroVolExpansionRatio       float64
+	MacroVolExpansionRiskMult    float64
+	RS4hWeakThresholdPct         float64
+	RS4hWeakRiskMult             float64
+	RS4hStrongThresholdPct       float64
+	RS4hStrongRiskMult           float64
+	DDThrottleTier2ThresholdPct  float64
+	DDThrottleTier2RiskMult      float64
+	MaxEffectiveRiskPerTradePct  float64
+	EMAPullback                  EMAPullbackStrategyConfig
+	VWAPBreakdown                VWAPBreakdownStrategyConfig
+	StructureBreak               StructureBreakStrategyConfig
 }
 
 // SweepStrategyConfig memuat parameter strategi sekunder 1-Bar Liquidity Sweep SHORT-ONLY.
@@ -172,6 +219,90 @@ type SweepStrategyConfig struct {
 	MaxDeltaZScore           float64
 	ScannerAllowExtendedVWAP bool
 	ScannerMaxExtraCoins     int
+}
+
+// RelResidualStrategyConfig holds opt-in settings for cross-sectional relative residual alpha.
+type RelResidualStrategyConfig struct {
+	Enabled           bool
+	Mode              string
+	LookbackBars      int
+	MinRelZ           float64
+	MinVWAPStretchATR float64
+	MinDeltaZ         float64
+	BypassBTCTier2    bool
+}
+
+// VolBreakoutStrategyConfig holds opt-in settings for volatility compression breakout alpha.
+type VolBreakoutStrategyConfig struct {
+	Enabled               bool
+	LookbackBars          int
+	MaxCompressionRatio   float64
+	MinRVOL               float64
+	MinBodyRatio          float64
+	MinDeltaZ             float64
+	AlignMacroTrend       bool
+	MaxEMA200DistATR      float64
+	MaxVWAPDistATR        float64
+	MaxNATRPct            float64
+	RiskMult              float64
+	EntryMarket           bool
+	ScannerEnabled        bool
+	MinNATRPct            float64
+	MinVolume24hUSDT      float64
+	MaxWatchedCoins       int
+	ExcludeTopVolRank     int
+	MaxScannerVWAPDistATR float64
+}
+
+// MacroRegimeRouterConfig holds opt-in settings for 1h BTC macro regime routing.
+type MacroRegimeRouterConfig struct {
+	Enabled             bool
+	TrendERThreshold    float64
+	VolShockRatio       float64
+	VWAPOnlyInRange     bool
+	BreakoutOnlyInTrend bool
+	RelOnlyInRange      bool
+}
+
+// EMAPullbackStrategyConfig holds opt-in settings for stacked EMA trend continuation pullback alpha.
+type EMAPullbackStrategyConfig struct {
+	Enabled          bool
+	FastPeriod       int
+	SlowPeriod       int
+	RetestLookback   int
+	TouchTolATR      float64
+	TouchTolSet      bool
+	MinBodyRatio     float64
+	MinBodySet       bool
+	MinDeltaZ        float64
+	MaxEMA200DistATR float64
+	RiskMult         float64
+}
+
+// VWAPBreakdownStrategyConfig holds opt-in settings for failed relief VWAP breakdown alpha.
+type VWAPBreakdownStrategyConfig struct {
+	Enabled         bool
+	LookbackBars    int
+	MinAboveBars    int
+	MinRVOL         float64
+	MinBodyRatio    float64
+	MinBodySet      bool
+	MinDeltaZ       float64
+	MaxBelowVWAPATR float64
+	RiskMult        float64
+}
+
+// StructureBreakStrategyConfig holds opt-in settings for 5-bar pivot market-structure break alpha.
+type StructureBreakStrategyConfig struct {
+	Enabled          bool
+	LookbackBars     int
+	MinBounceATR     float64
+	MinRVOL          float64
+	MinBodyRatio     float64
+	MinBodySet       bool
+	MinDeltaZ        float64
+	MaxEMA200DistATR float64
+	RiskMult         float64
 }
 
 // loadDotEnvWithOverwrite membaca file .env secara otomatis ke environment variable proses.
@@ -262,8 +393,8 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid DRY_RUN_MODE '%s' (must be 'true' or 'false')", dryRunStr)
 	}
 
-	apiKey := strings.TrimSpace(getEnv("BINANCE_API_KEY", ""))
-	secretKey := strings.TrimSpace(getEnv("BINANCE_SECRET_KEY", ""))
+	apiKey := strings.TrimSpace(getRawEnv("BINANCE_API_KEY", ""))
+	secretKey := strings.TrimSpace(getRawEnv("BINANCE_SECRET_KEY", ""))
 
 	// Credential Guard: Jika mode Live aktif, wajib ada API Key & Secret Key non-placeholder
 	if !dryRun {
@@ -272,7 +403,7 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		}
 	}
 
-	dbPath := getEnv("SQLITE_DB_PATH", "./data/trml.db")
+	dbPath := getRawEnv("SQLITE_DB_PATH", "./data/trml.db")
 	logLevel := strings.ToUpper(getEnv("LOG_LEVEL", "INFO"))
 
 	makerFee, err := decimal.NewFromString(getEnv("MAKER_FEE_RATE", "0.0002"))
@@ -316,17 +447,17 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_DAILY_DRAWDOWN_PCT '%s' (must be negative float between -0.01 and -1.00)", ddStr)
 	}
 
-	// Live safety guard: jika mode live (dryRun=false) dan drawdown di-set lebih longgar dari -0.05,
-	// paksa batas pengaman live ke -0.05 (-5.0%) untuk mencegah kerugian fatal uang riil.
-	if !dryRun && ddFloat < -0.05 {
-		slog.Warn("live mode active: clamping MAX_DAILY_DRAWDOWN_PCT to safe live limit of -0.05 (-5%)", "configured", ddFloat)
-		ddFloat = -0.05
+	// Live safety guard: jika mode live (dryRun=false) dan drawdown di-set lebih longgar dari -0.10,
+	// paksa batas pengaman live ke -0.10 (-10.0%) sementara tetap menjaga profil QMAX (-0.075).
+	if !dryRun && ddFloat < -0.10 {
+		slog.Warn("live mode active: clamping MAX_DAILY_DRAWDOWN_PCT to safe live limit of -0.10 (-10%)", "configured", ddFloat)
+		ddFloat = -0.10
 	}
 
 	slotsStr := getEnv("MAX_CONCURRENT_SLOTS", "3")
 	slots, err := strconv.Atoi(slotsStr)
-	if err != nil || slots < 1 || slots > 10 {
-		return nil, fmt.Errorf("config: invalid MAX_CONCURRENT_SLOTS '%s' (must be integer between 1 and 10)", slotsStr)
+	if err != nil || slots < 1 || slots > 16 {
+		return nil, fmt.Errorf("config: invalid MAX_CONCURRENT_SLOTS '%s' (must be integer between 1 and 16)", slotsStr)
 	}
 
 	levStr := getEnv("ACCOUNT_LEVERAGE", "5.0")
@@ -386,16 +517,22 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAX_EMA200_DISTANCE_ATR '%s' (must be float between 0.1 and 20.0)", maxEMA200DistStr)
 	}
 
-	minBounceZLongStr := getEnv("MIN_BOUNCE_ZSCORE_LONG", minBounceZStr)
-	minBounceZLong, err := parseFloatEnv(minBounceZLongStr)
-	if err != nil || minBounceZLong <= 0 {
-		minBounceZLong = minBounceZ
+	minBounceZLong := minBounceZ
+	if minBounceZLongStr, isSet := lookupCleanEnv("MIN_BOUNCE_ZSCORE_LONG"); isSet {
+		parsed, pErr := parseFloatEnv(minBounceZLongStr)
+		if pErr != nil || parsed <= 0 {
+			return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE_LONG '%s' (must be positive float)", minBounceZLongStr)
+		}
+		minBounceZLong = parsed
 	}
 
-	minBounceZShortStr := getEnv("MIN_BOUNCE_ZSCORE_SHORT", minBounceZStr)
-	minBounceZShort, err := parseFloatEnv(minBounceZShortStr)
-	if err != nil || minBounceZShort <= 0 {
-		minBounceZShort = minBounceZ
+	minBounceZShort := minBounceZ
+	if minBounceZShortStr, isSet := lookupCleanEnv("MIN_BOUNCE_ZSCORE_SHORT"); isSet {
+		parsed, pErr := parseFloatEnv(minBounceZShortStr)
+		if pErr != nil || parsed <= 0 {
+			return nil, fmt.Errorf("config: invalid MIN_BOUNCE_ZSCORE_SHORT '%s' (must be positive float)", minBounceZShortStr)
+		}
+		minBounceZShort = parsed
 	}
 
 	lookbackBarsStr := getEnv("LOOKBACK_IMPULSE_BARS", "18")
@@ -459,8 +596,8 @@ func LoadConfigFile(envPath string) (*Config, error) {
 
 	maxWatchedStr := getEnv("MAX_WATCHED_COINS", "20")
 	maxWatched, err := strconv.Atoi(maxWatchedStr)
-	if err != nil || maxWatched < 1 || maxWatched > 50 {
-		return nil, fmt.Errorf("config: invalid MAX_WATCHED_COINS '%s' (must be integer between 1 and 50)", maxWatchedStr)
+	if err != nil || maxWatched < 1 || maxWatched > 150 {
+		return nil, fmt.Errorf("config: invalid MAX_WATCHED_COINS '%s' (must be integer between 1 and 150)", maxWatchedStr)
 	}
 
 	minOIDeltaStr := getEnv("MIN_OI_DELTA_PCT", "0.00")
@@ -469,16 +606,27 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaStr)
 	}
 
-	minOIDeltaLongStr := getEnv("MIN_OI_DELTA_LONG_PCT", "0.00")
+	minOIDeltaLongStr, minOIDeltaLongSet := lookupCleanEnv("MIN_OI_DELTA_LONG_PCT")
+	if !minOIDeltaLongSet {
+		minOIDeltaLongStr = "0.00"
+	}
 	minOIDeltaLong, err := parseFloatEnv(minOIDeltaLongStr)
 	if err != nil || minOIDeltaLong < -5.0 || minOIDeltaLong > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_LONG_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaLongStr)
 	}
 
-	minOIDeltaShortStr := getEnv("MIN_OI_DELTA_SHORT_PCT", "-0.02")
+	minOIDeltaShortStr, minOIDeltaShortSet := lookupCleanEnv("MIN_OI_DELTA_SHORT_PCT")
+	if !minOIDeltaShortSet {
+		minOIDeltaShortStr = "-0.02"
+	}
 	minOIDeltaShort, err := parseFloatEnv(minOIDeltaShortStr)
 	if err != nil || minOIDeltaShort < -5.0 || minOIDeltaShort > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_OI_DELTA_SHORT_PCT '%s' (must be float between -5.0 and 10.0)", minOIDeltaShortStr)
+	}
+
+	disableOIFilter, err := parseBoolEnvStrict("DISABLE_OI_FILTER", getEnv("DISABLE_OI_FILTER", "false"))
+	if err != nil {
+		return nil, err
 	}
 
 	slMultStr := getEnv("SL_ATR_MULTIPLIER", "1.5")
@@ -659,8 +807,8 @@ func LoadConfigFile(envPath string) (*Config, error) {
 	}
 
 	httpPort := getEnv("HTTP_PORT", "2020")
-	dashPIN := strings.TrimSpace(getEnv("DASHBOARD_PIN", ""))
-	geminiKey := strings.TrimSpace(getEnv("GEMINI_API_KEY", ""))
+	dashPIN := getRawEnv("DASHBOARD_PIN", "")
+	geminiKey := getRawEnv("GEMINI_API_KEY", "")
 	geminiModel := strings.TrimSpace(getEnv("GEMINI_MODEL", "gemini-2.5-flash"))
 
 	geminiTimeoutStr := getEnv("GEMINI_TIMEOUT_SEC", "25")
@@ -774,7 +922,10 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MIN_IMPULSE_ATR_LONG '%s' (must be float between 0.0 and 10.0)", minImpulseATRLongStr)
 	}
 
-	minEMASlopeLongStr := getEnv("MIN_EMA_SLOPE_LONG", "0.0")
+	minEMASlopeLongStr, minEMASlopeLongSet := lookupCleanEnv("MIN_EMA_SLOPE_LONG")
+	if !minEMASlopeLongSet {
+		minEMASlopeLongStr = "0.0"
+	}
 	minEMASlopeLong, err := parseFloatEnv(minEMASlopeLongStr)
 	if err != nil || minEMASlopeLong < -1.0 || minEMASlopeLong > 10.0 {
 		return nil, fmt.Errorf("config: invalid MIN_EMA_SLOPE_LONG '%s' (must be float between -1.0 and 10.0)", minEMASlopeLongStr)
@@ -898,6 +1049,405 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid SWEEP_SCANNER_MAX_EXTRA_COINS '%s' (must be integer between 0 and 50)", sweepMaxExtraStr)
 	}
 
+	vwapStrategyEnabled, err := parseBoolEnvStrict("VWAP_STRATEGY_ENABLED", getEnv("VWAP_STRATEGY_ENABLED", "true"))
+	if err != nil {
+		return nil, err
+	}
+
+	relEnabled, err := parseBoolEnvStrict("REL_STRATEGY_ENABLED", getEnv("REL_STRATEGY_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	relMode := strings.ToUpper(strings.TrimSpace(getEnv("REL_MODE", "MEANREV")))
+	if relMode != "MEANREV" && relMode != "MOMENTUM" {
+		return nil, fmt.Errorf("config: invalid REL_MODE '%s' (must be MEANREV or MOMENTUM)", relMode)
+	}
+	relLookbackStr := getEnv("REL_LOOKBACK_BARS", "12")
+	relLookback, err := strconv.Atoi(relLookbackStr)
+	if err != nil || relLookback < 3 || relLookback > 72 {
+		return nil, fmt.Errorf("config: invalid REL_LOOKBACK_BARS '%s' (must be integer between 3 and 72)", relLookbackStr)
+	}
+	relMinZStr := getEnv("REL_MIN_Z", "1.80")
+	relMinZ, err := parseFloatEnv(relMinZStr)
+	if err != nil || relMinZ < 0.3 || relMinZ > 10.0 {
+		return nil, fmt.Errorf("config: invalid REL_MIN_Z '%s' (must be float between 0.3 and 10.0)", relMinZStr)
+	}
+	relStretchStr := getEnv("REL_MIN_VWAP_STRETCH_ATR", "1.20")
+	relStretch, err := parseFloatEnv(relStretchStr)
+	if err != nil || relStretch < 0.0 || relStretch > 10.0 {
+		return nil, fmt.Errorf("config: invalid REL_MIN_VWAP_STRETCH_ATR '%s' (must be float between 0.0 and 10.0)", relStretchStr)
+	}
+	relDeltaZStr := getEnv("REL_MIN_DELTA_Z", "0.20")
+	relDeltaZ, err := parseFloatEnv(relDeltaZStr)
+	if err != nil || relDeltaZ < -3.0 || relDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid REL_MIN_DELTA_Z '%s' (must be float between -3.0 and 5.0)", relDeltaZStr)
+	}
+	relBypassTier2, err := parseBoolEnvStrict("REL_BYPASS_BTC_TIER2", getEnv("REL_BYPASS_BTC_TIER2", "true"))
+	if err != nil {
+		return nil, err
+	}
+
+	boEnabled, err := parseBoolEnvStrict("BREAKOUT_STRATEGY_ENABLED", getEnv("BREAKOUT_STRATEGY_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	boLookbackStr := getEnv("BREAKOUT_LOOKBACK_BARS", "20")
+	boLookback, err := strconv.Atoi(boLookbackStr)
+	if err != nil || boLookback < 5 || boLookback > 100 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_LOOKBACK_BARS '%s' (must be integer between 5 and 100)", boLookbackStr)
+	}
+	boMaxCompStr := getEnv("BREAKOUT_MAX_COMPRESSION", "0.90")
+	boMaxComp, err := parseFloatEnv(boMaxCompStr)
+	if err != nil || boMaxComp < 0.30 || boMaxComp > 2.00 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MAX_COMPRESSION '%s' (must be float between 0.30 and 2.00)", boMaxCompStr)
+	}
+	boMinRVOLStr := getEnv("BREAKOUT_MIN_RVOL", "1.50")
+	boMinRVOL, err := parseFloatEnv(boMinRVOLStr)
+	if err != nil || boMinRVOL < 0.50 || boMinRVOL > 10.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MIN_RVOL '%s' (must be float between 0.50 and 10.0)", boMinRVOLStr)
+	}
+	boMinBodyStr := getEnv("BREAKOUT_MIN_BODY_RATIO", "0.50")
+	boMinBody, err := parseFloatEnv(boMinBodyStr)
+	if err != nil || boMinBody < 0.10 || boMinBody > 0.95 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MIN_BODY_RATIO '%s' (must be float between 0.10 and 0.95)", boMinBodyStr)
+	}
+	boMinDeltaZStr := getEnv("BREAKOUT_MIN_DELTA_Z", "0.75")
+	boMinDeltaZ, err := parseFloatEnv(boMinDeltaZStr)
+	if err != nil || boMinDeltaZ < 0.0 || boMinDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MIN_DELTA_Z '%s' (must be float between 0.0 and 5.0)", boMinDeltaZStr)
+	}
+	boAlignMacroTrend, err := parseBoolEnvStrict("BREAKOUT_ALIGN_MACRO_TREND", getEnv("BREAKOUT_ALIGN_MACRO_TREND", "false"))
+	if err != nil {
+		return nil, err
+	}
+	boMaxEMA200DistStr := getEnv("BREAKOUT_MAX_EMA200_DIST_ATR", "0.0")
+	boMaxEMA200Dist, err := parseFloatEnv(boMaxEMA200DistStr)
+	if err != nil || boMaxEMA200Dist < 0.0 || boMaxEMA200Dist > 20.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MAX_EMA200_DIST_ATR '%s' (must be float between 0.0 and 20.0)", boMaxEMA200DistStr)
+	}
+	boMaxVWAPDistStr := getEnv("BREAKOUT_MAX_VWAP_DIST_ATR", "0.0")
+	boMaxVWAPDist, err := parseFloatEnv(boMaxVWAPDistStr)
+	if err != nil || boMaxVWAPDist < 0.0 || boMaxVWAPDist > 20.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MAX_VWAP_DIST_ATR '%s' (must be float between 0.0 and 20.0)", boMaxVWAPDistStr)
+	}
+	boMaxNATRStr := getEnv("BREAKOUT_MAX_NATR_PCT", "0.0")
+	boMaxNATR, err := parseFloatEnv(boMaxNATRStr)
+	if err != nil || boMaxNATR < 0.0 || boMaxNATR > 20.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MAX_NATR_PCT '%s' (must be float between 0.0 and 20.0)", boMaxNATRStr)
+	}
+	boRiskMultStr := getEnv("BREAKOUT_RISK_MULT", "1.0")
+	boRiskMult, err := parseFloatEnv(boRiskMultStr)
+	if err != nil || boRiskMult < 0.05 || boRiskMult > 5.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_RISK_MULT '%s' (must be float between 0.05 and 5.0)", boRiskMultStr)
+	}
+	boEntryMarket, err := parseBoolEnvStrict("BREAKOUT_ENTRY_MARKET", getEnv("BREAKOUT_ENTRY_MARKET", "false"))
+	if err != nil {
+		return nil, err
+	}
+	boScannerEnabled, err := parseBoolEnvStrict("BREAKOUT_SCANNER_ENABLED", getEnv("BREAKOUT_SCANNER_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	boMinNATRStr := getEnv("BREAKOUT_MIN_NATR_PCT", "0.0")
+	boMinNATR, err := parseFloatEnv(boMinNATRStr)
+	if err != nil || boMinNATR < 0.0 || boMinNATR > 20.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MIN_NATR_PCT '%s' (must be float between 0.0 and 20.0)", boMinNATRStr)
+	}
+	boMinVolStr := getEnv("BREAKOUT_MIN_VOLUME_24H_USDT", "0.0")
+	boMinVol, err := parseFloatEnv(boMinVolStr)
+	if err != nil || boMinVol < 0.0 || boMinVol > 1e12 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MIN_VOLUME_24H_USDT '%s' (must be float >= 0)", boMinVolStr)
+	}
+	boMaxWatchedStr := getEnv("BREAKOUT_MAX_WATCHED_COINS", "0")
+	boMaxWatched, err := strconv.Atoi(boMaxWatchedStr)
+	if err != nil || boMaxWatched < 0 || boMaxWatched > 300 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MAX_WATCHED_COINS '%s' (must be integer between 0 and 300)", boMaxWatchedStr)
+	}
+	boExclTopStr := getEnv("BREAKOUT_EXCLUDE_TOP_VOL_RANK", "-1")
+	boExclTop, err := strconv.Atoi(boExclTopStr)
+	if err != nil || boExclTop < -1 || boExclTop > 100 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_EXCLUDE_TOP_VOL_RANK '%s' (must be integer between -1 and 100)", boExclTopStr)
+	}
+	boMaxScanVWAPStr := getEnv("BREAKOUT_MAX_SCANNER_VWAP_DIST_ATR", "0.0")
+	boMaxScanVWAP, err := parseFloatEnv(boMaxScanVWAPStr)
+	if err != nil || boMaxScanVWAP < 0.0 || boMaxScanVWAP > 50.0 {
+		return nil, fmt.Errorf("config: invalid BREAKOUT_MAX_SCANNER_VWAP_DIST_ATR '%s' (must be float between 0.0 and 50.0)", boMaxScanVWAPStr)
+	}
+
+	minBodyShortStr := getEnv("MIN_CANDLE_BODY_RATIO_SHORT", "0.0")
+	minBodyShort, err := parseFloatEnv(minBodyShortStr)
+	if err != nil || minBodyShort < 0.0 || minBodyShort > 1.0 {
+		return nil, fmt.Errorf("config: invalid MIN_CANDLE_BODY_RATIO_SHORT '%s' (must be float between 0.0 and 1.0)", minBodyShortStr)
+	}
+	maxAdvRetestShortStr := getEnv("MAX_ADVERSE_RETEST_ATR_SHORT", "0.0")
+	maxAdvRetestShort, err := parseFloatEnv(maxAdvRetestShortStr)
+	if err != nil || maxAdvRetestShort < 0.0 || maxAdvRetestShort > 5.0 {
+		return nil, fmt.Errorf("config: invalid MAX_ADVERSE_RETEST_ATR_SHORT '%s' (must be float between 0.0 and 5.0)", maxAdvRetestShortStr)
+	}
+	maxEMASlopeShortStr := getEnv("MAX_EMA_SLOPE_SHORT", "0.0")
+	maxEMASlopeShort, err := parseFloatEnv(maxEMASlopeShortStr)
+	if err != nil || maxEMASlopeShort < 0.0 || maxEMASlopeShort > 5.0 {
+		return nil, fmt.Errorf("config: invalid MAX_EMA_SLOPE_SHORT '%s' (must be float between 0.0 and 5.0)", maxEMASlopeShortStr)
+	}
+
+	macroEnabled, err := parseBoolEnvStrict("MACRO_REGIME_ROUTER_ENABLED", getEnv("MACRO_REGIME_ROUTER_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	macroERStr := getEnv("MACRO_TREND_ER_THRESHOLD", "0.30")
+	macroER, err := parseFloatEnv(macroERStr)
+	if err != nil || macroER < 0.05 || macroER > 0.95 {
+		return nil, fmt.Errorf("config: invalid MACRO_TREND_ER_THRESHOLD '%s' (must be float between 0.05 and 0.95)", macroERStr)
+	}
+	macroVolRatioStr := getEnv("MACRO_VOL_SHOCK_RATIO", "1.50")
+	macroVolRatio, err := parseFloatEnv(macroVolRatioStr)
+	if err != nil || macroVolRatio < 1.05 || macroVolRatio > 5.00 {
+		return nil, fmt.Errorf("config: invalid MACRO_VOL_SHOCK_RATIO '%s' (must be float between 1.05 and 5.00)", macroVolRatioStr)
+	}
+	macroVWAPRange, err := parseBoolEnvStrict("MACRO_VWAP_ONLY_IN_RANGE", getEnv("MACRO_VWAP_ONLY_IN_RANGE", "false"))
+	if err != nil {
+		return nil, err
+	}
+	macroBOTrend, err := parseBoolEnvStrict("MACRO_BREAKOUT_ONLY_IN_TREND", getEnv("MACRO_BREAKOUT_ONLY_IN_TREND", "false"))
+	if err != nil {
+		return nil, err
+	}
+	macroRelRange, err := parseBoolEnvStrict("MACRO_REL_ONLY_IN_RANGE", getEnv("MACRO_REL_ONLY_IN_RANGE", "false"))
+	if err != nil {
+		return nil, err
+	}
+
+	maxAdvFundStr := getEnv("MAX_ADVERSE_FUNDING_RATE", "0.0005")
+	maxAdvFund, err := parseFloatEnv(maxAdvFundStr)
+	if err != nil || maxAdvFund < 0.0 || maxAdvFund > 0.05 {
+		return nil, fmt.Errorf("config: invalid MAX_ADVERSE_FUNDING_RATE '%s' (must be float between 0.0 and 0.05)", maxAdvFundStr)
+	}
+	minShortFundStr := getEnv("MIN_SHORT_FUNDING_RATE", "-1.0")
+	minShortFund, err := parseFloatEnv(minShortFundStr)
+	if err != nil || minShortFund < -1.0 || minShortFund > 0.05 {
+		return nil, fmt.Errorf("config: invalid MIN_SHORT_FUNDING_RATE '%s' (must be float between -1.0 and 0.05)", minShortFundStr)
+	}
+	maxLongFundStr := getEnv("MAX_LONG_FUNDING_RATE", "1.0")
+	maxLongFund, err := parseFloatEnv(maxLongFundStr)
+	if err != nil || maxLongFund < -0.05 || maxLongFund > 1.0 {
+		return nil, fmt.Errorf("config: invalid MAX_LONG_FUNDING_RATE '%s' (must be float between -0.05 and 1.0)", maxLongFundStr)
+	}
+	rollingVWAPStr := getEnv("ROLLING_VWAP_BARS", "0")
+	rollingVWAPBars, err := strconv.Atoi(rollingVWAPStr)
+	if err != nil || rollingVWAPBars < 0 || rollingVWAPBars > 1000 {
+		return nil, fmt.Errorf("config: invalid ROLLING_VWAP_BARS '%s' (must be integer between 0 and 1000)", rollingVWAPStr)
+	}
+	maxEntriesBarStr := getEnv("MAX_NEW_ENTRIES_PER_BAR", "0")
+	maxEntriesBar, err := strconv.Atoi(maxEntriesBarStr)
+	if err != nil || maxEntriesBar < 0 || maxEntriesBar > 50 {
+		return nil, fmt.Errorf("config: invalid MAX_NEW_ENTRIES_PER_BAR '%s' (must be integer between 0 and 50)", maxEntriesBarStr)
+	}
+	clusterSLCntStr := getEnv("PORTFOLIO_CLUSTER_SL_COUNT", "0")
+	clusterSLCnt, err := strconv.Atoi(clusterSLCntStr)
+	if err != nil || clusterSLCnt < 0 || clusterSLCnt > 20 {
+		return nil, fmt.Errorf("config: invalid PORTFOLIO_CLUSTER_SL_COUNT '%s' (must be integer between 0 and 20)", clusterSLCntStr)
+	}
+	clusterCoolStr := getEnv("PORTFOLIO_CLUSTER_COOLDOWN_MINUTES", "0")
+	clusterCool, err := strconv.Atoi(clusterCoolStr)
+	if err != nil || clusterCool < 0 || clusterCool > 1440 {
+		return nil, fmt.Errorf("config: invalid PORTFOLIO_CLUSTER_COOLDOWN_MINUTES '%s' (must be integer between 0 and 1440)", clusterCoolStr)
+	}
+	exclTopVolStr := getEnv("SCANNER_EXCLUDE_TOP_VOL_RANK", "0")
+	exclTopVol, err := strconv.Atoi(exclTopVolStr)
+	if err != nil || exclTopVol < 0 || exclTopVol > 100 {
+		return nil, fmt.Errorf("config: invalid SCANNER_EXCLUDE_TOP_VOL_RANK '%s' (must be integer between 0 and 100)", exclTopVolStr)
+	}
+	htfEMAStr := getEnv("HTF_EMA_PERIOD", "0")
+	htfEMA, err := strconv.Atoi(htfEMAStr)
+	if err != nil || htfEMA < 0 || htfEMA > 500 {
+		return nil, fmt.Errorf("config: invalid HTF_EMA_PERIOD '%s' (must be integer between 0 and 500)", htfEMAStr)
+	}
+	breadthThreshStr := getEnv("MARKET_BREADTH_LOW_THRESHOLD", "0.0")
+	breadthThresh, err := parseFloatEnv(breadthThreshStr)
+	if err != nil || breadthThresh < 0.0 || breadthThresh > 0.95 {
+		return nil, fmt.Errorf("config: invalid MARKET_BREADTH_LOW_THRESHOLD '%s' (must be float between 0.0 and 0.95)", breadthThreshStr)
+	}
+	breadthMultStr := getEnv("MARKET_BREADTH_LOW_RISK_MULT", "1.0")
+	breadthMult, err := parseFloatEnv(breadthMultStr)
+	if err != nil || breadthMult < 0.0 || breadthMult > 1.0 {
+		return nil, fmt.Errorf("config: invalid MARKET_BREADTH_LOW_RISK_MULT '%s' (must be float between 0.0 and 1.0)", breadthMultStr)
+	}
+	var staleLossDur time.Duration
+	if staleLossStr := strings.TrimSpace(getEnv("STALE_LOSS_EXIT_DURATION", "")); staleLossStr != "" && staleLossStr != "0" {
+		d, dErr := time.ParseDuration(staleLossStr)
+		if dErr != nil || (d != 0 && d < 15*time.Minute) {
+			return nil, fmt.Errorf("config: invalid STALE_LOSS_EXIT_DURATION '%s' (must be duration >= 15m or empty/0)", staleLossStr)
+		}
+		staleLossDur = d
+	}
+	macroRangeMultStr := getEnv("MACRO_RANGE_RISK_MULT", "1.0")
+	macroRangeMult, err := parseFloatEnv(macroRangeMultStr)
+	if err != nil || macroRangeMult < 0.05 || macroRangeMult > 1.0 {
+		return nil, fmt.Errorf("config: invalid MACRO_RANGE_RISK_MULT '%s' (must be float between 0.05 and 1.0)", macroRangeMultStr)
+	}
+	boPriorityFirst, err := parseBoolEnvStrict("BREAKOUT_PRIORITY_FIRST", getEnv("BREAKOUT_PRIORITY_FIRST", "false"))
+	if err != nil {
+		return nil, err
+	}
+	htfMaxSlopeStr := getEnv("HTF_EMA_MAX_RISING_SLOPE_PCT", "0.0")
+	htfMaxSlope, err := parseFloatEnv(htfMaxSlopeStr)
+	if err != nil || htfMaxSlope < 0.0 || htfMaxSlope > 10.0 {
+		return nil, fmt.Errorf("config: invalid HTF_EMA_MAX_RISING_SLOPE_PCT '%s' (must be float between 0.0 and 10.0)", htfMaxSlopeStr)
+	}
+	ddThrottleThreshStr := getEnv("DD_THROTTLE_THRESHOLD_PCT", "0.0")
+	ddThrottleThresh, err := parseFloatEnv(ddThrottleThreshStr)
+	if err != nil || ddThrottleThresh < 0.0 || ddThrottleThresh > 0.80 {
+		return nil, fmt.Errorf("config: invalid DD_THROTTLE_THRESHOLD_PCT '%s' (must be float between 0.0 and 0.80)", ddThrottleThreshStr)
+	}
+	ddThrottleMultStr := getEnv("DD_THROTTLE_RISK_MULT", "1.0")
+	ddThrottleMult, err := parseFloatEnv(ddThrottleMultStr)
+	if err != nil || ddThrottleMult < 0.10 || ddThrottleMult > 1.0 {
+		return nil, fmt.Errorf("config: invalid DD_THROTTLE_RISK_MULT '%s' (must be float between 0.10 and 1.0)", ddThrottleMultStr)
+	}
+	resetPeakOnBoot, err := parseBoolEnvStrict("RESET_PEAK_EQUITY_ON_BOOT", getEnv("RESET_PEAK_EQUITY_ON_BOOT", "false"))
+	if err != nil {
+		return nil, err
+	}
+	macroVolExpRatio, err := parseFloatEnv(getEnv("MACRO_VOL_EXPANSION_RATIO", "0.0"))
+	if err != nil || macroVolExpRatio < 0.0 || macroVolExpRatio > 5.0 {
+		return nil, fmt.Errorf("config: invalid MACRO_VOL_EXPANSION_RATIO")
+	}
+	macroVolExpMult, err := parseFloatEnv(getEnv("MACRO_VOL_EXPANSION_RISK_MULT", "1.0"))
+	if err != nil || macroVolExpMult < 0.1 || macroVolExpMult > 3.0 {
+		return nil, fmt.Errorf("config: invalid MACRO_VOL_EXPANSION_RISK_MULT")
+	}
+	rs4hWeakThresh, err := parseFloatEnv(getEnv("RS4H_WEAK_THRESHOLD_PCT", "0.0"))
+	if err != nil || rs4hWeakThresh < -50.0 || rs4hWeakThresh > 0.0 {
+		return nil, fmt.Errorf("config: invalid RS4H_WEAK_THRESHOLD_PCT")
+	}
+	rs4hWeakMult, err := parseFloatEnv(getEnv("RS4H_WEAK_RISK_MULT", "1.0"))
+	if err != nil || rs4hWeakMult < 0.1 || rs4hWeakMult > 3.0 {
+		return nil, fmt.Errorf("config: invalid RS4H_WEAK_RISK_MULT")
+	}
+	rs4hStrongThresh, err := parseFloatEnv(getEnv("RS4H_STRONG_THRESHOLD_PCT", "0.0"))
+	if err != nil || rs4hStrongThresh < 0.0 || rs4hStrongThresh > 50.0 {
+		return nil, fmt.Errorf("config: invalid RS4H_STRONG_THRESHOLD_PCT")
+	}
+	rs4hStrongMult, err := parseFloatEnv(getEnv("RS4H_STRONG_RISK_MULT", "1.0"))
+	if err != nil || rs4hStrongMult < 0.0 || rs4hStrongMult > 3.0 {
+		return nil, fmt.Errorf("config: invalid RS4H_STRONG_RISK_MULT")
+	}
+	ddTier2Thresh, err := parseFloatEnv(getEnv("DD_THROTTLE_TIER2_THRESHOLD_PCT", "0.0"))
+	if err != nil || ddTier2Thresh < 0.0 || ddTier2Thresh > 0.90 {
+		return nil, fmt.Errorf("config: invalid DD_THROTTLE_TIER2_THRESHOLD_PCT")
+	}
+	ddTier2Mult, err := parseFloatEnv(getEnv("DD_THROTTLE_TIER2_RISK_MULT", "1.0"))
+	if err != nil || ddTier2Mult < 0.1 || ddTier2Mult > 1.0 {
+		return nil, fmt.Errorf("config: invalid DD_THROTTLE_TIER2_RISK_MULT")
+	}
+	maxEffRiskPct, err := parseFloatEnv(getEnv("MAX_EFFECTIVE_RISK_PER_TRADE_PCT", "0.0"))
+	if err != nil || maxEffRiskPct < 0.0 || maxEffRiskPct > 0.20 {
+		return nil, fmt.Errorf("config: invalid MAX_EFFECTIVE_RISK_PER_TRADE_PCT")
+	}
+
+	emaPullEnabled, err := parseBoolEnvStrict("EMA_PULLBACK_ENABLED", getEnv("EMA_PULLBACK_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	emaPullFast, err := strconv.Atoi(getEnv("EMA_PULLBACK_FAST", "20"))
+	if err != nil || emaPullFast < 5 || emaPullFast > 100 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_FAST")
+	}
+	emaPullSlow, err := strconv.Atoi(getEnv("EMA_PULLBACK_SLOW", "50"))
+	if err != nil || emaPullSlow <= emaPullFast || emaPullSlow > 200 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_SLOW")
+	}
+	emaPullRetest, err := strconv.Atoi(getEnv("EMA_PULLBACK_RETEST_BARS", "3"))
+	if err != nil || emaPullRetest < 1 || emaPullRetest > 15 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_RETEST_BARS")
+	}
+	emaPullTouchATR, err := parseFloatEnv(getEnv("EMA_PULLBACK_TOUCH_ATR", "0.30"))
+	if err != nil || emaPullTouchATR < 0.0 || emaPullTouchATR > 3.0 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_TOUCH_ATR")
+	}
+	emaPullMinBody, err := parseFloatEnv(getEnv("EMA_PULLBACK_MIN_BODY", "0.35"))
+	if err != nil || emaPullMinBody < 0.0 || emaPullMinBody > 1.0 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_MIN_BODY")
+	}
+	emaPullMinDeltaZ, err := parseFloatEnv(getEnv("EMA_PULLBACK_MIN_DELTA_Z", "0.65"))
+	if err != nil || emaPullMinDeltaZ < 0.0 || emaPullMinDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_MIN_DELTA_Z")
+	}
+	emaPullMaxEMA200, err := parseFloatEnv(getEnv("EMA_PULLBACK_MAX_EMA200_ATR", "5.0"))
+	if err != nil || emaPullMaxEMA200 < 0.5 || emaPullMaxEMA200 > 20.0 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_MAX_EMA200_ATR")
+	}
+	emaPullRiskMult, err := parseFloatEnv(getEnv("EMA_PULLBACK_RISK_MULT", "1.0"))
+	if err != nil || emaPullRiskMult < 0.05 || emaPullRiskMult > 5.0 {
+		return nil, fmt.Errorf("config: invalid EMA_PULLBACK_RISK_MULT")
+	}
+
+	vwapBrkEnabled, err := parseBoolEnvStrict("VWAP_BREAKDOWN_ENABLED", getEnv("VWAP_BREAKDOWN_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	vwapBrkLookback, err := strconv.Atoi(getEnv("VWAP_BREAKDOWN_LOOKBACK", "6"))
+	if err != nil || vwapBrkLookback < 2 || vwapBrkLookback > 30 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_LOOKBACK")
+	}
+	vwapBrkMinAbove, err := strconv.Atoi(getEnv("VWAP_BREAKDOWN_MIN_ABOVE", "2"))
+	if err != nil || vwapBrkMinAbove < 1 || vwapBrkMinAbove > 20 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_MIN_ABOVE")
+	}
+	vwapBrkMinRVOL, err := parseFloatEnv(getEnv("VWAP_BREAKDOWN_MIN_RVOL", "1.15"))
+	if err != nil || vwapBrkMinRVOL < 0.1 || vwapBrkMinRVOL > 10.0 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_MIN_RVOL")
+	}
+	vwapBrkMinBody, err := parseFloatEnv(getEnv("VWAP_BREAKDOWN_MIN_BODY", "0.45"))
+	if err != nil || vwapBrkMinBody < 0.0 || vwapBrkMinBody > 1.0 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_MIN_BODY")
+	}
+	vwapBrkMinDeltaZ, err := parseFloatEnv(getEnv("VWAP_BREAKDOWN_MIN_DELTA_Z", "0.65"))
+	if err != nil || vwapBrkMinDeltaZ < 0.0 || vwapBrkMinDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_MIN_DELTA_Z")
+	}
+	vwapBrkMaxBelow, err := parseFloatEnv(getEnv("VWAP_BREAKDOWN_MAX_BELOW_ATR", "1.50"))
+	if err != nil || vwapBrkMaxBelow < 0.1 || vwapBrkMaxBelow > 10.0 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_MAX_BELOW_ATR")
+	}
+	vwapBrkRiskMult, err := parseFloatEnv(getEnv("VWAP_BREAKDOWN_RISK_MULT", "1.0"))
+	if err != nil || vwapBrkRiskMult < 0.05 || vwapBrkRiskMult > 5.0 {
+		return nil, fmt.Errorf("config: invalid VWAP_BREAKDOWN_RISK_MULT")
+	}
+
+	structBrkEnabled, err := parseBoolEnvStrict("STRUCTURE_BREAK_ENABLED", getEnv("STRUCTURE_BREAK_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	structBrkLookback, err := strconv.Atoi(getEnv("STRUCTURE_BREAK_LOOKBACK", "20"))
+	if err != nil || structBrkLookback < 6 || structBrkLookback > 60 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_LOOKBACK")
+	}
+	structBrkMinBounce, err := parseFloatEnv(getEnv("STRUCTURE_BREAK_MIN_BOUNCE_ATR", "0.80"))
+	if err != nil || structBrkMinBounce < 0.1 || structBrkMinBounce > 10.0 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_MIN_BOUNCE_ATR")
+	}
+	structBrkMinRVOL, err := parseFloatEnv(getEnv("STRUCTURE_BREAK_MIN_RVOL", "1.15"))
+	if err != nil || structBrkMinRVOL < 0.1 || structBrkMinRVOL > 10.0 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_MIN_RVOL")
+	}
+	structBrkMinBody, err := parseFloatEnv(getEnv("STRUCTURE_BREAK_MIN_BODY", "0.45"))
+	if err != nil || structBrkMinBody < 0.0 || structBrkMinBody > 1.0 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_MIN_BODY")
+	}
+	structBrkMinDeltaZ, err := parseFloatEnv(getEnv("STRUCTURE_BREAK_MIN_DELTA_Z", "0.60"))
+	if err != nil || structBrkMinDeltaZ < 0.0 || structBrkMinDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_MIN_DELTA_Z")
+	}
+	structBrkMaxEMA200, err := parseFloatEnv(getEnv("STRUCTURE_BREAK_MAX_EMA200_ATR", "4.50"))
+	if err != nil || structBrkMaxEMA200 < 0.5 || structBrkMaxEMA200 > 20.0 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_MAX_EMA200_ATR")
+	}
+	structBrkRiskMult, err := parseFloatEnv(getEnv("STRUCTURE_BREAK_RISK_MULT", "1.0"))
+	if err != nil || structBrkRiskMult < 0.05 || structBrkRiskMult > 5.0 {
+		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_RISK_MULT")
+	}
+
 	return &Config{
 		Env:                      env,
 		APIKey:                   apiKey,
@@ -945,7 +1495,10 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MaxEntryDistanceATR:      maxEntryDist,
 		MinOIDeltaPct:            minOIDelta,
 		MinOIDeltaLongPct:        minOIDeltaLong,
+		MinOIDeltaLongSet:        minOIDeltaLongSet,
 		MinOIDeltaShortPct:       minOIDeltaShort,
+		MinOIDeltaShortSet:       minOIDeltaShortSet,
+		DisableOIFilter:          disableOIFilter,
 		SLATRMultiplier:          slMult,
 		TPATRMultiplier:          tpMult,
 		BreakEvenTriggerATR:      beTrigger,
@@ -975,14 +1528,21 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		MinSignalRVOL:            minSignalRVOL,
 		CooldownAfterExitMinutes: cooldownMins,
 		CooldownLossMinutes:      cooldownLossMins,
+		CooldownLossSet:          true,
 		CooldownProfitMinutes:    cooldownProfitMins,
+		CooldownProfitSet:        true,
 		VWAPSessionWarmupMinutes: vwapWarmupMins,
+		VWAPSessionWarmupSet:     true,
 		BlockedUTCHours:          blockedHours,
 
 		MinCandleBodyRatioLong:   minCandleBodyRatioLong,
+		MinCandleBodyRatioShort:  minBodyShort,
+		MaxAdverseRetestATRShort: maxAdvRetestShort,
+		MaxEMASlopeShort:         maxEMASlopeShort,
 		MaxPullbackRVOLLong:      maxPullbackRVOLLong,
 		MinImpulseATRLong:        minImpulseATRLong,
 		MinEMASlopeLong:          minEMASlopeLong,
+		MinEMASlopeLongSet:       minEMASlopeLongSet,
 		RequireCleanPullbackLong: requireCleanPullbackLong,
 		PartialTP1ATRMultLong:      partialTP1ATRMultLong,
 		SLATRMultiplierLong:        slMultLong,
@@ -1029,18 +1589,142 @@ func LoadConfigFile(envPath string) (*Config, error) {
 			ScannerAllowExtendedVWAP: sweepAllowExtVWAP,
 			ScannerMaxExtraCoins:     sweepMaxExtra,
 		},
+		VWAPStrategyEnabled: vwapStrategyEnabled,
+		RelResidual: RelResidualStrategyConfig{
+			Enabled:           relEnabled,
+			Mode:              relMode,
+			LookbackBars:      relLookback,
+			MinRelZ:           relMinZ,
+			MinVWAPStretchATR: relStretch,
+			MinDeltaZ:         relDeltaZ,
+			BypassBTCTier2:    relBypassTier2,
+		},
+		VolBreakout: VolBreakoutStrategyConfig{
+			Enabled:               boEnabled,
+			LookbackBars:          boLookback,
+			MaxCompressionRatio:   boMaxComp,
+			MinRVOL:               boMinRVOL,
+			MinBodyRatio:          boMinBody,
+			MinDeltaZ:             boMinDeltaZ,
+			AlignMacroTrend:       boAlignMacroTrend,
+			MaxEMA200DistATR:      boMaxEMA200Dist,
+			MaxVWAPDistATR:        boMaxVWAPDist,
+			MaxNATRPct:            boMaxNATR,
+			RiskMult:              boRiskMult,
+			EntryMarket:           boEntryMarket,
+			ScannerEnabled:        boScannerEnabled,
+			MinNATRPct:            boMinNATR,
+			MinVolume24hUSDT:      boMinVol,
+			MaxWatchedCoins:       boMaxWatched,
+			ExcludeTopVolRank:     boExclTop,
+			MaxScannerVWAPDistATR: boMaxScanVWAP,
+		},
+		MacroRouter: MacroRegimeRouterConfig{
+			Enabled:             macroEnabled,
+			TrendERThreshold:    macroER,
+			VolShockRatio:       macroVolRatio,
+			VWAPOnlyInRange:     macroVWAPRange,
+			BreakoutOnlyInTrend: macroBOTrend,
+			RelOnlyInRange:      macroRelRange,
+		},
+		MaxAdverseFundingRate:        maxAdvFund,
+		MinShortFundingRate:          minShortFund,
+		MaxLongFundingRate:           maxLongFund,
+		RollingVWAPBars:              rollingVWAPBars,
+		MaxNewEntriesPerBar:          maxEntriesBar,
+		PortfolioClusterSLCount:      clusterSLCnt,
+		PortfolioClusterCooldownMins: clusterCool,
+		ScannerExcludeTopVolRank:     exclTopVol,
+		HTFEMAPeriod:                 htfEMA,
+		MarketBreadthLowThreshold:    breadthThresh,
+		MarketBreadthLowRiskMult:     breadthMult,
+		StaleLossExitDuration:        staleLossDur,
+		MacroRangeRiskMult:           macroRangeMult,
+		BreakoutPriorityFirst:        boPriorityFirst,
+		HTFEMAMaxRisingSlopePct:      htfMaxSlope,
+		DDThrottleThresholdPct:       ddThrottleThresh,
+		DDThrottleRiskMult:           ddThrottleMult,
+		ResetPeakEquityOnBoot:        resetPeakOnBoot,
+		MacroVolExpansionRatio:       macroVolExpRatio,
+		MacroVolExpansionRiskMult:    macroVolExpMult,
+		RS4hWeakThresholdPct:         rs4hWeakThresh,
+		RS4hWeakRiskMult:             rs4hWeakMult,
+		RS4hStrongThresholdPct:       rs4hStrongThresh,
+		RS4hStrongRiskMult:           rs4hStrongMult,
+		DDThrottleTier2ThresholdPct:  ddTier2Thresh,
+		DDThrottleTier2RiskMult:      ddTier2Mult,
+		MaxEffectiveRiskPerTradePct:  maxEffRiskPct,
+		EMAPullback: EMAPullbackStrategyConfig{
+			Enabled:          emaPullEnabled,
+			FastPeriod:       emaPullFast,
+			SlowPeriod:       emaPullSlow,
+			RetestLookback:   emaPullRetest,
+			TouchTolATR:      emaPullTouchATR,
+			TouchTolSet:      true,
+			MinBodyRatio:     emaPullMinBody,
+			MinBodySet:       true,
+			MinDeltaZ:        emaPullMinDeltaZ,
+			MaxEMA200DistATR: emaPullMaxEMA200,
+			RiskMult:         emaPullRiskMult,
+		},
+		VWAPBreakdown: VWAPBreakdownStrategyConfig{
+			Enabled:         vwapBrkEnabled,
+			LookbackBars:    vwapBrkLookback,
+			MinAboveBars:    vwapBrkMinAbove,
+			MinRVOL:         vwapBrkMinRVOL,
+			MinBodyRatio:    vwapBrkMinBody,
+			MinBodySet:      true,
+			MinDeltaZ:       vwapBrkMinDeltaZ,
+			MaxBelowVWAPATR: vwapBrkMaxBelow,
+			RiskMult:        vwapBrkRiskMult,
+		},
+		StructureBreak: StructureBreakStrategyConfig{
+			Enabled:          structBrkEnabled,
+			LookbackBars:     structBrkLookback,
+			MinBounceATR:     structBrkMinBounce,
+			MinRVOL:          structBrkMinRVOL,
+			MinBodyRatio:     structBrkMinBody,
+			MinBodySet:       true,
+			MinDeltaZ:        structBrkMinDeltaZ,
+			MaxEMA200DistATR: structBrkMaxEMA200,
+			RiskMult:         structBrkRiskMult,
+		},
 	}, nil
 }
 
-func getEnv(key, defaultVal string) string {
+func getRawEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		val = strings.TrimSpace(val)
-		if idx := strings.Index(val, "#"); idx != -1 {
-			val = strings.TrimSpace(val[:idx])
-		}
 		if val != "" {
 			return val
 		}
+	}
+	return defaultVal
+}
+
+func cleanEnvValue(val string) string {
+	val = strings.TrimSpace(val)
+	if idx := strings.Index(val, "#"); idx != -1 {
+		val = strings.TrimSpace(val[:idx])
+	}
+	return val
+}
+
+func lookupCleanEnv(key string) (string, bool) {
+	raw, exists := os.LookupEnv(key)
+	if !exists {
+		return "", false
+	}
+	clean := cleanEnvValue(raw)
+	if clean == "" {
+		return "", false
+	}
+	return clean, true
+}
+
+func getEnv(key, defaultVal string) string {
+	if val, ok := lookupCleanEnv(key); ok {
+		return val
 	}
 	return defaultVal
 }

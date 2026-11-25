@@ -361,6 +361,58 @@ func ImportLegacyCSVCache(
 						}
 					}
 				}
+			case "metrics":
+				monthlyBuckets := make(map[string][]OpenInterestPoint)
+				daysByMonth := make(map[string]map[string]struct{})
+				for _, f := range files {
+					if f.IsDir() || !strings.HasSuffix(f.Name(), ".csv") {
+						continue
+					}
+					ym, ok := extractYearMonthFromFilename(f.Name())
+					if !ok || isCurrentOrFutureMonth(ym, referenceNow) {
+						stats.SkippedPartial++
+						continue
+					}
+					raw, err := os.ReadFile(filepath.Join(kindDir, f.Name()))
+					if err != nil || len(raw) == 0 {
+						continue
+					}
+					pts, err := ParseBinanceMetricsCSV(bytes.NewReader(raw), sym)
+					if err != nil || len(pts) == 0 {
+						continue
+					}
+					if daysByMonth[ym] == nil {
+						daysByMonth[ym] = make(map[string]struct{})
+					}
+					for _, pt := range pts {
+						daysByMonth[ym][pt.Timestamp.UTC().Format("2006-01-02")] = struct{}{}
+					}
+					monthlyBuckets[ym] = append(monthlyBuckets[ym], pts...)
+				}
+				for ym, pts := range monthlyBuckets {
+					mStart, pErr := time.Parse("2006-01", ym)
+					if pErr != nil {
+						continue
+					}
+					expectedDays := time.Date(mStart.Year(), mStart.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+					if len(daysByMonth[ym]) < expectedDays {
+						stats.SkippedPartial++
+						continue
+					}
+					deduped := sortAndDedupeOIPoints(pts)
+					if len(deduped) == 0 {
+						continue
+					}
+					binPath := filepath.Join(dirs.StoreDir, sym, "oi", ym+".bin")
+					if err := WriteCompactOIBin(binPath, deduped); err == nil {
+						stats.OIFiles++
+						if sqliteStore != nil {
+							startMs := deduped[0].Timestamp.UnixMilli()
+							endMs := deduped[len(deduped)-1].Timestamp.UnixMilli()
+							_ = sqliteStore.UpsertCacheManifest(ctx, fmt.Sprintf("oi:%s:%s", sym, ym), len(deduped), startMs, endMs, false)
+						}
+					}
+				}
 			default:
 				dur, tfErr := parseIntervalDurationStrict(kind)
 				if tfErr != nil {
@@ -410,6 +462,23 @@ func ImportLegacyCSVCache(
 	}
 
 	return stats, nil
+}
+
+func sortAndDedupeOIPoints(pts []OpenInterestPoint) []OpenInterestPoint {
+	sort.Slice(pts, func(i, j int) bool {
+		return pts[i].Timestamp.Before(pts[j].Timestamp)
+	})
+	out := make([]OpenInterestPoint, 0, len(pts))
+	var lastMs int64 = -1
+	for _, pt := range pts {
+		ms := pt.Timestamp.UnixMilli()
+		if ms == lastMs {
+			continue
+		}
+		lastMs = ms
+		out = append(out, pt)
+	}
+	return out
 }
 
 func sortAndDedupeBars(bars []HistoricalCandle) []HistoricalCandle {

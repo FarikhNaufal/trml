@@ -2,6 +2,7 @@ package simbroker
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -12,13 +13,38 @@ import (
 	"trml/internal/model"
 )
 
+func isFinitePos(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0
+}
+
+func normalizeCloseTime(t time.Time) time.Time {
+	if !t.IsZero() && t.UnixMilli()%1000 == 999 {
+		return t.Add(time.Millisecond)
+	}
+	return t
+}
+
+func isMoreProtectiveSL(side model.Side, currentSL, candidateSL decimal.Decimal) bool {
+	if candidateSL.LessThanOrEqual(decimal.Zero) {
+		return false
+	}
+	if currentSL.LessThanOrEqual(decimal.Zero) {
+		return true
+	}
+	if side == model.SideLong {
+		return candidateSL.GreaterThan(currentSL)
+	}
+	return candidateSL.LessThan(currentSL)
+}
+
 type SimBroker struct {
 	Mu                    sync.Mutex
 	Cfg                   SimBrokerConfig
-	SessionDayEpochUTC    int64
-	SessionStartEquity    decimal.Decimal
-	RealizedEquityUSDT    decimal.Decimal
-	CircuitBreakerTripped bool
+	SessionDayEpochUTC      int64
+	SessionStartEquity      decimal.Decimal
+	RealizedEquityUSDT      decimal.Decimal
+	PeakEffectiveEquityUSDT decimal.Decimal
+	CircuitBreakerTripped   bool
 	CurrentSimTime        time.Time
 
 	PendingOrders   map[string]*SimPendingOrder // symbol -> pending
@@ -39,13 +65,13 @@ func NewSimBroker(cfg SimBrokerConfig) *SimBroker {
 	if cfg.MaxDailyDrawdownPct >= 0 {
 		cfg.MaxDailyDrawdownPct = -0.05 // default -5%
 	}
-	if cfg.MakerFeeRate.IsZero() {
+	if !cfg.MakerFeeSet && cfg.MakerFeeRate.IsZero() {
 		cfg.MakerFeeRate = decimal.NewFromFloat(0.0002) // 2.0 bps
 	}
-	if cfg.TakerFeeRate.IsZero() {
+	if !cfg.TakerFeeSet && cfg.TakerFeeRate.IsZero() {
 		cfg.TakerFeeRate = decimal.NewFromFloat(0.0005) // 5.0 bps
 	}
-	if cfg.SlippageRate.IsZero() {
+	if !cfg.SlippageSet && cfg.SlippageRate.IsZero() {
 		cfg.SlippageRate = decimal.NewFromFloat(0.0005) // 5.0 bps
 	}
 	if cfg.SignalDelayBars <= 0 {
@@ -54,8 +80,14 @@ func NewSimBroker(cfg SimBrokerConfig) *SimBroker {
 	if cfg.LimitTimeoutBars <= 0 {
 		cfg.LimitTimeoutBars = 1
 	}
-	if cfg.PenetrationTicks <= 0 {
+	if !cfg.PenetrationTicksSet && cfg.PenetrationTicks <= 0 {
 		cfg.PenetrationTicks = 1
+	}
+	if cfg.PenetrationTicks < 0 {
+		cfg.PenetrationTicks = 0
+	}
+	if cfg.CandleDuration <= 0 {
+		cfg.CandleDuration = 5 * time.Minute
 	}
 	if cfg.MaxHoldingDuration <= 0 {
 		cfg.MaxHoldingDuration = 4 * time.Hour
@@ -65,10 +97,11 @@ func NewSimBroker(cfg SimBrokerConfig) *SimBroker {
 	}
 
 	return &SimBroker{
-		Cfg:                cfg,
-		SessionStartEquity: cfg.InitialEquityUSDT,
-		RealizedEquityUSDT: cfg.InitialEquityUSDT,
-		PendingOrders:      make(map[string]*SimPendingOrder),
+		Cfg:                     cfg,
+		SessionStartEquity:      cfg.InitialEquityUSDT,
+		RealizedEquityUSDT:      cfg.InitialEquityUSDT,
+		PeakEffectiveEquityUSDT: cfg.InitialEquityUSDT,
+		PendingOrders:           make(map[string]*SimPendingOrder),
 		OpenPositions:      make(map[string]*SimPosition),
 		ClosedTrades:       make([]SimTradeRecord, 0),
 		EquityCurve:        make([]EquityPoint, 0, 256),
@@ -122,6 +155,7 @@ func (s *SimBroker) ApplyFundingSettlement(symbol string, markPrice decimal.Deci
 		pos.FundingPaid = pos.FundingPaid.Sub(fundingFee)
 		s.RealizedEquityUSDT = s.RealizedEquityUSDT.Add(fundingFee)
 	}
+	s.Stats.FundingSettlements++
 }
 
 // SubmitLimitEntry menerima order intent dari Evaluator (Fase 1 Commit).
@@ -131,6 +165,9 @@ func (s *SimBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
 
 	if s.CircuitBreakerTripped || s.isDailyDrawdownBreachedLocked() {
 		return false, fmt.Errorf("daily circuit breaker active")
+	}
+	if s.calculateRealEffectiveEquityLocked().LessThanOrEqual(decimal.Zero) {
+		return false, fmt.Errorf("account equity depleted")
 	}
 	if _, exists := s.OpenPositions[intent.Symbol]; exists {
 		return false, fmt.Errorf("position already exists for symbol %s", intent.Symbol)
@@ -151,7 +188,11 @@ func (s *SimBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) {
 
 	timeoutDur := s.Cfg.LimitOrderTimeout
 	if timeoutDur <= 0 {
-		timeoutDur = time.Duration(s.Cfg.LimitTimeoutBars*5) * time.Minute
+		barDur := s.Cfg.CandleDuration
+		if barDur <= 0 {
+			barDur = 5 * time.Minute
+		}
+		timeoutDur = time.Duration(s.Cfg.LimitTimeoutBars) * barDur
 	}
 	timeout := intent.CreatedAt.Add(timeoutDur)
 	s.PendingOrders[intent.Symbol] = &SimPendingOrder{
@@ -170,7 +211,12 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	s.CurrentSimTime = c.CloseTime
+	if !isFinitePos(c.Open) || !isFinitePos(c.High) || !isFinitePos(c.Low) || !isFinitePos(c.Close) {
+		return
+	}
+
+	evalCloseTime := normalizeCloseTime(c.CloseTime)
+	s.CurrentSimTime = evalCloseTime
 
 	// 1. Rollover harian sirkuit breaker (00:00 UTC)
 	epochDay := c.OpenTime.UTC().Unix() / 86400
@@ -196,14 +242,18 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	}
 
 	// 2. Evaluasi Pending Entry Order (LIMIT + GTX Repeg opsional / MARKET)
-	justFilledOnThisBar := false
+	limitFilledOnThisBar := false
 	if pending, exists := s.PendingOrders[c.Symbol]; exists {
 		if c.OpenTime.After(pending.PlacedTime) || c.OpenTime.Equal(pending.PlacedTime) {
 			openDec := decimal.NewFromFloat(c.Open)
 			lowDec := decimal.NewFromFloat(c.Low)
 			highDec := decimal.NewFromFloat(c.High)
 
-			if strings.EqualFold(s.Cfg.EntryOrderType, "MARKET") {
+			orderType := pending.Intent.EntryOrderType
+			if orderType == "" {
+				orderType = s.Cfg.EntryOrderType
+			}
+			if strings.EqualFold(orderType, "MARKET") {
 				fillPrice := openDec
 				if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
 					if pending.Intent.Side == model.SideLong {
@@ -225,7 +275,6 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 				delete(s.PendingOrders, c.Symbol)
 				s.Stats.Filled++
 				s.Stats.MarketFilled++
-				justFilledOnThisBar = true
 			} else {
 				// Validasi Post-Only GTX saat pembukaan bar pertama menggunakan SSOT protection.WouldCrossMakerBook / RepegLimitEntryIntent
 				// (hanya repeg ketika order menyeberang spread; jika harga menjauh/tetap pasif, biarkan resting hingga terisi atau timeout).
@@ -265,7 +314,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 
 				if shouldEvalFill {
 					penTick := filter.TickSize.Mul(decimal.NewFromInt(int64(s.Cfg.PenetrationTicks)))
-					if penTick.IsZero() {
+					if penTick.IsZero() && s.Cfg.PenetrationTicks > 0 {
 						penTick = decimal.NewFromFloat(0.01)
 					}
 
@@ -290,8 +339,8 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 						s.OpenPositions[c.Symbol] = pos
 						delete(s.PendingOrders, c.Symbol)
 						s.Stats.Filled++
-						justFilledOnThisBar = true
-					} else if !c.CloseTime.Before(pending.TimeoutTime) {
+						limitFilledOnThisBar = true
+					} else if !evalCloseTime.Before(pending.TimeoutTime) {
 						delete(s.PendingOrders, c.Symbol)
 						s.Stats.TimedOut++
 					}
@@ -306,16 +355,28 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		return
 	}
 	pos.LastClosePrice = decimal.NewFromFloat(c.Close)
+	lowDec := decimal.NewFromFloat(c.Low)
+	highDec := decimal.NewFromFloat(c.High)
+	worstPrice := lowDec
+	if pos.Side == model.SideShort {
+		worstPrice = highDec
+	}
+	if pos.LastWorstBarIdx != barIndex || pos.LastWorstPrice.LessThanOrEqual(decimal.Zero) {
+		pos.LastWorstBarIdx = barIndex
+		pos.LastWorstPrice = worstPrice
+	} else if (pos.Side == model.SideLong && worstPrice.LessThan(pos.LastWorstPrice)) ||
+		(pos.Side == model.SideShort && worstPrice.GreaterThan(pos.LastWorstPrice)) {
+		pos.LastWorstPrice = worstPrice
+	}
 
 	// Update Peak Price dan MAE/MFE
-	// Pada bar saat entry baru saja terisi (justFilledOnThisBar), jangan gunakan High/Low bar penuh
+	// Pada bar saat limit entry baru saja terisi (limitFilledOnThisBar), jangan gunakan High/Low bar penuh
 	// sebagai PeakPrice/MFE karena kita tidak tahu apakah wick menguntungkan terjadi sebelum atau sesudah
-	// limit fill (mencegah look-ahead bias); gunakan hanya harga Close pasca-fill pada bar entry,
-	// namun tetap evaluasi risiko Stop Loss (MAE & slTouched) secara pesimistis.
+	// limit fill (mencegah look-ahead bias); untuk MARKET entry di Open bar seluruh bar terjadi pasca-fill.
 	ePriceF, _ := pos.EntryPrice.Float64()
 	if pos.Side == model.SideLong {
 		favRef := c.High
-		if justFilledOnThisBar {
+		if limitFilledOnThisBar {
 			favRef = c.Close
 		}
 		if favRef > ePriceF {
@@ -336,7 +397,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		}
 	} else {
 		favRef := c.Low
-		if justFilledOnThisBar {
+		if limitFilledOnThisBar {
 			favRef = c.Close
 		}
 		if favRef < ePriceF {
@@ -357,8 +418,6 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		}
 	}
 
-	lowDec := decimal.NewFromFloat(c.Low)
-	highDec := decimal.NewFromFloat(c.High)
 	slTouched := false
 	tp1Touched := false
 	tpFullTouched := false
@@ -367,20 +426,20 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		if !pos.CurrentSLPrice.IsZero() && lowDec.LessThanOrEqual(pos.CurrentSLPrice) {
 			slTouched = true
 		}
-		if !justFilledOnThisBar && !pos.IsTP1Hit && !pos.TP1Price.IsZero() && highDec.GreaterThanOrEqual(pos.TP1Price) {
+		if !limitFilledOnThisBar && !pos.IsTP1Hit && !pos.TP1Price.IsZero() && highDec.GreaterThanOrEqual(pos.TP1Price) {
 			tp1Touched = true
 		}
-		if !justFilledOnThisBar && !pos.TPPrice.IsZero() && highDec.GreaterThanOrEqual(pos.TPPrice) {
+		if !limitFilledOnThisBar && !pos.TPPrice.IsZero() && highDec.GreaterThanOrEqual(pos.TPPrice) {
 			tpFullTouched = true
 		}
 	} else {
 		if !pos.CurrentSLPrice.IsZero() && highDec.GreaterThanOrEqual(pos.CurrentSLPrice) {
 			slTouched = true
 		}
-		if !justFilledOnThisBar && !pos.IsTP1Hit && !pos.TP1Price.IsZero() && lowDec.LessThanOrEqual(pos.TP1Price) {
+		if !limitFilledOnThisBar && !pos.IsTP1Hit && !pos.TP1Price.IsZero() && lowDec.LessThanOrEqual(pos.TP1Price) {
 			tp1Touched = true
 		}
-		if !justFilledOnThisBar && !pos.TPPrice.IsZero() && lowDec.LessThanOrEqual(pos.TPPrice) {
+		if !limitFilledOnThisBar && !pos.TPPrice.IsZero() && lowDec.LessThanOrEqual(pos.TPPrice) {
 			tpFullTouched = true
 		}
 	}
@@ -447,17 +506,25 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			pos.Qty = splitPlan.RemainingQty
 			pos.IsTP1Hit = true
 
-			// Geser SL ke Break-Even (+ Runner Cushion jika ada) via Unified Protection Engine
+			// Geser SL ke Break-Even (+ Runner Cushion jika ada) via Unified Protection Engine tanpa downgrade tier/SL
 			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
-			pos.CurrentSLPrice = beSL
-			pos.ProtectionTier = 1
+			if isMoreProtectiveSL(pos.Side, pos.CurrentSLPrice, beSL) {
+				pos.CurrentSLPrice = beSL
+			}
+			if pos.ProtectionTier < 1 {
+				pos.ProtectionTier = 1
+			}
 		} else {
 			// Posisi terlalu kecil untuk dipecah (MinNotional / MinQty): transisikan 100% menjadi runner BE
 			s.Stats.UnsplittableTP1++
 			pos.IsTP1Hit = true
 			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
-			pos.CurrentSLPrice = beSL
-			pos.ProtectionTier = 1
+			if isMoreProtectiveSL(pos.Side, pos.CurrentSLPrice, beSL) {
+				pos.CurrentSLPrice = beSL
+			}
+			if pos.ProtectionTier < 1 {
+				pos.ProtectionTier = 1
+			}
 		}
 	}
 
@@ -473,11 +540,29 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	protDec := protection.EvaluatePositionProtection(pos.toSnapshot(filter.TickSize), decimal.NewFromFloat(c.Close), s.toProtectionConfig())
 	if protDec.ShouldUpdate {
 		pos.CurrentSLPrice = protDec.NewSLPrice
-		pos.ProtectionTier = int(protDec.NewTier)
+		if int(protDec.NewTier) > pos.ProtectionTier {
+			pos.ProtectionTier = int(protDec.NewTier)
+		}
+	}
+
+	// D2. Underwater Stale-Loss Time-Cut
+	closeDec := decimal.NewFromFloat(c.Close)
+	if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, closeDec, pos.OpenTime, evalCloseTime, s.Cfg.StaleLossExitDuration) {
+		exitPrice := closeDec
+		if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
+			if pos.Side == model.SideLong {
+				exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Sub(s.Cfg.SlippageRate))
+			} else {
+				exitPrice = exitPrice.Mul(decimal.NewFromFloat(1.0).Add(s.Cfg.SlippageRate))
+			}
+		}
+		s.recordClosedTradeLocked(pos, pos.Qty, exitPrice, "TIME_STOP_STALE_LOSS", c.CloseTime, int(barIndex-pos.OpenBarIndex))
+		delete(s.OpenPositions, c.Symbol)
+		return
 	}
 
 	// E. Time-Stop Holding Timeout (4 Jam = 48 bar 5m)
-	if s.Cfg.MaxHoldingDuration > 0 && c.CloseTime.Sub(pos.OpenTime) > s.Cfg.MaxHoldingDuration {
+	if s.Cfg.MaxHoldingDuration > 0 && evalCloseTime.Sub(pos.OpenTime) > s.Cfg.MaxHoldingDuration {
 		exitPrice := decimal.NewFromFloat(c.Close)
 		if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
 			if pos.Side == model.SideLong {
@@ -647,7 +732,11 @@ func (s *SimBroker) GetAvailableBalanceUSDT() decimal.Decimal {
 		usedMargin = usedMargin.Add(notional.Div(lev))
 	}
 
-	eff := s.calculateEffectiveEquityLocked()
+	realEff := s.calculateRealEffectiveEquityLocked()
+	if realEff.LessThanOrEqual(decimal.Zero) {
+		return decimal.Zero
+	}
+	eff := decimal.Min(s.calculateEffectiveEquityLocked(), realEff)
 	avail := eff.Sub(usedMargin)
 	if avail.LessThan(decimal.Zero) {
 		return decimal.Zero

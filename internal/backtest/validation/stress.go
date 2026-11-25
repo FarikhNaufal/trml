@@ -78,7 +78,9 @@ func RunFrictionStressMatrix(ctx context.Context, cfg StressConfig) ([]StressSce
 
 		bCfg := cfg.BaseBrokerCfg
 		bCfg.SlippageRate = bCfg.SlippageRate.Mul(decimal.NewFromFloat(sc.mult))
+		bCfg.SlippageSet = true
 		bCfg.PenetrationTicks = sc.pen
+		bCfg.PenetrationTicksSet = true
 
 		evalCfg := cfg.EvalCfg
 		evalCfg.Sizing.SlippageRate = bCfg.SlippageRate
@@ -102,7 +104,7 @@ func RunFrictionStressMatrix(ctx context.Context, cfg StressConfig) ([]StressSce
 			sim.ClosedTrades, sim.EquityCurve, initEq,
 			cfg.CandleMap[bench], nil, execAudit,
 		)
-		slipBps, _ := bCfg.SlippageRate.Mul(decimal.NewFromFloat(10000)).Float64()
+		slipBps, _ := sim.Cfg.SlippageRate.Mul(decimal.NewFromFloat(10000)).Float64()
 
 		results = append(results, StressScenario{
 			Label:            sc.label,

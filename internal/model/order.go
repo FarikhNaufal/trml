@@ -49,11 +49,12 @@ const (
 )
 
 type OrderIntent struct {
-	ClientOrderID string
-	Symbol        string
-	Side          Side
-	StrategyID    string
-	Qty           decimal.Decimal
+	ClientOrderID  string
+	Symbol         string
+	Side           Side
+	StrategyID     string
+	EntryOrderType string
+	Qty            decimal.Decimal
 	LimitPrice    decimal.Decimal
 	SLPrice       decimal.Decimal
 	TPPrice       decimal.Decimal
@@ -69,6 +70,7 @@ type LiveOrderRecord struct {
 	Symbol              string
 	Side                Side
 	StrategyID          string
+	EntryOrderType      string
 	IsEntry             bool
 	IsAlgo              bool
 	Status              OrderLifecycleStatus

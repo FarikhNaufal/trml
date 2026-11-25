@@ -26,6 +26,30 @@ type sharedMarketContext struct {
 	OIValidShort   bool
 }
 
+func isFiniteFloat(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func isFinitePositive(v float64) bool {
+	return v > 0 && isFiniteFloat(v)
+}
+
+func checkPrimaryNATRBounds(ctx sharedMarketContext, cfg EvaluatorConfig, prefix string) (AlphaCandidate, bool) {
+	if cfg.MinNATRPct > 0 && ctx.NATRPct < cfg.MinNATRPct {
+		return AlphaCandidate{
+			Reason:    "NATR_OUT_OF_BOUNDS",
+			SubReason: fmt.Sprintf("%s_NATR_%.2f%%_BELOW_MIN_%.2f%%", prefix, ctx.NATRPct, cfg.MinNATRPct),
+		}, false
+	}
+	if cfg.MaxNATRPct > 0 && ctx.NATRPct > cfg.MaxNATRPct {
+		return AlphaCandidate{
+			Reason:    "NATR_OUT_OF_BOUNDS",
+			SubReason: fmt.Sprintf("%s_NATR_%.2f%%_ABOVE_MAX_%.2f%%", prefix, ctx.NATRPct, cfg.MaxNATRPct),
+		}, false
+	}
+	return AlphaCandidate{}, true
+}
+
 func isWinningExit(reason string) bool {
 	switch strings.ToUpper(strings.TrimSpace(reason)) {
 	case "TAKE_PROFIT", "TRAILING_STOP", "PROFIT_LOCK":
@@ -60,11 +84,11 @@ func evaluateSharedPreChecks(
 	if !snap.LastExitTime.IsZero() {
 		cooldownMins := cfg.CooldownAfterExitMinutes
 		if isWinningExit(snap.LastExitReason) {
-			if cfg.CooldownProfitMinutes > 0 {
+			if cfg.CooldownProfitSet || cfg.CooldownProfitMinutes > 0 {
 				cooldownMins = cfg.CooldownProfitMinutes
 			}
 		} else {
-			if cfg.CooldownLossMinutes > 0 {
+			if cfg.CooldownLossSet || cfg.CooldownLossMinutes > 0 {
 				cooldownMins = cfg.CooldownLossMinutes
 			}
 		}
@@ -134,13 +158,24 @@ func evaluateSharedPreChecks(
 	ctx.ATR14 = atr14
 
 	natrPct := (atr14 / ctx.Latest.Close) * 100.0
-	if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) || natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
-		return ctx, false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("NATR_%.2f%%_OUTSIDE_%.2f%%_%.2f%%", natrPct, cfg.MinNATRPct, cfg.MaxNATRPct)
+	effectiveMinNATR := cfg.MinNATRPct
+	if cfg.VolBreakout.Enabled && cfg.VolBreakout.MinNATRPct > 0 && (effectiveMinNATR <= 0 || cfg.VolBreakout.MinNATRPct < effectiveMinNATR) {
+		effectiveMinNATR = cfg.VolBreakout.MinNATRPct
+	}
+	effectiveMaxNATR := cfg.MaxNATRPct
+	if cfg.VolBreakout.Enabled && cfg.VolBreakout.MaxNATRPct > 0 && cfg.VolBreakout.MaxNATRPct > effectiveMaxNATR {
+		effectiveMaxNATR = cfg.VolBreakout.MaxNATRPct
+	}
+	if !isFiniteFloat(natrPct) || natrPct < effectiveMinNATR || (effectiveMaxNATR > 0 && natrPct > effectiveMaxNATR) {
+		return ctx, false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("NATR_%.2f%%_OUTSIDE_%.2f%%_%.2f%%", natrPct, effectiveMinNATR, effectiveMaxNATR)
 	}
 	ctx.NATRPct = natrPct
 
 	vwap := snap.CurrentSessionVWAP
-	if math.IsNaN(vwap) || math.IsInf(vwap, 0) || vwap <= 0 {
+	if cfg.RollingVWAPBars > 0 && len(snap.ClosedCandles) > 0 {
+		vwap = indicator.CalculateRollingVWAP(snap.ClosedCandles, cfg.RollingVWAPBars)
+	}
+	if !isFinitePositive(vwap) {
 		return ctx, false, "INVALID_VWAP", ""
 	}
 	ctx.VWAP = vwap
@@ -181,11 +216,11 @@ func evaluateSharedPreChecks(
 
 	if oiDeltaOK {
 		minOIDeltaLong := cfg.MinOIDeltaLongPct
-		if minOIDeltaLong == 0 {
+		if !cfg.MinOIDeltaLongSet && minOIDeltaLong == 0 {
 			minOIDeltaLong = cfg.MinOIDeltaPct
 		}
 		minOIDeltaShort := cfg.MinOIDeltaShortPct
-		if minOIDeltaShort == 0 {
+		if !cfg.MinOIDeltaShortSet && minOIDeltaShort == 0 {
 			minOIDeltaShort = cfg.MinOIDeltaPct
 		}
 
@@ -218,12 +253,12 @@ func evaluateEarlyAllowedSide(latestClose, ema200 float64, cfg EvaluatorConfig) 
 
 func evaluateSessionTimeGuards(snap model.MarketSnapshot, cfg EvaluatorConfig) (bool, string, string) {
 	warmupMins := cfg.VWAPSessionWarmupMinutes
-	if warmupMins <= 0 {
+	if !cfg.VWAPSessionWarmupSet && warmupMins <= 0 {
 		warmupMins = 30
 	}
 	utcNow := snap.Now.UTC()
 	minsSinceMidnight := utcNow.Hour()*60 + utcNow.Minute()
-	if minsSinceMidnight < warmupMins {
+	if warmupMins > 0 && minsSinceMidnight < warmupMins {
 		return false, "VWAP_SESSION_WARMUP", fmt.Sprintf("UTC_%02d:%02d_IN_WARMUP_%dm", utcNow.Hour(), utcNow.Minute(), warmupMins)
 	}
 	if len(cfg.BlockedUTCHours) > 0 && cfg.BlockedUTCHours[utcNow.Hour()] {
@@ -239,6 +274,17 @@ func evaluateSideAndPostFilters(
 	targetSide model.Side,
 	cfg EvaluatorConfig,
 ) (bool, string, string) {
+	return evaluateSideAndPostFiltersWithOpts(ctx, snap, btcSnap, targetSide, cfg, false)
+}
+
+func evaluateSideAndPostFiltersWithOpts(
+	ctx sharedMarketContext,
+	snap model.MarketSnapshot,
+	btcSnap *model.MarketSnapshot,
+	targetSide model.Side,
+	cfg EvaluatorConfig,
+	bypassBTCTier2 bool,
+) (bool, string, string) {
 	// KONFIRMASI 5B: Filter Arah Eksekusi (ALLOWED_SIDE)
 	allowedSide := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
 	if allowedSide == "SHORT_ONLY" && targetSide == model.SideLong {
@@ -251,6 +297,56 @@ func evaluateSideAndPostFilters(
 	// Filter volatilitas minimum khusus LONG agar SHORT tetap bisa menangkap koin ber-NATR lebih rendah.
 	if targetSide == model.SideLong && cfg.MinNATRLongPct > 0 && ctx.NATRPct < cfg.MinNATRLongPct {
 		return false, "NATR_OUT_OF_BOUNDS", fmt.Sprintf("LONG_NATR_%.2f%%_BELOW_MIN_%.2f%%", ctx.NATRPct, cfg.MinNATRLongPct)
+	}
+	if cfg.FundingEnvelope.MinShortEnabled && targetSide == model.SideShort && snap.FundingRate < cfg.FundingEnvelope.MinShortRate {
+		return false, "FUNDING_CROWDING_FILTER", fmt.Sprintf("SHORT_FR_%.5f_BELOW_MIN_%.5f", snap.FundingRate, cfg.FundingEnvelope.MinShortRate)
+	}
+	if cfg.FundingEnvelope.MaxLongEnabled && targetSide == model.SideLong && snap.FundingRate > cfg.FundingEnvelope.MaxLongRate {
+		return false, "FUNDING_CROWDING_FILTER", fmt.Sprintf("LONG_FR_%.5f_ABOVE_MAX_%.5f", snap.FundingRate, cfg.FundingEnvelope.MaxLongRate)
+	}
+
+	// Higher-Timeframe (1h) Completed-Bar EMA Trend Alignment Filter
+	if cfg.HTFEMAPeriod > 0 {
+		hourly := CompletedHourlyCandles(snap.ClosedCandles)
+		minHourly := cfg.HTFEMAPeriod
+		if cfg.HTFEMAMaxRisingSlopePct > 0 {
+			minHourly = cfg.HTFEMAPeriod + 24
+		}
+		if len(hourly) < minHourly {
+			return false, "HTF_EMA_WARMING_UP", fmt.Sprintf("HOURLY_%d_LT_%d", len(hourly), minHourly)
+		}
+		htfEMA := indicator.CalculateEMA(hourly, cfg.HTFEMAPeriod)
+		if !isFinitePositive(htfEMA) {
+			return false, "INVALID_HTF_EMA", ""
+		}
+		if targetSide == model.SideShort && ctx.Latest.Close >= htfEMA {
+			return false, "HTF_EMA_TREND_MISMATCH", fmt.Sprintf("CLOSE_%.4f_ABOVE_1H_EMA%d_%.4f", ctx.Latest.Close, cfg.HTFEMAPeriod, htfEMA)
+		}
+		if targetSide == model.SideLong && ctx.Latest.Close <= htfEMA {
+			return false, "HTF_EMA_TREND_MISMATCH", fmt.Sprintf("CLOSE_%.4f_BELOW_1H_EMA%d_%.4f", ctx.Latest.Close, cfg.HTFEMAPeriod, htfEMA)
+		}
+		if cfg.HTFEMAMaxRisingSlopePct > 0 {
+			prevEMA := indicator.CalculateEMA(hourly[:len(hourly)-24], cfg.HTFEMAPeriod)
+			if !isFinitePositive(prevEMA) {
+				return false, "INVALID_HTF_EMA", ""
+			}
+			slopePct := ((htfEMA - prevEMA) / prevEMA) * 100.0
+			if !isFiniteFloat(slopePct) {
+				return false, "INVALID_HTF_EMA", ""
+			}
+			if targetSide == model.SideShort && slopePct > cfg.HTFEMAMaxRisingSlopePct {
+				return false, "HTF_EMA_SLOPE_RISING", fmt.Sprintf("1H_EMA%d_24H_SLOPE_%.2f%%_GT_%.2f%%", cfg.HTFEMAPeriod, slopePct, cfg.HTFEMAMaxRisingSlopePct)
+			}
+			if targetSide == model.SideLong && slopePct < -cfg.HTFEMAMaxRisingSlopePct {
+				return false, "HTF_EMA_SLOPE_FALLING", fmt.Sprintf("1H_EMA%d_24H_SLOPE_%.2f%%_LT_-%.2f%%", cfg.HTFEMAPeriod, slopePct, cfg.HTFEMAMaxRisingSlopePct)
+			}
+		}
+	}
+
+	// Cross-Sectional Market Breadth Capitulation Hard Veto (when risk multiplier <= 0)
+	if cfg.MarketBreadthLowThreshold > 0 && snap.MarketBreadthValid && targetSide == model.SideShort &&
+		snap.MarketBreadthPct < cfg.MarketBreadthLowThreshold && cfg.MarketBreadthLowRiskMult <= 0 {
+		return false, "MARKET_BREADTH_CAPITULATION_VETO", fmt.Sprintf("BREADTH_%.1f%%_BELOW_MIN_%.1f%%", snap.MarketBreadthPct*100.0, cfg.MarketBreadthLowThreshold*100.0)
 	}
 
 	// KONFIRMASI 5C & 5D: Proteksi Anti-Frenzy / Explosive Counter-Impulse Filter & Min Signal RVOL
@@ -337,14 +433,20 @@ func evaluateSideAndPostFilters(
 		if !cfg.BTCGateShortOnly {
 			tier2Applies = allowedSide == "AUTO" || allowedSide == ""
 		}
-		if tier2Applies {
+		if tier2Applies && !bypassBTCTier2 {
+			resolveBTCVWAP := func() float64 {
+				if cfg.RollingVWAPBars > 0 && len(btcSnap.ClosedCandles) > 0 {
+					return indicator.CalculateRollingVWAP(btcSnap.ClosedCandles, cfg.RollingVWAPBars)
+				}
+				return btcSnap.CurrentSessionVWAP
+			}
 			if targetSide == model.SideShort && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
 				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
-				btcVWAP := btcSnap.CurrentSessionVWAP
-				if math.IsNaN(btcEMA) || math.IsInf(btcEMA, 0) || btcEMA <= 0 {
+				btcVWAP := resolveBTCVWAP()
+				if !isFinitePositive(btcEMA) {
 					return false, "INVALID_BTC_EMA", ""
 				}
-				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
+				if !isFiniteFloat(btcVWAP) {
 					return false, "INVALID_BTC_VWAP", ""
 				}
 				if latestBTC.Close > btcEMA && (btcVWAP <= 0 || latestBTC.Close > btcVWAP) {
@@ -368,11 +470,11 @@ func evaluateSideAndPostFilters(
 
 			if targetSide == model.SideLong && len(btcSnap.ClosedCandles) >= cfg.EMAPeriod {
 				btcEMA := indicator.CalculateEMA(btcSnap.ClosedCandles, cfg.EMAPeriod)
-				btcVWAP := btcSnap.CurrentSessionVWAP
-				if math.IsNaN(btcEMA) || math.IsInf(btcEMA, 0) || btcEMA <= 0 {
+				btcVWAP := resolveBTCVWAP()
+				if !isFinitePositive(btcEMA) {
 					return false, "INVALID_BTC_EMA", ""
 				}
-				if math.IsNaN(btcVWAP) || math.IsInf(btcVWAP, 0) {
+				if !isFiniteFloat(btcVWAP) {
 					return false, "INVALID_BTC_VWAP", ""
 				}
 				btcBearish := latestBTC.Close < btcEMA || (btcVWAP > 0 && latestBTC.Close < btcVWAP)
@@ -391,7 +493,7 @@ func evaluateSideAndPostFilters(
 					for p := 0; p < persistenceBars; p++ {
 						idx := len(btcSnap.ClosedCandles) - 1 - p
 						c := btcSnap.ClosedCandles[idx]
-						barBearish := c.Close < btcEMA
+						barBearish := c.Close < btcEMA || (btcVWAP > 0 && c.Close < btcVWAP)
 						if cfg.BTCTier2LongSymmetric {
 							barBearish = c.Close < btcEMA && (btcVWAP <= 0 || c.Close < btcVWAP)
 						}
@@ -425,7 +527,8 @@ func resolveEntryAndBuildIntent(
 	effectiveEquity, availBal decimal.Decimal,
 	cfg EvaluatorConfig,
 ) (model.OrderIntent, bool, string, string) {
-	isMarket := strings.ToUpper(cfg.EntryOrderType) == "MARKET"
+	forceBreakoutMarket := strategyID == StrategyIDVolBreakout && cfg.VolBreakout.EntryMarket
+	isMarket := forceBreakoutMarket || strings.ToUpper(cfg.EntryOrderType) == "MARKET"
 	var rawEntryPrice float64
 	if targetSide == model.SideLong {
 		if isMarket {
@@ -442,12 +545,70 @@ func resolveEntryAndBuildIntent(
 	}
 
 	sizingCfg := cfg.Sizing
-	if sizingCfg.EntryOrderType == "" {
+	if forceBreakoutMarket {
+		sizingCfg.EntryOrderType = "MARKET"
+	} else if sizingCfg.EntryOrderType == "" {
 		sizingCfg.EntryOrderType = cfg.EntryOrderType
 	}
-	if cfg.BTCChopRiskMult > 0 && cfg.BTCChopRiskMult < 1.0 && btcSnap != nil &&
+	if strategyID == StrategyIDVolBreakout && isFinitePositive(cfg.VolBreakout.RiskMult) && cfg.VolBreakout.RiskMult != 1.0 {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.VolBreakout.RiskMult))
+	} else if strategyID == StrategyIDEMAPullback && isFinitePositive(cfg.EMAPullback.RiskMult) && cfg.EMAPullback.RiskMult != 1.0 {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.EMAPullback.RiskMult))
+	} else if strategyID == StrategyIDVWAPBreakdown && isFinitePositive(cfg.VWAPBreakdown.RiskMult) && cfg.VWAPBreakdown.RiskMult != 1.0 {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.VWAPBreakdown.RiskMult))
+	} else if strategyID == StrategyIDStructureBreak && isFinitePositive(cfg.StructureBreak.RiskMult) && cfg.StructureBreak.RiskMult != 1.0 {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.StructureBreak.RiskMult))
+	}
+	if isFinitePositive(cfg.BTCChopRiskMult) && cfg.BTCChopRiskMult < 1.0 && btcSnap != nil &&
 		isBTCChopHighVol(btcSnap.ClosedCandles, cfg.EMAPeriod, cfg.ATRPeriod) {
 		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.BTCChopRiskMult))
+	}
+	if cfg.MarketBreadthLowThreshold > 0 && snap.MarketBreadthValid && targetSide == model.SideShort &&
+		snap.MarketBreadthPct < cfg.MarketBreadthLowThreshold && isFinitePositive(cfg.MarketBreadthLowRiskMult) && cfg.MarketBreadthLowRiskMult < 1.0 {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.MarketBreadthLowRiskMult))
+	}
+	if btcSnap != nil && (cfg.RS4hWeakThresholdPct < 0 || cfg.RS4hStrongThresholdPct > 0) {
+		bars4h := 16
+		if cfg.CandleDuration > 0 {
+			if b := int((4 * time.Hour) / cfg.CandleDuration); b > 0 {
+				bars4h = b
+			}
+		}
+		if len(snap.ClosedCandles) > bars4h && len(btcSnap.ClosedCandles) > bars4h {
+			altNow := snap.ClosedCandles[len(snap.ClosedCandles)-1].Close
+			altPrev := snap.ClosedCandles[len(snap.ClosedCandles)-1-bars4h].Close
+			btcNow := btcSnap.ClosedCandles[len(btcSnap.ClosedCandles)-1].Close
+			btcPrev := btcSnap.ClosedCandles[len(btcSnap.ClosedCandles)-1-bars4h].Close
+			if isFinitePositive(altPrev) && isFinitePositive(btcPrev) && isFinitePositive(altNow) && isFinitePositive(btcNow) {
+				rs4hPct := (((altNow - altPrev) / altPrev) - ((btcNow - btcPrev) / btcPrev)) * 100.0
+				if isFiniteFloat(rs4hPct) && targetSide == model.SideShort {
+					if cfg.RS4hWeakThresholdPct < 0 && rs4hPct <= cfg.RS4hWeakThresholdPct &&
+						isFinitePositive(cfg.RS4hWeakRiskMult) && cfg.RS4hWeakRiskMult != 1.0 {
+						sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.RS4hWeakRiskMult))
+					} else if cfg.RS4hStrongThresholdPct > 0 && rs4hPct >= cfg.RS4hStrongThresholdPct {
+						if !isFinitePositive(cfg.RS4hStrongRiskMult) {
+							return model.OrderIntent{}, false, "RS4H_STRONG_OUTPERFORMER_VETO", ""
+						}
+						if cfg.RS4hStrongRiskMult != 1.0 {
+							sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.RS4hStrongRiskMult))
+						}
+					}
+				}
+			}
+		}
+	}
+	if cfg.DDThrottleTier2ThresholdPct > 0 && isFinitePositive(cfg.DDThrottleTier2RiskMult) && cfg.DDThrottleTier2RiskMult < 1.0 &&
+		snap.PortfolioDrawdownPct >= cfg.DDThrottleTier2ThresholdPct {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.DDThrottleTier2RiskMult))
+	} else if cfg.DDThrottleThresholdPct > 0 && isFinitePositive(cfg.DDThrottleRiskMult) && cfg.DDThrottleRiskMult < 1.0 &&
+		snap.PortfolioDrawdownPct >= cfg.DDThrottleThresholdPct {
+		sizingCfg.RiskPerTradePct = sizingCfg.RiskPerTradePct.Mul(decimal.NewFromFloat(cfg.DDThrottleRiskMult))
+	}
+	if isFinitePositive(cfg.MaxEffectiveRiskPerTradePct) {
+		capDec := decimal.NewFromFloat(cfg.MaxEffectiveRiskPerTradePct)
+		if sizingCfg.RiskPerTradePct.GreaterThan(capDec) {
+			sizingCfg.RiskPerTradePct = capDec
+		}
 	}
 
 	intent, ok := BuildSafeDecimalOrderIntent(snap, effectiveEquity, availBal, targetSide, rawEntryPrice, ctx.ATR14, sizingCfg)
@@ -455,6 +616,9 @@ func resolveEntryAndBuildIntent(
 		return model.OrderIntent{}, false, "SIZING_FAILED", ""
 	}
 	intent.StrategyID = NormalizeStrategyID(strategyID)
+	if forceBreakoutMarket {
+		intent.EntryOrderType = "MARKET"
+	}
 	return intent, true, "SIGNAL_APPROVED", ""
 }
 

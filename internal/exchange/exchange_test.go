@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -524,5 +525,278 @@ func TestExchangeSignaturePlacement_AlgoType_1021_And_USDTBasis(t *testing.T) {
 	}
 	if !strings.Contains(lastGetQuery, "&signature=") || strings.Contains(strings.Split(lastGetQuery, "&signature=")[1], "&") {
 		t.Fatalf("expected GET query trailing signature, got: %s", lastGetQuery)
+	}
+}
+
+func TestDoRequest_PostOrderFailClosedOnAmbiguousNetworkAnd5xx(t *testing.T) {
+	var postOrderAttempts atomic.Int32
+	var postAlgoAttempts atomic.Int32
+	var getOrderMode atomic.Int32 // 0: 502 error (ambiguous), 1: -2013 not found, 2: FILLED exists
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/fapi/v1/order":
+			if r.Method == http.MethodPost {
+				n := postOrderAttempts.Add(1)
+				if getOrderMode.Load() == 1 && n == 2 {
+					_, _ = w.Write([]byte(`{"orderId":9001,"clientOrderId":"CID_1","status":"FILLED","avgPrice":"100","executedQty":"1"}`))
+					return
+				}
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"code":0,"msg":"bad gateway"}`))
+				return
+			}
+			// GET /fapi/v1/order idempotency check
+			switch getOrderMode.Load() {
+			case 0:
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`upstream unavailable`))
+			case 1:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"code":-2013,"msg":"Order does not exist."}`))
+			case 2:
+				_, _ = w.Write([]byte(`{"orderId":9002,"clientOrderId":"CID_2","status":"FILLED","avgPrice":"100","executedQty":"1"}`))
+			}
+		case "/fapi/v1/algoOrder":
+			if r.Method == http.MethodPost {
+				postAlgoAttempts.Add(1)
+				w.WriteHeader(http.StatusGatewayTimeout)
+				_, _ = w.Write([]byte(`timeout`))
+				return
+			}
+		case "/fapi/v1/openAlgoOrders":
+			// Even empty array or error must not fail-open retry POST /algoOrder
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	ctx := context.Background()
+
+	// 1. Ambiguous 502 + GET 503 -> MUST abort after 1 POST attempt (fail closed!)
+	params := url.Values{}
+	params.Set("symbol", "BTCUSDT")
+	params.Set("newClientOrderId", "CID_AMB")
+	if _, err := client.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true); err == nil {
+		t.Fatalf("expected error on ambiguous POST /order 502")
+	}
+	if postOrderAttempts.Load() != 1 {
+		t.Fatalf("expected fail-closed 1 POST /order attempt on ambiguous verify error, got %d", postOrderAttempts.Load())
+	}
+
+	// 2. Explicit -2013 -> allowed to retry once and succeed
+	postOrderAttempts.Store(0)
+	getOrderMode.Store(1)
+	if _, err := client.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true); err != nil {
+		t.Fatalf("expected retry to succeed after explicit -2013 not found, got %v", err)
+	}
+	if postOrderAttempts.Load() != 2 {
+		t.Fatalf("expected 2 POST /order attempts after -2013, got %d", postOrderAttempts.Load())
+	}
+
+	// 3. Confirmed exists in GET -> returns existing body without retrying POST
+	postOrderAttempts.Store(0)
+	getOrderMode.Store(2)
+	body, err := client.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
+	if err != nil || !strings.Contains(string(body), "9002") || postOrderAttempts.Load() != 1 {
+		t.Fatalf("expected existing order body with 1 POST attempt, body=%s err=%v attempts=%d", string(body), err, postOrderAttempts.Load())
+	}
+
+	// 4. POST /algoOrder ambiguous 504 -> MUST abort after 1 attempt
+	algoParams := url.Values{}
+	algoParams.Set("symbol", "BTCUSDT")
+	algoParams.Set("clientAlgoId", "ALGO_AMB")
+	if _, err := client.DoRequest(ctx, http.MethodPost, "/fapi/v1/algoOrder", algoParams, true); err == nil {
+		t.Fatalf("expected error on ambiguous POST /algoOrder 504")
+	}
+	if postAlgoAttempts.Load() != 1 {
+		t.Fatalf("expected fail-closed 1 POST /algoOrder attempt, got %d", postAlgoAttempts.Load())
+	}
+}
+
+func TestPlaceLimitClose_GTXFallsBackToGTCAndReturnsActualClientOrderID(t *testing.T) {
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/fapi/v1/order" && r.Method == http.MethodPost {
+			n := attempts.Add(1)
+			rawBody := make([]byte, 4096)
+			readN, _ := r.Body.Read(rawBody)
+			vals, _ := url.ParseQuery(string(rawBody[:readN]))
+			if n == 1 {
+				if vals.Get("timeInForce") != "GTX" {
+					t.Fatalf("expected first attempt GTX, got %s", vals.Get("timeInForce"))
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"code":-5022,"msg":"Post Only order will be rejected"}`))
+				return
+			}
+			if vals.Get("timeInForce") != "GTC" {
+				t.Fatalf("expected fallback attempt GTC, got %s", vals.Get("timeInForce"))
+			}
+			cid := vals.Get("newClientOrderId")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"orderId":55123,"clientOrderId":%q,"status":"NEW"}`, cid)))
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	oid, actualCID, err := client.PlaceLimitClose(context.Background(), "ETHUSDT", model.SideLong, decimal.NewFromFloat(1.0), decimal.NewFromFloat(2500), "ORIG_TP1_CID")
+	if err != nil || oid != 55123 {
+		t.Fatalf("PlaceLimitClose fallback failed: oid=%d actualCID=%q err=%v", oid, actualCID, err)
+	}
+	if actualCID == "" || actualCID == "ORIG_TP1_CID" || !strings.HasPrefix(actualCID, "ALGO_TP1_") {
+		t.Fatalf("expected actual regenerated ALGO_TP1 clientOrderId returned, got %q", actualCID)
+	}
+}
+
+func TestEnsureOneWayMode_And_InitAndVerifySymbolMarginAndLeverage(t *testing.T) {
+	var dualCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/fapi/v1/positionSide/dual":
+			dualCalls.Add(1)
+			_, _ = w.Write([]byte(`{"dualSidePosition":false}`))
+		case "/fapi/v1/marginType", "/fapi/v1/leverage":
+			_, _ = w.Write([]byte(`{"code":200}`))
+		case "/fapi/v2/positionRisk":
+			_, _ = w.Write([]byte(`[{"symbol":"SOLUSDT","marginType":"isolated","leverage":"8"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	ctx := context.Background()
+	if err := client.EnsureOneWayMode(ctx); err != nil {
+		t.Fatalf("EnsureOneWayMode failed: %v", err)
+	}
+	if dualCalls.Load() != 1 {
+		t.Fatalf("expected 1 dual position check, got %d", dualCalls.Load())
+	}
+	ok, err := client.InitAndVerifySymbolMarginAndLeverage(ctx, "SOLUSDT", 8)
+	if err != nil || !ok {
+		t.Fatalf("InitAndVerifySymbolMarginAndLeverage failed: ok=%v err=%v", ok, err)
+	}
+	if dualCalls.Load() != 1 {
+		t.Fatalf("expected InitAndVerifySymbolMarginAndLeverage NOT to call /positionSide/dual, total dual calls=%d", dualCalls.Load())
+	}
+}
+
+func TestFetchExchangeInfo_ParsesMarketLotSizeAndMaxQty(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"symbols": [{
+				"symbol": "DOGEUSDT",
+				"contractType": "PERPETUAL",
+				"status": "TRADING",
+				"filters": [
+					{"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+					{"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1", "maxQty": "10000000"},
+					{"filterType": "MARKET_LOT_SIZE", "stepSize": "10", "minQty": "5", "maxQty": "250000"},
+					{"filterType": "MIN_NOTIONAL", "notional": "5.0"}
+				]
+			}]
+		}`))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "", "")
+	filters, err := client.FetchExchangeInfo(context.Background())
+	if err != nil {
+		t.Fatalf("FetchExchangeInfo failed: %v", err)
+	}
+	ef, ok := filters["DOGEUSDT"]
+	if !ok {
+		t.Fatalf("expected DOGEUSDT in filters")
+	}
+	if !ef.MaxQty.Equal(decimal.NewFromInt(10000000)) ||
+		!ef.MarketStepSize.Equal(decimal.NewFromInt(10)) ||
+		!ef.MarketMinQty.Equal(decimal.NewFromInt(5)) ||
+		!ef.MarketMaxQty.Equal(decimal.NewFromInt(250000)) {
+		t.Fatalf("unexpected parsed MARKET_LOT_SIZE / MaxQty fields: %+v", ef)
+	}
+}
+
+func TestFetchKlines_PaginatesBeyond1500(t *testing.T) {
+	base := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	totalBars := 2200
+	step := 5 * time.Minute
+	var pageCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fapi/v1/klines" {
+			http.NotFound(w, r)
+			return
+		}
+		pageCalls.Add(1)
+		lim, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		endMsStr := r.URL.Query().Get("endTime")
+		endIdx := totalBars
+		if endMsStr != "" {
+			endMs, _ := strconv.ParseInt(endMsStr, 10, 64)
+			for idx := totalBars - 1; idx >= 0; idx-- {
+				otMs := base.Add(time.Duration(idx) * step).UnixMilli()
+				if otMs <= endMs {
+					endIdx = idx + 1
+					break
+				}
+			}
+		}
+		startIdx := endIdx - lim
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		var sb strings.Builder
+		sb.WriteByte('[')
+		for i := startIdx; i < endIdx; i++ {
+			if i > startIdx {
+				sb.WriteByte(',')
+			}
+			ot := base.Add(time.Duration(i) * step)
+			ct := ot.Add(step - time.Millisecond)
+			fmt.Fprintf(&sb, `[%d,"100.0","101.0","99.0","100.5","10",%d,"1000.0",5,"5","500.0","0"]`, ot.UnixMilli(), ct.UnixMilli())
+		}
+		sb.WriteByte(']')
+		_, _ = w.Write([]byte(sb.String()))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "", "")
+	candles, err := client.FetchKlines(context.Background(), "ETHUSDT", "5m", 2000)
+	if err != nil {
+		t.Fatalf("FetchKlines pagination failed: %v", err)
+	}
+	if pageCalls.Load() != 2 || len(candles) != 2000 {
+		t.Fatalf("expected 2 page calls and 2000 candles, got pages=%d len=%d", pageCalls.Load(), len(candles))
+	}
+	for i := 1; i < len(candles); i++ {
+		if candles[i].OpenTime.Sub(candles[i-1].OpenTime) != step {
+			t.Fatalf("non-contiguous candle at %d: prev=%v cur=%v", i, candles[i-1].OpenTime, candles[i].OpenTime)
+		}
+	}
+}
+
+func TestFetchOpenInterestHistWithPeriod_AndResolvePeriod(t *testing.T) {
+	if ResolveOIStatsPeriod("1m") != "5m" || ResolveOIStatsPeriod("5m") != "5m" || ResolveOIStatsPeriod("15m") != "15m" || ResolveOIStatsPeriod("1h") != "1h" {
+		t.Fatalf("unexpected ResolveOIStatsPeriod mappings")
+	}
+	var gotPeriod string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPeriod = r.URL.Query().Get("period")
+		_, _ = w.Write([]byte(`[{"symbol":"BTCUSDT","sumOpenInterest":"12345.0","timestamp":1700000000000}]`))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "", "")
+	res, err := client.FetchOpenInterestHistWithPeriod(context.Background(), "BTCUSDT", "15m", 4)
+	if err != nil || len(res) != 1 || gotPeriod != "15m" {
+		t.Fatalf("expected period=15m and 1 item, got period=%q len=%d err=%v", gotPeriod, len(res), err)
 	}
 }

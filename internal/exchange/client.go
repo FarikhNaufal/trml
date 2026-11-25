@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -197,10 +198,16 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 		if err != nil {
 			lastErr = fmt.Errorf("exchange: network error on %s %s: %w", method, endpoint, err)
 
-			// Pencegahan Order Ganda: Jika POST order/algoOrder mengalami network error, cek apakah sudah diterima Binance
-			if method == http.MethodPost {
-				if existingBody, ok := c.verifyPostOrderIdempotency(ctx, endpoint, params); ok {
+			// Pencegahan Order Ganda (Fail-Closed): Jika POST /order atau /algoOrder mengalami network error,
+			// cek apakah order sudah diterima atau secara eksplisit belum ada (-2013 / terminal zero-fill).
+			// Jangan pernah retry buta saat hasil probe ambigu karena order MARKET bisa terisi ganda/rangkap tiga.
+			if method == http.MethodPost && isOrderCreationEndpoint(endpoint) {
+				existingBody, st := c.verifyPostOrderIdempotencyStatus(ctx, endpoint, params)
+				if st == postIdempConfirmedExists {
 					return existingBody, nil
+				}
+				if st != postIdempConfirmedNotFound {
+					return nil, fmt.Errorf("exchange: ambiguous POST %s network error (retry aborted to prevent duplicate order): %w", endpoint, lastErr)
 				}
 			}
 
@@ -248,9 +255,13 @@ func (c *Client) DoRequest(ctx context.Context, method, endpoint string, params 
 
 		// Tangani Rate Limit (429) dan Server Error (5xx) dengan retry bounded
 		if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode <= 504) {
-			if method == http.MethodPost && resp.StatusCode >= 500 && resp.StatusCode <= 504 {
-				if existingBody, ok := c.verifyPostOrderIdempotency(ctx, endpoint, params); ok {
+			if method == http.MethodPost && resp.StatusCode >= 500 && resp.StatusCode <= 504 && isOrderCreationEndpoint(endpoint) {
+				existingBody, st := c.verifyPostOrderIdempotencyStatus(ctx, endpoint, params)
+				if st == postIdempConfirmedExists {
 					return existingBody, nil
+				}
+				if st != postIdempConfirmedNotFound {
+					return body, fmt.Errorf("exchange: ambiguous POST %s HTTP %d (retry aborted to prevent duplicate order): %s", endpoint, resp.StatusCode, string(body))
 				}
 			}
 
@@ -361,31 +372,48 @@ func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, par
 	return body, nil
 }
 
+type postOrderIdempStatus uint8
+
+const (
+	postIdempUnknown postOrderIdempStatus = iota
+	postIdempConfirmedExists
+	postIdempConfirmedNotFound
+)
+
+func isOrderCreationEndpoint(endpoint string) bool {
+	return strings.Contains(endpoint, "/algoOrder") || strings.Contains(endpoint, "/order")
+}
+
 // verifyPostOrderIdempotency memeriksa apakah POST /order atau POST /algoOrder sebenarnya sudah diterima bursa
 // sebelum melakukan retry setelah network error / rate-limit / 5xx.
 func (c *Client) verifyPostOrderIdempotency(ctx context.Context, endpoint string, params url.Values) ([]byte, bool) {
+	body, st := c.verifyPostOrderIdempotencyStatus(ctx, endpoint, params)
+	return body, st == postIdempConfirmedExists
+}
+
+func (c *Client) verifyPostOrderIdempotencyStatus(ctx context.Context, endpoint string, params url.Values) ([]byte, postOrderIdempStatus) {
 	if params == nil {
-		return nil, false
+		return nil, postIdempUnknown
 	}
 	symbol := params.Get("symbol")
 	if symbol == "" {
-		return nil, false
+		return nil, postIdempUnknown
 	}
 
 	if strings.Contains(endpoint, "/algoOrder") {
 		clientAlgoID := params.Get("clientAlgoId")
 		if clientAlgoID == "" {
-			return nil, false
+			return nil, postIdempUnknown
 		}
 		qParams := url.Values{}
 		qParams.Set("symbol", symbol)
 		checkBody, checkErr := c.doRequestOnce(ctx, http.MethodGet, "/fapi/v1/openAlgoOrders", qParams, true)
 		if checkErr != nil || len(checkBody) == 0 {
-			return nil, false
+			return nil, postIdempUnknown
 		}
 		var openAlgos []QueryAlgoOrderResponse
 		if jsonErr := json.Unmarshal(checkBody, &openAlgos); jsonErr != nil {
-			return nil, false
+			return nil, postIdempUnknown
 		}
 		for _, item := range openAlgos {
 			if item.ClientAlgoID == clientAlgoID && item.AlgoID != 0 {
@@ -394,17 +422,19 @@ func (c *Client) verifyPostOrderIdempotency(ctx context.Context, endpoint string
 					ClientAlgoID: item.ClientAlgoID,
 				})
 				if mErr == nil {
-					return synth, true
+					return synth, postIdempConfirmedExists
 				}
 			}
 		}
-		return nil, false
+		// Jangan fail-open retry POST /algoOrder meskipun belum terlihat di openAlgoOrders,
+		// karena conditional algo order dapat langsung terpicu atau sedang dalam propagasi.
+		return nil, postIdempUnknown
 	}
 
 	if strings.Contains(endpoint, "/order") {
 		clientOID := params.Get("newClientOrderId")
 		if clientOID == "" {
-			return nil, false
+			return nil, postIdempUnknown
 		}
 		qParams := url.Values{}
 		qParams.Set("symbol", symbol)
@@ -416,12 +446,16 @@ func (c *Client) verifyPostOrderIdempotency(ctx context.Context, endpoint string
 				execQty, _ := strconv.ParseFloat(qResp.ExecutedQty, 64)
 				isTerminalZero := (qResp.Status == "EXPIRED" || qResp.Status == "EXPIRED_IN_MATCH" || qResp.Status == "REJECTED" || qResp.Status == "CANCELED") && execQty <= 0
 				if isTerminalZero {
-					return nil, false
+					return nil, postIdempConfirmedNotFound
 				}
 			}
-			return checkBody, true
+			return checkBody, postIdempConfirmedExists
+		}
+		var apiErr *APIError
+		if errors.As(checkErr, &apiErr) && apiErr.Code == -2013 {
+			return nil, postIdempConfirmedNotFound
 		}
 	}
 
-	return nil, false
+	return nil, postIdempUnknown
 }

@@ -26,6 +26,7 @@ func (m *mockBroker) GetEffectiveTotalEquityUSDT() decimal.Decimal {
 }
 func (m *mockBroker) GetAvailableBalanceUSDT() decimal.Decimal    { return decimal.NewFromFloat(987.65) }
 func (m *mockBroker) GetDailyTotalDrawdownPct() float64           { return -0.015 }
+func (m *mockBroker) GetDrawdownFromPeakPct() float64             { return 0.0 }
 func (m *mockBroker) IsCircuitBreakerTripped() bool               { return false }
 func (m *mockBroker) GetActiveSlotCount() int                     { return 1 }
 func (m *mockBroker) HasActiveOrderOrPosition(symbol string) bool { return symbol == "BTCUSDT" }
@@ -717,5 +718,235 @@ func TestStrategyStatsAndFiltering(t *testing.T) {
 	}
 	if sgResp.Total != 1 || len(sgResp.Signals) != 1 || sgResp.Signals[0].StrategyID != "LIQUIDITY_SWEEP_SHORT" {
 		t.Fatalf("unexpected filtered signals: %+v", sgResp)
+	}
+}
+
+func TestSecurity_SpoofedProxyHeadersDoNotBypassPINLockout(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	reader := &WebReader{db: db, leverage: 8.0}
+	server, err := NewServer(ServerConfig{
+		Port:         ":2020",
+		Env:          "DRY-RUN",
+		Reader:       reader,
+		Broker:       &mockBroker{},
+		DashboardPIN: "123456",
+	})
+	if err != nil {
+		t.Fatalf("failed create server: %v", err)
+	}
+
+	attackerAddr := "203.0.113.50:41234"
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(`{"pin":"000000"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("CF-Connecting-IP", "1.1.1."+string(rune('1'+i)))
+		req.Header.Set("X-Forwarded-For", "9.9.9."+string(rune('1'+i)))
+		req.RemoteAddr = attackerAddr
+		rec := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d expected 401, got %d", i+1, rec.Code)
+		}
+	}
+
+	// 5th attempt with a fresh spoofed header must STILL trip lockout (429) for attackerAddr
+	req := httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(`{"pin":"000000"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("CF-Connecting-IP", "8.8.8.8")
+	req.RemoteAddr = attackerAddr
+	rec := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 lockout even with rotated spoofed proxy header, got %d", rec.Code)
+	}
+
+	// ?pin= query parameter must NOT be accepted for authentication
+	req = httptest.NewRequest("GET", "/api/summary?pin=123456", nil)
+	req.RemoteAddr = "203.0.113.99:1111"
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when passing PIN via query param, got %d", rec.Code)
+	}
+
+	// Oversized verify body must return 400
+	huge := `{"pin":"` + strings.Repeat("1", 8192) + `"}`
+	req = httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(huge))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.98:1111"
+	rec = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized verify payload, got %d", rec.Code)
+	}
+
+	// Valid PIN via header resets failed count on clean IP
+	cleanAddr := "203.0.113.77:2222"
+	for i := 0; i < 3; i++ {
+		rFail := httptest.NewRequest("GET", "/api/summary", nil)
+		rFail.Header.Set("X-TRML-PIN", "000000")
+		rFail.RemoteAddr = cleanAddr
+		recFail := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(recFail, rFail)
+	}
+	rOK := httptest.NewRequest("GET", "/api/summary", nil)
+	rOK.Header.Set("X-TRML-PIN", "123456")
+	rOK.RemoteAddr = cleanAddr
+	recOK := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(recOK, rOK)
+	if recOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid header PIN, got %d", recOK.Code)
+	}
+	for i := 0; i < 4; i++ {
+		rFail := httptest.NewRequest("POST", "/api/auth/verify", strings.NewReader(`{"pin":"000000"}`))
+		rFail.Header.Set("Content-Type", "application/json")
+		rFail.RemoteAddr = cleanAddr
+		recFail := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(recFail, rFail)
+		if recFail.Code != http.StatusUnauthorized {
+			t.Fatalf("expected failed count reset after valid auth (attempt %d got %d)", i+1, recFail.Code)
+		}
+	}
+}
+
+func TestWebReader_ModeIsolation(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec(`
+		CREATE TABLE trade_ledger (
+			client_order_id TEXT PRIMARY KEY,
+			mode TEXT NOT NULL DEFAULT '',
+			symbol TEXT NOT NULL,
+			side TEXT NOT NULL,
+			strategy_id TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
+			qty TEXT NOT NULL,
+			entry_price TEXT NOT NULL,
+			exit_price TEXT NOT NULL,
+			sl_price_initial TEXT NOT NULL,
+			tp_price_initial TEXT NOT NULL,
+			net_pnl_usdt TEXT NOT NULL,
+			exit_reason TEXT NOT NULL,
+			opened_at_utc TEXT NOT NULL,
+			closed_at_utc TEXT NOT NULL,
+			mae_pct REAL NOT NULL DEFAULT 0.0,
+			mfe_pct REAL NOT NULL DEFAULT 0.0,
+			signal_audit_id INTEGER NOT NULL DEFAULT 0,
+			ai_autopsy TEXT NOT NULL DEFAULT ''
+		);
+		INSERT INTO trade_ledger (client_order_id, mode, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial, net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id)
+		VALUES
+		('DRY_1', 'DRY_RUN', 'BTCUSDT', 'LONG', '1', '100', '105', '95', '105', '50.0', 'TAKE_PROFIT', '2026-11-01T10:00:00.000000000Z', '2026-11-01T10:15:00.000000000Z', 101),
+		('LIVE_1', 'LIVE', 'ETHUSDT', 'SHORT', '2', '200', '190', '210', '190', '20.0', 'TAKE_PROFIT', '2026-11-01T11:00:00.000000000Z', '2026-11-01T11:20:00.000000000Z', 102);
+	`)
+	if err != nil {
+		t.Fatalf("seed db: %v", err)
+	}
+
+	ctx := context.Background()
+	liveReader := &WebReader{db: db, leverage: 8.0}
+	liveReader.SetMode("LIVE")
+
+	stats, err := liveReader.GetOverallStats(ctx)
+	if err != nil {
+		t.Fatalf("GetOverallStats(LIVE): %v", err)
+	}
+	if stats.TotalTrades != 1 || math.Abs(stats.TotalNetPnLUSDT-20.0) > 1e-6 {
+		t.Fatalf("expected only LIVE trade ($20), got %+v", stats)
+	}
+
+	trades, total, err := liveReader.GetTradesPaginated(ctx, 1, 10, "ALL")
+	if err != nil || total != 1 || len(trades) != 1 || trades[0].ClientOrderID != "LIVE_1" {
+		t.Fatalf("expected only LIVE_1 in paginated trades, got total=%d trades=%+v err=%v", total, trades, err)
+	}
+	if tr, err := liveReader.GetTradeByClientOrderID(ctx, "DRY_1"); err != nil || tr != nil {
+		t.Fatalf("expected DRY_1 hidden from LIVE reader, got tr=%+v err=%v", tr, err)
+	}
+
+	dryReader := &WebReader{db: db, leverage: 8.0}
+	dryReader.SetMode("DRY_RUN")
+	dryStats, err := dryReader.GetOverallStats(ctx)
+	if err != nil || dryStats.TotalTrades != 1 || math.Abs(dryStats.TotalNetPnLUSDT-50.0) > 1e-6 {
+		t.Fatalf("expected only DRY_RUN trade ($50), got %+v err=%v", dryStats, err)
+	}
+}
+
+func TestServer_NilReaderClampedPageAndCachedAutopsyNoRateLimit(t *testing.T) {
+	// 1. Nil Reader does not panic on /api/summary, /api/trades, /api/signals
+	srvNil, err := NewServer(ServerConfig{
+		Port:        "8080",
+		Env:         "DRY-RUN",
+		Broker:      &mockBroker{},
+		GeminiModel: "gemini-2.5-pro",
+	})
+	if err != nil {
+		t.Fatalf("NewServer nil reader: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	srvNil.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest("GET", "/api/summary", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/summary with nil Reader, got %d", rec.Code)
+	}
+	var sumBody map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &sumBody)
+	if sumBody["gemini_model"] != "gemini-2.5-pro" {
+		t.Fatalf("expected gemini_model gemini-2.5-pro in /api/summary, got %v", sumBody["gemini_model"])
+	}
+
+	rec = httptest.NewRecorder()
+	srvNil.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest("GET", "/api/trades", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 /api/trades with nil Reader, got %d", rec.Code)
+	}
+
+	// 2. Clamped page=0 -> page=1 & cached trade autopsy bypasses AI RPM limit
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+	_, _ = db.Exec(`
+		INSERT INTO trade_ledger (
+			client_order_id, symbol, side, qty, entry_price, exit_price, sl_price_initial, tp_price_initial,
+			net_pnl_usdt, exit_reason, opened_at_utc, closed_at_utc, mae_pct, mfe_pct, signal_audit_id, ai_autopsy, created_at_utc
+		) VALUES (
+			'CACHED_AUTOPSY_1', 'BTCUSDT', 'LONG', '0.05', '65000', '67000', '64000', '67000',
+			'100.0', 'TAKE_PROFIT', '2026-10-25T10:00:00Z', '2026-10-25T10:30:00Z', 0.5, 3.2, 1, 'Precomputed cache', '2026-10-25T10:30:00Z'
+		);
+	`)
+	srv, err := NewServer(ServerConfig{
+		Port:           "8080",
+		Env:            "DRY-RUN",
+		Reader:         &WebReader{db: db, leverage: 8.0},
+		Broker:         &mockBroker{},
+		AIRateLimitRPM: 1, // burst=3
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	recPage := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recPage, httptest.NewRequest("GET", "/api/trades?page=-2&limit=5", nil))
+	var pageResp map[string]any
+	_ = json.Unmarshal(recPage.Body.Bytes(), &pageResp)
+	if pageResp["page"] != float64(1) {
+		t.Fatalf("expected clamped page=1 for ?page=-2, got %v", pageResp["page"])
+	}
+
+	// Exhaust AI rate limit tokens (burst=3) on non-cached endpoint
+	for i := 0; i < 4; i++ {
+		r := httptest.NewRequest("GET", "/api/ai/executive-summary", nil)
+		r.RemoteAddr = "198.51.100.10:1234"
+		srv.httpServer.Handler.ServeHTTP(httptest.NewRecorder(), r)
+	}
+
+	// Cached trade-autopsy must still succeed with 200 (cache hits do NOT consume AI quota)
+	rCache := httptest.NewRequest("GET", "/api/ai/trade-autopsy?client_order_id=CACHED_AUTOPSY_1", nil)
+	rCache.RemoteAddr = "198.51.100.10:1234"
+	recCache := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recCache, rCache)
+	if recCache.Code != http.StatusOK {
+		t.Fatalf("expected cached trade autopsy to bypass AI rate limit, got HTTP %d: %s", recCache.Code, recCache.Body.String())
 	}
 }

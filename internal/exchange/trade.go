@@ -259,7 +259,8 @@ func (c *Client) PlaceMarketClose(ctx context.Context, symbol string, side model
 }
 
 // PlaceLimitClose mengirimkan order LIMIT (Post-Only GTX atau fallback GTC reduceOnly) untuk penutupan parsial/TP (POST /fapi/v1/order)
-func (c *Client) PlaceLimitClose(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (int64, error) {
+// dan mengembalikan (orderID, actualClientOrderID, err) agar fallback GTC tetap terlacak di broker.
+func (c *Client) PlaceLimitClose(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (int64, string, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	if side == model.SideLong {
@@ -272,8 +273,9 @@ func (c *Client) PlaceLimitClose(ctx context.Context, symbol string, side model.
 	params.Set("reduceOnly", "true")
 	params.Set("quantity", qty.String())
 	params.Set("price", price.String())
-	if clientOrderID != "" {
-		params.Set("newClientOrderId", clientOrderID)
+	usedClientOrderID := clientOrderID
+	if usedClientOrderID != "" {
+		params.Set("newClientOrderId", usedClientOrderID)
 	}
 
 	respBytes, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
@@ -283,49 +285,56 @@ func (c *Client) PlaceLimitClose(ctx context.Context, symbol string, side model.
 		if strings.Contains(errStr, "-2010") || strings.Contains(errStr, "-5022") || strings.Contains(errStr, "Post Only") {
 			params.Set("timeInForce", "GTC")
 			if clientOrderID != "" {
-				params.Set("newClientOrderId", model.FormatClientID("ALGO_TP1", symbol, time.Now().UTC()))
+				usedClientOrderID = model.FormatClientID("ALGO_TP1", symbol, time.Now().UTC())
+				params.Set("newClientOrderId", usedClientOrderID)
 			}
 			respBytes, err = c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
 		}
 		if err != nil {
-			return 0, fmt.Errorf("place limit close: %w (body: %s)", err, string(respBytes))
+			return 0, "", fmt.Errorf("place limit close: %w (body: %s)", err, string(respBytes))
 		}
 	}
 
 	var resp OrderResponse
 	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
-		return 0, fmt.Errorf("place limit close: failed to decode response: %w", err)
+		return 0, "", fmt.Errorf("place limit close: failed to decode response: %w", err)
+	}
+	if strings.TrimSpace(resp.ClientOrderID) != "" {
+		usedClientOrderID = strings.TrimSpace(resp.ClientOrderID)
 	}
 
-	return resp.OrderID, nil
+	return resp.OrderID, usedClientOrderID, nil
 }
 
-// InitAndVerifySymbol memverifikasi One-Way mode, isolasi margin, dan leverage 5x (Solusi P0-5 & P0-7)
-func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverage int) (bool, error) {
-	// 1. Verifikasi One-Way Mode (GET /fapi/v1/positionSide/dual)
+// EnsureOneWayMode memastikan akun futures berjalan dalam One-Way Mode (bukan Hedge Mode).
+// Dipanggil terpisah sekali di level akun agar loop verifikasi simbol tidak menghabiskan IP weight (30/call).
+func (c *Client) EnsureOneWayMode(ctx context.Context) error {
 	dualRespBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v1/positionSide/dual", nil, true)
 	if err != nil {
-		return false, fmt.Errorf("failed to query position mode: %w", err)
+		return fmt.Errorf("failed to query position mode: %w", err)
 	}
 	var dualResp DualSidePositionResponse
 	if err := sonic.Unmarshal(dualRespBytes, &dualResp); err != nil {
-		return false, fmt.Errorf("failed to decode position mode response: %w", err)
+		return fmt.Errorf("failed to decode position mode response: %w", err)
 	}
 	if dualResp.DualSidePosition {
 		// Jika Hedge Mode aktif, coba ubah ke One-Way Mode
 		changeParams := url.Values{}
 		changeParams.Set("dualSidePosition", "false")
-		_, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/positionSide/dual", changeParams, true)
-		if err != nil {
-			return false, fmt.Errorf("strategy requires One-Way Mode; failed to disable dualSidePosition: %w", err)
+		if _, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/positionSide/dual", changeParams, true); err != nil {
+			return fmt.Errorf("strategy requires One-Way Mode; failed to disable dualSidePosition: %w", err)
 		}
 	}
+	return nil
+}
 
-	// 2. Set Margin Type ISOLATED (abaikan error jika sudah ISOLATED / code -4046)
+// InitAndVerifySymbolMarginAndLeverage memverifikasi isolasi margin dan leverage untuk satu simbol (tanpa GET positionSide/dual).
+func (c *Client) InitAndVerifySymbolMarginAndLeverage(ctx context.Context, symbol string, leverage int) (bool, error) {
+	// 1. Set Margin Type ISOLATED (abaikan error jika sudah ISOLATED / code -4046)
 	marginParams := url.Values{}
 	marginParams.Set("symbol", symbol)
 	marginParams.Set("marginType", "ISOLATED")
-	_, err = c.DoRequest(ctx, http.MethodPost, "/fapi/v1/marginType", marginParams, true)
+	_, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/marginType", marginParams, true)
 	if err != nil {
 		var apiErr *APIError
 		isAlreadyIsolated := errors.As(err, &apiErr) && apiErr.Code == -4046
@@ -334,7 +343,7 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 		}
 	}
 
-	// 3. Set Leverage
+	// 2. Set Leverage
 	levParams := url.Values{}
 	levParams.Set("symbol", symbol)
 	levParams.Set("leverage", strconv.Itoa(leverage))
@@ -343,7 +352,7 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 		return false, fmt.Errorf("failed to set leverage: %w", err)
 	}
 
-	// 4. Verifikasi final state simbol di bursa (fail-closed)
+	// 3. Verifikasi final state simbol di bursa (fail-closed)
 	posRisks, err := c.GetPositionRisk(ctx, symbol)
 	if err != nil {
 		return false, fmt.Errorf("failed to verify symbol risk configuration: %w", err)
@@ -368,6 +377,14 @@ func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverag
 	}
 
 	return true, nil
+}
+
+// InitAndVerifySymbol memverifikasi One-Way mode, isolasi margin, dan leverage (Solusi P0-5 & P0-7)
+func (c *Client) InitAndVerifySymbol(ctx context.Context, symbol string, leverage int) (bool, error) {
+	if err := c.EnsureOneWayMode(ctx); err != nil {
+		return false, err
+	}
+	return c.InitAndVerifySymbolMarginAndLeverage(ctx, symbol, leverage)
 }
 
 // QueryOrder mengambil status order terkini dari bursa (GET /fapi/v1/order)

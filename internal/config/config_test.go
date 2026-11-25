@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -219,15 +221,24 @@ func TestMaxDailyDrawdownDryRunAndLiveClamping(t *testing.T) {
 		t.Errorf("expected -1.0 in dry-run, got %f", cfgDry.MaxDailyDrawdown)
 	}
 
-	// 2. Live mode: -1.0 is clamped to -0.05
+	// 2. Live mode: -0.075 (QMAX_PAMUNGKAS) preserved, while extreme -1.0 is clamped to -0.10
 	_ = os.Setenv("DRY_RUN_MODE", "false")
+	_ = os.Setenv("MAX_DAILY_DRAWDOWN_PCT", "-0.075")
+	cfgLiveQMax, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error in live mode QMAX: %v", err)
+	}
+	if cfgLiveQMax.MaxDailyDrawdown != -0.075 {
+		t.Errorf("expected live mode to preserve -0.075, got %f", cfgLiveQMax.MaxDailyDrawdown)
+	}
+
 	_ = os.Setenv("MAX_DAILY_DRAWDOWN_PCT", "-1.0")
 	cfgLive, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("unexpected error in live mode: %v", err)
 	}
-	if cfgLive.MaxDailyDrawdown != -0.05 {
-		t.Errorf("expected live mode to clamp to -0.05, got %f", cfgLive.MaxDailyDrawdown)
+	if cfgLive.MaxDailyDrawdown != -0.10 {
+		t.Errorf("expected live mode to clamp to -0.10, got %f", cfgLive.MaxDailyDrawdown)
 	}
 }
 
@@ -567,6 +578,109 @@ func TestLoadConfig_SweepStrategyDefaultsAndValidation(t *testing.T) {
 			t.Fatalf("expected error for invalid %s=%s", pair[0], pair[1])
 		}
 		_ = os.Unsetenv(pair[0])
+	}
+}
+
+func TestLoadConfig_DisableOIFilter_And_PromotedBacktestEnv(t *testing.T) {
+	defCfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig default failed: %v", err)
+	}
+	if defCfg.DisableOIFilter {
+		t.Fatalf("expected default DisableOIFilter=false")
+	}
+
+	t.Setenv("DISABLE_OI_FILTER", "true")
+	cfgOn, err := LoadConfig()
+	if err != nil || !cfgOn.DisableOIFilter {
+		t.Fatalf("expected DisableOIFilter=true, err=%v", err)
+	}
+	_ = os.Unsetenv("DISABLE_OI_FILTER")
+
+	// Validate every key/value in the promoted root backtest.env
+	raw, readErr := os.ReadFile(filepath.Join("..", "..", "backtest.env"))
+	if readErr != nil {
+		t.Fatalf("failed reading root backtest.env: %v", readErr)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		parts := strings.SplitN(trimmed, "=", 2)
+		if len(parts) == 2 {
+			t.Setenv(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		}
+	}
+	qmaxCfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("promoted backtest.env failed LoadConfig validation: %v", err)
+	}
+	if !qmaxCfg.DisableOIFilter || qmaxCfg.ResetPeakEquityOnBoot || qmaxCfg.Timeframe != "15m" || qmaxCfg.HTFEMAPeriod != 200 ||
+		qmaxCfg.MarketBreadthLowThreshold != 0.20 || qmaxCfg.StaleLossExitDuration != 6*time.Hour ||
+		qmaxCfg.PortfolioClusterSLCount != 3 || qmaxCfg.MaxEffectiveRiskPerTradePct != 0.038 {
+		t.Fatalf("unexpected parsed promoted QMAX config: %+v", qmaxCfg)
+	}
+
+	t.Setenv("RESET_PEAK_EQUITY_ON_BOOT", "true")
+	cfgReset, err := LoadConfig()
+	if err != nil || !cfgReset.ResetPeakEquityOnBoot {
+		t.Fatalf("expected ResetPeakEquityOnBoot=true when RESET_PEAK_EQUITY_ON_BOOT=true, got err=%v val=%v", err, cfgReset.ResetPeakEquityOnBoot)
+	}
+}
+
+func TestRawEnvPreservesHashInSecretsAndPIN(t *testing.T) {
+	t.Setenv("DRY_RUN_MODE", "false")
+	t.Setenv("BINANCE_API_KEY", "key#part1")
+	t.Setenv("BINANCE_SECRET_KEY", "#leadingHashSecret#end")
+	t.Setenv("DASHBOARD_PIN", "#MyPin99")
+	t.Setenv("GEMINI_API_KEY", "AIza#test#key")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed with # in secrets: %v", err)
+	}
+	if cfg.APIKey != "key#part1" || cfg.SecretKey != "#leadingHashSecret#end" {
+		t.Fatalf("expected full API credentials with '#', got key=%q secret=%q", cfg.APIKey, cfg.SecretKey)
+	}
+	if cfg.DashboardPIN != "#MyPin99" || cfg.GeminiAPIKey != "AIza#test#key" {
+		t.Fatalf("expected full PIN/Gemini key with '#', got pin=%q gemini=%q", cfg.DashboardPIN, cfg.GeminiAPIKey)
+	}
+}
+
+func TestZeroAndNegativeOverridesPreserved(t *testing.T) {
+	t.Setenv("DRY_RUN_MODE", "true")
+	t.Setenv("VWAP_SESSION_WARMUP_MINUTES", "0")
+	t.Setenv("COOLDOWN_AFTER_EXIT_MINUTES", "20")
+	t.Setenv("COOLDOWN_AFTER_WIN_MINUTES", "0")
+	t.Setenv("MIN_OI_DELTA_PCT", "0.25")
+	t.Setenv("MIN_OI_DELTA_LONG_PCT", "0.0")
+	t.Setenv("MIN_EMA_SLOPE_LONG", "-0.25")
+	t.Setenv("STALE_LOSS_EXIT_DURATION", "0m")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed with valid zero/negative overrides: %v", err)
+	}
+	if !cfg.VWAPSessionWarmupSet || cfg.VWAPSessionWarmupMinutes != 0 {
+		t.Fatalf("expected VWAPSessionWarmupSet=true and 0 mins, got set=%v mins=%d", cfg.VWAPSessionWarmupSet, cfg.VWAPSessionWarmupMinutes)
+	}
+	if !cfg.CooldownProfitSet || cfg.CooldownProfitMinutes != 0 {
+		t.Fatalf("expected CooldownProfitSet=true and 0 mins, got set=%v mins=%d", cfg.CooldownProfitSet, cfg.CooldownProfitMinutes)
+	}
+	if !cfg.MinOIDeltaLongSet || cfg.MinOIDeltaLongPct != 0.0 {
+		t.Fatalf("expected MinOIDeltaLongSet=true and 0.0, got set=%v val=%v", cfg.MinOIDeltaLongSet, cfg.MinOIDeltaLongPct)
+	}
+	if !cfg.MinEMASlopeLongSet || cfg.MinEMASlopeLong != -0.25 {
+		t.Fatalf("expected MinEMASlopeLongSet=true and -0.25, got set=%v val=%v", cfg.MinEMASlopeLongSet, cfg.MinEMASlopeLong)
+	}
+	if cfg.StaleLossExitDuration != 0 {
+		t.Fatalf("expected STALE_LOSS_EXIT_DURATION=0m accepted as disabled, got %v", cfg.StaleLossExitDuration)
+	}
+
+	t.Setenv("MIN_BOUNCE_ZSCORE_LONG", "not_a_float")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatalf("expected invalid MIN_BOUNCE_ZSCORE_LONG to return config error")
 	}
 }
 

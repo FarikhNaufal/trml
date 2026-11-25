@@ -72,6 +72,7 @@ type DryRunConfig struct {
 	MinBreakEvenOffsetPct    float64
 	LimitOrderTimeout        time.Duration
 	MaxHoldingDuration       time.Duration
+	StaleLossExitDuration    time.Duration
 	MaxMarkStaleness         time.Duration
 	MakerFeeRate             float64
 	TakerFeeRate             float64
@@ -126,9 +127,10 @@ type DryRunBroker struct {
 	Mu                    sync.Mutex
 	Cfg                   DryRunConfig
 	SessionDayEpochUTC    int64
-	SessionStartEquity    decimal.Decimal
-	RealizedEquityUSDT    decimal.Decimal
-	CircuitBreakerTripped bool
+	SessionStartEquity      decimal.Decimal
+	RealizedEquityUSDT      decimal.Decimal
+	PeakEffectiveEquityUSDT decimal.Decimal
+	CircuitBreakerTripped   bool
 	PendingOrders         map[string]*VirtualPendingOrder
 	OpenPositions         map[string]*VirtualOpenPosition
 	OnTradeClosedFn       func(rec TradeClosedRecord)
@@ -138,17 +140,19 @@ type DryRunBroker struct {
 	GetExchangeFilterFn   func(symbol string) (model.ExchangeFilter, bool)
 	GetBestQuoteFn        func(symbol string) (bestBid, bestAsk float64, ok bool)
 
-	eventChan        chan PositionEvent
+	eventQueue       []PositionEvent
+	eventCond        *sync.Cond
 	eventWg          sync.WaitGroup
 	asyncWg          sync.WaitGroup
 	eventMu          sync.Mutex
-	isClosed         bool
+	acceptClosed     bool
+	eventClosed      bool
 	lastPeriodicSync time.Time
 }
 
 func (d *DryRunBroker) goAsync(fn func()) {
 	d.eventMu.Lock()
-	if d.isClosed {
+	if d.acceptClosed {
 		d.eventMu.Unlock()
 		return
 	}
@@ -175,19 +179,28 @@ func (d *DryRunBroker) RestoreOpenPosition(pos *VirtualOpenPosition) {
 		pos.LastFundingEpoch = pos.OpenTime.UTC().Unix() / 28800
 	}
 	if _, exists := d.OpenPositions[pos.Symbol]; !exists {
-		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(pos.EntryFee).Sub(pos.FundingPaid)
+		entryFeeRem := pos.EntryFee
+		if !pos.InitialQty.IsZero() && pos.InitialQty.GreaterThan(pos.Qty) {
+			entryFeeRem = pos.EntryFee.Mul(pos.Qty).Div(pos.InitialQty)
+		}
+		d.RealizedEquityUSDT = d.RealizedEquityUSDT.Sub(entryFeeRem).Sub(pos.FundingPaid)
 	}
 	d.OpenPositions[pos.Symbol] = pos
 }
 
 func (d *DryRunBroker) enqueuePositionEvent(evt PositionEvent) {
 	d.eventMu.Lock()
-	if d.isClosed || d.eventChan == nil {
+	if d.eventClosed {
+		d.eventMu.Unlock()
+		return
+	}
+	if d.eventCond == nil {
 		d.eventMu.Unlock()
 		d.dispatchPositionEvent(evt)
 		return
 	}
-	d.eventChan <- evt
+	d.eventQueue = append(d.eventQueue, evt)
+	d.eventCond.Signal()
 	d.eventMu.Unlock()
 }
 
@@ -195,7 +208,22 @@ func (d *DryRunBroker) startEventWorker() {
 	d.eventWg.Add(1)
 	go func() {
 		defer d.eventWg.Done()
-		for evt := range d.eventChan {
+		for {
+			d.eventMu.Lock()
+			for len(d.eventQueue) == 0 && !d.eventClosed {
+				d.eventCond.Wait()
+			}
+			if len(d.eventQueue) == 0 && d.eventClosed {
+				d.eventMu.Unlock()
+				return
+			}
+			evt := d.eventQueue[0]
+			d.eventQueue[0] = PositionEvent{}
+			d.eventQueue = d.eventQueue[1:]
+			if len(d.eventQueue) == 0 {
+				d.eventQueue = nil
+			}
+			d.eventMu.Unlock()
 			d.dispatchPositionEvent(evt)
 		}
 	}()
@@ -211,18 +239,23 @@ func (d *DryRunBroker) dispatchPositionEvent(evt PositionEvent) {
 
 func (d *DryRunBroker) Close() {
 	d.eventMu.Lock()
-	if d.isClosed {
+	if d.acceptClosed {
 		d.eventMu.Unlock()
 		return
 	}
-	d.isClosed = true
-	if d.eventChan != nil {
-		close(d.eventChan)
+	d.acceptClosed = true
+	d.eventMu.Unlock()
+
+	d.asyncWg.Wait()
+
+	d.eventMu.Lock()
+	d.eventClosed = true
+	if d.eventCond != nil {
+		d.eventCond.Broadcast()
 	}
 	d.eventMu.Unlock()
 
 	d.eventWg.Wait()
-	d.asyncWg.Wait()
 }
 
 func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBroker {
@@ -251,14 +284,15 @@ func NewDryRunBroker(initialEquity decimal.Decimal, cfg DryRunConfig) *DryRunBro
 		cfg.MaxMarkStaleness = 15 * time.Second
 	}
 	broker := &DryRunBroker{
-		Cfg:                cfg,
-		SessionStartEquity: initialEquity,
-		RealizedEquityUSDT: initialEquity,
-		PendingOrders:      make(map[string]*VirtualPendingOrder),
-		OpenPositions:      make(map[string]*VirtualOpenPosition),
-		eventChan:          make(chan PositionEvent, 512),
-		lastPeriodicSync:   time.Now().UTC(),
+		Cfg:                     cfg,
+		SessionStartEquity:      initialEquity,
+		RealizedEquityUSDT:      initialEquity,
+		PeakEffectiveEquityUSDT: initialEquity,
+		PendingOrders:           make(map[string]*VirtualPendingOrder),
+		OpenPositions:           make(map[string]*VirtualOpenPosition),
+		lastPeriodicSync:        time.Now().UTC(),
 	}
+	broker.eventCond = sync.NewCond(&broker.eventMu)
 	broker.startEventWorker()
 	return broker
 }
@@ -267,9 +301,10 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 	origLimit := intent.LimitPrice
 	gtxValidated := false
 	repegAttempts := 0
+	effOrderType := effectiveEntryOrderType(intent.EntryOrderType, d.Cfg.EntryOrderType)
 
 	// Lakukan refresh BBO dan pre-repeg di luar lock agar tidak terjadi cross-lock contention
-	if !strings.EqualFold(d.Cfg.EntryOrderType, "MARKET") && d.GetBestQuoteFn != nil {
+	if !strings.EqualFold(effOrderType, "MARKET") && d.GetBestQuoteFn != nil {
 		if bid, ask, ok := d.GetBestQuoteFn(intent.Symbol); ok && bid > 0 && ask > 0 {
 			if wouldCrossMakerBook(intent.Side, intent.LimitPrice, bid, ask) {
 				maxRepegs, maxDrift := resolveEntryRepegSettings(d.Cfg.MaxEntryRepegAttempts, d.Cfg.MaxEntryRepegDriftPct)
@@ -319,7 +354,7 @@ func (d *DryRunBroker) SubmitLimitEntry(intent model.OrderIntent) (bool, error) 
 		return false, fmt.Errorf("all %d slots are occupied", d.Cfg.MaxSlots)
 	}
 
-	if strings.ToUpper(d.Cfg.EntryOrderType) == "MARKET" {
+	if strings.EqualFold(effOrderType, "MARKET") {
 		fillPrice := intent.LimitPrice
 		if d.Cfg.SlippageRate > 0 {
 			if intent.Side == model.SideLong {
@@ -451,6 +486,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 		if pos, ok := d.OpenPositions[symbol]; ok {
 			pos.LastMarkPrice = decimal.NewFromFloat(markPrice)
 			pos.MarkUpdatedAt = now
+			d.PeakEffectiveEquityUSDT, _ = protection.UpdatePeakAndDrawdownPct(d.PeakEffectiveEquityUSDT, d.calculateEffectiveEquityLocked())
 
 			entryF, _ := pos.EntryPrice.Float64()
 			if entryF > 0 {
@@ -706,7 +742,15 @@ func (d *DryRunBroker) OnRealtimeTick(
 				"newSL", protDec.NewSLPrice, "peakPrice", pos.PeakPrice, "triggerPrice", triggerRefPrice)
 		}
 
-		// 5. Time-Stop Max Holding (termasuk SlippageRate agar paritas dengan market close & SimBroker)
+		// 5. Underwater Stale-Loss Time-Cut
+		if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, triggerRefPrice, pos.OpenTime, now, d.Cfg.StaleLossExitDuration) {
+			exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
+			closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_STALE_LOSS"))
+			delete(d.PendingOrders, symbol)
+			return
+		}
+
+		// 6. Time-Stop Max Holding (termasuk SlippageRate agar paritas dengan market close & SimBroker)
 		if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
 			exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
 			closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
@@ -837,7 +881,9 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 			}
 		}
 		pos.IsBreakEvenMoved = true
-		pos.ProtectionTier = 1
+		if pos.ProtectionTier < 1 {
+			pos.ProtectionTier = 1
+		}
 
 		slog.Info("dryrun: position notional too small for partial TP1 split (< 5 USDT); moving SL to BE and letting 100% position run as runner",
 			"symbol", pos.Symbol, "qty", pos.Qty, "exitPrice", exitPrice, "newSL", pos.CurrentSLPrice)
@@ -889,7 +935,9 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		}
 	}
 	pos.IsBreakEvenMoved = true
-	pos.ProtectionTier = 1
+	if pos.ProtectionTier < 1 {
+		pos.ProtectionTier = 1
+	}
 
 	d.enqueuePositionEvent(PositionEvent{
 		Type: PositionEventSave,
@@ -990,6 +1038,7 @@ func (d *DryRunBroker) closePositionLocked(pos *VirtualOpenPosition, exitPrice d
 	}
 
 	delete(d.OpenPositions, pos.Symbol)
+	d.PeakEffectiveEquityUSDT, _ = protection.UpdatePeakAndDrawdownPct(d.PeakEffectiveEquityUSDT, d.calculateEffectiveEquityLocked())
 	_ = d.isDailyDrawdownBreachedLocked()
 
 	d.enqueuePositionEvent(PositionEvent{
@@ -1088,6 +1137,27 @@ func (d *DryRunBroker) GetDailyTotalDrawdownPct() float64 {
 	return ddFloat
 }
 
+// SetPeakEffectiveEquityUSDT raises the dry-run high-water mark equity if peak is higher than current peak.
+func (d *DryRunBroker) SetPeakEffectiveEquityUSDT(peak decimal.Decimal) {
+	if peak.LessThanOrEqual(decimal.Zero) {
+		return
+	}
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	if peak.GreaterThan(d.PeakEffectiveEquityUSDT) {
+		d.PeakEffectiveEquityUSDT = peak
+	}
+}
+
+// GetDrawdownFromPeakPct returns non-negative drawdown fraction from running HWM equity.
+func (d *DryRunBroker) GetDrawdownFromPeakPct() float64 {
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	var dd float64
+	d.PeakEffectiveEquityUSDT, dd = protection.UpdatePeakAndDrawdownPct(d.PeakEffectiveEquityUSDT, d.calculateEffectiveEquityLocked())
+	return dd
+}
+
 func (d *DryRunBroker) IsCircuitBreakerTripped() bool {
 	d.Mu.Lock()
 	defer d.Mu.Unlock()
@@ -1167,15 +1237,21 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 		}
 	}
 
-	if d.Cfg.MaxHoldingDuration > 0 {
+	if d.Cfg.MaxHoldingDuration > 0 || d.Cfg.StaleLossExitDuration > 0 {
 		for sym, pos := range d.OpenPositions {
-			if now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
-				triggerRefPrice := pos.LastMarkPrice
-				if triggerRefPrice.GreaterThan(decimal.Zero) {
-					exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
-					closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
-					delete(d.PendingOrders, sym)
+			reason := ""
+			if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
+				reason = "TIME_STOP_MAX_HOLDING"
+			} else if d.Cfg.StaleLossExitDuration > 0 {
+				markFresh := d.Cfg.MaxMarkStaleness <= 0 || pos.MarkUpdatedAt.IsZero() || now.Sub(pos.MarkUpdatedAt) <= d.Cfg.MaxMarkStaleness
+				if markFresh && protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, pos.LastMarkPrice, pos.OpenTime, now, d.Cfg.StaleLossExitDuration) {
+					reason = "TIME_STOP_STALE_LOSS"
 				}
+			}
+			if reason != "" && pos.LastMarkPrice.GreaterThan(decimal.Zero) {
+				exitPrice := d.applyMarketExitSlippage(pos.Side, pos.LastMarkPrice)
+				closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, reason))
+				delete(d.PendingOrders, sym)
 			}
 		}
 	}

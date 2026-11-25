@@ -9,7 +9,7 @@
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css?v=5">
+  <link rel="stylesheet" href="/style.css?v=6">
 </head>
 <body>
   <!-- Header -->
@@ -189,6 +189,11 @@
               <option value="ALL">All Strategies</option>
               <option value="VWAP_PULLBACK">VWAP</option>
               <option value="LIQUIDITY_SWEEP_SHORT">SWEEP</option>
+              <option value="VOL_BREAKOUT">BREAKOUT</option>
+              <option value="EMA_PULLBACK">EMA_PB</option>
+              <option value="VWAP_BREAKDOWN">VWAP_BD</option>
+              <option value="STRUCTURE_BREAK">STRUCT_BRK</option>
+              <option value="REL_RESIDUAL">REL_RESID</option>
             </select>
             <select id="trade-limit-select" class="select-input" title="Rows per page">
               <option value="10" selected>10 / page</option>
@@ -259,6 +264,11 @@
               <option value="ALL">All Strategies</option>
               <option value="VWAP_PULLBACK">VWAP</option>
               <option value="LIQUIDITY_SWEEP_SHORT">SWEEP</option>
+              <option value="VOL_BREAKOUT">BREAKOUT</option>
+              <option value="EMA_PULLBACK">EMA_PB</option>
+              <option value="VWAP_BREAKDOWN">VWAP_BD</option>
+              <option value="STRUCTURE_BREAK">STRUCT_BRK</option>
+              <option value="REL_RESIDUAL">REL_RESID</option>
             </select>
             <select id="signal-symbol-select" class="select-input" title="Filter by Symbol">
               <option value="ALL">All Symbols</option>
@@ -338,7 +348,7 @@
       </div>
 
       <div class="ai-modal-footer">
-        <span id="ai-modal-badge" class="ai-source-badge">gemini-3.5-flash-lite</span>
+        <span id="ai-modal-badge" class="ai-source-badge">AI Copilot</span>
         <div class="ai-modal-actions">
           <button id="ai-modal-refresh-btn" class="btn-ai-footer-action" title="Analisis Ulang dengan AI">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
@@ -395,6 +405,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=5"></script>
+  <script src="/app.js?v=6"></script>
 </body>
 </html>

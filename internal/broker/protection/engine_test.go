@@ -2,6 +2,7 @@ package protection
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
@@ -222,6 +223,49 @@ func TestCalculateBreakEvenSL(t *testing.T) {
 	shortBE := CalculateBreakEvenSL(shortPos, cfg)
 	if !shortBE.LessThan(shortPos.EntryPrice) {
 		t.Fatalf("expected Short BE < 100.0, got %s", shortBE)
+	}
+}
+
+func TestShouldTriggerStaleLossExit(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	entry := decimal.NewFromFloat(100.0)
+	staleDur := 6 * time.Hour
+
+	if ShouldTriggerStaleLossExit(model.SideLong, entry, decimal.NewFromFloat(98.0), t0, t0.Add(5*time.Hour+59*time.Minute), staleDur) {
+		t.Fatalf("expected false before staleDur elapsed")
+	}
+	if !ShouldTriggerStaleLossExit(model.SideLong, entry, decimal.NewFromFloat(99.5), t0, t0.Add(6*time.Hour), staleDur) {
+		t.Fatalf("expected true for underwater LONG at staleDur")
+	}
+	if ShouldTriggerStaleLossExit(model.SideLong, entry, entry, t0, t0.Add(6*time.Hour), staleDur) {
+		t.Fatalf("expected false at exact breakeven for LONG")
+	}
+	if ShouldTriggerStaleLossExit(model.SideLong, entry, decimal.NewFromFloat(101.0), t0, t0.Add(7*time.Hour), staleDur) {
+		t.Fatalf("expected false for profitable LONG")
+	}
+	if !ShouldTriggerStaleLossExit(model.SideShort, entry, decimal.NewFromFloat(100.5), t0, t0.Add(6*time.Hour), staleDur) {
+		t.Fatalf("expected true for underwater SHORT at staleDur")
+	}
+	if ShouldTriggerStaleLossExit(model.SideShort, entry, decimal.NewFromFloat(99.0), t0, t0.Add(6*time.Hour), staleDur) {
+		t.Fatalf("expected false for profitable SHORT")
+	}
+	if ShouldTriggerStaleLossExit(model.SideShort, entry, decimal.NewFromFloat(105.0), t0, t0.Add(6*time.Hour), 0) {
+		t.Fatalf("expected false when staleDur <= 0")
+	}
+}
+
+func TestUpdatePeakAndDrawdownPct(t *testing.T) {
+	peak, dd := UpdatePeakAndDrawdownPct(decimal.NewFromFloat(100.0), decimal.NewFromFloat(125.0))
+	if !peak.Equal(decimal.NewFromFloat(125.0)) || dd != 0.0 {
+		t.Fatalf("expected new peak 125 and dd=0, got peak=%s dd=%f", peak, dd)
+	}
+	peak, dd = UpdatePeakAndDrawdownPct(peak, decimal.NewFromFloat(100.0))
+	if !peak.Equal(decimal.NewFromFloat(125.0)) || dd < 0.1999 || dd > 0.2001 {
+		t.Fatalf("expected peak 125 and dd=0.20, got peak=%s dd=%f", peak, dd)
+	}
+	peak, dd = UpdatePeakAndDrawdownPct(decimal.Zero, decimal.Zero)
+	if !peak.IsZero() || dd != 0.0 {
+		t.Fatalf("expected dd=0 when zero equity, got peak=%s dd=%f", peak, dd)
 	}
 }
 

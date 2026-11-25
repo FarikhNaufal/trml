@@ -559,3 +559,106 @@ func TestModeIsolatedDailyStateAndFundingPersistence(t *testing.T) {
 		t.Fatalf("expected TP1OrderID=445566 TP1ClientOrderID=ALGO_TP1_ETH_1, got %+v", liveLoaded[0])
 	}
 }
+
+func TestGetPeakEquityForMode_And_GetRecentStopLossTimes(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	_ = repo.SaveDailyStateForMode(ctx, "DRY_RUN", 20740, decimal.NewFromFloat(100.0), decimal.NewFromFloat(140.0), false)
+	_ = repo.SaveDailyStateForMode(ctx, "DRY_RUN", 20741, decimal.NewFromFloat(140.0), decimal.NewFromFloat(120.0), false)
+	_ = repo.SaveDailyStateForMode(ctx, "LIVE", 20740, decimal.NewFromFloat(500.0), decimal.NewFromFloat(480.0), false)
+
+	dryPeak, foundDry, err := repo.GetPeakEquityForMode(ctx, "DRY_RUN")
+	if err != nil || !foundDry || !dryPeak.Equal(decimal.NewFromFloat(140.0)) {
+		t.Fatalf("expected DRY_RUN peak=140.0 found=true, got peak=%s found=%v err=%v", dryPeak, foundDry, err)
+	}
+	livePeak, foundLive, err := repo.GetPeakEquityForMode(ctx, "LIVE")
+	if err != nil || !foundLive || !livePeak.Equal(decimal.NewFromFloat(500.0)) {
+		t.Fatalf("expected LIVE peak=500.0 found=true, got peak=%s found=%v err=%v", livePeak, foundLive, err)
+	}
+
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	qtyOne := decimal.NewFromInt(1)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "T1", "BTCUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(95), decimal.NewFromFloat(105), decimal.NewFromFloat(90), decimal.NewFromFloat(5), "TAKE_PROFIT", now.Add(-50*time.Minute), now.Add(-20*time.Minute), 0, 0, 1)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "T2", "ETHUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(102), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(-2), "STOP_LOSS", now.Add(-55*time.Minute), now.Add(-40*time.Minute), 0, 0, 2)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "T3", "SOLUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(102), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(-2), "STOP_LOSS", now.Add(-30*time.Minute), now.Add(-10*time.Minute), 0, 0, 3)
+	_ = repo.LogTradeForMode(ctx, "DRY_RUN", "T_DRY", "DOGEUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(102), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(-2), "STOP_LOSS", now.Add(-25*time.Minute), now.Add(-8*time.Minute), 0, 0, 5)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "T4", "XRPUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(99), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(1), "PARTIAL_TAKE_PROFIT", now.Add(-20*time.Minute), now.Add(-5*time.Minute), 0, 0, 4)
+
+	slLive, err := repo.GetRecentStopLossTimesForMode(ctx, "LIVE", now.Add(-60*time.Minute))
+	if err != nil {
+		t.Fatalf("GetRecentStopLossTimesForMode(LIVE) failed: %v", err)
+	}
+	if len(slLive) != 2 || !slLive[0].Equal(now.Add(-40*time.Minute)) || !slLive[1].Equal(now.Add(-10*time.Minute)) {
+		t.Fatalf("expected 2 LIVE STOP_LOSS timestamps ascending (-40m, -10m), got %v", slLive)
+	}
+	slDry, err := repo.GetRecentStopLossTimesForMode(ctx, "DRY_RUN", now.Add(-60*time.Minute))
+	if err != nil || len(slDry) != 1 || !slDry[0].Equal(now.Add(-8*time.Minute)) {
+		t.Fatalf("expected 1 DRY_RUN STOP_LOSS (-8m), got %v err=%v", slDry, err)
+	}
+}
+
+func TestSQLiteTimestampFixedWidthOrdering_ModeExits_AndLiveOpenedAtUpdate(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	// 1. Boundary second lexicographical ordering test: .000000000Z < .100000000Z < .199999999Z
+	baseSec := time.Date(2026, 11, 25, 15, 0, 0, 0, time.UTC)
+	t0 := baseSec                                         // 15:00:00.000000000Z
+	t1 := baseSec.Add(100 * time.Millisecond)             // 15:00:00.100000000Z (RFC3339Nano ".1Z" used to sort AFTER .199Z!)
+	t2 := baseSec.Add(199999999 * time.Nanosecond)        // 15:00:00.199999999Z
+	qtyOne := decimal.NewFromInt(1)
+
+	_ = repo.LogTradeForMode(ctx, "LIVE", "E_EARLY", "ETHUSDT", "SHORT", qtyOne, decimal.NewFromInt(100), decimal.NewFromInt(102), decimal.NewFromInt(102), decimal.NewFromInt(95), decimal.NewFromInt(-2), "STOP_LOSS", t0.Add(-5*time.Minute), t1, 0, 0, 1)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "E_LATER", "ETHUSDT", "SHORT", qtyOne, decimal.NewFromInt(100), decimal.NewFromInt(95), decimal.NewFromInt(102), decimal.NewFromInt(95), decimal.NewFromInt(5), "TAKE_PROFIT", t0.Add(-4*time.Minute), t2, 0, 0, 2)
+	// Same timestamp PARTIAL_TAKE_PROFIT + STOP_LOSS -> outer join must ignore PARTIAL_TAKE_PROFIT
+	_ = repo.LogTradeForMode(ctx, "LIVE", "SOL_SL", "SOLUSDT", "SHORT", qtyOne, decimal.NewFromInt(100), decimal.NewFromInt(102), decimal.NewFromInt(102), decimal.NewFromInt(95), decimal.NewFromInt(-2), "STOP_LOSS", t0.Add(-5*time.Minute), t2, 0, 0, 3)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "SOL_SL_TP1", "SOLUSDT", "SHORT", qtyOne, decimal.NewFromInt(100), decimal.NewFromInt(98), decimal.NewFromInt(102), decimal.NewFromInt(95), decimal.NewFromInt(2), "PARTIAL_TAKE_PROFIT", t0.Add(-5*time.Minute), t2, 0, 0, 3)
+	// DRY_RUN exit must NOT leak into GetRecentExitsForMode(LIVE)
+	_ = repo.LogTradeForMode(ctx, "DRY_RUN", "DRY_DOGE", "DOGEUSDT", "SHORT", qtyOne, decimal.NewFromInt(100), decimal.NewFromInt(102), decimal.NewFromInt(102), decimal.NewFromInt(95), decimal.NewFromInt(-2), "STOP_LOSS", t0.Add(-5*time.Minute), t2, 0, 0, 4)
+
+	liveExits, err := repo.GetRecentExitsForMode(ctx, "LIVE", baseSec.Add(150*time.Millisecond))
+	if err != nil {
+		t.Fatalf("GetRecentExitsForMode(LIVE) failed: %v", err)
+	}
+	if _, leaked := liveExits["DOGEUSDT"]; leaked {
+		t.Fatalf("expected DRY_RUN exit NOT to leak into LIVE exits, got %+v", liveExits)
+	}
+	if rec, ok := liveExits["ETHUSDT"]; !ok || rec.ExitReason != "TAKE_PROFIT" || !rec.ClosedAt.Equal(t2) {
+		t.Fatalf("expected ETHUSDT latest exit at t2 TAKE_PROFIT, got %+v ok=%v", rec, ok)
+	}
+	if rec, ok := liveExits["SOLUSDT"]; !ok || rec.ExitReason != "STOP_LOSS" {
+		t.Fatalf("expected SOLUSDT exit STOP_LOSS (ignoring same-ts PARTIAL_TAKE_PROFIT), got %+v ok=%v", rec, ok)
+	}
+
+	slTimes, err := repo.GetRecentStopLossTimesForMode(ctx, "LIVE", baseSec.Add(50*time.Millisecond))
+	if err != nil || len(slTimes) != 2 || !slTimes[0].Equal(t1) || !slTimes[1].Equal(t2) {
+		t.Fatalf("expected 2 SL timestamps ordered [t1, t2], got %v err=%v", slTimes, err)
+	}
+
+	// 2. SaveLivePosition ON CONFLICT DO UPDATE must update opened_at_utc
+	oldOpen := baseSec.Add(-48 * time.Hour)
+	newOpen := baseSec
+	_ = repo.SaveLivePosition(ctx, StoredLivePosition{
+		Symbol: "AVAXUSDT", Side: "LONG", Qty: qtyOne, EntryPrice: decimal.NewFromInt(20),
+		SLPrice: decimal.NewFromInt(19), OpenedAt: oldOpen, UpdatedAt: oldOpen,
+	})
+	_ = repo.SaveLivePosition(ctx, StoredLivePosition{
+		Symbol: "AVAXUSDT", Side: "LONG", Qty: qtyOne, EntryPrice: decimal.NewFromInt(21),
+		SLPrice: decimal.NewFromInt(20), OpenedAt: newOpen, UpdatedAt: newOpen,
+	})
+	loaded, err := repo.GetAllLivePositions(ctx)
+	if err != nil || len(loaded) != 1 || !loaded[0].OpenedAt.Equal(newOpen) {
+		t.Fatalf("expected SaveLivePosition conflict update to update OpenedAt to %v, got %+v err=%v", newOpen, loaded, err)
+	}
+}

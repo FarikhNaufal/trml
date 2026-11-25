@@ -108,14 +108,24 @@ type RejectionStat struct {
 type WebReader struct {
 	db       *sql.DB
 	leverage float64
+	mode     string
 }
 
-func OpenReadOnlyReader(dbPath string, leverage ...float64) (*WebReader, error) {
+// SetMode restricts all trade_ledger queries to the normalized trading mode ("DRY_RUN" or "LIVE").
+// An empty mode disables mode filtering (preserving compatibility with legacy/test schemas).
+func (r *WebReader) SetMode(mode string) {
+	if r == nil {
+		return
+	}
+	r.mode = strings.ToUpper(strings.TrimSpace(mode))
+}
+
+func OpenReadOnlyReader(dbPath string, leverage float64, mode ...string) (*WebReader, error) {
 	sep := "?"
 	if strings.Contains(dbPath, "?") {
 		sep = "&"
 	}
-	dsn := fmt.Sprintf("%s%smode=ro&_pragma=busy_timeout(2000)&_pragma=journal_mode(WAL)&_pragma=query_only(true)", dbPath, sep)
+	dsn := fmt.Sprintf("%s%smode=ro&_pragma=busy_timeout(2000)&_pragma=query_only(true)", dbPath, sep)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -125,22 +135,128 @@ func OpenReadOnlyReader(dbPath string, leverage ...float64) (*WebReader, error) 
 	db.SetMaxOpenConns(4)
 	db.SetConnMaxLifetime(time.Hour)
 
-	lev := 8.0
-	if len(leverage) > 0 && leverage[0] > 0 {
-		lev = leverage[0]
+	lev := leverage
+	if lev <= 0 {
+		lev = 8.0
 	}
 
-	return &WebReader{db: db, leverage: lev}, nil
+	normMode := ""
+	if len(mode) > 0 {
+		normMode = strings.ToUpper(strings.TrimSpace(mode[0]))
+	}
+
+	return &WebReader{db: db, leverage: lev, mode: normMode}, nil
 }
 
 func (r *WebReader) Close() error {
-	if r.db != nil {
+	if r != nil && r.db != nil {
 		return r.db.Close()
 	}
 	return nil
 }
 
+func (r *WebReader) modeFilterClause(colPrefix string) (string, []any) {
+	if r == nil || r.mode == "" {
+		return "", nil
+	}
+	return colPrefix + "mode = ?", []any{r.mode}
+}
+
+func enrichTradeItem(it *TradeItem, leverage float64) {
+	entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
+	exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
+	qtyF, _ := strconv.ParseFloat(it.Qty, 64)
+	slF, _ := strconv.ParseFloat(it.SLPriceInitial, 64)
+	tpF, _ := strconv.ParseFloat(it.TPPriceInitial, 64)
+
+	if entryF > 0 {
+		if strings.ToUpper(it.Side) == "LONG" {
+			it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
+			if slF > 0 {
+				it.PlannedSLPct = math.Abs((entryF-slF)/entryF) * 100.0
+			}
+			if tpF > 0 {
+				it.PlannedTPPct = math.Abs((tpF-entryF)/entryF) * 100.0
+			}
+		} else {
+			it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
+			if slF > 0 {
+				it.PlannedSLPct = math.Abs((slF-entryF)/entryF) * 100.0
+			}
+			if tpF > 0 {
+				it.PlannedTPPct = math.Abs((entryF-tpF)/entryF) * 100.0
+			}
+		}
+
+		lev := leverage
+		if lev <= 0 {
+			lev = 8.0
+		}
+		notional := entryF * qtyF
+		if notional > 0 {
+			initialMargin := notional / lev
+			it.ROEPct = (it.NetPnLUSDT / initialMargin) * 100.0
+		} else {
+			it.ROEPct = it.PriceChangePct * lev
+		}
+	}
+
+	tOpen, err1 := time.Parse(time.RFC3339Nano, it.OpenedAtUTC)
+	if err1 != nil {
+		tOpen, err1 = time.Parse(time.RFC3339, it.OpenedAtUTC)
+	}
+	tClose, err2 := time.Parse(time.RFC3339Nano, it.ClosedAtUTC)
+	if err2 != nil {
+		tClose, err2 = time.Parse(time.RFC3339, it.ClosedAtUTC)
+	}
+	if err1 == nil && err2 == nil {
+		it.DurationSec = int64(tClose.Sub(tOpen).Seconds())
+	}
+}
+
+func classifySetupOutcome(pnl float64, hasTP1, hasRunnerWin, hasBE, hasSL int) (isFullWin, isPartialWin, isBE, isLoss bool) {
+	if (hasRunnerWin == 1 && pnl > 0) || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
+		return true, false, false, false
+	}
+	if hasTP1 == 1 && pnl > 0.005 {
+		return false, true, false, false
+	}
+	if (hasBE == 1 && pnl >= -0.05) || (hasSL == 0 && math.Abs(pnl) <= 0.05) {
+		return false, false, true, false
+	}
+	return false, false, false, true
+}
+
+func (r *WebReader) buildSetupStatsQuery() (string, []any) {
+	whereSQL := ""
+	clause, args := r.modeFilterClause("")
+	if clause != "" {
+		whereSQL = " WHERE " + clause
+	}
+	query := `
+		SELECT
+			CASE
+				WHEN signal_audit_id > 0 THEN 'SIG_' || CAST(signal_audit_id AS TEXT)
+				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
+				WHEN client_order_id LIKE 'ALGO_TP1_%' THEN 'ALGO_LIVE_' || SUBSTR(client_order_id, 10)
+				ELSE client_order_id
+			END AS setup_id,
+			COALESCE(MAX(NULLIF(strategy_id, '')), 'VWAP_PULLBACK') AS strategy_id,
+			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
+			MAX(CASE WHEN exit_reason = 'PARTIAL_TAKE_PROFIT' THEN 1 ELSE 0 END) AS has_tp1,
+			MAX(CASE WHEN exit_reason IN ('TAKE_PROFIT', 'TRAILING_STOP', 'PROFIT_LOCK') THEN 1 ELSE 0 END) AS has_runner_win,
+			MAX(CASE WHEN exit_reason = 'BREAK_EVEN' THEN 1 ELSE 0 END) AS has_be,
+			MAX(CASE WHEN exit_reason = 'STOP_LOSS' THEN 1 ELSE 0 END) AS has_sl
+		FROM trade_ledger` + whereSQL + `
+		GROUP BY setup_id;
+	`
+	return query, args
+}
+
 func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, statusFilter string, strategyFilter ...string) ([]TradeItem, int, error) {
+	if r == nil || r.db == nil {
+		return nil, 0, errors.New("reader: database not available")
+	}
 	if page < 1 {
 		page = 1
 	}
@@ -151,6 +267,11 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 
 	var whereClauses []string
 	var args []any
+
+	if modeClause, modeArgs := r.modeFilterClause(""); modeClause != "" {
+		whereClauses = append(whereClauses, modeClause)
+		args = append(args, modeArgs...)
+	}
 
 	if statusFilter != "" && statusFilter != "ALL" {
 		sf := strings.ToUpper(strings.TrimSpace(statusFilter))
@@ -192,7 +313,7 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
 		       COALESCE(ai_autopsy, '')
 		FROM trade_ledger` + whereSQL + `
-		ORDER BY rowid DESC
+		ORDER BY closed_at_utc DESC, rowid DESC
 		LIMIT ? OFFSET ?;
 	`
 	queryArgs := append(args, limit, offset)
@@ -216,52 +337,11 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 			return nil, 0, fmt.Errorf("scan trade row: %w", err)
 		}
 		it.NetPnLUSDT, _ = strconv.ParseFloat(pnlStr, 64)
-
-		entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
-		exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
-		qtyF, _ := strconv.ParseFloat(it.Qty, 64)
-		slF, _ := strconv.ParseFloat(it.SLPriceInitial, 64)
-		tpF, _ := strconv.ParseFloat(it.TPPriceInitial, 64)
-
-		if entryF > 0 {
-			if strings.ToUpper(it.Side) == "LONG" {
-				it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
-				if slF > 0 {
-					it.PlannedSLPct = math.Abs((entryF-slF)/entryF) * 100.0
-				}
-				if tpF > 0 {
-					it.PlannedTPPct = math.Abs((tpF-entryF)/entryF) * 100.0
-				}
-			} else {
-				it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
-				if slF > 0 {
-					it.PlannedSLPct = math.Abs((slF-entryF)/entryF) * 100.0
-				}
-				if tpF > 0 {
-					it.PlannedTPPct = math.Abs((entryF-tpF)/entryF) * 100.0
-				}
-			}
-
-			lev := r.leverage
-			if lev <= 0 {
-				lev = 8.0
-			}
-			notional := entryF * qtyF
-			if notional > 0 {
-				initialMargin := notional / lev
-				it.ROEPct = (it.NetPnLUSDT / initialMargin) * 100.0
-			} else {
-				it.ROEPct = it.PriceChangePct * lev
-			}
-		}
-
-		tOpen, err1 := time.Parse(time.RFC3339Nano, it.OpenedAtUTC)
-		tClose, err2 := time.Parse(time.RFC3339Nano, it.ClosedAtUTC)
-		if err1 == nil && err2 == nil {
-			it.DurationSec = int64(tClose.Sub(tOpen).Seconds())
-		}
-
+		enrichTradeItem(&it, r.leverage)
 		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate trade rows: %w", err)
 	}
 
 	return items, total, nil
@@ -269,18 +349,27 @@ func (r *WebReader) GetTradesPaginated(ctx context.Context, page, limit int, sta
 
 // GetTradeByClientOrderID mencari 1 data trade berdasarkan client_order_id
 func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID string) (*TradeItem, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("reader: database not available")
+	}
+	whereClauses := []string{"client_order_id = ?"}
+	args := []any{clientOrderID}
+	if modeClause, modeArgs := r.modeFilterClause(""); modeClause != "" {
+		whereClauses = append(whereClauses, modeClause)
+		args = append(args, modeArgs...)
+	}
 	query := `
 		SELECT client_order_id, symbol, side, COALESCE(strategy_id, 'VWAP_PULLBACK'), qty, entry_price, exit_price,
 		       COALESCE(sl_price_initial, ''), COALESCE(tp_price_initial, ''),
 		       net_pnl_usdt, mae_pct, mfe_pct, exit_reason, opened_at_utc, closed_at_utc, signal_audit_id,
 		       COALESCE(ai_autopsy, '')
 		FROM trade_ledger
-		WHERE client_order_id = ?
+		WHERE ` + strings.Join(whereClauses, " AND ") + `
 		LIMIT 1;
 	`
 	var it TradeItem
 	var pnlStr string
-	err := r.db.QueryRowContext(ctx, query, clientOrderID).Scan(
+	err := r.db.QueryRowContext(ctx, query, args...).Scan(
 		&it.ClientOrderID, &it.Symbol, &it.Side, &it.StrategyID, &it.Qty, &it.EntryPrice, &it.ExitPrice,
 		&it.SLPriceInitial, &it.TPPriceInitial,
 		&pnlStr, &it.MAEPct, &it.MFEPct, &it.ExitReason, &it.OpenedAtUTC, &it.ClosedAtUTC, &it.SignalAuditID,
@@ -293,55 +382,15 @@ func (r *WebReader) GetTradeByClientOrderID(ctx context.Context, clientOrderID s
 		return nil, fmt.Errorf("scan trade by id: %w", err)
 	}
 	it.NetPnLUSDT, _ = strconv.ParseFloat(pnlStr, 64)
-
-	entryF, _ := strconv.ParseFloat(it.EntryPrice, 64)
-	exitF, _ := strconv.ParseFloat(it.ExitPrice, 64)
-	qtyF, _ := strconv.ParseFloat(it.Qty, 64)
-	slF, _ := strconv.ParseFloat(it.SLPriceInitial, 64)
-	tpF, _ := strconv.ParseFloat(it.TPPriceInitial, 64)
-
-	if entryF > 0 {
-		if strings.ToUpper(it.Side) == "LONG" {
-			it.PriceChangePct = ((exitF - entryF) / entryF) * 100.0
-			if slF > 0 {
-				it.PlannedSLPct = math.Abs((entryF-slF)/entryF) * 100.0
-			}
-			if tpF > 0 {
-				it.PlannedTPPct = math.Abs((tpF-entryF)/entryF) * 100.0
-			}
-		} else {
-			it.PriceChangePct = ((entryF - exitF) / entryF) * 100.0
-			if slF > 0 {
-				it.PlannedSLPct = math.Abs((slF-entryF)/entryF) * 100.0
-			}
-			if tpF > 0 {
-				it.PlannedTPPct = math.Abs((entryF-tpF)/entryF) * 100.0
-			}
-		}
-
-		lev := r.leverage
-		if lev <= 0 {
-			lev = 8.0
-		}
-		notional := entryF * qtyF
-		if notional > 0 {
-			initialMargin := notional / lev
-			it.ROEPct = (it.NetPnLUSDT / initialMargin) * 100.0
-		} else {
-			it.ROEPct = it.PriceChangePct * lev
-		}
-	}
-
-	tOpen, err1 := time.Parse(time.RFC3339Nano, it.OpenedAtUTC)
-	tClose, err2 := time.Parse(time.RFC3339Nano, it.ClosedAtUTC)
-	if err1 == nil && err2 == nil {
-		it.DurationSec = int64(tClose.Sub(tOpen).Seconds())
-	}
+	enrichTradeItem(&it, r.leverage)
 
 	return &it, nil
 }
 
 func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, decisionFilter, symbolFilter string, strategyFilter ...string) ([]SignalItem, int, error) {
+	if r == nil || r.db == nil {
+		return nil, 0, errors.New("reader: database not available")
+	}
 	if page < 1 {
 		page = 1
 	}
@@ -418,30 +467,21 @@ func (r *WebReader) GetSignalsPaginated(ctx context.Context, page, limit int, de
 		}
 		items = append(items, it)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate signal rows: %w", err)
+	}
 
 	return items, total, nil
 }
 
 func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
+	if r == nil || r.db == nil {
+		return StatsItem{}, errors.New("reader: database not available")
+	}
 	// Agregasikan metrik per setup posisi (menggabungkan tiket partial _TP1 dan Runner menjadi 1 setup utuh)
 	// agar Win Rate, Avg Win, dan Realized R:R tidak terdistorsi ke bawah oleh pembagian lot.
-	query := `
-		SELECT 
-			CASE 
-				WHEN signal_audit_id > 0 THEN 'SIG_' || CAST(signal_audit_id AS TEXT)
-				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
-				WHEN client_order_id LIKE 'ALGO_TP1_%' THEN 'ALGO_LIVE_' || SUBSTR(client_order_id, 10)
-				ELSE client_order_id 
-			END AS setup_id,
-			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
-			MAX(CASE WHEN exit_reason = 'PARTIAL_TAKE_PROFIT' THEN 1 ELSE 0 END) AS has_tp1,
-			MAX(CASE WHEN exit_reason IN ('TAKE_PROFIT', 'TRAILING_STOP', 'PROFIT_LOCK') THEN 1 ELSE 0 END) AS has_runner_win,
-			MAX(CASE WHEN exit_reason = 'BREAK_EVEN' THEN 1 ELSE 0 END) AS has_be,
-			MAX(CASE WHEN exit_reason = 'STOP_LOSS' THEN 1 ELSE 0 END) AS has_sl
-		FROM trade_ledger
-		GROUP BY setup_id;
-	`
-	rows, err := r.db.QueryContext(ctx, query)
+	query, args := r.buildSetupStatsQuery()
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return StatsItem{}, fmt.Errorf("query stats: %w", err)
 	}
@@ -451,34 +491,35 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 	var totalWinVal, totalFullWinVal, totalLossVal float64
 
 	for rows.Next() {
-		var setupID string
+		var setupID, stratID string
 		var pnl float64
 		var hasTP1, hasRunnerWin, hasBE, hasSL int
-		if err := rows.Scan(&setupID, &pnl, &hasTP1, &hasRunnerWin, &hasBE, &hasSL); err != nil {
+		if err := rows.Scan(&setupID, &stratID, &pnl, &hasTP1, &hasRunnerWin, &hasBE, &hasSL); err != nil {
 			continue
 		}
 		stats.TotalTrades++
 		stats.TotalNetPnLUSDT += pnl
 
-		if (hasRunnerWin == 1 && pnl > 0) || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
-			// Full Win: runner mencapai target penuh (TP2, Trailing Stop, atau Profit Lock)
+		isFull, isPart, isBE, _ := classifySetupOutcome(pnl, hasTP1, hasRunnerWin, hasBE, hasSL)
+		switch {
+		case isFull:
 			stats.WinsCount++
 			stats.FullWinsCount++
 			totalWinVal += pnl
 			totalFullWinVal += pnl
-		} else if hasTP1 == 1 && pnl > 0.005 {
-			// Partial Win: TP1 mengamankan kas cuan, runner keluar di BE/SL dengan net PnL tetap positif
+		case isPart:
 			stats.WinsCount++
 			stats.PartialWinsCount++
 			totalWinVal += pnl
-		} else if (hasBE == 1 && pnl >= -0.05) || (hasSL == 0 && math.Abs(pnl) <= 0.05) {
-			// Pure Break-Even: Tier 1 rem dini modal kembali utuh (~$0.00)
+		case isBE:
 			stats.BreakEvenCount++
-		} else {
-			// Full Loss: Stop Loss tersenggol atau net PnL negatif
+		default:
 			stats.LossesCount++
 			totalLossVal += math.Abs(pnl)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return StatsItem{}, fmt.Errorf("iterate stats rows: %w", err)
 	}
 
 	if stats.TotalTrades > 0 {
@@ -518,37 +559,21 @@ func (r *WebReader) GetOverallStats(ctx context.Context) (StatsItem, error) {
 
 // GetStrategyStats mengagregasi statistik setup (WR & Net PF) per strategy_id dari trade_ledger.
 func (r *WebReader) GetStrategyStats(ctx context.Context) ([]StrategyStatsItem, error) {
-	if r.db == nil {
+	if r == nil || r.db == nil {
 		return nil, errors.New("reader: database not available")
 	}
 
-	query := `
-		SELECT
-			CASE
-				WHEN signal_audit_id > 0 THEN 'SIG_' || CAST(signal_audit_id AS TEXT)
-				WHEN client_order_id LIKE '%_TP1' THEN SUBSTR(client_order_id, 1, LENGTH(client_order_id) - 4)
-				WHEN client_order_id LIKE 'ALGO_TP1_%' THEN 'ALGO_LIVE_' || SUBSTR(client_order_id, 10)
-				ELSE client_order_id
-			END AS setup_id,
-			COALESCE(MAX(NULLIF(strategy_id, '')), 'VWAP_PULLBACK') AS strategy_id,
-			SUM(CAST(net_pnl_usdt AS REAL)) AS setup_net_pnl,
-			MAX(CASE WHEN exit_reason = 'PARTIAL_TAKE_PROFIT' THEN 1 ELSE 0 END) AS has_tp1,
-			MAX(CASE WHEN exit_reason IN ('TAKE_PROFIT', 'TRAILING_STOP', 'PROFIT_LOCK') THEN 1 ELSE 0 END) AS has_runner_win,
-			MAX(CASE WHEN exit_reason = 'BREAK_EVEN' THEN 1 ELSE 0 END) AS has_be,
-			MAX(CASE WHEN exit_reason = 'STOP_LOSS' THEN 1 ELSE 0 END) AS has_sl
-		FROM trade_ledger
-		GROUP BY setup_id;
-	`
-	rows, err := r.db.QueryContext(ctx, query)
+	query, args := r.buildSetupStatsQuery()
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query strategy stats: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	type accum struct {
-		item     StrategyStatsItem
-		winSum   float64
-		lossSum  float64
+		item    StrategyStatsItem
+		winSum  float64
+		lossSum float64
 	}
 	byStrat := make(map[string]*accum)
 
@@ -567,18 +592,20 @@ func (r *WebReader) GetStrategyStats(ctx context.Context) ([]StrategyStatsItem, 
 		a.item.TotalTrades++
 		a.item.TotalNetPnLUSDT += pnl
 
-		if (hasRunnerWin == 1 && pnl > 0) || (hasSL == 0 && hasBE == 0 && pnl > 0.05) {
+		isFull, isPart, isBE, _ := classifySetupOutcome(pnl, hasTP1, hasRunnerWin, hasBE, hasSL)
+		switch {
+		case isFull, isPart:
 			a.item.WinsCount++
 			a.winSum += pnl
-		} else if hasTP1 == 1 && pnl > 0.005 {
-			a.item.WinsCount++
-			a.winSum += pnl
-		} else if (hasBE == 1 && pnl >= -0.05) || (hasSL == 0 && math.Abs(pnl) <= 0.05) {
+		case isBE:
 			a.item.BreakEvenCount++
-		} else {
+		default:
 			a.item.LossesCount++
 			a.lossSum += math.Abs(pnl)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate strategy stats rows: %w", err)
 	}
 
 	keys := make([]string, 0, len(byStrat))
@@ -610,7 +637,7 @@ func (r *WebReader) GetStrategyStats(ctx context.Context) ([]StrategyStatsItem, 
 // GetSignalAuditSummary mengagregasi seluruh log evaluasi sinyal secara akurat
 func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSummary, error) {
 	var summary SignalAuditSummary
-	if r.db == nil {
+	if r == nil || r.db == nil {
 		return summary, errors.New("reader: database not available")
 	}
 
@@ -633,6 +660,9 @@ func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSumma
 				summary.TotalRejected += cnt
 			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return summary, fmt.Errorf("iterate decision counts: %w", err)
 	}
 
 	if summary.TotalEvaluated > 0 {
@@ -668,6 +698,9 @@ func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSumma
 				})
 			}
 		}
+		if err := rejRows.Err(); err != nil {
+			return summary, fmt.Errorf("iterate top rejections: %w", err)
+		}
 	}
 
 	return summary, nil
@@ -675,6 +708,9 @@ func (r *WebReader) GetSignalAuditSummary(ctx context.Context) (SignalAuditSumma
 
 // GetTradesForPatternMiner mengambil riwayat trade untuk penambangan pola AI tanpa memuat teks autopsy lama
 func (r *WebReader) GetTradesForPatternMiner(ctx context.Context, limit int) ([]TradeItem, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("reader: database not available")
+	}
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}

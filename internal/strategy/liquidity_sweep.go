@@ -19,6 +19,9 @@ func (LiquiditySweepAlpha) ID() string {
 
 // Evaluate checks 1-bar SHORT-ONLY liquidity sweep entry conditions using precomputed shared context.
 func (LiquiditySweepAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnapshot, cfg EvaluatorConfig) AlphaCandidate {
+	if rej, ok := checkPrimaryNATRBounds(ctx, cfg, "SWEEP"); !ok {
+		return rej
+	}
 	if strings.ToUpper(strings.TrimSpace(cfg.AllowedSide)) == "LONG_ONLY" {
 		return AlphaCandidate{
 			Reason:    "SIDE_DISABLED_LONG_ONLY",

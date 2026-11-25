@@ -153,6 +153,7 @@ func ParseExchangeInfoCatalog(raw []byte) (CatalogedExchangeInfo, error) {
 				TickSize    string `json:"tickSize"`
 				StepSize    string `json:"stepSize"`
 				MinQty      string `json:"minQty"`
+				MaxQty      string `json:"maxQty"`
 				MinNotional string `json:"minNotional"`
 				Notional    string `json:"notional"`
 			} `json:"filters"`
@@ -188,6 +189,11 @@ func ParseExchangeInfoCatalog(raw []byte) (CatalogedExchangeInfo, error) {
 			case "LOT_SIZE":
 				ef.StepSize, _ = decimal.NewFromString(f.StepSize)
 				ef.MinQty, _ = decimal.NewFromString(f.MinQty)
+				ef.MaxQty, _ = decimal.NewFromString(f.MaxQty)
+			case "MARKET_LOT_SIZE":
+				ef.MarketStepSize, _ = decimal.NewFromString(f.StepSize)
+				ef.MarketMinQty, _ = decimal.NewFromString(f.MinQty)
+				ef.MarketMaxQty, _ = decimal.NewFromString(f.MaxQty)
 			case "MIN_NOTIONAL":
 				if f.MinNotional != "" {
 					ef.MinNotional, _ = decimal.NewFromString(f.MinNotional)

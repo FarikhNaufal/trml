@@ -95,7 +95,11 @@ func ValidateCandlesWithOI(
 	}
 	covered := 0
 	for _, c := range candles {
-		if _, _, _, _, ok := oiMgr.LookupOpenInterestStrict(symbol, c.CloseTime, minOIInterval, maxOIInterval, maxOIStaleness); ok {
+		evalTime := c.CloseTime
+		if evalTime.UnixMilli()%1000 == 999 {
+			evalTime = evalTime.Add(time.Millisecond)
+		}
+		if _, _, _, _, ok := oiMgr.LookupOpenInterestStrict(symbol, evalTime, minOIInterval, maxOIInterval, maxOIStaleness); ok {
 			covered++
 		}
 	}

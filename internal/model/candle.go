@@ -28,6 +28,17 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time, expectedStep .
 	if len(expectedStep) > 0 && expectedStep[0] > 0 {
 		targetStep = expectedStep[0]
 	}
+	strictGapHorizon := 24 * time.Hour
+	if targetStep > strictGapHorizon {
+		strictGapHorizon = targetStep
+	}
+	var lastClosedOpenTime time.Time
+	for _, c := range raw {
+		if c.CloseTime.Before(serverTime) || c.CloseTime.Equal(serverTime) {
+			lastClosedOpenTime = c.OpenTime
+		}
+	}
+
 	var valid []Candle
 	for i, c := range raw {
 		if !c.CloseTime.Before(serverTime) && !c.CloseTime.Equal(serverTime) {
@@ -54,8 +65,13 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time, expectedStep .
 				return nil, fmt.Errorf("candle non-monotonic timestamp at index %d", i)
 			}
 			step := c.OpenTime.Sub(prev.OpenTime)
-			if step != targetStep {
-				return nil, fmt.Errorf("candle gap detected: expected %v, got %v", targetStep, step)
+			withinRecentWindow := !lastClosedOpenTime.IsZero() && lastClosedOpenTime.Sub(c.OpenTime) <= strictGapHorizon
+			if withinRecentWindow {
+				if step != targetStep {
+					return nil, fmt.Errorf("candle gap detected: expected %v, got %v", targetStep, step)
+				}
+			} else if step%targetStep != 0 {
+				return nil, fmt.Errorf("candle gap alignment invalid: step %v not multiple of %v", step, targetStep)
 			}
 		}
 		valid = append(valid, c)

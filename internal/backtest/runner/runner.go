@@ -45,12 +45,15 @@ type CommonOptions struct {
 	DynamicScanner    bool
 	ScannerRanking    string
 	MaxWatched        int
-	WarmupBars        int
-	Unconstrained     bool
-	Compounding       bool
-	CommitHash        string
-	BenchmarkSym      string
-	SaveToDB          bool
+	WarmupBars          int
+	TodayMode           bool
+	TodayStartUTC       time.Time
+	OverrideCompounding *bool
+	Unconstrained       bool
+	Compounding         bool
+	CommitHash          string
+	BenchmarkSym        string
+	SaveToDB            bool
 
 	// Report export paths (optional)
 	OutMarkdown  string
@@ -101,6 +104,7 @@ type LoadedDataset struct {
 	CandleDur     time.Duration
 	ExecTF        string
 	OIMode        string
+	TodayStartUTC time.Time
 	ScannerCfg    scanner.ScannerConfig
 	InitialEquity float64
 	Symbols       []string
@@ -152,6 +156,9 @@ func PrepareDataset(ctx context.Context, opts CommonOptions) (*LoadedDataset, er
 	if err != nil {
 		return nil, fmt.Errorf("failed loading backtest config (%s): %w", opts.EnvPath, err)
 	}
+	if appCfg != nil && appCfg.DisableOIFilter && oiMode != replay.OIModeStrict {
+		oiMode = replay.OIModeOff
+	}
 
 	initEq := 125.0
 	if appCfg != nil && appCfg.InitialEquity.GreaterThan(decimal.Zero) {
@@ -167,6 +174,24 @@ func PrepareDataset(ctx context.Context, opts CommonOptions) (*LoadedDataset, er
 	}
 	if opts.MaxWatched > 0 {
 		scannerCfg.MaxWatchedCoins = opts.MaxWatched
+	}
+
+	todayStart := opts.TodayStartUTC
+	if opts.TodayMode {
+		if todayStart.IsZero() {
+			ref := opts.To.UTC()
+			if ref.IsZero() {
+				ref = time.Now().UTC()
+			}
+			todayStart = time.Date(ref.Year(), ref.Month(), ref.Day(), 0, 0, 0, 0, time.UTC)
+		}
+		minLead := 24 * time.Hour
+		if barLead := time.Duration(220) * candleDur; barLead > minLead {
+			minLead = barLead
+		}
+		if requiredFrom := todayStart.Add(-minLead); opts.From.IsZero() || opts.From.After(requiredFrom) {
+			opts.From = requiredFrom
+		}
 	}
 
 	dirs := data.ResolveBacktestDirs(opts.CacheDir)
@@ -197,8 +222,12 @@ func PrepareDataset(ctx context.Context, opts CommonOptions) (*LoadedDataset, er
 		return nil, fmt.Errorf("no candle data available in [%s..%s]", opts.From.Format("2006-01-02"), opts.To.Format("2006-01-02"))
 	}
 
-	execTF := strings.ToLower(strings.TrimSpace(opts.ExecTF))
+	rawExecTF := strings.ToLower(strings.TrimSpace(opts.ExecTF))
+	execTF := rawExecTF
 	if execTF == "" {
+		execTF = interval
+	} else if execTF != "1m" && !strings.EqualFold(execTF, interval) {
+		slog.Warn("exec-tf tidak didukung untuk interval utama; fallback ke interval utama", "requested_exec_tf", opts.ExecTF, "interval", interval)
 		execTF = interval
 	}
 	var execCandles map[string][]data.HistoricalCandle
@@ -235,6 +264,7 @@ func PrepareDataset(ctx context.Context, opts CommonOptions) (*LoadedDataset, er
 		CandleDur:     candleDur,
 		ExecTF:        execTF,
 		OIMode:        oiMode,
+		TodayStartUTC: todayStart,
 		ScannerCfg:    scannerCfg,
 		InitialEquity: initEq,
 		Symbols:       symbols,
@@ -271,7 +301,12 @@ func ExecuteRun(ctx context.Context, ds *LoadedDataset, opts RunOptions) (*RunOu
 		ds.CandleMap[ds.getBenchmarkSym(opts.BenchmarkSym)], scanAudit, execAudit,
 	)
 
-	mc := validation.RunMonteCarlo(validation.ExtractAggregatedPnLs(summary), ds.InitialEquity, 1000, 42)
+	var mc validation.MonteCarloResult
+	if brokerCfg.EquityModeCompounding {
+		mc = validation.RunCompoundingMonteCarlo(summary.Trades, ds.InitialEquity, 1000, 42)
+	} else {
+		mc = validation.RunMonteCarlo(validation.ExtractAggregatedPnLs(summary), ds.InitialEquity, 1000, 42)
+	}
 	runID := generateRunID("run")
 
 	meta := buildReportMeta(runID, ds, opts.CommonOptions, brokerCfg, evalCfg, execAudit, sim.ClosedTrades, &mc, nil, nil)
@@ -289,7 +324,7 @@ func ExecuteRun(ctx context.Context, ds *LoadedDataset, opts RunOptions) (*RunOu
 	}
 
 	if opts.SaveToDB && ds.Store != nil {
-		if err := persistRunResult(ctx, ds.Store, runID, "run", ds, opts.CommonOptions, brokerCfg.SLGapFillEnabled, replayCfg.DeductPendingMargin, summary, sim.ClosedTrades, sim.EquityCurve, nil); err != nil {
+		if err := persistRunResult(ctx, ds.Store, runID, "run", ds, opts.CommonOptions, brokerCfg.EquityModeCompounding, brokerCfg.SLGapFillEnabled, replayCfg.DeductPendingMargin, summary, sim.ClosedTrades, sim.EquityCurve, nil); err != nil {
 			slog.Warn("gagal menyimpan run ke backtest.db", "run_id", runID, "err", err)
 		}
 	}
@@ -338,7 +373,12 @@ func ExecuteWalkForward(ctx context.Context, ds *LoadedDataset, opts WalkForward
 		return nil, "", err
 	}
 
-	mc := validation.RunMonteCarlo(validation.ExtractAggregatedPnLs(wfaRes.StitchedOOSSummary), ds.InitialEquity, 1000, 42)
+	var mc validation.MonteCarloResult
+	if brokerCfg.EquityModeCompounding {
+		mc = validation.RunCompoundingMonteCarlo(wfaRes.StitchedOOSSummary.Trades, ds.InitialEquity, 1000, 42)
+	} else {
+		mc = validation.RunMonteCarlo(validation.ExtractAggregatedPnLs(wfaRes.StitchedOOSSummary), ds.InitialEquity, 1000, 42)
+	}
 	runID := generateRunID("wfa")
 
 	var storedFolds []data.WalkForwardFoldRecord
@@ -356,7 +396,7 @@ func ExecuteWalkForward(ctx context.Context, ds *LoadedDataset, opts WalkForward
 		})
 	}
 	if opts.SaveToDB && ds.Store != nil {
-		if err := persistRunResult(ctx, ds.Store, runID, "walkforward", ds, opts.CommonOptions, brokerCfg.SLGapFillEnabled, replayCfg.DeductPendingMargin, wfaRes.StitchedOOSSummary, nil, wfaRes.StitchedOOSCurve, storedFolds); err != nil {
+		if err := persistRunResult(ctx, ds.Store, runID, "walkforward", ds, opts.CommonOptions, brokerCfg.EquityModeCompounding, brokerCfg.SLGapFillEnabled, replayCfg.DeductPendingMargin, wfaRes.StitchedOOSSummary, nil, wfaRes.StitchedOOSCurve, storedFolds); err != nil {
 			slog.Warn("gagal menyimpan walkforward run ke backtest.db", "run_id", runID, "err", err)
 		}
 	}
@@ -426,28 +466,21 @@ func ExecuteStress(ctx context.Context, ds *LoadedDataset, opts StressOptions) (
 
 // BuildEngineConfigs translates dataset & run flags into aligned EvaluatorConfig, SimBrokerConfig, and ReplayConfig.
 func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorConfig, simbroker.SimBrokerConfig, replay.ReplayConfig) {
-	evalCfg := BuildDefaultEvaluatorConfig(opts.EnvPath)
-	if ds.AppCfg != nil && (opts.EnvPath == "" || ds.AppCfg.Sweep.Enabled || len(ds.AppCfg.BlockedUTCHours) > 0 || ds.AppCfg.BTCChopBlockShort || ds.AppCfg.BTCChopRiskMult != 1.0 || ds.AppCfg.MaxSlots > 0) {
-		appEval := strategy.FromAppConfig(ds.AppCfg)
-		if appEval.Sweep.Enabled {
-			evalCfg.Sweep = appEval.Sweep
-		}
-		if len(appEval.BlockedUTCHours) > 0 {
-			evalCfg.BlockedUTCHours = appEval.BlockedUTCHours
-		}
-		if appEval.BTCChopBlockShort {
-			evalCfg.BTCChopBlockShort = true
-		}
-		if appEval.BTCChopRiskMult > 0 && appEval.BTCChopRiskMult < 1.0 {
-			evalCfg.BTCChopRiskMult = appEval.BTCChopRiskMult
-		}
-		if appEval.MaxSlots > 0 {
-			evalCfg.MaxSlots = appEval.MaxSlots
-		}
-		evalCfg.BTCGateShortOnly = appEval.BTCGateShortOnly
+	var evalCfg strategy.EvaluatorConfig
+	var brokerCfg simbroker.SimBrokerConfig
+	if ds.AppCfg != nil {
+		// SSOT: use in-memory ds.AppCfg directly without re-reading disk or mutating global env.
+		evalCfg = BuildEvaluatorConfigFromAppConfig(ds.AppCfg)
+		brokerCfg = BuildSimBrokerConfigFromAppConfig(ds.AppCfg, ds.InitialEquity)
+	} else {
+		evalCfg = BuildDefaultEvaluatorConfig(opts.EnvPath)
+		brokerCfg = BuildSimBrokerConfig(opts.EnvPath, ds.InitialEquity)
 	}
-	evalCfg.CandleDuration = ds.CandleDur
-	evalCfg.DisableOIFilter = ds.OIMode == replay.OIModeOff
+	if ds.CandleDur > 0 {
+		evalCfg.CandleDuration = ds.CandleDur
+		brokerCfg.CandleDuration = ds.CandleDur
+	}
+	evalCfg.DisableOIFilter = ds.OIMode == replay.OIModeOff || (ds.AppCfg != nil && ds.AppCfg.DisableOIFilter && ds.OIMode != replay.OIModeStrict)
 
 	if opts.RandomSeed != 0 || opts.RandomProb > 0 {
 		evalCfg.RandomEntrySeed = opts.RandomSeed
@@ -479,12 +512,13 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		evalCfg.BTCGateShortOnly = true
 	}
 
-	brokerCfg := BuildSimBrokerConfig(opts.EnvPath, ds.InitialEquity)
 	if ds.AppCfg != nil && ds.AppCfg.MaxSlots > 0 {
 		brokerCfg.MaxSlots = ds.AppCfg.MaxSlots
 	}
 	if opts.OverrideCompounding != nil {
 		brokerCfg.EquityModeCompounding = *opts.OverrideCompounding
+	} else if opts.CommonOptions.OverrideCompounding != nil {
+		brokerCfg.EquityModeCompounding = *opts.CommonOptions.OverrideCompounding
 	} else if opts.Compounding || (ds.AppCfg != nil && ds.AppCfg.EquityModeCompounding) {
 		brokerCfg.EquityModeCompounding = true
 	}
@@ -511,6 +545,30 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 	if warmup <= 0 {
 		warmup = 200
 	}
+	todayCutoff := opts.TodayStartUTC
+	if todayCutoff.IsZero() {
+		todayCutoff = ds.TodayStartUTC
+	}
+	if (opts.TodayMode || !todayCutoff.IsZero()) && len(ds.CandleMap) > 0 {
+		if todayCutoff.IsZero() {
+			ref := opts.To.UTC()
+			if ref.IsZero() {
+				ref = time.Now().UTC()
+			}
+			todayCutoff = time.Date(ref.Year(), ref.Month(), ref.Day(), 0, 0, 0, 0, time.UTC)
+		}
+		preToday := make(map[int64]struct{})
+		for _, bars := range ds.CandleMap {
+			for _, c := range bars {
+				if c.CloseTime.Before(todayCutoff) {
+					preToday[c.CloseTime.UnixMilli()] = struct{}{}
+				}
+			}
+		}
+		if len(preToday) > 0 {
+			warmup = len(preToday)
+		}
+	}
 	scanInterval := 15 * time.Minute
 	if ds.AppCfg != nil && ds.AppCfg.ScannerInterval > 0 {
 		scanInterval = ds.AppCfg.ScannerInterval
@@ -521,21 +579,38 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		deductPending = *opts.OverrideDeductPendingMargin
 	}
 
+	maxEntriesBar := 0
+	clusterSLCount := 0
+	var clusterCooldown time.Duration
+	if ds.AppCfg != nil {
+		maxEntriesBar = ds.AppCfg.MaxNewEntriesPerBar
+		clusterSLCount = ds.AppCfg.PortfolioClusterSLCount
+		clusterCooldown = time.Duration(ds.AppCfg.PortfolioClusterCooldownMins) * time.Minute
+	}
+
+	spreadFrac := evalCfg.MaxSpreadPct / 100.0
+	if spreadFrac <= 0 || spreadFrac > 0.01 {
+		spreadFrac = 0.0002
+	}
+
 	replayCfg := replay.ReplayConfig{
-		WarmupBars:            warmup,
-		SpreadPct:             evalCfg.MaxSpreadPct,
-		FundingRate:           0.0001,
-		FundingMgr:            ds.FundingMgr,
-		OIMode:                ds.OIMode,
-		OIMgr:                 ds.OIMgr,
-		ExecCandleMap:         ds.ExecCandles,
-		BenchmarkSym:          ds.getBenchmarkSym(opts.BenchmarkSym),
-		DynamicScannerEnabled: opts.DynamicScanner,
-		ScannerInterval:       scanInterval,
-		ScannerCfg:            ds.ScannerCfg,
-		UnconstrainedMode:     opts.Unconstrained,
-		DeductPendingMargin:   deductPending,
-		EquityModeCompounding: brokerCfg.EquityModeCompounding,
+		WarmupBars:               warmup,
+		SpreadPct:                spreadFrac,
+		FundingRate:              0.0001,
+		FundingMgr:               ds.FundingMgr,
+		OIMode:                   ds.OIMode,
+		OIMgr:                    ds.OIMgr,
+		ExecCandleMap:            ds.ExecCandles,
+		BenchmarkSym:             ds.getBenchmarkSym(opts.BenchmarkSym),
+		DynamicScannerEnabled:    opts.DynamicScanner,
+		ScannerInterval:          scanInterval,
+		ScannerCfg:               ds.ScannerCfg,
+		UnconstrainedMode:        opts.Unconstrained,
+		DeductPendingMargin:      deductPending,
+		EquityModeCompounding:    brokerCfg.EquityModeCompounding,
+		MaxNewEntriesPerBar:      maxEntriesBar,
+		PortfolioClusterSLCount:  clusterSLCount,
+		PortfolioClusterCooldown: clusterCooldown,
 	}
 	return evalCfg, brokerCfg, replayCfg
 }
@@ -634,7 +709,7 @@ func persistRunResult(
 	runID, mode string,
 	ds *LoadedDataset,
 	opts CommonOptions,
-	slGapFill, deductPendingMargin bool,
+	compounding, slGapFill, deductPendingMargin bool,
 	summary metrics.BacktestSummary,
 	trades []simbroker.SimTradeRecord,
 	curve []simbroker.EquityPoint,
@@ -659,7 +734,7 @@ func persistRunResult(
 		"exec_tf":               ds.ExecTF,
 		"oi_mode":               ds.OIMode,
 		"universe":              opts.UniverseMode,
-		"compounding":           opts.Compounding,
+		"compounding":           compounding,
 		"symbols_cnt":           len(ds.Symbols),
 		"max_slots":             maxSlots,
 		"sweep_enabled":         ds.AppCfg != nil && ds.AppCfg.Sweep.Enabled,
@@ -786,6 +861,8 @@ func ResolveBacktestScannerConfig(cfg *config.Config, intervalOverride string) (
 	scannerCfg := scanner.FromAppConfig(cfg, 600)
 	scannerCfg.Timeframe = interval
 	scannerCfg.CandleDuration = candleDur
+	// ReplayEngine.getMarketBreadth computes full-universe 1h breadth once per hour; disable redundant per-scan breadth work here.
+	scannerCfg.ComputeMarketBreadth = false
 	return interval, candleDur, scannerCfg
 }
 
@@ -970,10 +1047,9 @@ func LoadCandlesParallelWithCatalog(
 	return candleMap, filters
 }
 
-// BuildSimBrokerConfig translates env/config values into SimBrokerConfig with full Live parity.
-func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerConfig {
-	cfg, err := LoadConfigForBacktest(envPath)
-	if err != nil || cfg == nil {
+// BuildSimBrokerConfigFromAppConfig translates an in-memory Config struct into SimBrokerConfig with full Live parity.
+func BuildSimBrokerConfigFromAppConfig(cfg *config.Config, equity float64) simbroker.SimBrokerConfig {
+	if cfg == nil {
 		eqDec := decimal.NewFromFloat(125.0)
 		if equity > 0 {
 			eqDec = decimal.NewFromFloat(equity)
@@ -987,6 +1063,11 @@ func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 			MakerFeeRate:             decimal.NewFromFloat(0.0002),
 			TakerFeeRate:             decimal.NewFromFloat(0.0005),
 			SlippageRate:             decimal.NewFromFloat(0.0002),
+			MakerFeeSet:              true,
+			TakerFeeSet:              true,
+			SlippageSet:              true,
+			PenetrationTicksSet:      true,
+			CandleDuration:           5 * time.Minute,
 			SignalDelayBars:          1,
 			LimitTimeoutBars:         1,
 			LimitOrderTimeout:        150 * time.Second,
@@ -1061,6 +1142,10 @@ func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 	if limitTimeout <= 0 {
 		limitTimeout = 150 * time.Second
 	}
+	candleDur := cfg.CandleDuration
+	if candleDur <= 0 {
+		candleDur = 5 * time.Minute
+	}
 
 	return simbroker.SimBrokerConfig{
 		InitialEquityUSDT:        eqDec,
@@ -1071,6 +1156,11 @@ func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 		MakerFeeRate:             cfg.MakerFeeRate,
 		TakerFeeRate:             cfg.TakerFeeRate,
 		SlippageRate:             cfg.SlippageRate,
+		MakerFeeSet:              true,
+		TakerFeeSet:              true,
+		SlippageSet:              true,
+		PenetrationTicksSet:      true,
+		CandleDuration:           candleDur,
 		SLGapFillEnabled:         cfg.SLGapFillEnabled,
 		SignalDelayBars:          sigDelay,
 		LimitTimeoutBars:         1,
@@ -1094,21 +1184,30 @@ func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerCon
 		TrailingActivateATR:      trailAct,
 		TrailingDistanceATR:      trailDist,
 		MaxHoldingDuration:       maxHold,
+		StaleLossExitDuration:    cfg.StaleLossExitDuration,
 		EquityModeCompounding:    cfg.EquityModeCompounding,
 	}
 }
 
-// BuildDefaultEvaluatorConfig builds EvaluatorConfig aligned with config/env.
-func BuildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
+// BuildSimBrokerConfig translates env/config values into SimBrokerConfig with full Live parity.
+func BuildSimBrokerConfig(envPath string, equity float64) simbroker.SimBrokerConfig {
 	cfg, err := LoadConfigForBacktest(envPath)
 	if err != nil {
+		cfg = nil
+	}
+	return BuildSimBrokerConfigFromAppConfig(cfg, equity)
+}
+
+// BuildEvaluatorConfigFromAppConfig builds EvaluatorConfig aligned with an in-memory Config struct.
+func BuildEvaluatorConfigFromAppConfig(cfg *config.Config) strategy.EvaluatorConfig {
+	if cfg == nil {
 		return strategy.EvaluatorConfig{
 			CandleDuration:           5 * time.Minute,
 			MaxDailyDrawdownPct:      -0.05,
 			MaxSlots:                 3,
-			MaxSpreadPct:             0.0006,
-			MinNATRPct:               0.0050,
-			MaxNATRPct:               0.0180,
+			MaxSpreadPct:             0.06,
+			MinNATRPct:               0.50,
+			MaxNATRPct:               1.80,
 			EMAPeriod:                200,
 			ATRPeriod:                14,
 			DeltaZScoreWindow:        50,
@@ -1124,10 +1223,10 @@ func BuildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 			MaxEntryDistanceATR:      1.15,
 			EntryOrderType:           "LIMIT",
 			BTCGateEnabled:           true,
-			BTCMax5mDumpPct:          -0.0100,
-			BTCMax5mPumpPct:          0.0100,
+			BTCMax5mDumpPct:          1.00,
+			BTCMax5mPumpPct:          1.00,
 			BTCGatePersistenceBars:   3,
-			BTCCounterMomentumPct:    0.0030,
+			BTCCounterMomentumPct:    0.30,
 			AllowedSide:              "BOTH",
 			MaxFrenzyRVOL:            2.50,
 			MaxCounterImpulseATR:     0.80,
@@ -1172,4 +1271,13 @@ func BuildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
 	}
 
 	return evalCfg
+}
+
+// BuildDefaultEvaluatorConfig builds EvaluatorConfig aligned with config/env.
+func BuildDefaultEvaluatorConfig(envPath string) strategy.EvaluatorConfig {
+	cfg, err := LoadConfigForBacktest(envPath)
+	if err != nil {
+		cfg = nil
+	}
+	return BuildEvaluatorConfigFromAppConfig(cfg)
 }

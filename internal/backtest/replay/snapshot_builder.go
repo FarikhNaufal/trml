@@ -34,18 +34,13 @@ func NormalizeOIMode(raw string) string {
 // CalcRollingBufferCap returns a bar-history buffer capacity large enough for a full
 // 24h volume window plus warmup bars, and never less than 1000 bars.
 func CalcRollingBufferCap(candleDur time.Duration, warmupBars int) int {
-	bars24h := 288
-	if candleDur > 0 {
-		bars24h = int((24 * time.Hour) / candleDur)
-	}
-	if bars24h <= 0 {
-		bars24h = 288
-	}
-	capNeeded := bars24h + warmupBars
-	if capNeeded < 1000 {
-		capNeeded = 1000
-	}
-	return capNeeded
+	return CalcRollingBufferCapForHTF(candleDur, warmupBars, 0)
+}
+
+// CalcRollingBufferCapForHTF expands the rolling bar buffer when hourly HTF EMAs or breadth
+// metrics are enabled so resampled completed hourly series contain at least htfEMAPeriod+120 bars.
+func CalcRollingBufferCapForHTF(candleDur time.Duration, warmupBars int, htfEMAPeriod int) int {
+	return strategy.CalcRequiredHistoryBars(candleDur, warmupBars, htfEMAPeriod, false)
 }
 
 // effectiveEvalTime normalizes Binance kline CloseTime (...59.999) by +1ms to the exact
@@ -65,13 +60,18 @@ func BuildBTCMacroSnapshot(
 	btcCandles []model.Candle,
 	btcDeltas []float64,
 	baseSpreadPct float64,
+	rollingVWAPBars ...int,
 ) *model.MarketSnapshot {
 	if len(btcCandles) < 30 {
 		return nil
 	}
 	evalTime := effectiveEvalTime(simTime)
 	lastBTC := btcCandles[len(btcCandles)-1]
-	vwapBTC := indicator.CalculateSessionVWAP(btcCandles)
+	rollingBars := 0
+	if len(rollingVWAPBars) > 0 {
+		rollingBars = rollingVWAPBars[0]
+	}
+	vwapBTC := indicator.CalculateEffectiveVWAP(btcCandles, rollingBars)
 	btcSpread := calculateDynamicSpread(btcCandles, lastBTC.Close, baseSpreadPct)
 	snap := model.MarketSnapshot{
 		Symbol:              benchmarkSym,
@@ -114,7 +114,7 @@ func BuildSymbolSnapshot(
 		return model.MarketSnapshot{}, evalCfg, oiStatusDisabled, false
 	}
 	lastC := cList[len(cList)-1]
-	sessionVWAP := indicator.CalculateSessionVWAP(cList)
+	sessionVWAP := indicator.CalculateEffectiveVWAP(cList, evalCfg.RollingVWAPBars)
 	if sessionVWAP <= 0 || math.IsNaN(sessionVWAP) {
 		return model.MarketSnapshot{}, evalCfg, oiStatusDisabled, false
 	}
@@ -158,8 +158,8 @@ func BuildSymbolSnapshot(
 	case OIModeStrict:
 		adjCfg.DisableOIFilter = false
 		if oiMgr != nil {
-			if prevOI, currOI, prevT, currT, ok := oiMgr.LookupOpenInterestStrict(
-				sym, evalTime, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
+			if prevOI, currOI, prevT, currT, ok := oiMgr.LookupOpenInterestStrictWithTarget(
+				sym, evalTime, evalCfg.CandleDuration, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
 			); ok {
 				snap.PrevOpenInterest = prevOI
 				snap.CurrOpenInterest = currOI
@@ -174,8 +174,8 @@ func BuildSymbolSnapshot(
 		}
 	default: // OIModeAuto
 		if oiMgr != nil {
-			if prevOI, currOI, prevT, currT, ok := oiMgr.LookupOpenInterestStrict(
-				sym, evalTime, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
+			if prevOI, currOI, prevT, currT, ok := oiMgr.LookupOpenInterestStrictWithTarget(
+				sym, evalTime, evalCfg.CandleDuration, evalCfg.MinOIInterval, evalCfg.MaxOIInterval, evalCfg.MaxOIStaleness,
 			); ok {
 				snap.PrevOpenInterest = prevOI
 				snap.CurrOpenInterest = currOI

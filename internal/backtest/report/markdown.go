@@ -101,7 +101,7 @@ func renderCoreSummarySection(sb *strings.Builder, summary metrics.BacktestSumma
 	fmt.Fprintf(sb, "| **Recovery Factor / SQN** | `%.2f / %.2f` | Time-in-Market Exposure %.1f%% |\n", summary.RecoveryFactor, summary.SQN, summary.ExposurePct)
 	fmt.Fprintf(sb, "| **Losing Streak Terpanjang** | `%d` trade berturut | Rekor kerugian berurutan |\n", summary.MaxLosingStreak)
 	fmt.Fprintf(sb, "| **Fee & Friction Drag** | `%.2f%%` | Total fee ($%.2f) vs Profit Kotor |\n", summary.FeeDragPct, summary.TotalFees)
-	fmt.Fprintf(sb, "| **Net Funding Fee** | `%s USDT` | Total pendanaan Binance dibayar/diterima |\n", formatSignedUSD(summary.TotalFunding))
+	fmt.Fprintf(sb, "| **Net Funding Fee** | `%s USDT` | Total pendanaan Binance (+ diterima / - dibayar) |\n", formatSignedUSD(-summary.TotalFunding))
 	if mc != nil && mc.Iterations > 0 {
 		fmt.Fprintf(sb, "| **Monte Carlo p95 / p99 DD** | `-%.2f%% / -%.2f%%` | %d shuffles (Risk >=25%% DD: %.1f%%) |\n",
 			mc.P95MaxDDPct, mc.P99MaxDDPct, mc.Iterations, mc.RiskOfRuin25Pct)
@@ -327,6 +327,6 @@ func renderConclusionSection(sb *strings.Builder, summary metrics.BacktestSummar
 		sb.WriteString("> Interval 95% menyentuh wilayah negatif. Disarankan menjalankan `backtest ablate` untuk membuang filter yang menambah friction drag.\n")
 	} else {
 		sb.WriteString("> [!CAUTION] **KESIMPULAN: EXPECTANCY NEGATIF ATAU PROFIT FACTOR < 1.0.**\n")
-		sb.WriteString("> Biaya transaksi dan slippage mengikis sebagian besar keuntungan pada timeframe 5m. Strategi tidak siap untuk live modal riil tanpa optimasi.\n")
+		sb.WriteString("> Biaya transaksi dan slippage mengikis sebagian besar keuntungan pada konfigurasi timeframe uji. Strategi tidak siap untuk live modal riil tanpa optimasi.\n")
 	}
 }

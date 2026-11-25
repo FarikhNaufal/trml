@@ -41,6 +41,7 @@ type StreamManager struct {
 	PingInterval               time.Duration
 	PingTimeout                time.Duration
 	MaxConsecutiveDialFailures int
+	NowFn                      func() time.Time
 }
 
 const (
@@ -232,11 +233,13 @@ type DynamicStream struct {
 	mgr     *StreamManager
 	baseURL string
 
-	mu      sync.Mutex
-	sendMu  sync.Mutex
-	streams []string
-	conn    *websocket.Conn
-	reqID   atomic.Int64
+	sendMu        sync.Mutex // Strict lock order: sendMu -> mu
+	mu            sync.Mutex
+	streams       []string
+	conn          *websocket.Conn
+	syncedConn    *websocket.Conn
+	syncedStreams []string
+	reqID         atomic.Int64
 }
 
 func NewDynamicStream(mgr *StreamManager, baseURL string, initialStreams []string) *DynamicStream {
@@ -324,31 +327,32 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 		return fmt.Errorf("ws: dial error for %s: %w", streamURL, err)
 	}
 	defer func() {
+		d.sendMu.Lock()
 		d.mu.Lock()
 		if d.conn == conn {
 			d.conn = nil
 		}
+		if d.syncedConn == conn {
+			d.syncedConn = nil
+			d.syncedStreams = nil
+		}
 		d.mu.Unlock()
+		d.sendMu.Unlock()
 		_ = conn.CloseNow()
 	}()
 
+	d.sendMu.Lock()
 	d.mu.Lock()
 	d.conn = conn
 	latest := make([]string, len(d.streams))
 	copy(latest, d.streams)
 	d.mu.Unlock()
-
-	// Sinkronkan diff bila UpdateStreams terjadi selama proses dial
-	added, removed := diffStreams(dialed, latest)
-	if len(removed) > 0 {
-		if err := d.sendControlMsg(ctx, conn, "UNSUBSCRIBE", removed); err != nil {
-			return fmt.Errorf("ws: failed to sync initial UNSUBSCRIBE diff: %w", err)
-		}
-	}
-	if len(added) > 0 {
-		if err := d.sendControlMsg(ctx, conn, "SUBSCRIBE", added); err != nil {
-			return fmt.Errorf("ws: failed to sync initial SUBSCRIBE diff: %w", err)
-		}
+	d.syncedConn = conn
+	d.syncedStreams = dialed
+	_, _, syncErr := d.syncConnStreamsLocked(ctx, conn, latest)
+	d.sendMu.Unlock()
+	if syncErr != nil {
+		return fmt.Errorf("ws: failed to sync initial stream diff: %w", syncErr)
 	}
 
 	connStart := time.Now()
@@ -359,36 +363,75 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 // UpdateStreams memperbarui langganan secara diferensial via SUBSCRIBE/UNSUBSCRIBE tanpa memutus soket aktif.
 func (d *DynamicStream) UpdateStreams(ctx context.Context, newStreams []string) error {
 	d.mu.Lock()
-	added, removed := diffStreams(d.streams, newStreams)
-	if len(added) == 0 && len(removed) == 0 {
+	addedTarget, removedTarget := diffStreams(d.streams, newStreams)
+	if len(addedTarget) == 0 && len(removedTarget) == 0 {
 		d.mu.Unlock()
 		return nil
 	}
 	copied := make([]string, len(newStreams))
 	copy(copied, newStreams)
 	d.streams = copied
-	conn := d.conn
 	d.mu.Unlock()
 
-	if conn == nil {
+	d.sendMu.Lock()
+	defer d.sendMu.Unlock()
+
+	d.mu.Lock()
+	conn := d.conn
+	target := make([]string, len(d.streams))
+	copy(target, d.streams)
+	d.mu.Unlock()
+
+	if conn == nil || d.syncedConn != conn {
 		return nil
 	}
 
-	if len(removed) > 0 {
-		if err := d.sendControlMsg(ctx, conn, "UNSUBSCRIBE", removed); err != nil {
-			return err
-		}
+	addedN, removedN, err := d.syncConnStreamsLocked(ctx, conn, target)
+	if err != nil {
+		return err
 	}
-	if len(added) > 0 {
-		if err := d.sendControlMsg(ctx, conn, "SUBSCRIBE", added); err != nil {
-			return err
-		}
+	if addedN > 0 || removedN > 0 {
+		slog.Info("ws: applied differential stream update", "baseURL", d.baseURL, "added", addedN, "removed", removedN)
 	}
-	slog.Info("ws: applied differential stream update", "baseURL", d.baseURL, "added", len(added), "removed", len(removed))
 	return nil
 }
 
+func (d *DynamicStream) syncConnStreamsLocked(ctx context.Context, conn *websocket.Conn, target []string) (int, int, error) {
+	added, removed := diffStreams(d.syncedStreams, target)
+	if len(removed) > 0 {
+		if err := d.writeControlMsgLocked(ctx, conn, "UNSUBSCRIBE", removed); err != nil {
+			return 0, 0, err
+		}
+		removedSet := make(map[string]bool, len(removed))
+		for _, s := range removed {
+			removedSet[s] = true
+		}
+		kept := make([]string, 0, len(d.syncedStreams))
+		for _, s := range d.syncedStreams {
+			if !removedSet[s] {
+				kept = append(kept, s)
+			}
+		}
+		d.syncedStreams = kept
+	}
+	if len(added) > 0 {
+		if err := d.writeControlMsgLocked(ctx, conn, "SUBSCRIBE", added); err != nil {
+			return 0, len(removed), err
+		}
+	}
+	syncedCopy := make([]string, len(target))
+	copy(syncedCopy, target)
+	d.syncedStreams = syncedCopy
+	return len(added), len(removed), nil
+}
+
 func (d *DynamicStream) sendControlMsg(ctx context.Context, conn *websocket.Conn, method string, params []string) error {
+	d.sendMu.Lock()
+	defer d.sendMu.Unlock()
+	return d.writeControlMsgLocked(ctx, conn, method, params)
+}
+
+func (d *DynamicStream) writeControlMsgLocked(ctx context.Context, conn *websocket.Conn, method string, params []string) error {
 	if len(params) == 0 {
 		return nil
 	}
@@ -406,8 +449,6 @@ func (d *DynamicStream) sendControlMsg(ctx context.Context, conn *websocket.Conn
 		return err
 	}
 
-	d.sendMu.Lock()
-	defer d.sendMu.Unlock()
 	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wCancel()
 	return conn.Write(wCtx, websocket.MessageText, raw)
@@ -626,6 +667,9 @@ func (s *ShardedDynamicStream) UpdateStreams(ctx context.Context, newStreams []s
 // ProcessMessage membedah JSON payload dari Binance dengan penanganan parse error fail-closed (Solusi M4)
 func (m *StreamManager) ProcessMessage(msg []byte) {
 	now := time.Now().UTC()
+	if m.NowFn != nil {
+		now = m.NowFn()
+	}
 
 	// 1. Cek Wrapper stream kombinasi (misal {"stream":"...","data":{...}})
 	var wrapper struct {

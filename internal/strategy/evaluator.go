@@ -31,7 +31,9 @@ type EvaluatorConfig struct {
 	MinBarDeltaZScore     float64
 	MinOIDeltaPct         float64
 	MinOIDeltaLongPct     float64
+	MinOIDeltaLongSet     bool
 	MinOIDeltaShortPct    float64
+	MinOIDeltaShortSet    bool
 	DisableOIFilter       bool
 	MaxAdverseFundingRate float64
 
@@ -48,11 +50,15 @@ type EvaluatorConfig struct {
 	MaxEntryDistanceATR  float64
 	EntryOrderType       string
 
-	// Option C: Optimasi Seleksi Entry Sisi LONG
+	// Option C: Optimasi Seleksi Entry Sisi LONG & SHORT
 	MinCandleBodyRatioLong     float64
+	MinCandleBodyRatioShort    float64
+	MaxAdverseRetestATRShort   float64
+	MaxEMASlopeShort           float64
 	MaxPullbackRVOLLong        float64
 	MinImpulseATRLong          float64
 	MinEMASlopeLong            float64
+	MinEMASlopeLongSet         bool
 	RequireCleanPullbackLong   bool
 	MinNATRLongPct             float64
 	BTCChopBlockLong           bool
@@ -75,8 +81,11 @@ type EvaluatorConfig struct {
 
 	CooldownAfterExitMinutes int
 	CooldownLossMinutes      int
+	CooldownLossSet          bool
 	CooldownProfitMinutes    int
+	CooldownProfitSet        bool
 	VWAPSessionWarmupMinutes int
+	VWAPSessionWarmupSet     bool
 	BlockedUTCHours          map[int]bool // Optional UTC hours [0..23] to skip new entries
 
 	// Random Entry Benchmark (Case C)
@@ -85,6 +94,31 @@ type EvaluatorConfig struct {
 
 	// Secondary Strategy: 1-Bar Liquidity Sweep SHORT-ONLY
 	Sweep SweepConfig
+
+	// Multi-Regime Strategy Suite (all opt-in; DisableVWAP defaults to false so zero-value preserves VWAP)
+	DisableVWAP     bool
+	RelResidual     RelResidualConfig
+	VolBreakout     VolBreakoutConfig
+	EMAPullback     EMAPullbackConfig
+	VWAPBreakdown   VWAPBreakdownConfig
+	StructureBreak  StructureBreakConfig
+	MacroRouter     MacroRegimeRouterConfig
+	FundingEnvelope           FundingEnvelopeConfig
+	RollingVWAPBars           int
+	HTFEMAPeriod              int
+	MarketBreadthLowThreshold float64
+	MarketBreadthLowRiskMult  float64
+	BreakoutPriorityFirst     bool
+	HTFEMAMaxRisingSlopePct   float64
+	DDThrottleThresholdPct      float64
+	DDThrottleRiskMult          float64
+	RS4hWeakThresholdPct        float64
+	RS4hWeakRiskMult            float64
+	RS4hStrongThresholdPct      float64
+	RS4hStrongRiskMult          float64
+	DDThrottleTier2ThresholdPct float64
+	DDThrottleTier2RiskMult     float64
+	MaxEffectiveRiskPerTradePct float64
 
 	Sizing SizingConfig
 }
@@ -113,8 +147,10 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 		MinBarDeltaZScore:          cfg.MinBounceZScore,
 		MinOIDeltaPct:              cfg.MinOIDeltaPct,
 		MinOIDeltaLongPct:          cfg.MinOIDeltaLongPct,
+		MinOIDeltaLongSet:          cfg.MinOIDeltaLongSet,
 		MinOIDeltaShortPct:         cfg.MinOIDeltaShortPct,
-		MaxAdverseFundingRate:      0.0005,
+		MinOIDeltaShortSet:         cfg.MinOIDeltaShortSet,
+		MaxAdverseFundingRate:      cfg.MaxAdverseFundingRate,
 		PullbackToleranceATR:       cfg.PullbackToleranceATR,
 		MinBounceZScore:            cfg.MinBounceZScore,
 		MinBounceZScoreLong:        cfg.MinBounceZScoreLong,
@@ -126,10 +162,15 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 		MinImpulseATR:              cfg.MinImpulseATR,
 		MaxEntryDistanceATR:        cfg.MaxEntryDistanceATR,
 		EntryOrderType:             cfg.EntryOrderType,
+		DisableOIFilter:            cfg.DisableOIFilter,
 		MinCandleBodyRatioLong:     cfg.MinCandleBodyRatioLong,
+		MinCandleBodyRatioShort:    cfg.MinCandleBodyRatioShort,
+		MaxAdverseRetestATRShort:   cfg.MaxAdverseRetestATRShort,
+		MaxEMASlopeShort:           cfg.MaxEMASlopeShort,
 		MaxPullbackRVOLLong:        cfg.MaxPullbackRVOLLong,
 		MinImpulseATRLong:          cfg.MinImpulseATRLong,
 		MinEMASlopeLong:            cfg.MinEMASlopeLong,
+		MinEMASlopeLongSet:         cfg.MinEMASlopeLongSet,
 		RequireCleanPullbackLong:   cfg.RequireCleanPullbackLong,
 		MinNATRLongPct:             cfg.MinNATRLongPct,
 		BTCChopBlockLong:           cfg.BTCChopBlockLong,
@@ -149,8 +190,11 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 		MinSignalRVOL:              cfg.MinSignalRVOL,
 		CooldownAfterExitMinutes:   cfg.CooldownAfterExitMinutes,
 		CooldownLossMinutes:        cfg.CooldownLossMinutes,
+		CooldownLossSet:            cfg.CooldownLossSet,
 		CooldownProfitMinutes:      cfg.CooldownProfitMinutes,
+		CooldownProfitSet:          cfg.CooldownProfitSet,
 		VWAPSessionWarmupMinutes:   cfg.VWAPSessionWarmupMinutes,
+		VWAPSessionWarmupSet:       cfg.VWAPSessionWarmupSet,
 		BlockedUTCHours:            cfg.BlockedUTCHours,
 		Sweep: SweepConfig{
 			Enabled:           cfg.Sweep.Enabled,
@@ -159,6 +203,98 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 			MaxLowerWickRatio: cfg.Sweep.MaxLowerWickRatio,
 			MaxDeltaZScore:    cfg.Sweep.MaxDeltaZScore,
 		},
+		DisableVWAP: !cfg.VWAPStrategyEnabled,
+		RelResidual: RelResidualConfig{
+			Enabled:           cfg.RelResidual.Enabled,
+			Mode:              cfg.RelResidual.Mode,
+			LookbackBars:      cfg.RelResidual.LookbackBars,
+			MinRelZ:           cfg.RelResidual.MinRelZ,
+			MinVWAPStretchATR: cfg.RelResidual.MinVWAPStretchATR,
+			MinDeltaZ:         cfg.RelResidual.MinDeltaZ,
+			BypassBTCTier2:    cfg.RelResidual.BypassBTCTier2,
+		},
+		VolBreakout: VolBreakoutConfig{
+			Enabled:             cfg.VolBreakout.Enabled,
+			LookbackBars:        cfg.VolBreakout.LookbackBars,
+			MaxCompressionRatio: cfg.VolBreakout.MaxCompressionRatio,
+			MinRVOL:             cfg.VolBreakout.MinRVOL,
+			MinBodyRatio:        cfg.VolBreakout.MinBodyRatio,
+			MinDeltaZ:           cfg.VolBreakout.MinDeltaZ,
+			AlignMacroTrend:     cfg.VolBreakout.AlignMacroTrend,
+			MaxEMA200DistATR:    cfg.VolBreakout.MaxEMA200DistATR,
+			MaxVWAPDistATR:      cfg.VolBreakout.MaxVWAPDistATR,
+			MaxNATRPct:          cfg.VolBreakout.MaxNATRPct,
+			MinNATRPct:          cfg.VolBreakout.MinNATRPct,
+			RiskMult:            cfg.VolBreakout.RiskMult,
+			EntryMarket:         cfg.VolBreakout.EntryMarket,
+		},
+		EMAPullback: EMAPullbackConfig{
+			Enabled:          cfg.EMAPullback.Enabled,
+			FastPeriod:       cfg.EMAPullback.FastPeriod,
+			SlowPeriod:       cfg.EMAPullback.SlowPeriod,
+			RetestLookback:   cfg.EMAPullback.RetestLookback,
+			TouchTolATR:      cfg.EMAPullback.TouchTolATR,
+			TouchTolSet:      cfg.EMAPullback.TouchTolSet,
+			MinBodyRatio:     cfg.EMAPullback.MinBodyRatio,
+			MinBodySet:       cfg.EMAPullback.MinBodySet,
+			MinDeltaZ:        cfg.EMAPullback.MinDeltaZ,
+			MaxEMA200DistATR: cfg.EMAPullback.MaxEMA200DistATR,
+			RiskMult:         cfg.EMAPullback.RiskMult,
+		},
+		VWAPBreakdown: VWAPBreakdownConfig{
+			Enabled:         cfg.VWAPBreakdown.Enabled,
+			LookbackBars:    cfg.VWAPBreakdown.LookbackBars,
+			MinAboveBars:    cfg.VWAPBreakdown.MinAboveBars,
+			MinRVOL:         cfg.VWAPBreakdown.MinRVOL,
+			MinBodyRatio:    cfg.VWAPBreakdown.MinBodyRatio,
+			MinBodySet:      cfg.VWAPBreakdown.MinBodySet,
+			MinDeltaZ:       cfg.VWAPBreakdown.MinDeltaZ,
+			MaxBelowVWAPATR: cfg.VWAPBreakdown.MaxBelowVWAPATR,
+			RiskMult:        cfg.VWAPBreakdown.RiskMult,
+		},
+		StructureBreak: StructureBreakConfig{
+			Enabled:          cfg.StructureBreak.Enabled,
+			LookbackBars:     cfg.StructureBreak.LookbackBars,
+			MinBounceATR:     cfg.StructureBreak.MinBounceATR,
+			MinRVOL:          cfg.StructureBreak.MinRVOL,
+			MinBodyRatio:     cfg.StructureBreak.MinBodyRatio,
+			MinBodySet:       cfg.StructureBreak.MinBodySet,
+			MinDeltaZ:        cfg.StructureBreak.MinDeltaZ,
+			MaxEMA200DistATR: cfg.StructureBreak.MaxEMA200DistATR,
+			RiskMult:         cfg.StructureBreak.RiskMult,
+		},
+		MacroRouter: MacroRegimeRouterConfig{
+			Enabled:              cfg.MacroRouter.Enabled,
+			TrendERThreshold:     cfg.MacroRouter.TrendERThreshold,
+			VolShockRatio:        cfg.MacroRouter.VolShockRatio,
+			VWAPOnlyInRange:      cfg.MacroRouter.VWAPOnlyInRange,
+			BreakoutOnlyInTrend:  cfg.MacroRouter.BreakoutOnlyInTrend,
+			RelOnlyInRange:       cfg.MacroRouter.RelOnlyInRange,
+			RangeRiskMult:        cfg.MacroRangeRiskMult,
+			VolExpansionRatio:    cfg.MacroVolExpansionRatio,
+			VolExpansionRiskMult: cfg.MacroVolExpansionRiskMult,
+		},
+		FundingEnvelope: FundingEnvelopeConfig{
+			MinShortEnabled: cfg.MinShortFundingRate > -0.99,
+			MinShortRate:    cfg.MinShortFundingRate,
+			MaxLongEnabled:  cfg.MaxLongFundingRate < 0.99,
+			MaxLongRate:     cfg.MaxLongFundingRate,
+		},
+		RollingVWAPBars:             cfg.RollingVWAPBars,
+		HTFEMAPeriod:                cfg.HTFEMAPeriod,
+		MarketBreadthLowThreshold:   cfg.MarketBreadthLowThreshold,
+		MarketBreadthLowRiskMult:    cfg.MarketBreadthLowRiskMult,
+		BreakoutPriorityFirst:       cfg.BreakoutPriorityFirst,
+		HTFEMAMaxRisingSlopePct:     cfg.HTFEMAMaxRisingSlopePct,
+		DDThrottleThresholdPct:      cfg.DDThrottleThresholdPct,
+		DDThrottleRiskMult:          cfg.DDThrottleRiskMult,
+		RS4hWeakThresholdPct:        cfg.RS4hWeakThresholdPct,
+		RS4hWeakRiskMult:            cfg.RS4hWeakRiskMult,
+		RS4hStrongThresholdPct:      cfg.RS4hStrongThresholdPct,
+		RS4hStrongRiskMult:          cfg.RS4hStrongRiskMult,
+		DDThrottleTier2ThresholdPct: cfg.DDThrottleTier2ThresholdPct,
+		DDThrottleTier2RiskMult:     cfg.DDThrottleTier2RiskMult,
+		MaxEffectiveRiskPerTradePct: cfg.MaxEffectiveRiskPerTradePct,
 		Sizing: SizingConfig{
 			RiskPerTradePct:                cfg.RiskPerTradePct,
 			MaxSlotMarginFraction:          cfg.MaxSlotMarginFrac,
@@ -174,6 +310,7 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 			TakerFeeRate:                   cfg.TakerFeeRate,
 			SlippageRate:                   cfg.SlippageRate,
 			EntryOrderType:                 cfg.EntryOrderType,
+			DisablePartialTP:               !cfg.PartialTPEnabled,
 		},
 	}
 }
@@ -192,6 +329,10 @@ func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnap
 	ema200 := ctx.EMA200
 	atr14 := ctx.ATR14
 	vwap := ctx.VWAP
+
+	if rej, ok := checkPrimaryNATRBounds(ctx, cfg, "VWAP"); !ok {
+		return rej
+	}
 
 	// Filter Anti-Chasing: Batasi jarak maksimal penutupan candle dari garis VWAP
 	maxEntryDistATR := cfg.MaxEntryDistanceATR
@@ -304,6 +445,10 @@ func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnap
 	// KONFIRMASI 3: Zona Pullback Retest (Sentuhan Garis VWAP Dua Arah dengan Urutan Kronologis)
 	tolDist := pullbackTol * atr14
 	maxAdverseRetestDist := 0.75 * atr14 // Batas bawah: jangan biarkan pullback anjlok jebol > 0.75 ATR menembus VWAP
+	maxAdverseRetestShort := maxAdverseRetestDist
+	if cfg.MaxAdverseRetestATRShort > 0 {
+		maxAdverseRetestShort = cfg.MaxAdverseRetestATRShort * atr14
+	}
 	var longTestedVWAP bool
 	var shortTestedVWAP bool
 
@@ -326,7 +471,7 @@ func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnap
 				longTestedVWAP = true
 			}
 		}
-		if cameFromBelow && c.High >= vwap-tolDist && c.High <= vwap+maxAdverseRetestDist && (latestImpulseIdxShort >= 0 && i >= latestImpulseIdxShort) {
+		if cameFromBelow && c.High >= vwap-tolDist && c.High <= vwap+maxAdverseRetestShort && (latestImpulseIdxShort >= 0 && i >= latestImpulseIdxShort) {
 			shortTestedVWAP = true
 		}
 	}
@@ -367,6 +512,12 @@ func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnap
 
 	// Short: Tolak jika lower wick >= 50% dari total range (rejection keras dari buyer / Hammer).
 	isBearishShape := (latest.Close < latest.Open) && (latestRange <= 0 || lowerWick < latestRange*0.50)
+	if isBearishShape && cfg.MinCandleBodyRatioShort > 0 && latestRange > 0 {
+		body := latest.Open - latest.Close
+		if (body / latestRange) < cfg.MinCandleBodyRatioShort {
+			isBearishShape = false
+		}
+	}
 
 	longBounce := isBullishShape && (latest.Close >= vwap) && (barDeltaZScore >= minBounceZLong)
 	shortBounce := isBearishShape && (latest.Close <= vwap) && (barDeltaZScore <= -minBounceZShort)
@@ -379,7 +530,7 @@ func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnap
 	// Filter Tren Struktural & Anti-Chop EMA200
 	minEMADist := cfg.MinEMA200DistanceATR * atr14
 	emaTrendLong := (latest.Close > ema200) && (minEMADist <= 0 || (latest.Close-ema200) >= minEMADist)
-	if emaTrendLong && cfg.MinEMASlopeLong > 0 && len(snap.ClosedCandles) >= cfg.EMAPeriod+20 {
+	if emaTrendLong && (cfg.MinEMASlopeLong > 0 || cfg.MinEMASlopeLongSet) && len(snap.ClosedCandles) >= cfg.EMAPeriod+20 {
 		emaPrev := indicator.CalculateEMA(snap.ClosedCandles[:len(snap.ClosedCandles)-20], cfg.EMAPeriod)
 		if !math.IsNaN(emaPrev) && !math.IsInf(emaPrev, 0) && emaPrev > 0 {
 			slope := (ema200 - emaPrev) / (20.0 * atr14)
@@ -389,6 +540,15 @@ func (VWAPPullbackAlpha) Evaluate(ctx sharedMarketContext, snap model.MarketSnap
 		}
 	}
 	emaTrendShort := (latest.Close < ema200) && (minEMADist <= 0 || (ema200-latest.Close) >= minEMADist)
+	if emaTrendShort && cfg.MaxEMASlopeShort > 0 && len(snap.ClosedCandles) >= cfg.EMAPeriod+20 {
+		emaPrev := indicator.CalculateEMA(snap.ClosedCandles[:len(snap.ClosedCandles)-20], cfg.EMAPeriod)
+		if !math.IsNaN(emaPrev) && !math.IsInf(emaPrev, 0) && emaPrev > 0 {
+			slope := (ema200 - emaPrev) / (20.0 * atr14)
+			if slope > cfg.MaxEMASlopeShort {
+				emaTrendShort = false
+			}
+		}
+	}
 
 	longValid := emaTrendLong &&
 		validBullishImpulse &&
@@ -488,6 +648,13 @@ func EvaluateSignal(
 	effectiveEquity, availBal decimal.Decimal,
 	cfg EvaluatorConfig,
 ) (model.OrderIntent, bool, string, string) {
+	isolatedCfg := cfg
+	isolatedCfg.Sweep.Enabled = false
+	isolatedCfg.VolBreakout.Enabled = false
+	isolatedCfg.RelResidual.Enabled = false
+	isolatedCfg.EMAPullback.Enabled = false
+	isolatedCfg.VWAPBreakdown.Enabled = false
+	isolatedCfg.StructureBreak.Enabled = false
 	dec := EvaluatePortfolio(
 		snap,
 		btcSnap,
@@ -497,7 +664,7 @@ func EvaluateSignal(
 		effectiveEquity,
 		availBal,
 		SymbolScope{AllowPrimary: true, AllowSweep: false},
-		cfg,
+		isolatedCfg,
 	)
 	return dec.Intent, dec.Approved, dec.Reason, dec.SubReason
 }

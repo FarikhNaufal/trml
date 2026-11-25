@@ -672,3 +672,97 @@ func TestWebSocketAlgoUpdateAndExpiredInMatch(t *testing.T) {
 		t.Fatalf("expected EXPIRED_IN_MATCH mapped to StatusExpired, got calls=%d status=%s", orderCalls.Load(), orderEvt.Status)
 	}
 }
+
+func TestDynamicStream_ConcurrentUpdateStreamsDuringDialAndActiveSync(t *testing.T) {
+	var subsMu sync.Mutex
+	serverSubs := make(map[string]bool)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		subsMu.Lock()
+		for _, s := range strings.Split(r.URL.Query().Get("streams"), "/") {
+			if s != "" {
+				serverSubs[s] = true
+			}
+		}
+		subsMu.Unlock()
+
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+		for {
+			_, raw, err := c.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var msg struct {
+				Method string   `json:"method"`
+				Params []string `json:"params"`
+			}
+			if json.Unmarshal(raw, &msg) == nil {
+				subsMu.Lock()
+				for _, p := range msg.Params {
+					if msg.Method == "SUBSCRIBE" {
+						serverSubs[p] = true
+					} else if msg.Method == "UNSUBSCRIBE" {
+						delete(serverSubs, p)
+					}
+				}
+				subsMu.Unlock()
+			}
+		}
+	}))
+	defer ts.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream"
+	mgr := NewStreamManager(EventHandlers{})
+	ds := NewDynamicStream(mgr, wsBase, []string{"btcusdt@bookTicker"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ds.Start(ctx)
+
+	var updWg sync.WaitGroup
+	sets := [][]string{
+		{"btcusdt@bookTicker", "ethusdt@bookTicker"},
+		{"btcusdt@bookTicker", "solusdt@bookTicker", "ethusdt@bookTicker"},
+		{"btcusdt@bookTicker", "adausdt@bookTicker"},
+	}
+	for i := 0; i < 6; i++ {
+		updWg.Add(1)
+		target := sets[i%len(sets)]
+		go func(st []string) {
+			defer updWg.Done()
+			_ = ds.UpdateStreams(ctx, st)
+		}(target)
+	}
+	updWg.Wait()
+
+	finalTarget := []string{"btcusdt@bookTicker", "xrpusdt@bookTicker", "dogeusdt@bookTicker"}
+	if err := ds.UpdateStreams(ctx, finalTarget); err != nil {
+		t.Fatalf("final UpdateStreams failed: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		subsMu.Lock()
+		matched := len(serverSubs) == len(finalTarget)
+		for _, st := range finalTarget {
+			if !serverSubs[st] {
+				matched = false
+				break
+			}
+		}
+		subsMu.Unlock()
+		if matched {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	subsMu.Lock()
+	defer subsMu.Unlock()
+	t.Fatalf("server subscriptions %v did not converge to final target %v", serverSubs, finalTarget)
+}

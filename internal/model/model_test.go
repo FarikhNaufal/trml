@@ -448,3 +448,105 @@ func TestFormatClientID_MaxLengthAndASCII(t *testing.T) {
 		t.Fatalf("expected deterministic entry ID <= 36 chars, got %d (%q)", len(entryID), entryID)
 	}
 }
+
+func TestValidateAndFilterCandles_MaintenanceGapToleranceBeyond24h(t *testing.T) {
+	step := 15 * time.Minute
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	totalBars := 6 * 96 // 6 days of 15m bars
+
+	// 1. Gap of 30m located 5 days ago (outside 24h strict window) -> must PASS on bar-aligned maintenance gap
+	seriesOldGap := make([]Candle, 0, totalBars)
+	gapOldIdx := 40
+	for i := 0; i < totalBars; i++ {
+		if i == gapOldIdx {
+			continue // 15m missing bar 5+ days ago
+		}
+		ot := now.Add(-time.Duration(totalBars-i) * step)
+		seriesOldGap = append(seriesOldGap, Candle{
+			OpenTime:        ot,
+			CloseTime:       ot.Add(step - time.Millisecond),
+			Open:            100,
+			High:            101,
+			Low:             99,
+			Close:           100.5,
+			VolumeBase:      10,
+			QuoteVolumeUSDT: 1000,
+		})
+	}
+	validOldGap, err := ValidateAndFilterCandles(seriesOldGap, now, step)
+	if err != nil {
+		t.Fatalf("expected deep (>24h) aligned maintenance gap to pass, got err=%v", err)
+	}
+	if len(validOldGap) != totalBars-1 {
+		t.Fatalf("expected %d candles returned, got %d", totalBars-1, len(validOldGap))
+	}
+
+	// 2. Gap inside last 24h -> must FAIL strictly
+	seriesRecentGap := make([]Candle, 0, totalBars)
+	gapRecentIdx := totalBars - 10
+	for i := 0; i < totalBars; i++ {
+		if i == gapRecentIdx {
+			continue
+		}
+		ot := now.Add(-time.Duration(totalBars-i) * step)
+		seriesRecentGap = append(seriesRecentGap, Candle{
+			OpenTime:        ot,
+			CloseTime:       ot.Add(step - time.Millisecond),
+			Open:            100,
+			High:            101,
+			Low:             99,
+			Close:           100.5,
+			VolumeBase:      10,
+			QuoteVolumeUSDT: 1000,
+		})
+	}
+	if _, err := ValidateAndFilterCandles(seriesRecentGap, now, step); err == nil {
+		t.Fatalf("expected recent (<24h) candle gap to fail strictly")
+	}
+}
+
+func TestValidateAndFilterCandles_RejectsGapStraddling24hWindow(t *testing.T) {
+	step := 5 * time.Minute
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	// prev at -25h (outside 24h), c at now-5m (inside 24h): gap ends inside 24h window and MUST fail.
+	cPrev := Candle{
+		OpenTime:        now.Add(-25 * time.Hour),
+		CloseTime:       now.Add(-25*time.Hour + step - time.Millisecond),
+		Open:            100, High: 101, Low: 99, Close: 100.5,
+		VolumeBase:      10, QuoteVolumeUSDT: 1000,
+	}
+	cCur := Candle{
+		OpenTime:        now.Add(-step),
+		CloseTime:       now.Add(-time.Millisecond),
+		Open:            100.5, High: 102, Low: 100, Close: 101,
+		VolumeBase:      12, QuoteVolumeUSDT: 1200,
+	}
+	if _, err := ValidateAndFilterCandles([]Candle{cPrev, cCur}, now, step); err == nil {
+		t.Fatalf("expected straddling gap entering 24h strict window to fail")
+	}
+}
+
+func TestExchangeFilter_EffectiveMarketLotSizeAndMaxQty(t *testing.T) {
+	ef := ExchangeFilter{
+		TickSize:       decimal.NewFromFloat(0.01),
+		StepSize:       decimal.NewFromFloat(0.1),
+		MinQty:         decimal.NewFromFloat(0.1),
+		MaxQty:         decimal.NewFromFloat(5000),
+		MarketStepSize: decimal.NewFromFloat(1.0),
+		MarketMinQty:   decimal.NewFromFloat(1.0),
+		MarketMaxQty:   decimal.NewFromFloat(200),
+	}
+	if got := ef.EffectiveStepSize(false); !got.Equal(decimal.NewFromFloat(1.0)) {
+		t.Fatalf("expected coarser MarketStepSize 1.0 even for LIMIT entry so STOP_MARKET exits work, got %s", got)
+	}
+	if got := ef.EffectiveMinQty(true); !got.Equal(decimal.NewFromFloat(1.0)) {
+		t.Fatalf("expected MarketMinQty 1.0 for MARKET entry, got %s", got)
+	}
+	if got := ef.EffectiveMinQty(false); !got.Equal(decimal.NewFromFloat(0.1)) {
+		t.Fatalf("expected MinQty 0.1 for LIMIT entry, got %s", got)
+	}
+	if got := ef.EffectiveMaxQty(false); !got.Equal(decimal.NewFromFloat(200)) {
+		t.Fatalf("expected tightest MaxQty 200 across LOT_SIZE & MARKET_LOT_SIZE, got %s", got)
+	}
+}

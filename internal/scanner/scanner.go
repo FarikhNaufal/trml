@@ -11,6 +11,7 @@ import (
 	"trml/internal/config"
 	"trml/internal/indicator"
 	"trml/internal/model"
+	"trml/internal/strategy"
 )
 
 const (
@@ -29,8 +30,10 @@ const (
 	defaultScannerDeltaWindow     = 50
 	defaultScannerRankingMode     = "pullback"
 
+	BenchmarkSymbol = "BTCUSDT"
+
 	scannerSpreadSafetyRatio = 0.80 // Require 20% spread headroom during scanning vs execution cutoff.
-	maxScannerKlineLimit     = 600  // Cap REST kline weight per symbol during bulk scans.
+	maxScannerKlineLimit     = 4500 // Support 15m/5m HTF EMA200 + 24h slope bootstrap via REST pagination.
 	scannerWorkerConcurrency = 5    // Bound concurrent kline REST fetches to respect exchange rate limits.
 
 	exhaustionRVOLRatio        = 2.50 / defaultScannerMinRVOL // Penalize late parabolic spikes (>= 2.50 at default 1.80 MinRVOL).
@@ -61,8 +64,18 @@ type ScannerConfig struct {
 	Timeframe             string
 	CandleDuration        time.Duration
 	RankingMode           string
-	SweepExtendedVWAP     bool
-	SweepMaxExtraCoins    int
+	ExcludeTopVolRank            int
+	SweepExtendedVWAP            bool
+	SweepMaxExtraCoins           int
+	BreakoutScannerEnabled       bool
+	BreakoutMinNATRPct           float64
+	BreakoutMaxNATRPct           float64
+	BreakoutMinVolume24hUSDT     float64
+	BreakoutMaxWatchedCoins      int
+	BreakoutExcludeTopVolRank     int
+	BreakoutMaxScannerVWAPDistATR float64
+	RollingVWAPBars               int
+	ComputeMarketBreadth          bool
 }
 
 // FromAppConfig builds a ScannerConfig from application config while applying safe defaults.
@@ -129,8 +142,18 @@ func FromAppConfig(cfg *config.Config, bootstrapCount int) ScannerConfig {
 		Timeframe:             timeframe,
 		CandleDuration:        candleDuration,
 		RankingMode:           rankingMode,
-		SweepExtendedVWAP:     cfg.Sweep.Enabled && cfg.Sweep.ScannerAllowExtendedVWAP,
-		SweepMaxExtraCoins:    cfg.Sweep.ScannerMaxExtraCoins,
+		ExcludeTopVolRank:            cfg.ScannerExcludeTopVolRank,
+		SweepExtendedVWAP:            cfg.Sweep.Enabled && cfg.Sweep.ScannerAllowExtendedVWAP,
+		SweepMaxExtraCoins:           cfg.Sweep.ScannerMaxExtraCoins,
+		BreakoutScannerEnabled:       cfg.VolBreakout.ScannerEnabled,
+		BreakoutMinNATRPct:           cfg.VolBreakout.MinNATRPct,
+		BreakoutMaxNATRPct:           cfg.VolBreakout.MaxNATRPct,
+		BreakoutMinVolume24hUSDT:     cfg.VolBreakout.MinVolume24hUSDT,
+		BreakoutMaxWatchedCoins:      cfg.VolBreakout.MaxWatchedCoins,
+		BreakoutExcludeTopVolRank:     cfg.VolBreakout.ExcludeTopVolRank,
+		BreakoutMaxScannerVWAPDistATR: cfg.VolBreakout.MaxScannerVWAPDistATR,
+		RollingVWAPBars:               cfg.RollingVWAPBars,
+		ComputeMarketBreadth:          cfg.MarketBreadthLowThreshold > 0,
 	}
 }
 
@@ -149,14 +172,19 @@ type ScanStats struct {
 	PrimaryPassed     int
 	FallbackUsed      int
 	SelectedCount     int
+	BreakoutCount     int
 	SweepExtraCount   int
 }
 
-// PartitionedScanResult separates primary VWAP pullback symbols from extended-VWAP liquidity-sweep extras.
+// PartitionedScanResult separates primary VWAP pullback symbols from breakout and extended-VWAP liquidity-sweep extras.
 type PartitionedScanResult struct {
-	Primary    []string
-	SweepExtra []string
-	Stats      ScanStats
+	Primary            []string
+	Breakout           []string
+	SweepExtra         []string
+	Stats              ScanStats
+	MarketBreadthPct   float64
+	MarketBreadthValid bool
+	MarketBreadthTotal int
 }
 
 type scanRejectKind uint8
@@ -258,8 +286,42 @@ func RunBulkMarketScannerWithStats(
 	return res.Primary, res.Stats
 }
 
+func buildTopVolExclusion(perpetualFilters map[string]model.ExchangeFilter, vol24hMap map[string]float64, limit int) map[string]bool {
+	if limit <= 0 {
+		return nil
+	}
+	type volRankEntry struct {
+		sym string
+		vol float64
+	}
+	ranked := make([]volRankEntry, 0, len(perpetualFilters))
+	for sym := range perpetualFilters {
+		if !strings.HasSuffix(sym, "USDT") || sym == BenchmarkSymbol {
+			continue
+		}
+		v := vol24hMap[sym]
+		if v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) {
+			ranked = append(ranked, volRankEntry{sym: sym, vol: v})
+		}
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].vol != ranked[j].vol {
+			return ranked[i].vol > ranked[j].vol
+		}
+		return ranked[i].sym < ranked[j].sym
+	})
+	if limit > len(ranked) {
+		limit = len(ranked)
+	}
+	excluded := make(map[string]bool, limit)
+	for i := 0; i < limit; i++ {
+		excluded[ranked[i].sym] = true
+	}
+	return excluded
+}
+
 // RunBulkMarketScannerPartitioned runs a single-pass bulk scan and returns both the primary watchlist
-// (unchanged L1 VWAP Pullback criteria) and optional extended-VWAP downtrend candidates for liquidity sweep.
+// (unchanged L1 VWAP Pullback criteria) and optional breakout / extended-VWAP downtrend candidates.
 func RunBulkMarketScannerPartitioned(
 	cfg ScannerConfig,
 	activeStates map[string]*model.SymbolState,
@@ -279,42 +341,87 @@ func RunBulkMarketScannerPartitioned(
 	var stats ScanStats
 	var passed []Candidate
 	var candidates []Candidate
+	var breakoutCandidates []Candidate
 	var sweepCandidates []Candidate
 	rankMode := strings.ToLower(strings.TrimSpace(cfg.RankingMode))
 
+	excludedTopVol := buildTopVolExclusion(perpetualFilters, vol24hMap, cfg.ExcludeTopVolRank)
+	boEnabled := cfg.BreakoutScannerEnabled
+	boMinVol := cfg.BreakoutMinVolume24hUSDT
+	if boMinVol <= 0 {
+		boMinVol = cfg.MinVolume24hUSDT
+	}
+	boMinNATR := cfg.BreakoutMinNATRPct
+	if boMinNATR <= 0 {
+		boMinNATR = cfg.MinNATRPct
+	}
+	boMaxNATR := cfg.BreakoutMaxNATRPct
+	if boMaxNATR <= 0 {
+		boMaxNATR = cfg.MaxNATRPct
+	}
+	boMaxCoins := cfg.BreakoutMaxWatchedCoins
+	if boMaxCoins <= 0 {
+		boMaxCoins = cfg.MaxWatchedCoins
+	}
+	boExclRank := cfg.BreakoutExcludeTopVolRank
+	if boExclRank < 0 {
+		boExclRank = cfg.ExcludeTopVolRank
+	}
+	var excludedBreakoutTopVol map[string]bool
+	if boEnabled {
+		excludedBreakoutTopVol = buildTopVolExclusion(perpetualFilters, vol24hMap, boExclRank)
+	}
+
+	type preScreenFlags struct {
+		allowPrimary   bool
+		allowBreakout  bool
+		includeBreadth bool
+	}
+	preFlags := make(map[string]preScreenFlags)
 	var symbolsToScan []string
 	for sym := range perpetualFilters {
-		if !strings.HasSuffix(sym, "USDT") {
+		if !strings.HasSuffix(sym, "USDT") || sym == BenchmarkSymbol {
 			continue
 		}
 		stats.TotalPerpUSDT++
 		vol := vol24hMap[sym]
-		if math.IsNaN(vol) || math.IsInf(vol, 0) || vol < cfg.MinVolume24hUSDT {
+		volFinite := !math.IsNaN(vol) && !math.IsInf(vol, 0)
+		includeBreadth := cfg.ComputeMarketBreadth && sym != "BTCUSDT" && volFinite && vol >= cfg.MinVolume24hUSDT
+		pOK := !excludedTopVol[sym] && volFinite && vol >= cfg.MinVolume24hUSDT
+		bOK := boEnabled && !excludedBreakoutTopVol[sym] && volFinite && vol >= boMinVol
+		if !pOK && !bOK {
 			stats.VolRejected++
+			if includeBreadth {
+				preFlags[sym] = preScreenFlags{includeBreadth: true}
+				symbolsToScan = append(symbolsToScan, sym)
+			}
 			continue
 		}
 		bk, ok := bookMap[sym]
-		if !ok || math.IsNaN(bk.BestBid) || math.IsNaN(bk.BestAsk) || math.IsInf(bk.BestBid, 0) || math.IsInf(bk.BestAsk, 0) || bk.BestBid <= 0 || bk.BestAsk <= bk.BestBid {
+		spreadOK := ok && !math.IsNaN(bk.BestBid) && !math.IsNaN(bk.BestAsk) && !math.IsInf(bk.BestBid, 0) && !math.IsInf(bk.BestAsk, 0) && bk.BestBid > 0 && bk.BestAsk > bk.BestBid
+		if spreadOK {
+			spreadPct := ((bk.BestAsk - bk.BestBid) / bk.BestBid) * 100.0
+			maxScanSpread := cfg.MaxSpreadPct * scannerSpreadSafetyRatio
+			if maxScanSpread <= 0 {
+				maxScanSpread = cfg.MaxSpreadPct
+			}
+			if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) || spreadPct > maxScanSpread {
+				spreadOK = false
+			}
+		}
+		if !spreadOK {
 			stats.SpreadRejected++
+			if includeBreadth {
+				preFlags[sym] = preScreenFlags{includeBreadth: true}
+				symbolsToScan = append(symbolsToScan, sym)
+			}
 			continue
 		}
-		spreadPct := ((bk.BestAsk - bk.BestBid) / bk.BestBid) * 100.0
-		if math.IsNaN(spreadPct) || math.IsInf(spreadPct, 0) {
-			stats.SpreadRejected++
-			continue
-		}
-		maxScanSpread := cfg.MaxSpreadPct * scannerSpreadSafetyRatio
-		if maxScanSpread <= 0 {
-			maxScanSpread = cfg.MaxSpreadPct
-		}
-		if spreadPct > maxScanSpread {
-			stats.SpreadRejected++
-			continue
-		}
+		stats.PreFilterPassed++
+		preFlags[sym] = preScreenFlags{allowPrimary: pOK, allowBreakout: bOK, includeBreadth: includeBreadth}
 		symbolsToScan = append(symbolsToScan, sym)
 	}
 	sort.Strings(symbolsToScan)
-	stats.PreFilterPassed = len(symbolsToScan)
 
 	klineLimit := cfg.BootstrapCount + 1
 	if klineLimit > maxScannerKlineLimit {
@@ -325,9 +432,13 @@ func RunBulkMarketScannerPartitioned(
 	}
 
 	type scanResult struct {
-		cand      Candidate
-		sweepCand *Candidate
-		reject    scanRejectKind
+		cand           *Candidate
+		boCand         *Candidate
+		sweepCand      *Candidate
+		reject         scanRejectKind
+		breadthOnly    bool
+		breadthCounted bool
+		breadthAbove   bool
 	}
 
 	resultsChan := make(chan scanResult, len(symbolsToScan))
@@ -343,7 +454,8 @@ func RunBulkMarketScannerPartitioned(
 
 	for _, sym := range symbolsToScan {
 		wg.Add(1)
-		go func(symbol string) {
+		pf := preFlags[sym]
+		go func(symbol string, flags preScreenFlags) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -353,53 +465,108 @@ func RunBulkMarketScannerPartitioned(
 				rawKlines = fetchKlinesFn(symbol, klineLimit)
 			}
 			if len(rawKlines) < cfg.EMAPeriod+1 {
+				if !flags.allowPrimary && !flags.allowBreakout {
+					resultsChan <- scanResult{breadthOnly: true}
+					return
+				}
 				resultsChan <- scanResult{reject: scanRejectKlineShort}
 				return
 			}
 			validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime, cfg.CandleDuration)
 			if err != nil {
+				if !flags.allowPrimary && !flags.allowBreakout {
+					resultsChan <- scanResult{breadthOnly: true}
+					return
+				}
 				resultsChan <- scanResult{reject: scanRejectKlineInvalid}
 				return
 			}
+			var breadthCounted, breadthAbove bool
+			if flags.includeBreadth {
+				breadthAbove, breadthCounted = strategy.IsAboveHourlyEMA200(validKlines)
+			}
+			if !flags.allowPrimary && !flags.allowBreakout {
+				resultsChan <- scanResult{
+					breadthOnly:    true,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
+				return
+			}
 			if len(validKlines) < cfg.EMAPeriod+1 {
-				resultsChan <- scanResult{reject: scanRejectKlineShort}
+				resultsChan <- scanResult{
+					reject:         scanRejectKlineShort,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
 				return
 			}
 
 			atr14 := indicator.CalculateATR(validKlines, cfg.ATRPeriod)
 			if math.IsNaN(atr14) || math.IsInf(atr14, 0) || atr14 <= 0 {
-				resultsChan <- scanResult{reject: scanRejectATR}
+				resultsChan <- scanResult{
+					reject:         scanRejectATR,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
 				return
 			}
 			lastClose := validKlines[len(validKlines)-1].Close
 			if math.IsNaN(lastClose) || math.IsInf(lastClose, 0) || lastClose <= 0 {
-				resultsChan <- scanResult{reject: scanRejectKlineInvalid}
+				resultsChan <- scanResult{
+					reject:         scanRejectKlineInvalid,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
 				return
 			}
 			natrPct := (atr14 / lastClose) * 100.0
-			if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) || natrPct < cfg.MinNATRPct || natrPct > cfg.MaxNATRPct {
-				resultsChan <- scanResult{reject: scanRejectNATR}
+			if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) {
+				resultsChan <- scanResult{
+					reject:         scanRejectNATR,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
+				return
+			}
+
+			pNATROK := flags.allowPrimary && natrPct >= cfg.MinNATRPct && natrPct <= cfg.MaxNATRPct
+			bNATROK := flags.allowBreakout && natrPct >= boMinNATR && natrPct <= boMaxNATR
+			if !pNATROK && !bNATROK {
+				resultsChan <- scanResult{
+					reject:         scanRejectNATR,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
 				return
 			}
 
 			var distVWAPATR float64
-			needVWAP := (cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") && atr14 > 0
+			var sessionVWAP float64
+			needVWAP := ((cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") && pNATROK) || (cfg.BreakoutMaxScannerVWAPDistATR > 0 && bNATROK)
 			if needVWAP {
-				sessionVWAP := indicator.CalculateSessionVWAP(validKlines)
-				if math.IsNaN(sessionVWAP) || math.IsInf(sessionVWAP, 0) || sessionVWAP <= 0 {
-					resultsChan <- scanResult{reject: scanRejectVWAPDist}
-					return
+				sessionVWAP = indicator.CalculateEffectiveVWAP(validKlines, cfg.RollingVWAPBars)
+				if !math.IsNaN(sessionVWAP) && !math.IsInf(sessionVWAP, 0) && sessionVWAP > 0 {
+					distVWAPATR = math.Abs(lastClose-sessionVWAP) / atr14
+				} else {
+					sessionVWAP = 0
 				}
-				distVWAPATR = math.Abs(lastClose-sessionVWAP) / atr14
-				if cfg.MaxScannerVWAPDistATR > 0 && distVWAPATR > cfg.MaxScannerVWAPDistATR {
-					var extra *Candidate
+			}
+
+			var sweepExtra *Candidate
+			pVWAPOK := pNATROK
+			if pVWAPOK && (cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") {
+				if sessionVWAP <= 0 {
+					pVWAPOK = false
+				} else if cfg.MaxScannerVWAPDistATR > 0 && distVWAPATR > cfg.MaxScannerVWAPDistATR {
+					pVWAPOK = false
 					if cfg.SweepExtendedVWAP && lastClose <= sessionVWAP {
 						ema200 := indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
 						if !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0 && lastClose < ema200 {
 							rvolExt := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
 							if !math.IsNaN(rvolExt) && !math.IsInf(rvolExt, 0) {
 								liqB := computeLiquidityLogBonus(vol24hMap[symbol], cfg.MinVolume24hUSDT)
-								extra = &Candidate{
+								sweepExtra = &Candidate{
 									Symbol:  symbol,
 									RVOL:    rvolExt,
 									Score:   0.50*liqB + 0.25*math.Min(rvolExt, 2.0),
@@ -408,29 +575,86 @@ func RunBulkMarketScannerPartitioned(
 							}
 						}
 					}
-					resultsChan <- scanResult{reject: scanRejectVWAPDist, sweepCand: extra}
-					return
 				}
+			}
+
+			bVWAPOK := bNATROK
+			if bVWAPOK && cfg.BreakoutMaxScannerVWAPDistATR > 0 {
+				if sessionVWAP <= 0 || distVWAPATR > cfg.BreakoutMaxScannerVWAPDistATR {
+					bVWAPOK = false
+				}
+			}
+
+			if !pVWAPOK && !bVWAPOK {
+				resultsChan <- scanResult{
+					reject:         scanRejectVWAPDist,
+					sweepCand:      sweepExtra,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
+				return
 			}
 
 			rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
 			if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
-				resultsChan <- scanResult{reject: scanRejectATR}
+				resultsChan <- scanResult{
+					reject:         scanRejectATR,
+					breadthCounted: breadthCounted,
+					breadthAbove:   breadthAbove,
+				}
 				return
 			}
-			score := rvol
-			if rankMode == "pullback" {
-				score = computePullbackScore(cfg, rvol, distVWAPATR, natrPct, vol24hMap[symbol])
+
+			var pCand *Candidate
+			if pVWAPOK {
+				score := rvol
+				if rankMode == "pullback" {
+					score = computePullbackScore(cfg, rvol, distVWAPATR, natrPct, vol24hMap[symbol])
+				}
+				pCand = &Candidate{
+					Symbol:    symbol,
+					RVOL:      rvol,
+					Score:     score,
+					Candles:   validKlines,
+					IsPrimary: rvol >= cfg.MinRVOL,
+				}
 			}
-			cand := Candidate{
-				Symbol:    symbol,
-				RVOL:      rvol,
-				Score:     score,
-				Candles:   validKlines,
-				IsPrimary: rvol >= cfg.MinRVOL,
+
+			var bCand *Candidate
+			if bVWAPOK {
+				atr60 := indicator.CalculateATR(validKlines, 60)
+				compRatio := 1.0
+				if !math.IsNaN(atr60) && !math.IsInf(atr60, 0) && atr60 > 0 {
+					compRatio = atr14 / atr60
+				}
+				squeezeScore := math.Max(0.0, 1.20-compRatio)
+				liqBonus := computeLiquidityLogBonus(vol24hMap[symbol], boMinVol)
+				bCand = &Candidate{
+					Symbol:  symbol,
+					RVOL:    rvol,
+					Score:   0.65*squeezeScore + 0.35*liqBonus,
+					Candles: validKlines,
+				}
 			}
-			resultsChan <- scanResult{cand: cand, reject: scanValid}
-		}(sym)
+
+			rej := scanValid
+			if pCand == nil {
+				// Record primary-bucket rejection telemetry when only breakout matched
+				if flags.allowPrimary && !pNATROK {
+					rej = scanRejectNATR
+				} else if flags.allowPrimary && !pVWAPOK {
+					rej = scanRejectVWAPDist
+				}
+			}
+			resultsChan <- scanResult{
+				cand:           pCand,
+				boCand:         bCand,
+				sweepCand:      sweepExtra,
+				reject:         rej,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
+			}
+		}(sym, pf)
 	}
 
 	wg.Wait()
@@ -441,7 +665,30 @@ func RunBulkMarketScannerPartitioned(
 		fallbackFloor = defaultScannerFallbackRVOL
 	}
 
+	breadthTotal := 0
+	breadthAboveCount := 0
 	for res := range resultsChan {
+		if res.breadthCounted {
+			breadthTotal++
+			if res.breadthAbove {
+				breadthAboveCount++
+			}
+		}
+		if res.breadthOnly {
+			continue
+		}
+		if res.boCand != nil {
+			breakoutCandidates = append(breakoutCandidates, *res.boCand)
+		}
+		if res.cand != nil {
+			stats.CandidatesValid++
+			candidates = append(candidates, *res.cand)
+			if res.cand.IsPrimary {
+				stats.PrimaryPassed++
+				passed = append(passed, *res.cand)
+			}
+			continue
+		}
 		switch res.reject {
 		case scanRejectKlineShort:
 			stats.KlineFetchOrShort++
@@ -455,13 +702,6 @@ func RunBulkMarketScannerPartitioned(
 			stats.VWAPDistRejected++
 			if res.sweepCand != nil {
 				sweepCandidates = append(sweepCandidates, *res.sweepCand)
-			}
-		case scanValid:
-			stats.CandidatesValid++
-			candidates = append(candidates, res.cand)
-			if res.cand.IsPrimary {
-				stats.PrimaryPassed++
-				passed = append(passed, res.cand)
 			}
 		}
 	}
@@ -516,6 +756,15 @@ func RunBulkMarketScannerPartitioned(
 		if !exists {
 			st = model.NewSymbolState(cand.Symbol, perpetualFilters[cand.Symbol], cfg.BootstrapCount, cfg.DeltaWindow+1)
 			st.TargetOIInterval = cfg.CandleDuration
+		} else {
+			st.Mu.Lock()
+			if updatedFilter, hasFilter := perpetualFilters[cand.Symbol]; hasFilter {
+				st.Filter = updatedFilter
+			}
+			if cfg.CandleDuration > 0 {
+				st.TargetOIInterval = cfg.CandleDuration
+			}
+			st.Mu.Unlock()
 		}
 		if err := BootstrapSymbolState(st, cand.Candles, serverTime, cfg.BootstrapCount, cfg.DeltaWindow+1, cfg.CandleDuration); err != nil {
 			slog.Warn("scanner: failed to bootstrap symbol state, skipping symbol", "symbol", cand.Symbol, "err", err)
@@ -542,6 +791,22 @@ func RunBulkMarketScannerPartitioned(
 	}
 	stats.SelectedCount = len(selected)
 
+	var boSelected []string
+	if boEnabled && boMaxCoins > 0 && len(breakoutCandidates) > 0 {
+		sortByMode(breakoutCandidates, "pullback")
+		for i := 0; i < len(breakoutCandidates) && len(boSelected) < boMaxCoins; i++ {
+			cand := breakoutCandidates[i]
+			if cand.RVOL < fallbackFloor {
+				continue
+			}
+			if !selectedSet[cand.Symbol] && !bootstrapCand(cand) {
+				continue
+			}
+			boSelected = append(boSelected, cand.Symbol)
+		}
+	}
+	stats.BreakoutCount = len(boSelected)
+
 	var sweepSelected []string
 	if cfg.SweepExtendedVWAP && cfg.SweepMaxExtraCoins > 0 && len(sweepCandidates) > 0 {
 		var eligible []Candidate
@@ -562,9 +827,19 @@ func RunBulkMarketScannerPartitioned(
 	}
 	stats.SweepExtraCount = len(sweepSelected)
 
+	var breadthPct float64
+	var breadthValid bool
+	if cfg.ComputeMarketBreadth {
+		breadthPct, breadthValid = strategy.FinalizeMarketBreadth(breadthAboveCount, breadthTotal, strategy.DefaultMinBreadthSymbols)
+	}
+
 	return PartitionedScanResult{
-		Primary:    selected,
-		SweepExtra: sweepSelected,
-		Stats:      stats,
+		Primary:            selected,
+		Breakout:           boSelected,
+		SweepExtra:         sweepSelected,
+		Stats:              stats,
+		MarketBreadthPct:   breadthPct,
+		MarketBreadthValid: breadthValid,
+		MarketBreadthTotal: breadthTotal,
 	}
 }

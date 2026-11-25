@@ -28,8 +28,12 @@ type ReplayConfig struct {
 	ScannerInterval       time.Duration                    // interval scanning ulang (default 15 menit)
 	ScannerCfg            scanner.ScannerConfig            // konfigurasi scanner produksi
 	UnconstrainedMode     bool                             // mode evaluasi sinyal murni (tanpa batas slot portofolio & cooldown)
-	DeductPendingMargin   bool                             // kurangi available margin intra-bar saat order disubmit
-	EquityModeCompounding bool                             // compounding vs modal tetap
+	DeductPendingMargin      bool          // kurangi available margin intra-bar saat order disubmit
+	EquityModeCompounding    bool          // compounding vs modal tetap
+	MaxNewEntriesPerBar      int           // batas maksimal entry baru dalam satu bar (0 = unlimited)
+	PortfolioClusterSLCount  int           // jumlah SL dalam 60 menit untuk memicu jeda portofolio (0 = off)
+	PortfolioClusterCooldown time.Duration // durasi jeda saat cluster SL tercapai
+	SettleOpenPositionsAtEnd bool          // tutup posisi terbuka di akhir timeline (untuk WFA window boundary)
 }
 
 // ReplayStats captures execution, scanner, and data-coverage telemetry produced by a ReplayEngine run.
@@ -58,6 +62,11 @@ type ReplayEngine struct {
 	fundingMgr   *data.FundingManager
 	oiMgr        *data.MetricsOIDownloader
 	lastExits    map[string]lastExitInfo
+
+	clusterSL          *strategy.ClusterSLTracker
+	lastBreadthHourKey int64
+	cachedBreadthPct   float64
+	cachedBreadthValid bool
 
 	// Signal observability
 	TotalSignalsEvaluated int64
@@ -100,6 +109,7 @@ func NewReplayEngine(
 		fundingMgr:    cfg.FundingMgr,
 		oiMgr:         cfg.OIMgr,
 		lastExits:     make(map[string]lastExitInfo),
+		clusterSL:     strategy.NewClusterSLTracker(cfg.PortfolioClusterSLCount, cfg.PortfolioClusterCooldown),
 		RejectReasons: make(map[string]int64),
 	}
 }
@@ -138,14 +148,26 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 	lastSeenBarTime := make(map[string]time.Time, len(sortedSymbols))
 	lastSeenClose := make(map[string]float64, len(sortedSymbols))
 
-	bufferCap := CalcRollingBufferCap(r.cfg.ScannerCfg.CandleDuration, r.cfg.WarmupBars)
+	candleDur := r.cfg.ScannerCfg.CandleDuration
+	if candleDur <= 0 {
+		candleDur = r.evaluatorCfg.CandleDuration
+	}
+	bufferCap := strategy.CalcRequiredHistoryBars(
+		candleDur,
+		r.cfg.WarmupBars,
+		r.evaluatorCfg.HTFEMAPeriod,
+		r.evaluatorCfg.MarketBreadthLowThreshold > 0,
+	)
 	scanSim := NewScannerSimulator(r.cfg.ScannerCfg, r.filters, func(cList []model.Candle, lastClose float64) float64 {
 		return calculateDynamicSpread(cList, lastClose, r.cfg.SpreadPct)
 	})
 
 	var lastScanTime time.Time
 	watchedSymbols := make(map[string]bool)
+	breakoutSymbols := make(map[string]bool)
 	sweepExtraSymbols := make(map[string]bool)
+	var primaryOrder []string
+	var breakoutOrder []string
 	lastClosedTradeIdx := 0
 	var prevSimTime time.Time
 
@@ -168,6 +190,10 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			}
 		}
 
+		if !r.cfg.UnconstrainedMode {
+			r.broker.CheckCrossMarginLiquidation(0.005, simTime, int64(barIdx))
+		}
+
 		lastClosedTradeIdx = r.syncLastExits(lastClosedTradeIdx)
 
 		if barIdx >= r.cfg.WarmupBars {
@@ -175,15 +201,39 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 			// B. Prepare BTC macro snapshot and evaluate signals on active/watched symbols
 			btcSnap := r.buildBTCMacro(simTime, rollingCandles, rollingDeltas)
-			r.evaluateSignalsAtBar(simTime, sortedSymbols, closedAtSimTime, watchedSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, btcSnap)
+			r.evaluateSignalsAtBar(simTime, sortedSymbols, primaryOrder, breakoutOrder, closedAtSimTime, watchedSymbols, breakoutSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, btcSnap)
 		}
 
 		// C. Post-bar dynamic scan cadence: new watchlist activates on subsequent closed bars
 		// (begins at the end of the final warmup bar so barIdx == WarmupBars has an active watchlist).
 		if r.cfg.DynamicScannerEnabled && barIdx >= r.cfg.WarmupBars-1 &&
 			(lastScanTime.IsZero() || simTime.Sub(lastScanTime) >= r.cfg.ScannerInterval) {
-			lastScanTime = simTime
-			watchedSymbols, sweepExtraSymbols = scanSim.RunCyclePartitioned(sortedSymbols, rollingCandles, simTime)
+			nextWatch, nextSweepExtra := scanSim.RunCyclePartitioned(sortedSymbols, rollingCandles, simTime)
+			nextPrimaryOrder := append([]string(nil), scanSim.LastPrimaryOrder...)
+			nextBreakoutOrder := append([]string(nil), scanSim.LastBreakoutOrder...)
+			nextBreakout := make(map[string]bool, len(scanSim.LastBreakoutSet))
+			for sym, ok := range scanSim.LastBreakoutSet {
+				if ok {
+					nextBreakout[sym] = true
+				}
+			}
+
+			// Retain prior watchlist if scan produced nothing (matching BotEngine behavior).
+			if len(nextWatch) > 0 || len(nextBreakout) > 0 || len(nextSweepExtra) > 0 || len(watchedSymbols) == 0 {
+				watchedSymbols = nextWatch
+				sweepExtraSymbols = nextSweepExtra
+				primaryOrder = nextPrimaryOrder
+				breakoutOrder = nextBreakoutOrder
+				breakoutSymbols = nextBreakout
+			}
+			// If first scan still lacks EMAPeriod+1 warmup bars, allow retrying on next closed bar instead of waiting ScannerInterval.
+			emaReq := r.cfg.ScannerCfg.EMAPeriod
+			if emaReq <= 0 {
+				emaReq = 200
+			}
+			if !lastScanTime.IsZero() || len(watchedSymbols) > 0 || len(breakoutSymbols) > 0 || len(sweepExtraSymbols) > 0 || barIdx >= emaReq {
+				lastScanTime = simTime
+			}
 		}
 
 		prevSimTime = simTime
@@ -201,6 +251,20 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			if r.broker.ForceClosePosition(sym, decimal.NewFromFloat(lastSeenClose[sym]), "DELIST_OR_DATA_END_SETTLE", lastTime, lastBarIdx) {
 				r.Stats.DelistForceClosed++
 			}
+		}
+	}
+	if r.cfg.SettleOpenPositionsAtEnd {
+		settledAny := false
+		for _, sym := range sortedSymbols {
+			if !r.broker.HasActiveOrderOrPosition(sym) {
+				continue
+			}
+			if r.broker.ForceClosePosition(sym, decimal.NewFromFloat(lastSeenClose[sym]), "WINDOW_END_SETTLE", lastTime, lastBarIdx) {
+				settledAny = true
+			}
+		}
+		if settledAny {
+			r.broker.RecordTimelineEquity(lastTime)
 		}
 	}
 
@@ -247,7 +311,11 @@ func (r *ReplayEngine) stepSymbolAtTime(
 
 		if r.fundingMgr != nil {
 			if rate, isSettlement := r.fundingMgr.CheckSettlement(sym, c.OpenTime, c.CloseTime); isSettlement {
-				r.broker.ApplyFundingSettlement(sym, decimal.NewFromFloat(c.Close), decimal.NewFromFloat(rate))
+				fundMark := c.Open
+				if fundMark <= 0 {
+					fundMark = c.Close
+				}
+				r.broker.ApplyFundingSettlement(sym, decimal.NewFromFloat(fundMark), decimal.NewFromFloat(rate))
 			}
 		}
 
@@ -327,6 +395,9 @@ func (r *ReplayEngine) syncLastExits(fromIdx int) int {
 			time:   tr.ExitTime,
 			reason: tr.ExitReason,
 		}
+		if r.clusterSL != nil {
+			r.clusterSL.RecordExit(tr.ExitTime, tr.ExitReason)
+		}
 	}
 	return len(r.broker.ClosedTrades)
 }
@@ -336,8 +407,7 @@ func (r *ReplayEngine) buildBTCMacro(
 	rollingCandles map[string][]model.Candle,
 	rollingDeltas map[string][]float64,
 ) *model.MarketSnapshot {
-	if !r.evaluatorCfg.BTCGateEnabled && !r.evaluatorCfg.BTCChopBlockLong && !r.evaluatorCfg.BTCChopBlockShort &&
-		(r.evaluatorCfg.BTCChopRiskMult <= 0 || r.evaluatorCfg.BTCChopRiskMult >= 1.0) {
+	if !strategy.NeedsBTCMacroSnapshot(r.evaluatorCfg) {
 		return nil
 	}
 	return BuildBTCMacroSnapshot(
@@ -346,14 +416,18 @@ func (r *ReplayEngine) buildBTCMacro(
 		rollingCandles[r.cfg.BenchmarkSym],
 		rollingDeltas[r.cfg.BenchmarkSym],
 		r.cfg.SpreadPct,
+		r.evaluatorCfg.RollingVWAPBars,
 	)
 }
 
 func (r *ReplayEngine) evaluateSignalsAtBar(
 	simTime time.Time,
 	sortedSymbols []string,
+	primaryOrder []string,
+	breakoutOrder []string,
 	closedAtSimTime map[string]bool,
 	watchedSymbols map[string]bool,
+	breakoutSymbols map[string]bool,
 	sweepExtraSymbols map[string]bool,
 	rollingCandles map[string][]model.Candle,
 	rollingDeltas map[string][]float64,
@@ -369,8 +443,39 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		isDailyBreached = false
 		availBal = decimal.NewFromFloat(1000000.0)
 	}
+	entriesThisBar := 0
+	clusterPaused := false
+	if !r.cfg.UnconstrainedMode && r.clusterSL != nil {
+		clusterPaused, _ = r.clusterSL.IsPaused(simTime)
+	}
+	breadthPct, breadthValid := r.getMarketBreadth(simTime, sortedSymbols, rollingCandles)
+	portDD := r.broker.GetDrawdownFromPeakPct()
 
-	for _, sym := range sortedSymbols {
+	evalOrder := sortedSymbols
+	if r.cfg.DynamicScannerEnabled && (len(primaryOrder) > 0 || len(breakoutOrder) > 0) {
+		ordered := make([]string, 0, len(sortedSymbols))
+		seen := make(map[string]bool, len(sortedSymbols))
+		for _, sym := range primaryOrder {
+			if !seen[sym] {
+				seen[sym] = true
+				ordered = append(ordered, sym)
+			}
+		}
+		for _, sym := range breakoutOrder {
+			if !seen[sym] {
+				seen[sym] = true
+				ordered = append(ordered, sym)
+			}
+		}
+		for _, sym := range sortedSymbols {
+			if !seen[sym] {
+				ordered = append(ordered, sym)
+			}
+		}
+		evalOrder = ordered
+	}
+
+	for _, sym := range evalOrder {
 		if !closedAtSimTime[sym] {
 			continue
 		}
@@ -383,8 +488,9 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		}
 		hasActive := r.broker.HasActiveOrderOrPosition(sym)
 		inPrimary := !r.cfg.DynamicScannerEnabled || watchedSymbols[sym]
+		inBreakout := !r.cfg.DynamicScannerEnabled || breakoutSymbols[sym]
 		inSweepExtra := r.cfg.DynamicScannerEnabled && sweepExtraSymbols[sym]
-		if r.cfg.DynamicScannerEnabled && !inPrimary && !inSweepExtra && !hasActive {
+		if r.cfg.DynamicScannerEnabled && !inPrimary && !inBreakout && !inSweepExtra && !hasActive {
 			continue
 		}
 		if len(cList) < r.evaluatorCfg.EMAPeriod {
@@ -408,6 +514,9 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		if !okSnap {
 			continue
 		}
+		snap.MarketBreadthPct = breadthPct
+		snap.MarketBreadthValid = breadthValid
+		snap.PortfolioDrawdownPct = portDD
 		switch oiStatus {
 		case oiStatusCovered:
 			r.Stats.OICoveredCount++
@@ -418,9 +527,21 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		}
 
 		r.TotalSignalsEvaluated++
+		if clusterPaused {
+			r.SignalsRejected++
+			r.RejectReasons["PORTFOLIO_CLUSTER_SL_COOLDOWN"]++
+			continue
+		}
+		if !r.cfg.UnconstrainedMode && r.cfg.MaxNewEntriesPerBar > 0 && entriesThisBar >= r.cfg.MaxNewEntriesPerBar {
+			r.SignalsRejected++
+			r.RejectReasons["BAR_ENTRY_CAP_REACHED"]++
+			continue
+		}
 		scope := strategy.SymbolScope{
-			AllowPrimary: inPrimary,
-			AllowSweep:   inPrimary || inSweepExtra,
+			AllowPrimary:          inPrimary,
+			AllowBreakout:         inBreakout,
+			BreakoutScopeExplicit: r.cfg.ScannerCfg.BreakoutScannerEnabled,
+			AllowSweep:            inPrimary || inSweepExtra,
 		}
 		dec := strategy.EvaluatePortfolio(
 			snap,
@@ -435,8 +556,13 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		)
 
 		if dec.Approved {
-			r.SignalsApproved++
-			_, _ = r.broker.SubmitLimitEntry(dec.Intent)
+			if okSub, _ := r.broker.SubmitLimitEntry(dec.Intent); okSub {
+				r.SignalsApproved++
+				entriesThisBar++
+			} else {
+				r.SignalsRejected++
+				r.RejectReasons["BROKER_SUBMIT_REJECTED"]++
+			}
 			if !r.cfg.UnconstrainedMode {
 				activeSlots = r.broker.GetActiveSlotCount()
 				if r.cfg.DeductPendingMargin {
@@ -448,6 +574,71 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 			r.RejectReasons[dec.Reason]++
 		}
 	}
+}
+
+func (r *ReplayEngine) getMarketBreadth(
+	simTime time.Time,
+	sortedSymbols []string,
+	rollingCandles map[string][]model.Candle,
+) (float64, bool) {
+	if r.evaluatorCfg.MarketBreadthLowThreshold <= 0 {
+		return 0, false
+	}
+	hourKey := effectiveEvalTime(simTime).UTC().Unix() / 3600
+	if hourKey == r.lastBreadthHourKey && r.lastBreadthHourKey != 0 {
+		return r.cachedBreadthPct, r.cachedBreadthValid
+	}
+
+	candleDur := r.cfg.ScannerCfg.CandleDuration
+	if candleDur <= 0 {
+		candleDur = r.evaluatorCfg.CandleDuration
+	}
+	if candleDur <= 0 {
+		candleDur = 15 * time.Minute
+	}
+	bars24h := int((24 * time.Hour) / candleDur)
+	if bars24h <= 0 {
+		bars24h = 96
+	}
+	minVol := r.cfg.ScannerCfg.MinVolume24hUSDT
+	if minVol <= 0 {
+		minVol = 15_000_000.0
+	}
+
+	above := 0
+	total := 0
+	for _, sym := range sortedSymbols {
+		if sym == r.cfg.BenchmarkSym {
+			continue
+		}
+		cList := rollingCandles[sym]
+		if len(cList) < 200 {
+			continue
+		}
+		startVol := len(cList) - bars24h
+		if startVol < 0 {
+			startVol = 0
+		}
+		vol24h := 0.0
+		for _, c := range cList[startVol:] {
+			vol24h += c.QuoteVolumeUSDT
+		}
+		if vol24h < minVol {
+			continue
+		}
+		if isAbove, ok := strategy.IsAboveHourlyEMA200(cList); ok {
+			total++
+			if isAbove {
+				above++
+			}
+		}
+	}
+
+	pct, valid := strategy.FinalizeMarketBreadth(above, total, strategy.DefaultMinBreadthSymbols)
+	r.lastBreadthHourKey = hourKey
+	r.cachedBreadthPct = pct
+	r.cachedBreadthValid = valid
+	return pct, valid
 }
 
 func (r *ReplayEngine) finalizeStats(scanStats ScannerAuditStats) {

@@ -79,10 +79,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/api/signals", s.requireAuth(s.handleSignals))
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// 3. AI Copilot Endpoints (Protected by PIN + Token Bucket Rate Limit)
+	// 3. AI Copilot Endpoints (Protected by PIN + Token Bucket Rate Limit; trade-autopsy rate-limits only on cache miss)
 	mux.HandleFunc("/api/ai/executive-summary", s.requireAuth(s.aiRateLimit(s.handleAIExecutiveSummary)))
 	mux.HandleFunc("/api/ai/position-health", s.requireAuth(s.aiRateLimit(s.handleAIPositionHealth)))
-	mux.HandleFunc("/api/ai/trade-autopsy", s.requireAuth(s.aiRateLimit(s.handleAITradeAutopsy)))
+	mux.HandleFunc("/api/ai/trade-autopsy", s.requireAuth(s.handleAITradeAutopsy))
 	mux.HandleFunc("/api/ai/pattern-miner", s.requireAuth(s.aiRateLimit(s.handleAIPatternMiner)))
 
 	// 2. Static File Server (Embedded PWA Assets)
@@ -131,7 +131,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
 	var equityF, balanceF float64
@@ -151,8 +151,17 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		positions = s.cfg.Broker.GetActivePositions()
 	}
 
-	stats, _ := s.cfg.Reader.GetOverallStats(ctx)
-	strategyStats, _ := s.cfg.Reader.GetStrategyStats(ctx)
+	var stats StatsItem
+	var strategyStats []StrategyStatsItem
+	if s.cfg.Reader != nil {
+		var err error
+		if stats, err = s.cfg.Reader.GetOverallStats(ctx); err != nil {
+			slog.Warn("web server: failed to load overall stats", "err", err)
+		}
+		if strategyStats, err = s.cfg.Reader.GetStrategyStats(ctx); err != nil {
+			slog.Warn("web server: failed to load strategy stats", "err", err)
+		}
+	}
 
 	circuitBreaker := false
 	if s.cfg.IsCircuitBreaker != nil {
@@ -167,6 +176,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"active_slots":           activeSlots,
 		"max_slots":              s.cfg.MaxSlots,
 		"env":                    s.cfg.Env,
+		"gemini_model":           s.gemini.Model(),
 		"circuit_breaker":        circuitBreaker,
 		"positions":              positions,
 		"stats":                  stats,
@@ -200,26 +210,33 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.cfg.Reader == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "READER_UNAVAILABLE"})
+		return
+	}
 
 	q := r.URL.Query()
 	page, _ := strconv.Atoi(q.Get("page"))
+	if page < 1 {
+		page = 1
+	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	status := q.Get("status")
 	strategyFilter := q.Get("strategy")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
 	trades, total, err := s.cfg.Reader.GetTradesPaginated(ctx, page, limit, status, strategyFilter)
 	if err != nil {
 		slog.Error("web server: failed to get trades", "err", err)
-		http.Error(w, `{"error":"failed to query trades"}`, http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to query trades"})
 		return
 	}
 
-	if limit < 1 || limit > 100 {
-		limit = 10
-	}
 	totalPages := 1
 	if total > 0 {
 		totalPages = (total + limit - 1) / limit
@@ -241,27 +258,34 @@ func (s *Server) handleSignals(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.cfg.Reader == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "READER_UNAVAILABLE"})
+		return
+	}
 
 	q := r.URL.Query()
 	page, _ := strconv.Atoi(q.Get("page"))
+	if page < 1 {
+		page = 1
+	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit < 1 || limit > 100 {
+		limit = 15
+	}
 	decision := q.Get("decision")
 	symbol := q.Get("symbol")
 	strategyFilter := q.Get("strategy")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
 	signals, total, err := s.cfg.Reader.GetSignalsPaginated(ctx, page, limit, decision, symbol, strategyFilter)
 	if err != nil {
 		slog.Error("web server: failed to get signals", "err", err)
-		http.Error(w, `{"error":"failed to query signals"}`, http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to query signals"})
 		return
 	}
 
-	if limit < 1 || limit > 100 {
-		limit = 15
-	}
 	totalPages := 1
 	if total > 0 {
 		totalPages = (total + limit - 1) / limit
@@ -298,21 +322,24 @@ func (s *Server) handleVerifyPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := s.rateLimiter.getClientIP(r)
-
-	if blocked, wait := s.rateLimiter.IsBlocked(ip); blocked {
-		seconds := int(wait.Seconds())
-		if seconds < 1 {
-			seconds = 1
+	var ip string
+	if s.rateLimiter != nil {
+		ip = s.rateLimiter.getClientIP(r)
+		if blocked, wait := s.rateLimiter.IsBlocked(ip); blocked {
+			seconds := int(wait.Seconds())
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error":   "TOO_MANY_FAILED_ATTEMPTS",
+				"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
+			})
+			return
 		}
-		w.Header().Set("Retry-After", strconv.Itoa(seconds))
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{
-			"error":   "TOO_MANY_FAILED_ATTEMPTS",
-			"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
-		})
-		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var req struct {
 		PIN string `json:"pin"`
 	}
@@ -325,13 +352,14 @@ func (s *Server) handleVerifyPIN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.validatePIN(req.PIN) {
-		isBlocked := s.rateLimiter.RecordFailedPIN(ip)
-		if isBlocked {
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{
-				"error":   "TOO_MANY_FAILED_ATTEMPTS",
-				"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
-			})
-			return
+		if s.rateLimiter != nil {
+			if isBlocked := s.rateLimiter.RecordFailedPIN(ip); isBlocked {
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{
+					"error":   "TOO_MANY_FAILED_ATTEMPTS",
+					"message": "Terlalu banyak percobaan PIN yang salah. Akses ditangguhkan selama 5 menit.",
+				})
+				return
+			}
 		}
 		writeJSON(w, http.StatusUnauthorized, map[string]string{
 			"error":   "INVALID_PIN",
@@ -340,7 +368,9 @@ func (s *Server) handleVerifyPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.rateLimiter.ResetFailedPIN(ip)
+	if s.rateLimiter != nil {
+		s.rateLimiter.ResetFailedPIN(ip)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"message": "PIN berhasil diverifikasi.",
@@ -358,26 +388,32 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 
 	var stats StatsItem
 	if s.cfg.Reader != nil {
-		stats, _ = s.cfg.Reader.GetOverallStats(ctx)
+		var err error
+		if stats, err = s.cfg.Reader.GetOverallStats(ctx); err != nil {
+			slog.Warn("web server: executive summary overall stats error", "err", err)
+		}
 	}
 
 	var equityF float64
-	dailyDrawdownPct := 0.0
+	dailyDrawdownFrac := 0.0
 	if s.cfg.Broker != nil {
 		eqDec := s.cfg.Broker.GetEffectiveTotalEquityUSDT()
 		equityF, _ = eqDec.Float64()
-		dailyDrawdownPct = s.cfg.Broker.GetDailyTotalDrawdownPct()
+		dailyDrawdownFrac = s.cfg.Broker.GetDailyTotalDrawdownPct()
 	}
 
-	maxDailyDrawdown := s.cfg.MaxDailyDrawdown
-	if maxDailyDrawdown == 0 {
-		maxDailyDrawdown = -0.03
+	maxDailyDrawdownFrac := s.cfg.MaxDailyDrawdown
+	if maxDailyDrawdownFrac == 0 {
+		maxDailyDrawdownFrac = -0.03
 	}
 
 	// Ambil riwayat trade terakhir (kosongkan AIAutopsy agar hemat token prompt)
 	var recentTrades []TradeItem
 	if s.cfg.Reader != nil {
-		recentTrades, _, _ = s.cfg.Reader.GetTradesPaginated(ctx, 1, 6, "ALL")
+		var err error
+		if recentTrades, _, err = s.cfg.Reader.GetTradesPaginated(ctx, 1, 6, "ALL"); err != nil {
+			slog.Warn("web server: executive summary recent trades error", "err", err)
+		}
 		for i := range recentTrades {
 			recentTrades[i].AIAutopsy = ""
 		}
@@ -386,12 +422,15 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 	// Agregasi sinyal komprehensif dari signal audit log
 	var auditSummary SignalAuditSummary
 	if s.cfg.Reader != nil {
-		auditSummary, _ = s.cfg.Reader.GetSignalAuditSummary(ctx)
+		var err error
+		if auditSummary, err = s.cfg.Reader.GetSignalAuditSummary(ctx); err != nil {
+			slog.Warn("web server: executive summary audit summary error", "err", err)
+		}
 	}
 
 	activeSlots := 0
 	if s.cfg.Broker != nil {
-		activeSlots = len(s.cfg.Broker.GetActivePositions())
+		activeSlots = s.cfg.Broker.GetActiveSlotCount()
 	}
 	maxSlots := s.cfg.MaxSlots
 	if maxSlots <= 0 {
@@ -419,8 +458,8 @@ func (s *Server) handleAIExecutiveSummary(w http.ResponseWriter, r *http.Request
 			"avg_loss_usdt":          stats.AvgLossUSDT,
 			"active_slots":           activeSlots,
 			"max_slots":              maxSlots,
-			"daily_drawdown_pct":     dailyDrawdownPct,
-			"max_daily_drawdown_pct": maxDailyDrawdown,
+			"daily_drawdown_pct":     dailyDrawdownFrac * 100.0,
+			"max_daily_drawdown_pct": maxDailyDrawdownFrac * 100.0,
 		},
 		"signal_audit_summary": auditSummary,
 		"recent_trades":        recentTrades,
@@ -549,22 +588,22 @@ func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
 
 	forceRefresh := r.URL.Query().Get("refresh") == "true"
 
-	// 1. Cek cache di SQLite terlebih dahulu jika bukan force refresh
-	if !forceRefresh && s.cfg.Repo != nil {
-		if cachedAutopsy, err := s.cfg.Repo.GetTradeAutopsy(ctx, clientOrderID); err == nil && cachedAutopsy != "" {
-			writeJSON(w, http.StatusOK, ai.AIResponse{
-				Text:   cachedAutopsy,
-				Source: "cache",
-			})
-			return
-		}
-	}
-
-	// 2. Ambil detail trade dari reader
+	// 1. Ambil detail trade dari read-only Reader terlebih dahulu (Zero Lock Contention)
 	if s.cfg.Reader == nil {
+		if !forceRefresh && s.cfg.Repo != nil {
+			if cachedAutopsy, err := s.cfg.Repo.GetTradeAutopsy(ctx, clientOrderID); err == nil && cachedAutopsy != "" {
+				writeJSON(w, http.StatusOK, ai.AIResponse{
+					Text:   cachedAutopsy,
+					Source: "cache",
+					Model:  s.gemini.Model(),
+				})
+				return
+			}
+		}
 		writeJSON(w, http.StatusInternalServerError, ai.AIResponse{
 			Error:  "READER_UNAVAILABLE",
 			Source: "fallback",
+			Model:  s.gemini.Model(),
 		})
 		return
 	}
@@ -574,16 +613,35 @@ func (s *Server) handleAITradeAutopsy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, ai.AIResponse{
 			Error:  "TRADE_NOT_FOUND",
 			Source: "fallback",
+			Model:  s.gemini.Model(),
 		})
 		return
 	}
 
-	// Jika di TradeItem sudah ada ai_autopsy dan bukan force refresh
-	if !forceRefresh && trade.AIAutopsy != "" {
-		writeJSON(w, http.StatusOK, ai.AIResponse{
-			Text:   trade.AIAutopsy,
-			Source: "cache",
-		})
+	// 2. Cek cache dari read-only row; fallback ke Repo writer hanya jika Reader kosong
+	if !forceRefresh {
+		if trade.AIAutopsy != "" {
+			writeJSON(w, http.StatusOK, ai.AIResponse{
+				Text:   trade.AIAutopsy,
+				Source: "cache",
+				Model:  s.gemini.Model(),
+			})
+			return
+		}
+		if s.cfg.Repo != nil {
+			if cachedAutopsy, err := s.cfg.Repo.GetTradeAutopsy(ctx, clientOrderID); err == nil && cachedAutopsy != "" {
+				writeJSON(w, http.StatusOK, ai.AIResponse{
+					Text:   cachedAutopsy,
+					Source: "cache",
+					Model:  s.gemini.Model(),
+				})
+				return
+			}
+		}
+	}
+
+	// 3. Enforce AI rate limit hanya saat cache miss (sebelum memanggil Gemini)
+	if !s.checkAIRateLimit(w, r) {
 		return
 	}
 
@@ -634,9 +692,16 @@ func (s *Server) handleAIPatternMiner(w http.ResponseWriter, r *http.Request) {
 	var trades []TradeItem
 
 	if s.cfg.Reader != nil {
-		stats, _ = s.cfg.Reader.GetOverallStats(ctx)
-		auditSummary, _ = s.cfg.Reader.GetSignalAuditSummary(ctx)
-		trades, _ = s.cfg.Reader.GetTradesForPatternMiner(ctx, 50)
+		var err error
+		if stats, err = s.cfg.Reader.GetOverallStats(ctx); err != nil {
+			slog.Warn("web server: pattern miner overall stats error", "err", err)
+		}
+		if auditSummary, err = s.cfg.Reader.GetSignalAuditSummary(ctx); err != nil {
+			slog.Warn("web server: pattern miner audit summary error", "err", err)
+		}
+		if trades, err = s.cfg.Reader.GetTradesForPatternMiner(ctx, 50); err != nil {
+			slog.Warn("web server: pattern miner trades error", "err", err)
+		}
 	}
 
 	payload := map[string]any{

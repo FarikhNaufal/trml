@@ -112,7 +112,7 @@ func registerCommonFlags(fs *flag.FlagSet, defaultUnconstrained bool) *commonFla
 		offline:       fs.Bool("offline", false, "Strict offline mode: zero network requests"),
 		universe:      fs.String("universe", "pit", "Universe discovery: pit | cache | legacy-ticker"),
 		allowREST:     fs.Bool("allow-rest-fallback", false, "Allow rate-limited REST fallback if Vision returns 404"),
-		execTF:        fs.String("exec-tf", "5m", "Broker execution resolution: 5m (fast) or 1m (sub-bar parity)"),
+		execTF:        fs.String("exec-tf", "", "Broker execution resolution: 1m (sub-bar parity) or match candle interval (default)"),
 		oiMode:        fs.String("oi-mode", replay.OIModeAuto, "Historical 5m OI mode: auto | strict | off"),
 		scannerRank:   fs.String("scanner-rank", "", "Scanner ranking mode override (pullback, rvol)"),
 		maxWatched:    fs.Int("max-watched", 0, "Override MAX_WATCHED_COINS"),
@@ -125,38 +125,54 @@ func registerCommonFlags(fs *flag.FlagSet, defaultUnconstrained bool) *commonFla
 	}
 }
 
-func (f *commonFlagRefs) toRunnerOptions() runner.CommonOptions {
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	return visited
+}
+
+func (f *commonFlagRefs) toRunnerOptions(visited map[string]bool) runner.CommonOptions {
 	from, to := resolveDateRange(*f.today, *f.pastWeek, *f.pastMonth, *f.from, *f.to)
-	warmup := 200
+	var todayStartUTC time.Time
 	if *f.today {
-		warmup = 288
+		ref := to.UTC()
+		todayStartUTC = time.Date(ref.Year(), ref.Month(), ref.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	var overrideCompounding *bool
+	if visited != nil && visited["compounding"] {
+		overrideCompounding = f.compounding
 	}
 	return runner.CommonOptions{
-		EnvPath:           *f.env,
-		CacheDir:          *f.cacheDir,
-		SymbolsCSV:        *f.symbols,
-		Interval:          *f.interval,
-		ExecTF:            *f.execTF,
-		OIMode:            *f.oiMode,
-		UniverseMode:      *f.universe,
-		From:              from,
-		To:                to,
-		InitialEquity:     *f.equity,
-		Offline:           *f.offline,
-		AllowRESTFallback: *f.allowREST || *f.today,
-		DynamicScanner:    *f.scanner,
-		ScannerRanking:    *f.scannerRank,
-		MaxWatched:        *f.maxWatched,
-		WarmupBars:        warmup,
-		Unconstrained:     *f.unconstrained,
-		Compounding:       *f.compounding,
-		CommitHash:        getGitCommitHash(),
-		BenchmarkSym:      "BTCUSDT",
-		SaveToDB:          true,
-		OutMarkdown:       *f.outMD,
-		OutTradesCSV:      *f.csvOut,
-		OutEquityCSV:      *f.eqCSVOut,
-		OutJSON:           *f.jsonOut,
+		EnvPath:             *f.env,
+		CacheDir:            *f.cacheDir,
+		SymbolsCSV:          *f.symbols,
+		Interval:            *f.interval,
+		ExecTF:              *f.execTF,
+		OIMode:              *f.oiMode,
+		UniverseMode:        *f.universe,
+		From:                from,
+		To:                  to,
+		InitialEquity:       *f.equity,
+		Offline:             *f.offline,
+		AllowRESTFallback:   *f.allowREST || *f.today,
+		DynamicScanner:      *f.scanner,
+		ScannerRanking:      *f.scannerRank,
+		MaxWatched:          *f.maxWatched,
+		WarmupBars:          200,
+		TodayMode:           *f.today,
+		TodayStartUTC:       todayStartUTC,
+		OverrideCompounding: overrideCompounding,
+		Unconstrained:       *f.unconstrained,
+		Compounding:         *f.compounding,
+		CommitHash:          getGitCommitHash(),
+		BenchmarkSym:        "BTCUSDT",
+		SaveToDB:            true,
+		OutMarkdown:         *f.outMD,
+		OutTradesCSV:        *f.csvOut,
+		OutEquityCSV:        *f.eqCSVOut,
+		OutJSON:             *f.jsonOut,
 	}
 }
 
@@ -315,13 +331,26 @@ func handleDataCommand(args []string) {
 		if oiDownloader != nil {
 			_ = oiDownloader.LoadOpenInterestRange(ctx, symbols, from, to)
 		}
+		minOI, maxOI, maxStale := 4*time.Minute, 7*time.Minute, 10*time.Minute
+		if cfg != nil {
+			evalCfg := strategy.FromAppConfig(cfg)
+			if evalCfg.MinOIInterval > 0 {
+				minOI = evalCfg.MinOIInterval
+			}
+			if evalCfg.MaxOIInterval > 0 {
+				maxOI = evalCfg.MaxOIInterval
+			}
+			if evalCfg.MaxOIStaleness > 0 {
+				maxStale = evalCfg.MaxOIStaleness
+			}
+		}
 		for _, sym := range symbols {
 			candles, err := dl.FetchCandleRange(ctx, sym, interval, from, to)
 			if err != nil {
 				fmt.Printf("[GAGAL] %s: %v\n", sym, err)
 				continue
 			}
-			rep := data.ValidateCandlesWithOI(sym, candles, candleDur, oiDownloader, 4*time.Minute, 7*time.Minute, 10*time.Minute)
+			rep := data.ValidateCandlesWithOI(sym, candles, candleDur, oiDownloader, minOI, maxOI, maxStale)
 			oiInfo := ""
 			if oiDownloader != nil {
 				oiInfo = fmt.Sprintf(" | OI Cov: %.1f%%", rep.OICoveragePct)
@@ -352,20 +381,26 @@ func handleRunCommand(args []string) {
 	flagSLGapFill := fs.Bool("flag-sl-gap-fill", false, "Force enable SL gap fill at candle open + slippage")
 	flagDeductPendingMargin := fs.Bool("flag-deduct-pending-margin", false, "Deduct available margin intra-bar upon limit submit")
 	_ = fs.Parse(args)
-	visited := make(map[string]bool)
-	fs.Visit(func(f *flag.Flag) {
-		visited[f.Name] = true
-	})
+	visited := visitedFlags(fs)
 
 	ctx := context.Background()
-	common := cf.toRunnerOptions()
-	fmt.Printf("Menyiapkan dataset (%s, exec=%s, oi=%s, universe=%s)...\n", common.Interval, common.ExecTF, common.OIMode, common.UniverseMode)
+	common := cf.toRunnerOptions(visited)
+	intervalLabel := common.Interval
+	if intervalLabel == "" {
+		intervalLabel = "auto"
+	}
+	execLabel := common.ExecTF
+	if execLabel == "" {
+		execLabel = "auto"
+	}
+	fmt.Printf("Menyiapkan dataset (%s, exec=%s, oi=%s, universe=%s)...\n", intervalLabel, execLabel, common.OIMode, common.UniverseMode)
 	ds, err := runner.PrepareDataset(ctx, common)
 	if err != nil {
 		slog.Error("Gagal menyiapkan dataset", "err", err)
 		os.Exit(1)
 	}
 	defer ds.Close()
+	fmt.Printf("Dataset siap (%s, exec=%s, oi=%s, %d simbol)\n", ds.Interval, ds.ExecTF, ds.OIMode, len(ds.CandleMap))
 
 	runOpts := runner.RunOptions{
 		CommonOptions:       common,
@@ -413,9 +448,10 @@ func handleWalkForwardCommand(args []string) {
 	testDays := fs.Int("test-days", 15, "Out-of-Sample test window length in days")
 	stepDays := fs.Int("step-days", 15, "Rolling step length in days")
 	_ = fs.Parse(args)
+	visited := visitedFlags(fs)
 
 	ctx := context.Background()
-	common := cf.toRunnerOptions()
+	common := cf.toRunnerOptions(visited)
 	ds, err := runner.PrepareDataset(ctx, common)
 	if err != nil {
 		slog.Error("Gagal menyiapkan dataset WFA", "err", err)
@@ -444,6 +480,7 @@ func handleStressCommand(args []string) {
 	multStr := fs.String("multipliers", "1.0,1.5,2.0,3.0", "Comma-separated slippage multipliers")
 	testPen2 := fs.Bool("test-pen2", true, "Also test 2x slippage combined with 2 penetration ticks")
 	_ = fs.Parse(args)
+	visited := visitedFlags(fs)
 
 	var mults []float64
 	for _, p := range strings.Split(*multStr, ",") {
@@ -453,7 +490,7 @@ func handleStressCommand(args []string) {
 	}
 
 	ctx := context.Background()
-	common := cf.toRunnerOptions()
+	common := cf.toRunnerOptions(visited)
 	ds, err := runner.PrepareDataset(ctx, common)
 	if err != nil {
 		slog.Error("Gagal menyiapkan dataset stress", "err", err)
@@ -478,9 +515,10 @@ func handleAblateCommand(args []string) {
 	fs := flag.NewFlagSet("ablate", flag.ExitOnError)
 	cf := registerCommonFlags(fs, true)
 	_ = fs.Parse(args)
+	visited := visitedFlags(fs)
 
 	ctx := context.Background()
-	common := cf.toRunnerOptions()
+	common := cf.toRunnerOptions(visited)
 	common.SaveToDB = false
 	ds, err := runner.PrepareDataset(ctx, common)
 	if err != nil {

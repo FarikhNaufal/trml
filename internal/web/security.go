@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const maxTrackedIPs = 10000
+
 type clientBucket struct {
 	tokens         float64
 	lastTokenTime  time.Time
@@ -19,11 +21,12 @@ type clientBucket struct {
 }
 
 type IPRateLimiter struct {
-	mu          sync.Mutex
-	clients     map[string]*clientBucket
-	rateRPM     float64
-	burst       float64
-	lastCleanup time.Time
+	mu                sync.Mutex
+	clients           map[string]*clientBucket
+	rateRPM           float64
+	burst             float64
+	lastCleanup       time.Time
+	TrustProxyHeaders bool
 }
 
 func NewIPRateLimiter(rateRPM int, burst int) *IPRateLimiter {
@@ -41,20 +44,30 @@ func NewIPRateLimiter(rateRPM int, burst int) *IPRateLimiter {
 	}
 }
 
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(remoteAddr)
+	}
+	parsed := net.ParseIP(host)
+	return parsed != nil && parsed.IsLoopback()
+}
+
 func (limiter *IPRateLimiter) getClientIP(r *http.Request) string {
-	if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-		return strings.TrimSpace(cf)
-	}
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		return strings.TrimSpace(realIP)
-	}
-	forwarded := r.Header.Get("X-Forwarded-For")
-	if forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
+	// Hanya percaya header proxy jika eksplisit diaktifkan DAN peer koneksi langsung berasal dari loopback proxy tepercaya.
+	if limiter.TrustProxyHeaders && isLoopbackRemoteAddr(r.RemoteAddr) {
+		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
+			return strings.TrimSpace(cf)
+		}
+		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+			return strings.TrimSpace(realIP)
+		}
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			parts := strings.Split(forwarded, ",")
+			if len(parts) > 0 {
+				if ip := strings.TrimSpace(parts[0]); ip != "" {
+					return ip
+				}
 			}
 		}
 	}
@@ -65,30 +78,53 @@ func (limiter *IPRateLimiter) getClientIP(r *http.Request) string {
 	return ip
 }
 
-func (limiter *IPRateLimiter) Allow(ip string) (bool, time.Duration) {
-	limiter.mu.Lock()
-	defer limiter.mu.Unlock()
-
-	now := time.Now()
-
-	// Periodic cleanup every 10 minutes
-	if now.Sub(limiter.lastCleanup) > 10*time.Minute {
+func (limiter *IPRateLimiter) cleanupLocked(now time.Time) {
+	if now.Sub(limiter.lastCleanup) <= 10*time.Minute && len(limiter.clients) < maxTrackedIPs {
+		return
+	}
+	for k, b := range limiter.clients {
+		if now.Sub(b.lastTokenTime) > 30*time.Minute && now.After(b.blockedUntil) {
+			delete(limiter.clients, k)
+		}
+	}
+	if len(limiter.clients) >= maxTrackedIPs {
 		for k, b := range limiter.clients {
-			if now.Sub(b.lastTokenTime) > 30*time.Minute && now.After(b.blockedUntil) {
+			if now.After(b.blockedUntil) {
 				delete(limiter.clients, k)
+				if len(limiter.clients) < maxTrackedIPs {
+					break
+				}
 			}
 		}
-		limiter.lastCleanup = now
 	}
+	limiter.lastCleanup = now
+}
 
+func (limiter *IPRateLimiter) getOrCreateBucketLocked(ip string, now time.Time) *clientBucket {
+	limiter.cleanupLocked(now)
 	b, exists := limiter.clients[ip]
 	if !exists {
+		if len(limiter.clients) >= maxTrackedIPs {
+			return &clientBucket{
+				tokens:        limiter.burst,
+				lastTokenTime: now,
+			}
+		}
 		b = &clientBucket{
 			tokens:        limiter.burst,
 			lastTokenTime: now,
 		}
 		limiter.clients[ip] = b
 	}
+	return b
+}
+
+func (limiter *IPRateLimiter) Allow(ip string) (bool, time.Duration) {
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+
+	now := time.Now()
+	b := limiter.getOrCreateBucketLocked(ip, now)
 
 	if now.Before(b.blockedUntil) {
 		return false, b.blockedUntil.Sub(now)
@@ -120,15 +156,13 @@ func (limiter *IPRateLimiter) RecordFailedPIN(ip string) bool {
 	defer limiter.mu.Unlock()
 
 	now := time.Now()
-	b, exists := limiter.clients[ip]
-	if !exists {
-		b = &clientBucket{
-			tokens:        limiter.burst,
-			lastTokenTime: now,
-		}
-		limiter.clients[ip] = b
+	b := limiter.getOrCreateBucketLocked(ip, now)
+	// Jika blokir sebelumnya sudah kedaluwarsa, reset counter agar tidak langsung terkunci ulang di percobaan pertama.
+	if !b.blockedUntil.IsZero() && !now.Before(b.blockedUntil) {
+		b.failedPINCount = 0
+		b.blockedUntil = time.Time{}
 	}
-
+	b.lastTokenTime = now
 	b.failedPINCount++
 	if b.failedPINCount >= 5 {
 		b.blockedUntil = now.Add(5 * time.Minute)
@@ -209,9 +243,6 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 				pin = cookie.Value
 			}
 		}
-		if pin == "" {
-			pin = r.URL.Query().Get("pin")
-		}
 
 		if !s.validatePIN(pin) {
 			if s.rateLimiter != nil && ip != "" && pin != "" {
@@ -225,36 +256,45 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			})
 			return
 		}
+		if s.rateLimiter != nil && ip != "" {
+			s.rateLimiter.ResetFailedPIN(ip)
+		}
 
 		next(w, r)
 	}
 }
 
+// checkAIRateLimit enforces per-IP AI token bucket limits, writing a 429 JSON error if rejected.
+func (s *Server) checkAIRateLimit(w http.ResponseWriter, r *http.Request) bool {
+	if s.rateLimiter == nil {
+		return true
+	}
+
+	ip := s.rateLimiter.getClientIP(r)
+	allowed, waitDuration := s.rateLimiter.Allow(ip)
+	if !allowed {
+		seconds := int(waitDuration.Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "RATE_LIMITED",
+			"message": "Batas panggilan AI Copilot tercapai (10 req/menit). Silakan tunggu sebentar.",
+		})
+		return false
+	}
+	return true
+}
+
 // aiRateLimit middleware membatasi jumlah panggilan ke endpoint AI per IP
 func (s *Server) aiRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.rateLimiter == nil {
-			next(w, r)
+		if !s.checkAIRateLimit(w, r) {
 			return
 		}
-
-		ip := s.rateLimiter.getClientIP(r)
-		allowed, waitDuration := s.rateLimiter.Allow(ip)
-		if !allowed {
-			seconds := int(waitDuration.Seconds())
-			if seconds < 1 {
-				seconds = 1
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			w.WriteHeader(http.StatusTooManyRequests)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":   "RATE_LIMITED",
-				"message": "Batas panggilan AI Copilot tercapai (10 req/menit). Silakan tunggu sebentar.",
-			})
-			return
-		}
-
 		next(w, r)
 	}
 }

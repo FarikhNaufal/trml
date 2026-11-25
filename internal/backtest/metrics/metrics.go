@@ -155,33 +155,26 @@ func CalculateMetricsV2(
 			grossLoss += math.Abs(t.GrossPnL)
 		}
 
-		hasTP1 := false
-		finalReason := ""
+		finalReason := extractFinalExitReason(t.ExitReasons)
 		for _, r := range t.ExitReasons {
-			if r == "PARTIAL_TAKE_PROFIT" {
-				hasTP1 = true
-			} else {
-				finalReason = r
-			}
 			res.ExitDistribution[r]++
 		}
-		if finalReason == "" && len(t.ExitReasons) > 0 {
-			finalReason = t.ExitReasons[0]
-		}
 
-		if pnl > 0.0001 {
+		isWin, isBE, _ := classifyAggregatedTrade(*t)
+		switch {
+		case isWin:
 			res.WinsCount++
 			sumWin += pnl
 			currentLosingStreak = 0
-			if hasTP1 && (finalReason == "TAKE_PROFIT" || finalReason == "TRAILING_STOP" || finalReason == "PROFIT_LOCK") {
+			if finalReason == "TAKE_PROFIT" || finalReason == "TRAILING_STOP" || finalReason == "PROFIT_LOCK" {
 				res.FullWinsCount++
 			} else {
 				res.PartialWinsCount++
 			}
-		} else if math.Abs(pnl) <= 0.0001 || (strings.Contains(finalReason, "BREAK_EVEN") && pnl >= -0.05) {
+		case isBE:
 			res.BreakEvenCount++
 			currentLosingStreak = 0
-		} else {
+		default:
 			res.LossesCount++
 			sumLoss += math.Abs(pnl)
 			currentLosingStreak++
@@ -343,7 +336,40 @@ func aggregateSetupTrades(rawTrades []simbroker.SimTradeRecord) []AggregatedTrad
 	for _, key := range orderedKeys {
 		trades = append(trades, *grouped[key])
 	}
+	sort.SliceStable(trades, func(i, j int) bool {
+		if !trades[i].ExitTime.Equal(trades[j].ExitTime) {
+			return trades[i].ExitTime.Before(trades[j].ExitTime)
+		}
+		if !trades[i].EntryTime.Equal(trades[j].EntryTime) {
+			return trades[i].EntryTime.Before(trades[j].EntryTime)
+		}
+		return trades[i].SetupID < trades[j].SetupID
+	})
 	return trades
+}
+
+func extractFinalExitReason(reasons []string) string {
+	finalReason := ""
+	for _, r := range reasons {
+		if r != "PARTIAL_TAKE_PROFIT" {
+			finalReason = r
+		}
+	}
+	if finalReason == "" && len(reasons) > 0 {
+		finalReason = reasons[0]
+	}
+	return finalReason
+}
+
+func classifyAggregatedTrade(t AggregatedTrade) (isWin, isBE, isLoss bool) {
+	if t.NetPnL > 0.0001 {
+		return true, false, false
+	}
+	finalReason := extractFinalExitReason(t.ExitReasons)
+	if math.Abs(t.NetPnL) <= 0.0001 || (strings.Contains(finalReason, "BREAK_EVEN") && t.NetPnL >= -0.05) {
+		return false, true, false
+	}
+	return false, false, true
 }
 
 func applyEquityCurveMetrics(res *BacktestSummary, curve []simbroker.EquityPoint, initialEquity float64, trades []AggregatedTrade) {
@@ -362,8 +388,8 @@ func applyEquityCurveMetrics(res *BacktestSummary, curve []simbroker.EquityPoint
 
 		for _, pt := range curve {
 			eq := pt.EffectiveEquity
-			if eq <= 0 {
-				eq = pt.RealizedEquity
+			if eq < 0 {
+				eq = 0
 			}
 			if eq > peak {
 				peak = eq
@@ -416,13 +442,17 @@ func applyEquityCurveMetrics(res *BacktestSummary, curve []simbroker.EquityPoint
 
 	// Span days from curve first/last or trade timestamps for CAGR
 	spanDays := estimateSpanDays(curve, trades)
-	if initialEquity > 0 && res.FinalEquity > 0 && spanDays >= 1.0 {
-		ratio := res.FinalEquity / initialEquity
-		// Annualized CAGR when window >= 7 days; avoid extreme exponent extrapolation on tiny smoke tests.
-		if spanDays >= 7.0 {
-			res.CAGR = (math.Pow(ratio, 365.0/spanDays) - 1.0) * 100.0
+	if initialEquity > 0 && spanDays >= 1.0 {
+		if res.FinalEquity <= 0 {
+			res.CAGR = -100.0
 		} else {
-			res.CAGR = (ratio - 1.0) * (365.0 / spanDays) * 100.0
+			ratio := res.FinalEquity / initialEquity
+			// Annualized CAGR when window >= 7 days; avoid extreme exponent extrapolation on tiny smoke tests.
+			if spanDays >= 7.0 {
+				res.CAGR = (math.Pow(ratio, 365.0/spanDays) - 1.0) * 100.0
+			} else {
+				res.CAGR = (ratio - 1.0) * (365.0 / spanDays) * 100.0
+			}
 		}
 	}
 

@@ -214,4 +214,45 @@ func TestCalculateMetricsV2_MTMDrawdownRegimeAndAttribution(t *testing.T) {
 	}
 }
 
+func TestCalculateMetricsV2_FullWinWithoutTP1ChronologicalDDAndRuinCAGR(t *testing.T) {
+	t0 := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	// Single-leg full TAKE_PROFIT without PARTIAL_TAKE_PROFIT must count as FullWinsCount=1.
+	// Also setup B exits earlier with loss -20 while setup A exits later with +30 -> MaxDD must reflect exit order (-20 = 20%)!
+	raw := []simbroker.SimTradeRecord{
+		{
+			ID: "A_LATE_WIN", Symbol: "BTCUSDT", Side: model.SideLong,
+			EntryTime: t0, ExitTime: t0.Add(48 * time.Hour),
+			GrossPnL: decimal.NewFromFloat(31), NetPnL: decimal.NewFromFloat(30),
+			FeeTotal: decimal.NewFromFloat(1), ExitReason: "TAKE_PROFIT",
+		},
+		{
+			ID: "B_EARLY_LOSS", Symbol: "ETHUSDT", Side: model.SideLong,
+			EntryTime: t0.Add(time.Hour), ExitTime: t0.Add(2 * time.Hour),
+			GrossPnL: decimal.NewFromFloat(-19), NetPnL: decimal.NewFromFloat(-20),
+			FeeTotal: decimal.NewFromFloat(1), ExitReason: "STOP_LOSS",
+		},
+	}
+	s := CalculateMetricsV2(raw, nil, 100.0, nil, nil, nil)
+	if s.FullWinsCount != 1 || s.PartialWinsCount != 0 {
+		t.Fatalf("expected FullWinsCount=1 PartialWinsCount=0 without TP1, got full=%d part=%d", s.FullWinsCount, s.PartialWinsCount)
+	}
+	if s.MaxDrawdownUSDT < 19.9 || s.MaxDrawdownPct < 19.9 {
+		t.Fatalf("expected chronological exit order to record 20 USDT (20%%) drawdown first, got usdt=%.2f pct=%.2f", s.MaxDrawdownUSDT, s.MaxDrawdownPct)
+	}
+
+	// Total ruin (FinalEquity <= 0) must report CAGR = -100.0
+	ruin := []simbroker.SimTradeRecord{
+		{
+			ID: "RUIN", Symbol: "BTCUSDT", Side: model.SideLong,
+			EntryTime: t0, ExitTime: t0.Add(10 * 24 * time.Hour),
+			GrossPnL: decimal.NewFromFloat(-100), NetPnL: decimal.NewFromFloat(-105),
+			ExitReason: "LIQUIDATION",
+		},
+	}
+	sr := CalculateMetricsV2(ruin, nil, 100.0, nil, nil, nil)
+	if sr.CAGR != -100.0 {
+		t.Fatalf("expected CAGR -100.0 on ruin, got %.2f", sr.CAGR)
+	}
+}
+
 

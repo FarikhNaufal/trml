@@ -240,14 +240,16 @@ func (s *segmentAccumulator) addTrade(t AggregatedTrade) {
 		s.stat.GrossLoss += math.Abs(t.GrossPnL)
 	}
 
-	if t.NetPnL > 0.0001 {
+	isWin, isBE, _ := classifyAggregatedTrade(t)
+	switch {
+	case isWin:
 		s.stat.Wins++
 		s.stat.NetProfit += t.NetPnL
-	} else if t.NetPnL < -0.0001 {
+	case isBE:
+		s.stat.BreakEven++
+	default:
 		s.stat.Losses++
 		s.stat.NetLoss += math.Abs(t.NetPnL)
-	} else {
-		s.stat.BreakEven++
 	}
 }
 

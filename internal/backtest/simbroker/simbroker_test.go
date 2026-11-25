@@ -41,11 +41,11 @@ func TestSimBroker_LimitPenetrationAndFill(t *testing.T) {
 		t.Fatalf("failed submit limit: %v", err)
 	}
 
-	// Candle 1 (t=10:05): Low hits 40000.0 exactly (Touch only, NO penetration)
+	// Candle 1 (t=10:00..10:05): Low hits 40000.0 exactly (Touch only, NO penetration)
 	// Must NOT fill because PenetrationTicks = 1 requires Low <= 40000.0 - 0.10 = 39999.90
 	c1 := data.HistoricalCandle{
-		OpenTime:  now.Add(5 * time.Minute),
-		CloseTime: now.Add(10*time.Minute - time.Millisecond),
+		OpenTime:  now,
+		CloseTime: now.Add(5*time.Minute - time.Millisecond),
 		Symbol:    "BTCUSDT",
 		Open:      40100.0,
 		High:      40150.0,
@@ -64,11 +64,11 @@ func TestSimBroker_LimitPenetrationAndFill(t *testing.T) {
 		t.Fatalf("order should not have filled on mere price touch")
 	}
 
-	// Candle 2 (t=10:10): Low penetrates to 39999.0 (below 39999.90)
+	// Candle 2 (t=10:05..10:10): Low penetrates to 39999.0 (below 39999.90)
 	// MUST fill!
 	c2 := data.HistoricalCandle{
-		OpenTime:  now.Add(10 * time.Minute),
-		CloseTime: now.Add(15*time.Minute - time.Millisecond),
+		OpenTime:  now.Add(5 * time.Minute),
+		CloseTime: now.Add(10*time.Minute - time.Millisecond),
 		Symbol:    "BTCUSDT",
 		Open:      40050.0,
 		High:      40080.0,
@@ -422,6 +422,9 @@ func TestSimBroker_FundingSettlement(t *testing.T) {
 	// Final Realized Equity: 1000 + 99.15 = 1099.15
 	if !broker.RealizedEquityUSDT.Equal(decimal.NewFromFloat(1099.15)) {
 		t.Errorf("expected final realized equity 1099.15, got %s", broker.RealizedEquityUSDT)
+	}
+	if broker.Stats.FundingSettlements != 1 {
+		t.Errorf("expected FundingSettlements=1, got %d", broker.Stats.FundingSettlements)
 	}
 }
 
@@ -1080,6 +1083,321 @@ func TestSimBroker_NoSameBarTP1LookAheadOnEntryFill(t *testing.T) {
 	}
 	if !pos.PeakPrice.Equal(decimal.NewFromFloat(100.2)) {
 		t.Fatalf("expected entry-bar PeakPrice capped at post-fill Close (100.2), got %s", pos.PeakPrice)
+	}
+}
+
+func TestSimBroker_StaleLossExitDuration(t *testing.T) {
+	b := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT:       decimal.NewFromFloat(1000.0),
+		MaxSlots:                3,
+		AccountLeverage:         5.0,
+		EntryOrderType:          "MARKET",
+		MakerFeeRate:            decimal.NewFromFloat(0.0002),
+		TakerFeeRate:            decimal.NewFromFloat(0.0005),
+		SlippageRate:            decimal.NewFromFloat(0.0),
+		StaleLossExitDuration:   6 * time.Hour,
+		MaxHoldingDuration:      18 * time.Hour,
+		IntrabarConflictSLFirst: true,
+	})
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1), MinNotional: decimal.NewFromFloat(5)}
+	b.SetExchangeFilter("LOSSUSDT", f)
+	b.SetExchangeFilter("WINUSDT", f)
+
+	t0 := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "STALE_LOSS",
+		Symbol:        "LOSSUSDT",
+		Side:          model.SideShort,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(110.0),
+		TPPrice:       decimal.NewFromFloat(85.0),
+		CreatedAt:     t0,
+	})
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "STALE_WIN",
+		Symbol:        "WINUSDT",
+		Side:          model.SideShort,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(110.0),
+		TPPrice:       decimal.NewFromFloat(85.0),
+		CreatedAt:     t0,
+	})
+
+	// Entry bar at t0..t0+15m
+	b.ProcessCandle(data.HistoricalCandle{OpenTime: t0, CloseTime: t0.Add(15 * time.Minute), Symbol: "LOSSUSDT", Open: 100.0, High: 100.5, Low: 99.5, Close: 100.0}, 1)
+	b.ProcessCandle(data.HistoricalCandle{OpenTime: t0, CloseTime: t0.Add(15 * time.Minute), Symbol: "WINUSDT", Open: 100.0, High: 100.5, Low: 99.5, Close: 100.0}, 1)
+
+	// At t0+6h15m: LOSSUSDT closes underwater (101.0 > 100.0) -> must exit via TIME_STOP_STALE_LOSS;
+	// WINUSDT closes in profit (98.0 < 100.0) -> must stay open!
+	laterOpen := t0.Add(6 * time.Hour)
+	b.ProcessCandle(data.HistoricalCandle{OpenTime: laterOpen, CloseTime: laterOpen.Add(15 * time.Minute), Symbol: "LOSSUSDT", Open: 100.8, High: 101.2, Low: 100.5, Close: 101.0}, 25)
+	b.ProcessCandle(data.HistoricalCandle{OpenTime: laterOpen, CloseTime: laterOpen.Add(15 * time.Minute), Symbol: "WINUSDT", Open: 98.5, High: 98.8, Low: 97.8, Close: 98.0}, 25)
+
+	if b.OpenPositions["LOSSUSDT"] != nil {
+		t.Fatalf("expected underwater LOSSUSDT closed at StaleLossExitDuration")
+	}
+	if b.OpenPositions["WINUSDT"] == nil {
+		t.Fatalf("expected profitable WINUSDT to remain open past StaleLossExitDuration")
+	}
+	if len(b.ClosedTrades) != 1 || b.ClosedTrades[0].ExitReason != "TIME_STOP_STALE_LOSS" {
+		t.Fatalf("expected 1 TIME_STOP_STALE_LOSS trade, got %+v", b.ClosedTrades)
+	}
+}
+
+func TestSimBroker_GetDrawdownFromPeakPct(t *testing.T) {
+	b := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		MaxSlots:          3,
+		AccountLeverage:   5.0,
+	})
+	if dd := b.GetDrawdownFromPeakPct(); dd != 0.0 {
+		t.Fatalf("expected initial drawdown 0, got %.4f", dd)
+	}
+	// Simulate realized drop to 900 -> 10% DD from 1000 peak
+	b.Mu.Lock()
+	b.RealizedEquityUSDT = decimal.NewFromFloat(900.0)
+	b.Mu.Unlock()
+	if dd := b.GetDrawdownFromPeakPct(); dd < 0.099 || dd > 0.101 {
+		t.Fatalf("expected 10%% DD from 1000 peak, got %.4f", dd)
+	}
+	// New peak at 1100 -> DD resets to 0, then drop to 1045 -> 5% DD
+	b.Mu.Lock()
+	b.RealizedEquityUSDT = decimal.NewFromFloat(1100.0)
+	b.Mu.Unlock()
+	if dd := b.GetDrawdownFromPeakPct(); dd != 0.0 {
+		t.Fatalf("expected 0%% DD at new peak 1100, got %.4f", dd)
+	}
+	b.Mu.Lock()
+	b.RealizedEquityUSDT = decimal.NewFromFloat(1045.0)
+	b.Mu.Unlock()
+	if dd := b.GetDrawdownFromPeakPct(); dd < 0.049 || dd > 0.051 {
+		t.Fatalf("expected 5%% DD from new peak 1100, got %.4f", dd)
+	}
+}
+
+func TestSimBroker_CrossMarginLiquidationAndDepletedEquity(t *testing.T) {
+	b := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(100.0),
+		MaxSlots:          3,
+		AccountLeverage:   10.0,
+		MakerFeeRate:      decimal.Zero,
+		TakerFeeRate:      decimal.Zero,
+		SlippageRate:      decimal.NewFromFloat(0.0002),
+		PenetrationTicks:  1,
+		LimitOrderTimeout: 15 * time.Minute,
+	})
+	filter := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinQty:      decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	b.SetExchangeFilter("BTCUSDT", filter)
+	b.SetExchangeFilter("ETHUSDT", filter)
+
+	t0 := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	ok, err := b.SubmitLimitEntry(model.OrderIntent{
+		Symbol:     "BTCUSDT",
+		Side:       model.SideShort,
+		Qty:        decimal.NewFromFloat(9.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(150.0),
+		TPPrice:    decimal.NewFromFloat(50.0),
+		ATRAtEntry: decimal.NewFromFloat(5.0),
+		CreatedAt:  t0,
+	})
+	if !ok || err != nil {
+		t.Fatalf("expected entry submit ok, got ok=%v err=%v", ok, err)
+	}
+
+	// Bar 1: filled at 100.0 (Notional = 900 USDT, Equity = 100 USDT)
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0,
+		CloseTime: t0.Add(15 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      100.0,
+		High:      100.5,
+		Low:       99.5,
+		Close:     100.0,
+	}, 1)
+
+	if b.CheckCrossMarginLiquidation(0.005, t0.Add(15*time.Minute), 1) {
+		t.Fatalf("did not expect liquidation at entry equity=100, notional=900")
+	}
+
+	// Submit a pending order on ETHUSDT to ensure liquidation clears all pending orders too
+	okPend, errPend := b.SubmitLimitEntry(model.OrderIntent{
+		Symbol:     "ETHUSDT",
+		Side:       model.SideShort,
+		Qty:        decimal.NewFromFloat(1.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(120.0),
+		TPPrice:    decimal.NewFromFloat(80.0),
+		ATRAtEntry: decimal.NewFromFloat(2.0),
+		CreatedAt:  t0.Add(15 * time.Minute),
+	})
+	if !okPend || errPend != nil {
+		t.Fatalf("expected ETHUSDT pending submit ok, got %v %v", okPend, errPend)
+	}
+
+	// Bar 2: price spikes to 112.0 without hitting SL=150 -> Unrealized PnL = -108, effEq = -8 <= maintMargin (~5.04)
+	t1 := t0.Add(15 * time.Minute)
+	b.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t1,
+		CloseTime: t1.Add(15 * time.Minute),
+		Symbol:    "BTCUSDT",
+		Open:      105.0,
+		High:      112.5,
+		Low:       104.5,
+		Close:     112.0,
+	}, 2)
+
+	if !b.CheckCrossMarginLiquidation(0.005, t1.Add(15*time.Minute), 2) {
+		t.Fatalf("expected cross-margin liquidation when equity <= maintenance margin")
+	}
+	if len(b.OpenPositions) != 0 || len(b.PendingOrders) != 0 {
+		t.Fatalf("expected 0 open positions and 0 pending orders after liquidation, got open=%d pend=%d", len(b.OpenPositions), len(b.PendingOrders))
+	}
+	if b.Stats.LiquidatedCount != 1 {
+		t.Fatalf("expected LiquidatedCount=1, got %d", b.Stats.LiquidatedCount)
+	}
+	if len(b.ClosedTrades) != 1 || b.ClosedTrades[0].ExitReason != "LIQUIDATION" {
+		t.Fatalf("expected 1 LIQUIDATION closed trade, got %+v", b.ClosedTrades)
+	}
+	if !b.RealizedEquityUSDT.Equal(decimal.Zero) {
+		t.Fatalf("expected realized equity clamped to 0 after wipeout, got %s", b.RealizedEquityUSDT.String())
+	}
+	if !b.GetAvailableBalanceUSDT().Equal(decimal.Zero) {
+		t.Fatalf("expected 0 available balance after liquidation, got %s", b.GetAvailableBalanceUSDT().String())
+	}
+	if okNew, errNew := b.SubmitLimitEntry(model.OrderIntent{
+		Symbol:     "ETHUSDT",
+		Side:       model.SideShort,
+		Qty:        decimal.NewFromFloat(1.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(120.0),
+		TPPrice:    decimal.NewFromFloat(80.0),
+		ATRAtEntry: decimal.NewFromFloat(2.0),
+		CreatedAt:  t1.Add(15 * time.Minute),
+	}); okNew || errNew == nil {
+		t.Fatalf("expected new order rejected after liquidation/wipeout, got ok=%v err=%v", okNew, errNew)
+	}
+}
+
+func TestSimBroker_Batch3TimeNormalizationZeroOverridesAndMarketBarTP(t *testing.T) {
+	// 1. Explicit zero fee/slippage/penetration overrides must be preserved when *Set=true.
+	bZero := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT:   decimal.NewFromFloat(1000.0),
+		MakerFeeRate:        decimal.Zero,
+		TakerFeeRate:        decimal.Zero,
+		SlippageRate:        decimal.Zero,
+		PenetrationTicks:    0,
+		MakerFeeSet:         true,
+		TakerFeeSet:         true,
+		SlippageSet:         true,
+		PenetrationTicksSet: true,
+		LimitOrderTimeout:   5 * time.Minute,
+	})
+	if !bZero.Cfg.MakerFeeRate.IsZero() || !bZero.Cfg.TakerFeeRate.IsZero() || !bZero.Cfg.SlippageRate.IsZero() || bZero.Cfg.PenetrationTicks != 0 {
+		t.Fatalf("expected zero overrides preserved, got %+v", bZero.Cfg)
+	}
+
+	// 2. ...999ms Binance CloseTime triggers exact 5m LimitOrderTimeout on the first bar (no 1-bar lag).
+	bZero.SetExchangeFilter("SOLUSDT", model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)})
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	_, _ = bZero.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "EXACT_TIMEOUT",
+		Symbol:        "SOLUSDT",
+		Side:          model.SideLong,
+		LimitPrice:    decimal.NewFromFloat(90.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(85.0),
+		TPPrice:       decimal.NewFromFloat(110.0),
+		CreatedAt:     t0,
+	})
+	bZero.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0,
+		CloseTime: t0.Add(5*time.Minute - time.Millisecond), // 10:04:59.999 -> normalizes to 10:05:00.000
+		Symbol:    "SOLUSDT",
+		Open:      100.0,
+		High:      101.0,
+		Low:       99.0,
+		Close:     100.5,
+	}, 1)
+	if bZero.Stats.TimedOut != 1 {
+		t.Fatalf("expected 5m LimitOrderTimeout to expire cleanly at 10:04:59.999 (+1ms), got TimedOut=%d", bZero.Stats.TimedOut)
+	}
+
+	// 3. MARKET entry fills at Open and allows intrabar TP1/MFE on entry bar when SL is untouched.
+	bMkt := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		EntryOrderType:    "MARKET",
+		SlippageRate:      decimal.Zero,
+		SlippageSet:       true,
+		PartialTPEnabled:  true,
+		PartialTP1Ratio:   0.5,
+	})
+	bMkt.SetExchangeFilter("ETHUSDT", model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1), MinNotional: decimal.NewFromFloat(5.0)})
+	_, _ = bMkt.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID:  "MKT_SAME_BAR_TP1",
+		Symbol:         "ETHUSDT",
+		Side:           model.SideLong,
+		EntryOrderType: "MARKET",
+		LimitPrice:     decimal.NewFromFloat(100.0),
+		Qty:            decimal.NewFromFloat(2.0),
+		SLPrice:        decimal.NewFromFloat(95.0),
+		TP1Price:       decimal.NewFromFloat(103.0),
+		TPPrice:        decimal.NewFromFloat(110.0),
+		ATRAtEntry:     decimal.NewFromFloat(2.0),
+		CreatedAt:      t0,
+	})
+	bMkt.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0,
+		CloseTime: t0.Add(5*time.Minute - time.Millisecond),
+		Symbol:    "ETHUSDT",
+		Open:      100.0,
+		High:      104.0,
+		Low:       99.0,
+		Close:     103.5,
+	}, 1)
+	if len(bMkt.ClosedTrades) != 1 || bMkt.ClosedTrades[0].ExitReason != "PARTIAL_TAKE_PROFIT" {
+		t.Fatalf("expected MARKET entry-bar TP1 trigger when SL untouched, got trades=%+v", bMkt.ClosedTrades)
+	}
+
+	// 4. Intrabar adverse wick triggers cross-margin liquidation even if Close recovers.
+	bLiq := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT:       decimal.NewFromFloat(100.0),
+		AccountLeverage:         10.0,
+		EntryOrderType:          "MARKET",
+		SlippageRate:            decimal.Zero,
+		SlippageSet:             true,
+		MakerFeeSet:             true,
+		TakerFeeSet:             true,
+		IntrabarConflictSLFirst: true,
+	})
+	bLiq.SetExchangeFilter("BTCUSDT", model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.1), StepSize: decimal.NewFromFloat(0.1)})
+	_, _ = bLiq.SubmitLimitEntry(model.OrderIntent{
+		Symbol:     "BTCUSDT",
+		Side:       model.SideShort,
+		Qty:        decimal.NewFromFloat(9.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(150.0),
+		TPPrice:    decimal.NewFromFloat(50.0),
+		CreatedAt:  t0,
+	})
+	bLiq.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0,
+		CloseTime: t0.Add(5*time.Minute - time.Millisecond),
+		Symbol:    "BTCUSDT",
+		Open:      100.0,
+		High:      113.0, // unrealized -117 <= maintMargin even though Close recovers to 101!
+		Low:       99.5,
+		Close:     101.0,
+	}, 1)
+	if !bLiq.CheckCrossMarginLiquidation(0.005, t0.Add(5*time.Minute), 1) {
+		t.Fatalf("expected intrabar wick High=113 to trigger cross-margin liquidation")
 	}
 }
 

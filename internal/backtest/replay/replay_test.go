@@ -497,4 +497,37 @@ func TestReplayEngine_SkipStaleSymbolAndEffectiveEvalTimeOI999(t *testing.T) {
 	}
 }
 
+func TestReplayEngine_BuildBTCMacro_EnabledForMacroAndRel(t *testing.T) {
+	btcCandles := make([]model.Candle, 40)
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	for i := range btcCandles {
+		btcCandles[i] = model.Candle{
+			OpenTime:  base.Add(time.Duration(i) * 15 * time.Minute),
+			CloseTime: base.Add(time.Duration(i+1)*15*time.Minute - time.Millisecond),
+			Open:      60000,
+			High:      60100,
+			Low:       59900,
+			Close:     60050,
+		}
+	}
+	rollingCandles := map[string][]model.Candle{"BTCUSDT": btcCandles}
+	rollingDeltas := map[string][]float64{"BTCUSDT": make([]float64, 40)}
+
+	engMacro := NewReplayEngine(ReplayConfig{BenchmarkSym: "BTCUSDT"}, strategy.EvaluatorConfig{
+		BTCGateEnabled: false,
+		MacroRouter:    strategy.MacroRegimeRouterConfig{Enabled: true},
+	}, simbroker.NewSimBroker(simbroker.SimBrokerConfig{}), nil, nil)
+	if snap := engMacro.buildBTCMacro(base.Add(10*time.Hour), rollingCandles, rollingDeltas); snap == nil {
+		t.Fatalf("expected non-nil btcSnap when MacroRouter.Enabled=true and BTCGateEnabled=false")
+	}
+
+	engRel := NewReplayEngine(ReplayConfig{BenchmarkSym: "BTCUSDT"}, strategy.EvaluatorConfig{
+		BTCGateEnabled: false,
+		RelResidual:    strategy.RelResidualConfig{Enabled: true},
+	}, simbroker.NewSimBroker(simbroker.SimBrokerConfig{}), nil, nil)
+	if snap := engRel.buildBTCMacro(base.Add(10*time.Hour), rollingCandles, rollingDeltas); snap == nil {
+		t.Fatalf("expected non-nil btcSnap when RelResidual.Enabled=true and BTCGateEnabled=false")
+	}
+}
+
 

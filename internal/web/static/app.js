@@ -26,6 +26,8 @@ const state = {
   isPollingActive: true,
   lastSummary: null,
   pinRequired: false,
+  pin: '',
+  geminiModel: 'gemini-2.5-flash',
   currentAIMarkdown: ''
 };
 
@@ -119,13 +121,19 @@ function formatDuration(sec) {
 
 function renderStrategyBadge(strategyID) {
   const raw = (strategyID || '').trim().toUpperCase();
-  if (raw === 'LIQUIDITY_SWEEP_SHORT') {
-    return '<span class="badge badge-strat-sweep" title="LIQUIDITY_SWEEP_SHORT">SWEEP</span>';
+  const badgeMap = {
+    VWAP_PULLBACK: '<span class="badge badge-strat-vwap" title="VWAP_PULLBACK">VWAP</span>',
+    LIQUIDITY_SWEEP_SHORT: '<span class="badge badge-strat-sweep" title="LIQUIDITY_SWEEP_SHORT">SWEEP</span>',
+    VOL_BREAKOUT: '<span class="badge badge-tp" title="VOL_BREAKOUT">BREAKOUT</span>',
+    EMA_PULLBACK: '<span class="badge badge-time" title="EMA_PULLBACK">EMA_PB</span>',
+    VWAP_BREAKDOWN: '<span class="badge badge-sl" title="VWAP_BREAKDOWN">VWAP_BD</span>',
+    STRUCTURE_BREAK: '<span class="badge badge-be" title="STRUCTURE_BREAK">STRUCT_BRK</span>',
+    REL_RESIDUAL: '<span class="badge badge-time" title="REL_RESIDUAL">REL_RESID</span>'
+  };
+  if (!raw) {
+    return badgeMap.VWAP_PULLBACK;
   }
-  if (!raw || raw === 'VWAP_PULLBACK') {
-    return '<span class="badge badge-strat-vwap" title="VWAP_PULLBACK">VWAP</span>';
-  }
-  return `<span class="badge badge-time" title="${escapeHtml(raw)}">${escapeHtml(raw)}</span>`;
+  return badgeMap[raw] || `<span class="badge badge-time" title="${escapeHtml(raw)}">${escapeHtml(raw)}</span>`;
 }
 
 function updateConnectionStatus(isOnline) {
@@ -158,6 +166,9 @@ async function fetchSummary() {
 }
 
 function renderSummary(data) {
+  if (data.gemini_model) {
+    state.geminiModel = data.gemini_model;
+  }
   // Environment Badge
   const envBadge = document.getElementById('env-badge');
   if (envBadge) {
@@ -218,7 +229,7 @@ function renderSummary(data) {
     const maxDD = Math.abs(data.max_daily_drawdown_pct || 0.03);
     const maxDDPct = (maxDD < 1 ? maxDD * 100 : maxDD).toFixed(2);
     elDDSub.textContent = data.circuit_breaker ? 'CIRCUIT BREAKER TRIPPED' : `Breaker: Max ${maxDDPct}%`;
-    if (data.circuit_breaker) elDDSub.classList.add('val-red');
+    elDDSub.classList.toggle('val-red', !!data.circuit_breaker);
   }
 
   // Active Slots
@@ -403,13 +414,12 @@ function renderScanner(data) {
   }
 
   const countBadge = document.getElementById('radar-count-badge');
-  if (countBadge && data.coins && data.coins.length > 0) {
-    countBadge.textContent = `Top ${data.coins.length} Scanner`;
+  const coins = data.coins || [];
+  if (countBadge) {
+    countBadge.textContent = coins.length > 0 ? `Top ${coins.length} Scanner` : '0 Watched';
   }
 
   if (!tbody) return;
-
-  const coins = data.coins || [];
   if (coins.length === 0) {
     tbody.innerHTML = `
       <tr>
@@ -695,7 +705,24 @@ function formatAuditReason(decision, code, subReason, strategyID) {
     'NO_SWEEP_HIGH': 'No 12-Bar High Sweep',
     'SWEEP_REJECTION_WICK': 'Weak Sweep Rejection Wick',
     'EMA200_CHOP_ZONE': 'Too Close To EMA200',
-    'TREND_ABOVE_EMA200': 'Above EMA200 (Short Disabled)'
+    'TREND_ABOVE_EMA200': 'Above EMA200 (Short Disabled)',
+    'HTF_EMA_WARMING_UP': 'HTF 1H EMA200 Masih Warmup',
+    'HTF_EMA_TREND_MISMATCH': 'Tren HTF 1H Tidak Searah',
+    'HTF_EMA_RISING_BLOCK_SHORT': 'Slope HTF EMA Naik (Blokir Short)',
+    'MARKET_BREADTH_TOO_LOW': 'Breadth Pasar Altcoin Terlalu Lemah',
+    'RS4H_TOO_STRONG_FOR_SHORT': 'Relative Strength 4H Terlalu Kuat untuk Short',
+    'PORTFOLIO_CLUSTER_SL_COOLDOWN': 'Jeda Portofolio (Cluster Stop Loss)',
+    'BAR_ENTRY_CAP_REACHED': 'Batas Entry Baru per Bar Tercapai',
+    'DD_THROTTLE_HALT': 'Drawdown Portofolio Memicu Penghentian Entry',
+    'VOL_BREAKOUT_NO_BREAK': 'Vol Breakout Belum Menembus Range',
+    'EMA_PULLBACK_NO_SETUP': 'Setup EMA Pullback Belum Terbentuk',
+    'VWAP_BREAKDOWN_NO_SETUP': 'Setup VWAP Breakdown Belum Terbentuk',
+    'STRUCTURE_BREAK_NO_SETUP': 'Setup Structure Break Belum Terbentuk',
+    'REL_RESIDUAL_NO_SETUP': 'Residual Relatif terhadap BTC Belum Ekstrem',
+    'BTC_CHOP_LONG_BLOCKED': 'BTC Choppy High-Vol (Long Diblokir)',
+    'BTC_CHOP_SHORT_BLOCKED': 'BTC Choppy High-Vol (Short Diblokir)',
+    'BTC_MACRO_BEAR_LONG_BLOCKED': 'Rezim Makro BTC Bear (Long Diblokir)',
+    'BTC_MACRO_BULL_SHORT_BLOCKED': 'Rezim Makro BTC Bull (Short Diblokir)'
   };
 
   if (cleaned.includes('|')) {
@@ -993,10 +1020,21 @@ function startClock() {
 let currentAITriggerBtn = null;
 let currentModalTitle = '';
 let currentModalBaseUrl = '';
+let aiModalRequestSeq = 0;
 let lastExecutiveSummaryData = null;
 let lastExecutiveSummaryTime = 0;
 let lastPatternMinerData = null;
 let lastPatternMinerTime = 0;
+
+function stripRefreshParam(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl, window.location.origin);
+    parsed.searchParams.delete('refresh');
+    return parsed.pathname + parsed.search;
+  } catch (_) {
+    return rawUrl.replace(/([?&])refresh=true(&|$)/g, (_, p1, p2) => (p2 ? p1 : '')).replace(/[?&]$/, '');
+  }
+}
 
 async function openAIModal(title, url, triggerBtn) {
   const modal = document.getElementById('ai-modal');
@@ -1007,8 +1045,9 @@ async function openAIModal(title, url, triggerBtn) {
 
   if (!modal) return;
 
+  const reqSeq = ++aiModalRequestSeq;
   currentModalTitle = title;
-  currentModalBaseUrl = url;
+  currentModalBaseUrl = stripRefreshParam(url);
   currentAITriggerBtn = triggerBtn;
 
   if (triggerBtn) {
@@ -1016,15 +1055,17 @@ async function openAIModal(title, url, triggerBtn) {
     triggerBtn.disabled = true;
   }
 
+  const activeModel = state.geminiModel || 'gemini-2.5-flash';
   if (titleEl) titleEl.textContent = title;
-  if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite';
+  if (badgeEl) badgeEl.textContent = activeModel;
 
   // Check in-memory cache for executive debrief (30s) or pattern miner (3m) if not force refresh
-  const isExecutive = url.includes('/api/ai/executive-summary');
-  const isPatternMiner = url.includes('/api/ai/pattern-miner');
+  const isExecutive = currentModalBaseUrl.includes('/api/ai/executive-summary');
+  const isPatternMiner = currentModalBaseUrl.includes('/api/ai/pattern-miner');
   const isForceRefresh = url.includes('refresh=true');
 
   if (isExecutive && !isForceRefresh && lastExecutiveSummaryData && (Date.now() - lastExecutiveSummaryTime < 30000)) {
+    const cachedModel = lastExecutiveSummaryData.model || activeModel;
     if (loadingEl) {
       loadingEl.classList.add('hidden');
       loadingEl.style.display = 'none';
@@ -1035,7 +1076,7 @@ async function openAIModal(title, url, triggerBtn) {
       contentEl.style.display = 'block';
     }
     state.currentAIMarkdown = lastExecutiveSummaryData.text || '';
-    if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite | In-Memory (30s)';
+    if (badgeEl) badgeEl.textContent = `${cachedModel} | In-Memory (30s)`;
     modal.classList.remove('hidden');
     modal.setAttribute('aria-hidden', 'false');
     if (triggerBtn) {
@@ -1046,6 +1087,7 @@ async function openAIModal(title, url, triggerBtn) {
   }
 
   if (isPatternMiner && !isForceRefresh && lastPatternMinerData && (Date.now() - lastPatternMinerTime < 180000)) {
+    const cachedModel = lastPatternMinerData.model || activeModel;
     if (loadingEl) {
       loadingEl.classList.add('hidden');
       loadingEl.style.display = 'none';
@@ -1056,7 +1098,7 @@ async function openAIModal(title, url, triggerBtn) {
       contentEl.style.display = 'block';
     }
     state.currentAIMarkdown = lastPatternMinerData.text || '';
-    if (badgeEl) badgeEl.textContent = 'gemini-3.5-flash-lite | In-Memory (3m)';
+    if (badgeEl) badgeEl.textContent = `${cachedModel} | In-Memory (3m)`;
     modal.classList.remove('hidden');
     modal.setAttribute('aria-hidden', 'false');
     if (triggerBtn) {
@@ -1083,6 +1125,12 @@ async function openAIModal(title, url, triggerBtn) {
   try {
     const res = await authFetch(url);
     const data = await res.json();
+    if (reqSeq !== aiModalRequestSeq) return; // Ignore stale response from prior modal
+
+    if (data.model) {
+      state.geminiModel = data.model;
+    }
+    const respModel = data.model || state.geminiModel || 'gemini-2.5-flash';
 
     if (!res.ok || data.error) {
       let errMsg = data.message || data.error || 'Gagal memuat analisis AI.';
@@ -1109,7 +1157,7 @@ async function openAIModal(title, url, triggerBtn) {
         contentEl.innerHTML = renderMarkdown(data.text);
       }
       if (badgeEl) {
-        badgeEl.textContent = data.source === 'cache' ? 'gemini-3.5-flash-lite | Local Cache' : 'gemini-3.5-flash-lite | Live';
+        badgeEl.textContent = data.source === 'cache' ? `${respModel} | Local Cache` : `${respModel} | Live`;
       }
       if (isExecutive && data.text) {
         lastExecutiveSummaryData = data;
@@ -1121,6 +1169,7 @@ async function openAIModal(title, url, triggerBtn) {
       }
     }
   } catch (err) {
+    if (reqSeq !== aiModalRequestSeq) return;
     console.error('AI modal fetch error:', err);
     state.currentAIMarkdown = 'Gagal menghubungi server TRML.';
     if (contentEl) {
@@ -1128,23 +1177,28 @@ async function openAIModal(title, url, triggerBtn) {
     }
     if (badgeEl) badgeEl.textContent = 'Offline';
   } finally {
-    if (loadingEl) {
-      loadingEl.classList.add('hidden');
-      loadingEl.style.display = 'none';
-    }
-    if (contentEl) {
-      contentEl.classList.remove('hidden');
-      contentEl.style.display = 'block';
+    if (reqSeq === aiModalRequestSeq) {
+      if (loadingEl) {
+        loadingEl.classList.add('hidden');
+        loadingEl.style.display = 'none';
+      }
+      if (contentEl) {
+        contentEl.classList.remove('hidden');
+        contentEl.style.display = 'block';
+      }
     }
     if (triggerBtn) {
       triggerBtn.classList.remove('is-loading');
       triggerBtn.disabled = false;
     }
-    currentAITriggerBtn = null;
+    if (currentAITriggerBtn === triggerBtn) {
+      currentAITriggerBtn = null;
+    }
   }
 }
 
 function closeAIModal() {
+  aiModalRequestSeq++;
   const modal = document.getElementById('ai-modal');
   if (modal) {
     modal.classList.add('hidden');
@@ -1262,12 +1316,16 @@ function setupAIEvents() {
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {
       if (!currentModalBaseUrl) return;
-      const sep = currentModalBaseUrl.includes('?') ? '&' : '?';
-      const refreshUrl = currentModalBaseUrl + sep + 'refresh=true';
-      // Clear in-memory cache if executive debrief
-      if (currentModalBaseUrl.includes('executive-summary')) {
+      const base = stripRefreshParam(currentModalBaseUrl);
+      const sep = base.includes('?') ? '&' : '?';
+      const refreshUrl = base + sep + 'refresh=true';
+      if (base.includes('executive-summary')) {
         lastExecutiveSummaryData = null;
         lastExecutiveSummaryTime = 0;
+      }
+      if (base.includes('pattern-miner')) {
+        lastPatternMinerData = null;
+        lastPatternMinerTime = 0;
       }
       openAIModal(currentModalTitle, refreshUrl, currentAITriggerBtn);
     });
@@ -1278,6 +1336,8 @@ function setupAIEvents() {
 let enteredPinDigits = '';
 
 function showPinScreen(errMsg) {
+  state.pin = '';
+  localStorage.removeItem('trml_pin');
   const pinScreen = document.getElementById('pin-screen');
   const errEl = document.getElementById('pin-error-msg');
   if (pinScreen) {
@@ -1329,6 +1389,7 @@ async function verifyEnteredPIN() {
     });
     const data = await res.json();
     if (res.ok && data.status === 'ok') {
+      state.pin = enteredPinDigits;
       localStorage.setItem('trml_pin', enteredPinDigits);
       hidePinScreen();
       // Start initial polling
@@ -1420,6 +1481,7 @@ async function checkAuthAndStart() {
           body: JSON.stringify({ pin: storedPin })
         });
         if (verifyRes.ok) {
+          state.pin = storedPin;
           hidePinScreen();
           fetchSummary();
           fetchScanner();
@@ -1460,14 +1522,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // Background Polling
   // High-frequency polling (every 3 seconds for summary & positions)
   setInterval(() => {
-    if (state.isPollingActive && (!state.pinRequired || localStorage.getItem('trml_pin'))) {
+    if (state.isPollingActive && (!state.pinRequired || (state.pin && localStorage.getItem('trml_pin')))) {
       fetchSummary();
     }
   }, 3000);
 
   // Scanner radar polling (every 5 seconds)
   setInterval(() => {
-    if (state.isPollingActive && (!state.pinRequired || localStorage.getItem('trml_pin'))) {
+    if (state.isPollingActive && (!state.pinRequired || (state.pin && localStorage.getItem('trml_pin')))) {
       fetchScanner();
     }
   }, 5000);
@@ -1475,7 +1537,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Page visibility awareness: pause polling when tab is hidden, resume immediately when visible
   document.addEventListener('visibilitychange', () => {
     state.isPollingActive = !document.hidden;
-    if (state.isPollingActive && (!state.pinRequired || localStorage.getItem('trml_pin'))) {
+    if (state.isPollingActive && (!state.pinRequired || (state.pin && localStorage.getItem('trml_pin')))) {
       fetchSummary();
       fetchScanner();
     }
@@ -1484,7 +1546,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Register PWA Service Worker
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js?v=4').then((reg) => {
+      navigator.serviceWorker.register('/sw.js?v=6').then((reg) => {
         reg.update();
       }).catch((err) => {
         console.warn('Service worker registration failed:', err);

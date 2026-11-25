@@ -2,6 +2,7 @@ package protection
 
 import (
 	"math"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"trml/internal/model"
@@ -268,5 +269,48 @@ func quantizePriceSafely(price, tickSize decimal.Decimal, roundUp bool) decimal.
 		}
 	}
 	return price
+}
+
+// ShouldTriggerStaleLossExit evaluates whether an open position has been held for at least staleDur
+// while still underwater relative to EntryPrice (SSOT across SimBroker, DryRunBroker, BinanceLiveBroker).
+func ShouldTriggerStaleLossExit(
+	side model.Side,
+	entryPrice, currentPrice decimal.Decimal,
+	openTime, now time.Time,
+	staleDur time.Duration,
+) bool {
+	if staleDur <= 0 || openTime.IsZero() || now.Sub(openTime) < staleDur {
+		return false
+	}
+	if entryPrice.LessThanOrEqual(decimal.Zero) || currentPrice.LessThanOrEqual(decimal.Zero) {
+		return false
+	}
+	switch side {
+	case model.SideLong:
+		return currentPrice.LessThan(entryPrice)
+	case model.SideShort:
+		return currentPrice.GreaterThan(entryPrice)
+	default:
+		return false
+	}
+}
+
+// UpdatePeakAndDrawdownPct updates a running equity HWM and returns the updated peak and
+// non-negative drawdown fraction in [0, 1] (SSOT across SimBroker, DryRunBroker, BinanceLiveBroker).
+func UpdatePeakAndDrawdownPct(peakEquity, effectiveEquity decimal.Decimal) (decimal.Decimal, float64) {
+	newPeak := peakEquity
+	if effectiveEquity.GreaterThan(newPeak) {
+		newPeak = effectiveEquity
+	}
+	if newPeak.LessThanOrEqual(decimal.Zero) || effectiveEquity.GreaterThanOrEqual(newPeak) {
+		return newPeak, 0.0
+	}
+	ddF, _ := newPeak.Sub(effectiveEquity).Div(newPeak).Float64()
+	if ddF < 0 {
+		ddF = 0.0
+	} else if ddF > 1.0 {
+		ddF = 1.0
+	}
+	return newPeak, ddF
 }
 

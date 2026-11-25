@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS account_daily_state_by_mode (
 
 CREATE TABLE IF NOT EXISTS trade_ledger (
     client_order_id      TEXT PRIMARY KEY,
+    mode                 TEXT NOT NULL DEFAULT '',
     symbol               TEXT NOT NULL,
     side                 TEXT NOT NULL,
     strategy_id          TEXT NOT NULL DEFAULT 'VWAP_PULLBACK',
@@ -215,6 +216,7 @@ func OpenDB(dbPath string) (*DB, error) {
 
 	// Migrasi otomatis kolom trade_ledger
 	ledgerCols := []struct{ col, def string }{
+		{"mode", "TEXT NOT NULL DEFAULT ''"},
 		{"signal_audit_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"ai_autopsy", "TEXT NOT NULL DEFAULT ''"},
 		{"strategy_id", "TEXT NOT NULL DEFAULT 'VWAP_PULLBACK'"},
