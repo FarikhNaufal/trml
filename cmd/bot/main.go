@@ -1124,6 +1124,7 @@ func main() {
 			Reader:            webReader,
 			Broker:            engine.broker,
 			GetScannerCoinsFn: engine.getScannerCoins,
+			GetTelemetryFn:    engine.getTelemetry,
 			IsCircuitBreaker: func() bool {
 				if engine.dryRunBroker != nil {
 					engine.dryRunBroker.Mu.Lock()
@@ -1243,6 +1244,56 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 		})
 	}
 	return result
+}
+
+func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
+	e.statesMu.RLock()
+	btcSt := e.activeStates[BenchmarkSymbol]
+	breadthPct := e.marketBreadthPct
+	breadthValid := e.marketBreadthValid
+	e.statesMu.RUnlock()
+
+	var btcCandles []model.Candle
+	if btcSt != nil {
+		btcSt.Mu.Lock()
+		btcCandles = slices.Clone(btcSt.ClosedCandles)
+		btcSt.Mu.Unlock()
+	}
+
+	macro := strategy.ClassifyMacroRegime(
+		btcCandles,
+		e.evaluatorCfg.MacroRouter.TrendERThreshold,
+		e.evaluatorCfg.MacroRouter.VolShockRatio,
+	)
+
+	clusterPaused := false
+	clusterUntilUTC := ""
+	if e.clusterSL != nil {
+		if paused, until := e.clusterSL.IsPaused(e.exchangeNow()); paused {
+			clusterPaused = true
+			if !until.IsZero() {
+				clusterUntilUTC = until.UTC().Format(time.RFC3339)
+			}
+		}
+	}
+
+	return &web.TelemetryDTO{
+		MacroRegime:          string(macro.Regime),
+		MacroER:              macro.EfficiencyRatio,
+		MacroVolRatio:        macro.VolRatio1h,
+		MacroReturn24hPct:    macro.Return24hPct,
+		RangeRiskMult:        e.evaluatorCfg.MacroRouter.RangeRiskMult,
+		VolExpansionRatio:    e.evaluatorCfg.MacroRouter.VolExpansionRatio,
+		VolExpansionRiskMult: e.evaluatorCfg.MacroRouter.VolExpansionRiskMult,
+		MarketBreadthPct:     breadthPct,
+		MarketBreadthValid:   breadthValid,
+		ClusterSLPaused:      clusterPaused,
+		ClusterSLUntilUTC:    clusterUntilUTC,
+		Timeframe:            e.cfg.Timeframe,
+		ScannerInterval:      e.cfg.ScannerInterval.String(),
+		AllowedSide:          e.cfg.AllowedSide,
+		DisableOIFilter:      e.cfg.DisableOIFilter,
+	}
 }
 
 const scanFetchTimeout = 2 * time.Minute

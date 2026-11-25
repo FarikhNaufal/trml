@@ -28,6 +28,24 @@ type ScannerCoinDTO struct {
 	LastUpdateUTC string  `json:"last_update_utc"`
 }
 
+type TelemetryDTO struct {
+	MacroRegime          string  `json:"macro_regime"`
+	MacroER              float64 `json:"macro_er"`
+	MacroVolRatio        float64 `json:"macro_vol_ratio"`
+	MacroReturn24hPct    float64 `json:"macro_return_24h_pct"`
+	RangeRiskMult        float64 `json:"range_risk_mult"`
+	VolExpansionRatio    float64 `json:"vol_expansion_ratio"`
+	VolExpansionRiskMult float64 `json:"vol_expansion_risk_mult"`
+	MarketBreadthPct     float64 `json:"market_breadth_pct"`
+	MarketBreadthValid   bool    `json:"market_breadth_valid"`
+	ClusterSLPaused      bool    `json:"cluster_sl_paused"`
+	ClusterSLUntilUTC    string  `json:"cluster_sl_until_utc,omitempty"`
+	Timeframe            string  `json:"timeframe"`
+	ScannerInterval      string  `json:"scanner_interval"`
+	AllowedSide          string  `json:"allowed_side"`
+	DisableOIFilter      bool    `json:"disable_oi_filter"`
+}
+
 type ServerConfig struct {
 	Port              string
 	Env               string
@@ -36,6 +54,7 @@ type ServerConfig struct {
 	Reader            *WebReader
 	Broker            broker.ExecutionBroker
 	GetScannerCoinsFn func() []ScannerCoinDTO
+	GetTelemetryFn    func() *TelemetryDTO
 	IsCircuitBreaker  func() bool
 	Repo              storage.Repository
 	DashboardPIN      string
@@ -93,7 +112,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	fileServer := http.FileServer(http.FS(subFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if strings.HasSuffix(path, ".js") || strings.HasSuffix(path, ".css") || path == "/" || path == "/index.html" {
+		if strings.HasPrefix(path, "/vendor/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else if strings.HasSuffix(path, ".js") || strings.HasSuffix(path, ".css") || path == "/" || path == "/index.html" {
 			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 			w.Header().Set("Pragma", "no-cache")
 			w.Header().Set("Expires", "0")
@@ -168,6 +189,11 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		circuitBreaker = s.cfg.IsCircuitBreaker()
 	}
 
+	var telemetry *TelemetryDTO
+	if s.cfg.GetTelemetryFn != nil {
+		telemetry = s.cfg.GetTelemetryFn()
+	}
+
 	resp := map[string]any{
 		"equity":                 equityF,
 		"balance":                balanceF,
@@ -181,6 +207,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"positions":              positions,
 		"stats":                  stats,
 		"strategy_stats":         strategyStats,
+		"telemetry":              telemetry,
 	}
 
 	writeJSON(w, http.StatusOK, resp)

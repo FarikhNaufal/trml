@@ -1,12 +1,12 @@
 {
-  "name": "TRML Binance Futures Dashboard",
-  "short_name": "TRML Bot",
-  "description": "High-Frequency Intraday Trading Engine & Risk Dashboard",
+  "name": "TRML Quant Execution Desk",
+  "short_name": "TRML Desk",
+  "description": "High-density institutional monitoring & AI execution desk for TRML futures engine.",
   "start_url": "/",
   "display": "standalone",
-  "orientation": "portrait-primary",
-  "background_color": "#0b0e14",
-  "theme_color": "#0b0e14",
+  "background_color": "#f6f8fa",
+  "theme_color": "#f6f8fa",
+  "orientation": "any",
   "icons": [
     {
       "src": "/icon.svg",

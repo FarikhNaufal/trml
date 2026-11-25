@@ -1,410 +1,556 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>TRML - Binance USDⓈ-M Futures Bot</title>
-  <meta name="description" content="Ultra-lightweight real-time dashboard and trade ledger for TRML Binance Futures bot.">
-  <meta name="theme-color" content="#0b0e14">
-  <link rel="manifest" href="/manifest.json">
-  <link rel="icon" type="image/svg+xml" href="/icon.svg">
-  <link rel="apple-touch-icon" href="/icon.svg">
-  <link rel="stylesheet" href="/style.css?v=6">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>TRML Quant Execution Desk</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#f6f8fa" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="TRML Desk" />
+
+  <script>
+    (() => {
+      try {
+        const mode = localStorage.getItem('themeMode');
+        const isDark = mode === 'dark';
+        document.documentElement.classList.toggle('dark', isDark);
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', isDark ? '#0b1017' : '#f6f8fa');
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/vendor/basecoat-mira.cdn.min.css?v=7" />
+  <link rel="stylesheet" href="/style.css?v=7" />
+
+  <script src="/vendor/basecoat.min.js?v=7" defer></script>
+  <script src="/vendor/tabs.min.js?v=7" defer></script>
+  <script src="/vendor/toast.min.js?v=7" defer></script>
+  <script src="/vendor/popover.min.js?v=7" defer></script>
+  <script src="/vendor/input-otp.min.js?v=7" defer></script>
+  <script src="/vendor/command.min.js?v=7" defer></script>
+  <script src="/app.js?v=7" defer></script>
 </head>
 <body>
-  <!-- Header -->
-  <header class="app-header">
-    <div class="header-inner">
-      <div class="brand-group">
-        <div class="brand-info-wrap">
-          <img src="/icon.svg" alt="TRML" class="brand-icon">
+  <!-- Basecoat Toast Host -->
+  <ol id="toaster" class="toaster" role="list" aria-label="Notifications"></ol>
+
+  <!-- PIN Security Screen (Hidden by default if no PIN required) -->
+  <div id="pin-screen" class="trml-pin-screen hidden" aria-hidden="true">
+    <section class="card trml-pin-card" data-size="sm">
+      <header class="border-b">
+        <div class="trml-pin-brand">
+          <span class="trml-brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 6-6"/></svg>
+          </span>
           <div>
-            <div class="brand-title">TR<span>M</span>L FUTURES</div>
-            <div class="brand-subtitle">VWAP Mean Reversion &amp; Delta Momentum</div>
+            <h2>TRML Desk Lock</h2>
+            <p id="pin-status-badge">Enter 6-digit access PIN to unlock telemetry &amp; ledger.</p>
           </div>
         </div>
-        <span id="env-badge" class="env-badge env-dryrun">DRY-RUN</span>
-      </div>
-
-      <div class="header-status-group">
-        <div class="status-dot-wrapper">
-          <span id="status-dot" class="status-dot"></span>
-          <span id="status-text">ONLINE</span>
-        </div>
-        <div id="utc-clock" class="utc-clock">--:--:-- UTC</div>
-        <button id="btn-ai-executive" class="btn-ai-action" title="AI Executive Debrief" aria-label="AI Executive Debrief">
-          <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
-            <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
-          </svg>
-        </button>
-        <button id="btn-refresh" class="btn-refresh" title="Refresh Live Data" aria-label="Refresh Data">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
-          </svg>
-          <span>Refresh</span>
-        </button>
-      </div>
-    </div>
-  </header>
-
-
-  <!-- Main Content Container -->
-  <main class="main-container">
-    <!-- KPI Summary Grid -->
-    <section class="kpi-grid">
-      <div class="kpi-card">
-        <div class="kpi-title">
-          <span>Effective Equity</span>
-          <span class="badge badge-time">USDT</span>
-        </div>
-        <div id="kpi-equity" class="kpi-value">—</div>
-        <div id="kpi-balance" class="kpi-sub">Avail: —</div>
-      </div>
-
-      <div class="kpi-card">
-        <div class="kpi-title">
-          <span>PnL</span>
-          <span id="kpi-winrate" class="badge badge-time">—% WR</span>
-        </div>
-        <div id="kpi-pnl" class="kpi-value">—</div>
-        <div id="kpi-trades-count" class="kpi-sub">— Closed Setups</div>
-      </div>
-
-      <div class="kpi-card">
-        <div class="kpi-title">
-          <span>Realized R:R Ratio</span>
-        </div>
-        <div id="kpi-rr" class="kpi-value val-yellow">— : 1</div>
-        <div id="kpi-rr-sub" class="kpi-sub">Full +— / -—</div>
-      </div>
-
-      <div class="kpi-card">
-        <div class="kpi-title">
-          <span>Daily Drawdown</span>
-        </div>
-        <div id="kpi-drawdown" class="kpi-value">—%</div>
-        <div id="kpi-drawdown-sub" class="kpi-sub">Breaker: —</div>
-      </div>
-
-      <div class="kpi-card">
-        <div class="kpi-title">
-          <span>Active Slots</span>
-        </div>
-        <div id="kpi-slots" class="kpi-value">— / —</div>
-        <div id="kpi-slots-sub" class="kpi-sub">— Slots Available</div>
-      </div>
-
-      <div class="kpi-card">
-        <div class="kpi-title">
-          <span>Outcome Breakdown</span>
-        </div>
-        <div id="kpi-outcomes" class="kpi-value kpi-outcomes-val">
-          <span class="val-green">— Full TP</span> &bull; <span class="val-blue">— Part TP</span> &bull; <span class="val-yellow">— BE</span> &bull; <span class="val-red">— SL</span>
-        </div>
-        <div id="kpi-outcomes-sub" class="kpi-sub">—</div>
-      </div>
-
-    </section>
-
-    <!-- Strategy Attribution Strip -->
-    <div id="strategy-attribution-strip" class="strategy-strip hidden"></div>
-
-    <!-- Active Positions Section -->
-    <section class="panel">
-      <div class="panel-header">
-        <div class="panel-title-group">
-          <span class="panel-title">Active Positions</span>
-          <span id="pos-count-badge" class="panel-badge">0 Open</span>
-        </div>
-      </div>
-      <div id="positions-container" class="positions-grid is-empty">
-        <div class="empty-state">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <circle cx="12" cy="12" r="10"/>
-            <path d="M12 6v6l4 2"/>
-          </svg>
-          <div>No active positions open. Scanner is monitoring top liquid coins for high-conviction retests.</div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Watched Coins Radar Section -->
-    <section class="panel">
-      <div class="panel-header">
-        <div class="panel-title-group">
-          <span class="panel-title">Watched Coins Radar</span>
-          <span id="radar-count-badge" class="panel-badge">Top 20 Scanner</span>
-        </div>
-        <div class="panel-controls">
-          <span id="radar-last-scan" class="pagination-info">Last Scan: Just now</span>
-        </div>
-      </div>
-      <div class="table-responsive">
-        <table class="trml-table">
-          <thead>
-            <tr>
-              <th class="col-sticky-symbol sticky-col">Symbol</th>
-              <th>Mark Price</th>
-
-              <th>Session VWAP</th>
-              <th>Distance to VWAP</th>
-              <th>NATR %</th>
-              <th>RVOL</th>
-              <th>Spread %</th>
-              <th>Funding Rate</th>
-            </tr>
-          </thead>
-          <tbody id="radar-tbody">
-            <tr>
-              <td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading scanner radar...</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- Trade Ledger Section (Paginated) -->
-    <section class="panel">
-      <div class="panel-header">
-        <div class="panel-title-group">
-          <span class="panel-title">Trade Ledger</span>
-          <span id="trades-total-badge" class="panel-badge">0 Records</span>
-          <button id="btn-pattern-miner" class="btn-ai-action" title="🔬 AI Pattern Miner (Audit Pola Kelemahan)" aria-label="AI Pattern Miner">
-            <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
-              <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
-            </svg>
-          </button>
-        </div>
-        <div class="panel-controls">
-          <div class="filter-group">
-            <button class="filter-pill active" data-filter-trade="ALL">ALL</button>
-            <button class="filter-pill" data-filter-trade="TAKE_PROFIT">TP</button>
-            <button class="filter-pill" data-filter-trade="BREAK_EVEN">BE</button>
-            <button class="filter-pill" data-filter-trade="STOP_LOSS">SL</button>
+      </header>
+      <section class="trml-pin-body">
+        <div class="trml-otp-wrap">
+          <div class="input-otp" id="pin-otp">
+            <input
+              id="pin-otp-input"
+              class="input"
+              type="text"
+              inputmode="numeric"
+              pattern="[0-9]*"
+              data-filter
+              autocomplete="one-time-code"
+              spellcheck="false"
+              maxlength="6"
+              dir="ltr"
+              aria-label="6-digit dashboard PIN"
+            />
+            <div aria-hidden="true">
+              <div>
+                <span></span><span></span><span></span><span></span><span></span><span></span>
+              </div>
+            </div>
           </div>
-          <div class="panel-selects-group">
-            <select id="trade-strategy-select" class="select-input" title="Filter by Strategy">
-              <option value="ALL">All Strategies</option>
-              <option value="VWAP_PULLBACK">VWAP</option>
-              <option value="LIQUIDITY_SWEEP_SHORT">SWEEP</option>
-              <option value="VOL_BREAKOUT">BREAKOUT</option>
-              <option value="EMA_PULLBACK">EMA_PB</option>
-              <option value="VWAP_BREAKDOWN">VWAP_BD</option>
-              <option value="STRUCTURE_BREAK">STRUCT_BRK</option>
-              <option value="REL_RESIDUAL">REL_RESID</option>
-            </select>
-            <select id="trade-limit-select" class="select-input" title="Rows per page">
-              <option value="10" selected>10 / page</option>
-              <option value="25">25 / page</option>
-              <option value="50">50 / page</option>
-            </select>
-          </div>
+          <p id="pin-error-msg" class="trml-pin-error" role="alert"></p>
         </div>
-      </div>
 
-      <!-- Desktop View: Table -->
-      <div class="table-responsive responsive-table-hide-mobile">
-        <table class="trml-table">
-          <thead>
-            <tr>
-              <th class="col-sticky-symbol sticky-col">Symbol</th>
-              <th>Closed At (UTC)</th>
-              <th>Side</th>
-              <th>Strategy</th>
-              <th>Qty</th>
-              <th>Entry Price</th>
-              <th>Exit Price</th>
-              <th>Net PnL (ROE)</th>
-              <th>MAE / MFE</th>
-              <th>Hold Duration</th>
-              <th>Exit Reason</th>
-              <th style="text-align: center; width: 44px;">AI</th>
-            </tr>
-          </thead>
-          <tbody id="trades-tbody">
-            <tr>
-              <td colspan="12" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading trades...</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- Mobile View: Card Stream -->
-      <div id="trades-mobile-stream" class="mobile-card-stream">
-        <!-- Rendered by JS on mobile -->
-      </div>
-
-      <!-- Pagination Footer -->
-      <div class="pagination-bar">
-        <div id="trades-page-info" class="pagination-info">Page 1 of 1 (0 Total)</div>
-        <div class="pagination-controls">
-          <button id="trades-btn-prev" class="btn-page" disabled>&larr; Previous</button>
-          <button id="trades-btn-next" class="btn-page" disabled>Next &rarr;</button>
+        <div id="pin-keypad" class="trml-keypad" role="group" aria-label="PIN numeric keypad">
+          <button type="button" class="btn" data-variant="outline" data-key="1">1</button>
+          <button type="button" class="btn" data-variant="outline" data-key="2">2</button>
+          <button type="button" class="btn" data-variant="outline" data-key="3">3</button>
+          <button type="button" class="btn" data-variant="outline" data-key="4">4</button>
+          <button type="button" class="btn" data-variant="outline" data-key="5">5</button>
+          <button type="button" class="btn" data-variant="outline" data-key="6">6</button>
+          <button type="button" class="btn" data-variant="outline" data-key="7">7</button>
+          <button type="button" class="btn" data-variant="outline" data-key="8">8</button>
+          <button type="button" class="btn" data-variant="outline" data-key="9">9</button>
+          <button type="button" class="btn" data-variant="ghost" data-key="CLEAR">CLR</button>
+          <button type="button" class="btn" data-variant="outline" data-key="0">0</button>
+          <button type="button" class="btn" data-variant="ghost" data-key="DEL" aria-label="Delete digit">⌫</button>
         </div>
-      </div>
+      </section>
     </section>
-
-    <!-- Signal Audit Log Section (Paginated) -->
-    <section class="panel">
-      <div class="panel-header">
-        <div class="panel-title-group">
-          <span class="panel-title">Signal Audit Feed</span>
-          <span id="signals-total-badge" class="panel-badge">0 Signals</span>
-        </div>
-        <div class="panel-controls">
-          <div class="filter-group">
-            <button class="filter-pill active" data-filter-signal="ALL">ALL</button>
-            <button class="filter-pill" data-filter-signal="APPROVE">APPROVED</button>
-            <button class="filter-pill" data-filter-signal="REJECT">REJECTED</button>
-          </div>
-          <div class="panel-selects-group">
-            <select id="signal-strategy-select" class="select-input" title="Filter by Strategy">
-              <option value="ALL">All Strategies</option>
-              <option value="VWAP_PULLBACK">VWAP</option>
-              <option value="LIQUIDITY_SWEEP_SHORT">SWEEP</option>
-              <option value="VOL_BREAKOUT">BREAKOUT</option>
-              <option value="EMA_PULLBACK">EMA_PB</option>
-              <option value="VWAP_BREAKDOWN">VWAP_BD</option>
-              <option value="STRUCTURE_BREAK">STRUCT_BRK</option>
-              <option value="REL_RESIDUAL">REL_RESID</option>
-            </select>
-            <select id="signal-symbol-select" class="select-input" title="Filter by Symbol">
-              <option value="ALL">All Symbols</option>
-            </select>
-            <select id="signal-limit-select" class="select-input" title="Rows per page">
-              <option value="15" selected>15 / page</option>
-              <option value="30">30 / page</option>
-              <option value="50">50 / page</option>
-            </select>
-          </div>
-        </div>
-      </div>
-
-      <!-- Desktop View: Table -->
-      <div class="table-responsive responsive-table-hide-mobile">
-        <table class="trml-table">
-          <thead>
-            <tr>
-              <th class="col-sticky-symbol sticky-col">Symbol</th>
-              <th>Candle Time (UTC)</th>
-              <th>Side</th>
-              <th>Strategy</th>
-              <th>Close Price</th>
-              <th>Session VWAP</th>
-              <th>Delta Z-Score</th>
-              <th>OI Delta %</th>
-              <th>RVOL</th>
-              <th>Decision</th>
-              <th class="col-audit-reason-th">Audit Evaluation &amp; Reason</th>
-            </tr>
-          </thead>
-          <tbody id="signals-tbody">
-
-            <tr>
-              <td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 24px;">Loading signal audit log...</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- Mobile View: Card Stream -->
-      <div id="signals-mobile-stream" class="mobile-card-stream">
-        <!-- Rendered by JS on mobile -->
-      </div>
-
-      <!-- Pagination Footer -->
-      <div class="pagination-bar">
-        <div id="signals-page-info" class="pagination-info">Page 1 of 1 (0 Total)</div>
-        <div class="pagination-controls">
-          <button id="signals-btn-prev" class="btn-page" disabled>&larr; Previous</button>
-          <button id="signals-btn-next" class="btn-page" disabled>Next &rarr;</button>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <!-- Universal AI Copilot Modal -->
-  <div id="ai-modal" class="ai-modal-overlay hidden" aria-hidden="true">
-    <div class="ai-modal-card">
-      <div class="ai-modal-header">
-        <div class="ai-modal-title-group">
-          <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
-            <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
-          </svg>
-          <span id="ai-modal-title">AI Copilot Analysis</span>
-        </div>
-        <button id="ai-modal-close" class="ai-modal-close-btn" aria-label="Close modal">&times;</button>
-      </div>
-
-      <div id="ai-modal-body" class="ai-modal-body">
-        <div id="ai-modal-loading" class="ai-modal-loading">
-          <div class="ai-spinner"></div>
-          <div>Menganalisis data orderflow &amp; eksekusi TRML...</div>
-        </div>
-        <div id="ai-modal-content" class="ai-markdown-content hidden"></div>
-      </div>
-
-      <div class="ai-modal-footer">
-        <span id="ai-modal-badge" class="ai-source-badge">AI Copilot</span>
-        <div class="ai-modal-actions">
-          <button id="ai-modal-refresh-btn" class="btn-ai-footer-action" title="Analisis Ulang dengan AI">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
-              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
-            </svg>
-            <span>Analisis Ulang</span>
-          </button>
-          <button id="ai-modal-copy-btn" class="btn-ai-footer-action" title="Copy to clipboard">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13">
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-            </svg>
-            <span>Salin</span>
-          </button>
-        </div>
-      </div>
-    </div>
   </div>
 
-  <!-- PIN Authentication Screen (shown if DASHBOARD_PIN configured) -->
-  <div id="pin-screen" class="pin-screen-overlay hidden" aria-hidden="true">
-    <div class="pin-card">
-      <div class="pin-brand">
-        <img src="/icon.svg" alt="TRML" class="pin-brand-icon">
-        <div class="pin-brand-title">TR<span>M</span>L SECURITY</div>
-        <div class="pin-brand-sub">Masukkan 6-Digit PIN untuk Mengakses Dashboard</div>
-      </div>
+  <!-- Main Workspace Shell -->
+  <div id="app-shell" class="trml-shell hidden">
+    <!-- Compact Desk Topbar -->
+    <header class="trml-topbar">
+      <div class="trml-topbar-inner">
+        <div class="trml-topbar-left">
+          <div class="trml-brand">
+            <span class="trml-brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 14 4-4 3 3 6-6"/></svg>
+            </span>
+            <span class="trml-brand-name">TR<span>M</span>L FUTURES</span>
+            <span id="env-badge" class="badge" data-variant="secondary">DRY-RUN</span>
+          </div>
 
-      <div class="pin-dots-container" id="pin-dots">
-        <span class="pin-dot"></span>
-        <span class="pin-dot"></span>
-        <span class="pin-dot"></span>
-        <span class="pin-dot"></span>
-        <span class="pin-dot"></span>
-        <span class="pin-dot"></span>
-      </div>
+          <span id="conn-badge" class="trml-conn-pill" title="Telemetry connection">
+            <span class="trml-conn-dot" aria-hidden="true"></span>
+            <span id="conn-text">Syncing</span>
+          </span>
 
-      <div id="pin-error-msg" class="pin-error hidden">PIN tidak valid</div>
+          <!-- Point 3: Q-MAX Macro Regime & Risk Telemetry Popover -->
+          <div id="telemetry-popover" class="popover trml-telemetry-popover">
+            <button
+              id="telemetry-trigger"
+              type="button"
+              class="btn"
+              data-variant="outline"
+              data-size="xs"
+              aria-expanded="false"
+              aria-controls="telemetry-popover-panel"
+            >
+              <span class="trml-telem-dot" aria-hidden="true"></span>
+              <span id="telemetry-chip-label" class="trml-mono">Macro: —</span>
+            </button>
+            <div id="telemetry-popover-panel" data-popover aria-hidden="true" class="trml-telem-panel">
+              <div class="trml-telem-panel-head">
+                <strong>Q-MAX Engine Telemetry</strong>
+                <span class="trml-muted-text">Zero-DB RAM Snapshot</span>
+              </div>
+              <div id="telemetry-popover-body" class="trml-telem-grid">
+                <span class="trml-muted-text">Waiting for telemetry…</span>
+              </div>
+            </div>
+          </div>
+        </div>
 
-      <div class="pin-keypad">
-        <button class="pin-key" data-key="1">1</button>
-        <button class="pin-key" data-key="2">2</button>
-        <button class="pin-key" data-key="3">3</button>
-        <button class="pin-key" data-key="4">4</button>
-        <button class="pin-key" data-key="5">5</button>
-        <button class="pin-key" data-key="6">6</button>
-        <button class="pin-key" data-key="7">7</button>
-        <button class="pin-key" data-key="8">8</button>
-        <button class="pin-key" data-key="9">9</button>
-        <button class="pin-key pin-key-fn" data-key="clear">C</button>
-        <button class="pin-key" data-key="0">0</button>
-        <button class="pin-key pin-key-fn" data-key="backspace">&larr;</button>
+        <div class="trml-topbar-right">
+          <span id="utc-clock" class="trml-mono trml-clock hidden-mobile" title="UTC Execution Clock">--:--:-- UTC</span>
+
+          <button id="cmd-trigger-btn" type="button" class="btn hidden-mobile" data-variant="outline" data-size="xs" title="Quick Command (⌘K)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <span>Jump</span>
+            <kbd class="trml-kbd">⌘K</kbd>
+          </button>
+
+          <button id="ai-exec-btn" type="button" class="btn" data-variant="primary" data-size="xs" title="Gemini Executive Daily Debrief">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3Z"/></svg>
+            <span>AI Debrief</span>
+          </button>
+
+          <button id="theme-toggle-btn" type="button" class="btn" data-variant="outline" data-size="icon-xs" title="Switch Light / Dark theme" aria-label="Toggle Light or Dark theme">
+            <svg id="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+            <svg id="theme-icon-sun" class="hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+          </button>
+
+          <button id="refresh-btn" type="button" class="btn" data-variant="outline" data-size="icon-xs" title="Force Refresh" aria-label="Refresh telemetry">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+          </button>
+        </div>
       </div>
-    </div>
+    </header>
+
+    <main class="trml-main">
+      <!-- Conditional System Alerts (Circuit Breaker / Cluster SL Cooldown / Offline) -->
+      <div id="alert-stack" class="trml-alert-stack hidden" aria-live="polite"></div>
+
+      <!-- Asymmetric Capital & Risk Summary Strip -->
+      <section class="trml-hero-grid" aria-label="Portfolio summary">
+        <!-- 1. Primary Anchor: Account Equity & Risk Budget -->
+        <section class="card trml-hero-card" data-size="sm">
+          <header class="border-b trml-card-head">
+            <div>
+              <h2>Account Capital</h2>
+              <p>Mark-to-market equity &amp; exposure caps</p>
+            </div>
+            <span id="kpi-equity-delta" class="badge trml-mono" data-variant="outline">$0.00 PnL</span>
+          </header>
+          <section class="trml-capital-body">
+            <div class="trml-capital-top">
+              <div>
+                <div class="trml-field-label">Effective Equity</div>
+                <div id="kpi-equity" class="trml-equity-val trml-mono">$0.00</div>
+              </div>
+              <div class="trml-avail-wrap">
+                <div class="trml-field-label">Available Margin</div>
+                <div id="kpi-balance" class="trml-avail-val trml-mono">$0.00</div>
+              </div>
+            </div>
+
+            <div class="trml-meters">
+              <div class="trml-meter-row">
+                <div class="trml-meter-meta">
+                  <span>Daily Drawdown <span id="kpi-dd-max" class="trml-muted-text"></span></span>
+                  <span id="kpi-dd-val" class="trml-mono">0.00%</span>
+                </div>
+                <div class="progress trml-progress" role="progressbar" aria-label="Daily drawdown utilization" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                  <span id="kpi-dd-bar" style="width: 0%"></span>
+                </div>
+              </div>
+              <div class="trml-meter-row">
+                <div class="trml-meter-meta">
+                  <span>Active Slots</span>
+                  <span class="trml-mono"><span id="kpi-slots-val">0 / 0</span> <span id="kpi-slots-pct" class="trml-muted-text">(0%)</span></span>
+                </div>
+                <div class="progress trml-progress" role="progressbar" aria-label="Active position slots" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                  <span id="kpi-slots-bar" style="width: 0%"></span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <!-- 2. Execution Quality Ledger KPIs -->
+        <section class="card trml-hero-card" data-size="sm">
+          <header class="border-b trml-card-head">
+            <div>
+              <h2>Execution Outcomes</h2>
+              <p>Mode-isolated realized statistics</p>
+            </div>
+            <span id="stat-avgr" class="badge trml-mono" data-variant="outline">0.00 R</span>
+          </header>
+          <section class="trml-outcomes-grid">
+            <div class="trml-stat-cell">
+              <span class="trml-field-label">Closed Trades</span>
+              <strong id="stat-trades" class="trml-mono">0</strong>
+            </div>
+            <div class="trml-stat-cell">
+              <span class="trml-field-label">Win Rate</span>
+              <strong id="stat-winrate" class="trml-mono">0.0%</strong>
+            </div>
+            <div class="trml-stat-cell">
+              <span class="trml-field-label">Profit Factor</span>
+              <strong id="stat-pf" class="trml-mono">0.00</strong>
+            </div>
+            <div class="trml-stat-cell">
+              <span class="trml-field-label">Avg Win</span>
+              <strong id="stat-avgwin" class="trml-mono trml-pos">$0.00</strong>
+            </div>
+            <div class="trml-stat-cell">
+              <span class="trml-field-label">Avg Loss</span>
+              <strong id="stat-avgloss" class="trml-mono trml-neg">$0.00</strong>
+            </div>
+            <div class="trml-stat-cell">
+              <span class="trml-field-label">Regime &amp; TF</span>
+              <strong id="telemetry-inline-summary" class="trml-mono trml-text-sm">—</strong>
+            </div>
+          </section>
+        </section>
+
+        <!-- 3. Strategy Attribution & Q-MAX Snapshot -->
+        <section class="card trml-hero-card" data-size="sm">
+          <header class="border-b trml-card-head">
+            <div>
+              <h2>Alpha Attribution</h2>
+              <p>Per-strategy expectancy &amp; PnL breakdown</p>
+            </div>
+          </header>
+          <section class="trml-strat-body">
+            <div id="strategy-stats-list" class="trml-strat-list">
+              <div class="trml-muted-text">No closed strategy trades yet.</div>
+            </div>
+          </section>
+        </section>
+      </section>
+
+      <!-- Workspace Tabs -->
+      <div class="tabs trml-tabs" id="workspace-tabs">
+        <nav role="tablist" aria-orientation="horizontal" data-variant="line" class="trml-tablist">
+          <button type="button" role="tab" id="tab-desk" aria-controls="panel-desk" aria-selected="true">
+            <span>Desk</span>
+            <span id="tab-desk-count" class="badge trml-mono" data-variant="secondary">0</span>
+          </button>
+          <button type="button" role="tab" id="tab-ledger" aria-controls="panel-ledger" aria-selected="false">
+            <span>Trade Ledger</span>
+          </button>
+          <button type="button" role="tab" id="tab-audit" aria-controls="panel-audit" aria-selected="false">
+            <span>Signal Audit</span>
+          </button>
+        </nav>
+
+        <!-- Panel 1: Desk (Active Positions + Scanner Radar) -->
+        <div id="panel-desk" role="tabpanel" aria-labelledby="tab-desk" class="trml-tabpanel">
+          <!-- Active Positions -->
+          <section class="card trml-panel-card" data-size="sm">
+            <header class="border-b trml-panel-head">
+              <div class="trml-panel-title-wrap">
+                <h2>Active Positions</h2>
+                <span id="positions-count-badge" class="badge trml-mono" data-variant="secondary">0 open</span>
+              </div>
+              <span class="trml-muted-text">Live mark-to-market with SL/TP range track</span>
+            </header>
+
+            <div id="positions-table-wrap" class="table-container trml-table-wrap hidden">
+              <table class="table trml-table">
+                <thead>
+                  <tr>
+                    <th class="col-sticky">Symbol</th>
+                    <th>Side / Alpha</th>
+                    <th class="num">Size / Entry</th>
+                    <th class="num">Mark</th>
+                    <th>SL ↔ TP Track</th>
+                    <th class="num">uPnL / ROE</th>
+                    <th class="num">Hold</th>
+                    <th class="num">AI</th>
+                  </tr>
+                </thead>
+                <tbody id="positions-tbody"></tbody>
+              </table>
+            </div>
+            <div id="positions-mobile-list" class="trml-mobile-cards hidden"></div>
+            <section id="positions-empty" class="empty trml-empty">
+              <figure aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9 12h6"/></svg>
+              </figure>
+              <header>
+                <h3>Flat book — no open positions</h3>
+                <p>Bot is monitoring watched symbols for verified Q-MAX setups.</p>
+              </header>
+            </section>
+          </section>
+
+          <!-- Watched Scanner Radar -->
+          <section class="card trml-panel-card" data-size="sm">
+            <header class="border-b trml-panel-head">
+              <div class="trml-panel-title-wrap">
+                <h2>Scanner Radar</h2>
+                <span id="scanner-count-badge" class="badge trml-mono" data-variant="outline">0 coins</span>
+                <span id="scanner-updated" class="trml-muted-text trml-mono"></span>
+              </div>
+              <div class="trml-panel-actions">
+                <input
+                  id="scanner-filter"
+                  type="search"
+                  class="input trml-filter-input"
+                  placeholder="Filter symbol…"
+                  aria-label="Filter scanner symbols"
+                  autocomplete="off"
+                />
+              </div>
+            </header>
+
+            <div id="scanner-table-wrap" class="table-container trml-table-wrap">
+              <table class="table trml-table">
+                <thead>
+                  <tr>
+                    <th class="col-sticky">Symbol</th>
+                    <th class="num">Mark Price</th>
+                    <th class="num">Session VWAP</th>
+                    <th class="num">Dist VWAP%</th>
+                    <th class="num">Spread%</th>
+                    <th class="num">Funding</th>
+                    <th class="num">NATR%</th>
+                    <th class="num">RVOL</th>
+                  </tr>
+                </thead>
+                <tbody id="scanner-tbody"></tbody>
+              </table>
+            </div>
+            <div id="scanner-mobile-list" class="trml-mobile-cards"></div>
+            <section id="scanner-empty" class="empty trml-empty hidden">
+              <header>
+                <h3>No matching symbols</h3>
+                <p>Clear your filter or wait for the next scanner cycle.</p>
+              </header>
+            </section>
+          </section>
+        </div>
+
+        <!-- Panel 2: Trade Ledger -->
+        <div id="panel-ledger" role="tabpanel" aria-labelledby="tab-ledger" class="trml-tabpanel" hidden>
+          <section class="card trml-panel-card" data-size="sm">
+            <header class="border-b trml-panel-head">
+              <div class="trml-panel-title-wrap">
+                <h2>Trade Ledger</h2>
+                <span id="trades-summary" class="trml-muted-text trml-mono">0 records</span>
+              </div>
+              <div class="trml-panel-actions">
+                <div id="trades-strat-group" class="button-group trml-seg-group" role="group" aria-label="Filter trades by strategy">
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="ALL" aria-pressed="true">ALL</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="VWAP_PULLBACK" aria-pressed="false">VWAP</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="VOL_BREAKOUT" aria-pressed="false">VOL</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="REL_RESIDUAL" aria-pressed="false">REL</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="LIQ_SWEEP" aria-pressed="false">SWEEP</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="EMA_PULLBACK" aria-pressed="false">EMA</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="VWAP_BREAKDOWN" aria-pressed="false">BRK</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-strategy="STRUCTURE_BREAK" aria-pressed="false">STR</button>
+                </div>
+                <button id="ai-miner-btn" type="button" class="btn" data-variant="outline" data-size="xs" title="AI Losing Pattern Miner">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3Z"/></svg>
+                  <span>Pattern Miner</span>
+                </button>
+              </div>
+            </header>
+
+            <div id="trades-table-wrap" class="table-container trml-table-wrap">
+              <table class="table trml-table">
+                <thead>
+                  <tr>
+                    <th>Closed UTC</th>
+                    <th class="col-sticky">Symbol</th>
+                    <th>Side / Alpha</th>
+                    <th class="num">Entry → Exit</th>
+                    <th>Exit Reason</th>
+                    <th class="num">MAE / MFE</th>
+                    <th class="num">Net PnL</th>
+                    <th class="num">Autopsy</th>
+                  </tr>
+                </thead>
+                <tbody id="trades-tbody"></tbody>
+              </table>
+            </div>
+            <div id="trades-mobile-list" class="trml-mobile-cards"></div>
+            <section id="trades-empty" class="empty trml-empty hidden">
+              <header>
+                <h3>No closed trades found</h3>
+                <p>No trades match the selected strategy in this environment.</p>
+              </header>
+            </section>
+            <footer class="border-t trml-pagination" id="trades-pagination"></footer>
+          </section>
+        </div>
+
+        <!-- Panel 3: Signal Audit -->
+        <div id="panel-audit" role="tabpanel" aria-labelledby="tab-audit" class="trml-tabpanel" hidden>
+          <section class="card trml-panel-card" data-size="sm">
+            <header class="border-b trml-panel-head">
+              <div class="trml-panel-title-wrap">
+                <h2>Signal Audit Log</h2>
+                <span id="signals-summary" class="trml-muted-text trml-mono">0 signals</span>
+              </div>
+              <div class="trml-panel-actions">
+                <div id="signals-filter-group" class="button-group trml-seg-group" role="group" aria-label="Filter signal decisions">
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-status="ALL" aria-pressed="true">ALL</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-status="EXECUTED" aria-pressed="false">EXECUTED</button>
+                  <button type="button" class="btn" data-variant="outline" data-size="xs" data-status="REJECTED" aria-pressed="false">REJECTED</button>
+                </div>
+              </div>
+            </header>
+
+            <div id="signals-table-wrap" class="table-container trml-table-wrap">
+              <table class="table trml-table">
+                <thead>
+                  <tr>
+                    <th>Candle UTC</th>
+                    <th class="col-sticky">Symbol</th>
+                    <th>Side / Alpha</th>
+                    <th>Decision</th>
+                    <th>Primary Filter / Execution Note</th>
+                    <th class="num">Inspect</th>
+                  </tr>
+                </thead>
+                <tbody id="signals-tbody"></tbody>
+              </table>
+            </div>
+            <div id="signals-mobile-list" class="trml-mobile-cards"></div>
+            <section id="signals-empty" class="empty trml-empty hidden">
+              <header>
+                <h3>No signal logs available</h3>
+                <p>Signal telemetry appears once 5m bars close on watched symbols.</p>
+              </header>
+            </section>
+            <footer class="border-t trml-pagination" id="signals-pagination"></footer>
+          </section>
+        </div>
+      </div>
+    </main>
   </div>
 
-  <script src="/app.js?v=6"></script>
+  <!-- AI Copilot Slide-Over Sheet (Basecoat Sheet) -->
+  <dialog id="ai-sheet" class="sheet trml-sheet" data-side="right" aria-labelledby="ai-sheet-title">
+    <article>
+      <header class="border-b">
+        <div class="trml-sheet-head-row">
+          <div>
+            <h2 id="ai-sheet-title">AI Desk Copilot</h2>
+            <p id="ai-sheet-subtitle">Automated quantitative evaluation</p>
+          </div>
+          <span id="ai-sheet-model" class="badge trml-mono" data-variant="secondary">Gemini</span>
+        </div>
+      </header>
+      <section id="ai-sheet-body" class="trml-sheet-body"></section>
+      <footer class="border-t trml-sheet-footer">
+        <button id="ai-sheet-copy-btn" type="button" class="btn" data-variant="outline" data-size="sm">Copy Notes</button>
+        <button id="ai-sheet-close-btn" type="button" class="btn" data-variant="primary" data-size="sm">Done</button>
+      </footer>
+      <button type="button" aria-label="Close AI Copilot" onclick="document.getElementById('ai-sheet').close()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </article>
+  </dialog>
+
+  <!-- Signal Metrics Inspector Dialog (Basecoat Dialog) -->
+  <dialog id="signal-detail-dialog" class="dialog trml-dialog" aria-labelledby="signal-detail-title">
+    <div>
+      <header class="border-b trml-dialog-head">
+        <h2 id="signal-detail-title">Signal Metrics</h2>
+        <p id="signal-detail-subtitle">Snapshot diagnostics</p>
+      </header>
+      <section id="signal-detail-body" class="trml-dialog-body"></section>
+      <footer class="border-t trml-dialog-footer">
+        <button id="signal-detail-close-btn" type="button" class="btn" data-variant="outline" data-size="sm" onclick="document.getElementById('signal-detail-dialog').close()">Close</button>
+      </footer>
+      <button type="button" aria-label="Close dialog" onclick="document.getElementById('signal-detail-dialog').close()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+  </dialog>
+
+  <!-- Quick Command Palette (Basecoat Command Dialog) -->
+  <dialog id="cmd-dialog" class="command-dialog" aria-label="Quick desk navigation">
+    <div id="cmd-menu" class="command">
+      <header>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <input
+          id="cmd-input"
+          type="text"
+          placeholder="Jump to tab, symbol, or action…"
+          aria-autocomplete="list"
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="cmd-menu-list"
+        />
+      </header>
+      <div role="menu" id="cmd-menu-list" aria-orientation="vertical" data-empty="No matching commands or symbols.">
+        <div role="group" aria-labelledby="cmd-grp-nav">
+          <div role="heading" id="cmd-grp-nav">Workspace</div>
+          <div role="menuitem" data-cmd="tab:desk" data-keywords="positions scanner active">Open Desk (Active &amp; Radar)</div>
+          <div role="menuitem" data-cmd="tab:ledger" data-keywords="trades history pnl">Open Trade Ledger</div>
+          <div role="menuitem" data-cmd="tab:audit" data-keywords="signals rejected executed">Open Signal Audit</div>
+        </div>
+        <div role="group" aria-labelledby="cmd-grp-actions">
+          <div role="heading" id="cmd-grp-actions">Actions</div>
+          <div role="menuitem" data-cmd="action:refresh" data-keywords="reload sync">Refresh All Data</div>
+          <div role="menuitem" data-cmd="action:theme" data-keywords="light dark mode color">Toggle Light / Dark Theme</div>
+          <div role="menuitem" data-cmd="action:ai-debrief" data-keywords="gemini copilot executive summary">Run AI Executive Debrief</div>
+          <div role="menuitem" data-cmd="action:ai-miner" data-keywords="gemini losses pattern miner">Run AI Pattern Miner</div>
+        </div>
+        <div id="cmd-symbols-group" role="group" aria-labelledby="cmd-grp-symbols">
+          <div role="heading" id="cmd-grp-symbols">Active &amp; Scanned Symbols</div>
+        </div>
+      </div>
+    </div>
+  </dialog>
 </body>
 </html>

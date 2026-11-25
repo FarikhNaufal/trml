@@ -1,1556 +1,1474 @@
-/**
- * TRML Binance USDⓈ-M Futures Intraday Dashboard
- * Ultra-Lightweight Vanilla JS State & Controller
- */
+'use strict';
 
-// Global State
+// =========================================================================
+// TRML Quant Execution Desk Controller (Basecoat v1.3.0 + Vanilla JS)
+// =========================================================================
+
+const POLL_SUMMARY_IDLE_MS = 5000;
+const POLL_SUMMARY_ACTIVE_MS = 3000;
+const POLL_SCANNER_MS = 5000;
+
 const state = {
-  trades: {
-    page: 1,
-    limit: 10,
-    filter: 'ALL',
-    strategy: 'ALL',
-    totalPages: 1,
-    total: 0
-  },
-  signals: {
-    page: 1,
-    limit: 15,
-    decision: 'ALL',
-    symbol: 'ALL',
-    strategy: 'ALL',
-    totalPages: 1,
-    total: 0
-  },
-  knownSymbols: new Set(),
-  isPollingActive: true,
-  lastSummary: null,
   pinRequired: false,
-  pin: '',
-  geminiModel: 'gemini-2.5-flash',
-  currentAIMarkdown: ''
+  pinVerified: false,
+  storedPin: '',
+  pinSubmitting: false,
+
+  activeTab: 'desk', // 'desk' | 'ledger' | 'audit'
+  activeSlotsCount: 0,
+  consecutiveErrors: 0,
+
+  lastSummaryData: null,
+  lastScannerCoins: [],
+  scannerFilter: '',
+
+  tradesPage: 1,
+  tradesLimit: 20,
+  tradesTotal: 0,
+  tradesStrategy: 'ALL',
+
+  signalsPage: 1,
+  signalsLimit: 20,
+  signalsTotal: 0,
+  signalsFilter: 'ALL',
+  signalRecordsById: new Map(),
+
+  summaryTimer: null,
+  scannerTimer: null,
+  summaryInFlight: false,
+  scannerInFlight: false,
+
+  aiRequestSeq: 0,
+  aiRawMarkdown: '',
+  highlightSymbol: ''
 };
 
-// Authenticated Fetch wrapper menyematkan header X-TRML-PIN jika ada
-async function authFetch(url, options = {}) {
-  options.headers = options.headers || {};
-  const pin = localStorage.getItem('trml_pin');
-  if (pin) {
-    if (options.headers instanceof Headers) {
-      options.headers.set('X-TRML-PIN', pin);
-    } else {
-      options.headers['X-TRML-PIN'] = pin;
-    }
-  }
-  const res = await fetch(url, options);
-  if (res.status === 401 && state.pinRequired) {
-    showPinScreen('Sesi kedaluwarsa atau PIN tidak valid.');
-  }
-  return res;
-}
-
-// Lightweight Markdown Renderer (Anti-XSS Sanitized)
-function renderMarkdown(md) {
-  if (!md) return '';
-  let html = md
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-  html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
-  html = html.replace(/^## (.*$)/gim, '<h3>$1</h3>');
-  html = html.replace(/^# (.*$)/gim, '<h3>$1</h3>');
-  html = html.replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>');
-  html = html.replace(/^\s*[-*]\s+(.*$)/gim, '<li>$1</li>');
-  html = html.replace(/(<li>.*<\/li>)/gim, '<ul>$1</ul>');
-  html = html.replace(/<\/ul>\s*<ul>/gim, '');
-  html = html.replace(/\n\n/gim, '</p><p>');
-  html = html.replace(/\n/gim, '<br>');
-  return `<p>${html}</p>`;
-}
-
-// Utilities
-function escapeHtml(str) {
-  if (str === null || str === undefined) return '';
-  return String(str)
+// -------------------------------------------------------------------------
+// Security & Format Utilities
+// -------------------------------------------------------------------------
+function escapeHtml(val) {
+  if (val === null || val === undefined) return '';
+  return String(val)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/'/g, '&#39;');
 }
 
-function formatUSD(val) {
-  if (isNaN(val)) return '$0.00';
-  return '$' + Number(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function showToast(category, title, description = '') {
+  const toaster = document.getElementById('toaster');
+  if (!toaster || typeof toaster.toast !== 'function') return;
+  toaster.toast({ category, title, description });
 }
 
-function formatSignedUSD(val) {
-  if (isNaN(val)) return '$0.00';
-  const prefix = val > 0 ? '+$' : (val < 0 ? '-$' : '$');
-  return prefix + Math.abs(val).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function fmtMoney(val, showSign = false) {
+  const n = Number(val || 0);
+  const abs = Math.abs(n).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+  if (n < 0) return `-$${abs}`;
+  if (showSign && n > 0) return `+$${abs}`;
+  return `$${abs}`;
 }
 
-function formatSignedPct(val) {
-  if (isNaN(val)) return '0.00%';
-  const prefix = val > 0 ? '+' : '';
-  return prefix + Number(val).toFixed(2) + '%';
+function fmtPrice(val) {
+  const n = Number(val || 0);
+  if (n === 0 || !Number.isFinite(n)) return '0';
+  if (Math.abs(n) >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (Math.abs(n) >= 10) return n.toFixed(3);
+  if (Math.abs(n) >= 0.1) return n.toFixed(4);
+  return n.toFixed(5);
 }
 
-function formatTimeUTC(isoStr) {
-  if (!isoStr) return '--';
-  const d = new Date(isoStr);
-  if (isNaN(d.getTime())) return isoStr;
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const min = String(d.getUTCMinutes()).padStart(2, '0');
-  const ss = String(d.getUTCSeconds()).padStart(2, '0');
-  return `${mm}-${dd} ${hh}:${min}:${ss}`;
+function fmtPct(val, decimals = 2, showSign = false) {
+  const n = Number(val || 0);
+  if (!Number.isFinite(n)) return '0.00%';
+  const prefix = showSign && n > 0 ? '+' : '';
+  return `${prefix}${n.toFixed(decimals)}%`;
 }
 
-function formatDuration(sec) {
-  if (!sec || sec < 0) return '0s';
-  if (sec < 60) return `${sec}s`;
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  if (m < 60) return `${m}m ${s}s`;
+function fmtFunding(val) {
+  const pct = Number(val || 0) * 100;
+  const prefix = pct > 0 ? '+' : '';
+  return `${prefix}${pct.toFixed(4)}%`;
+}
+
+function fmtDuration(sec) {
+  const s = Math.max(0, Math.floor(Number(sec || 0)));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m < 60) return `${m}m ${r}s`;
   const h = Math.floor(m / 60);
-  const remM = m % 60;
-  return `${h}h ${remM}m`;
+  return `${h}h ${m % 60}m`;
 }
 
-function renderStrategyBadge(strategyID) {
-  const raw = (strategyID || '').trim().toUpperCase();
-  const badgeMap = {
-    VWAP_PULLBACK: '<span class="badge badge-strat-vwap" title="VWAP_PULLBACK">VWAP</span>',
-    LIQUIDITY_SWEEP_SHORT: '<span class="badge badge-strat-sweep" title="LIQUIDITY_SWEEP_SHORT">SWEEP</span>',
-    VOL_BREAKOUT: '<span class="badge badge-tp" title="VOL_BREAKOUT">BREAKOUT</span>',
-    EMA_PULLBACK: '<span class="badge badge-time" title="EMA_PULLBACK">EMA_PB</span>',
-    VWAP_BREAKDOWN: '<span class="badge badge-sl" title="VWAP_BREAKDOWN">VWAP_BD</span>',
-    STRUCTURE_BREAK: '<span class="badge badge-be" title="STRUCTURE_BREAK">STRUCT_BRK</span>',
-    REL_RESIDUAL: '<span class="badge badge-time" title="REL_RESIDUAL">REL_RESID</span>'
+function fmtUTC(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return escapeHtml(iso);
+  const pad = (x) => String(x).padStart(2, '0');
+  return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function formatStrategyLabel(raw) {
+  const map = {
+    VWAP_PULLBACK: 'VWAP',
+    VOL_BREAKOUT: 'VOL',
+    REL_RESIDUAL: 'REL',
+    LIQ_SWEEP: 'SWEEP',
+    EMA_PULLBACK: 'EMA',
+    VWAP_BREAKDOWN: 'BRK',
+    STRUCTURE_BREAK: 'STRUCT'
   };
-  if (!raw) {
-    return badgeMap.VWAP_PULLBACK;
-  }
-  return badgeMap[raw] || `<span class="badge badge-time" title="${escapeHtml(raw)}">${escapeHtml(raw)}</span>`;
+  const key = String(raw || 'VWAP_PULLBACK').trim().toUpperCase();
+  return map[key] || key.slice(0, 8);
 }
 
-function updateConnectionStatus(isOnline) {
-  const dot = document.getElementById('status-dot');
-  const txt = document.getElementById('status-text');
-  if (dot && txt) {
-    if (isOnline) {
-      dot.classList.remove('offline');
-      txt.textContent = 'ONLINE';
-    } else {
-      dot.classList.add('offline');
-      txt.textContent = 'OFFLINE';
-    }
-  }
-}
-
-// 1. Fetch Summary & KPIs
-async function fetchSummary() {
-  try {
-    const res = await authFetch('/api/summary');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    state.lastSummary = data;
-    updateConnectionStatus(true);
-    renderSummary(data);
-  } catch (err) {
-    console.warn('Failed to fetch summary:', err);
-    updateConnectionStatus(false);
-  }
-}
-
-function renderSummary(data) {
-  if (data.gemini_model) {
-    state.geminiModel = data.gemini_model;
-  }
-  // Environment Badge
-  const envBadge = document.getElementById('env-badge');
-  if (envBadge) {
-    envBadge.textContent = data.env || 'DRY-RUN';
-    if (data.env === 'LIVE') {
-      envBadge.className = 'env-badge env-live';
-    } else {
-      envBadge.className = 'env-badge env-dryrun';
-    }
-  }
-
-  // Equity & Balance
-  const elEquity = document.getElementById('kpi-equity');
-  const elBalance = document.getElementById('kpi-balance');
-  if (elEquity) elEquity.textContent = formatUSD(data.equity);
-  if (elBalance) elBalance.textContent = `Avail: ${formatUSD(data.balance)}`;
-
-  // Net PnL & Win Rate
-  const stats = data.stats || {};
-  const elPnL = document.getElementById('kpi-pnl');
-  const elTradesCount = document.getElementById('kpi-trades-count');
-  const elWinRate = document.getElementById('kpi-winrate');
-  if (elPnL) {
-    elPnL.textContent = formatSignedUSD(stats.total_net_pnl_usdt || 0);
-    elPnL.className = 'kpi-value ' + (stats.total_net_pnl_usdt > 0 ? 'val-green' : (stats.total_net_pnl_usdt < 0 ? 'val-red' : ''));
-  }
-  if (elTradesCount) elTradesCount.textContent = `${stats.total_trades || 0} Closed Setups`;
-  if (elWinRate) {
-    const adjWR = stats.adjusted_win_rate_pct !== undefined && stats.adjusted_win_rate_pct > 0 
-      ? stats.adjusted_win_rate_pct 
-      : (stats.win_rate_pct || 0);
-    elWinRate.textContent = `${adjWR.toFixed(1)}% WR`;
-    elWinRate.title = `Pure Trading WR: ${adjWR.toFixed(1)}% (Wins / Wins+Losses)\nAll-inclusive WR: ${(stats.win_rate_pct || 0).toFixed(1)}% (Wins / Total)`;
-  }
-
-  // Realized R:R (Target Full RR terhadap SL)
-  const elRR = document.getElementById('kpi-rr');
-  const elRRSub = document.getElementById('kpi-rr-sub');
-  if (elRR) {
-    const rrVal = stats.realized_rr || stats.blended_rr || 0;
-    elRR.textContent = `${rrVal.toFixed(2)} : 1`;
-  }
-  if (elRRSub) {
-    const fullWin = stats.avg_full_win_usdt || stats.avg_win_usdt || 0;
-    const avgLoss = stats.avg_loss_usdt || 0;
-    elRRSub.textContent = `Full +${formatUSD(fullWin)} / -${formatUSD(avgLoss)}`;
-  }
-
-  // Daily Drawdown
-  const elDD = document.getElementById('kpi-drawdown');
-  const elDDSub = document.getElementById('kpi-drawdown-sub');
-  const ddPct = (data.daily_drawdown_pct || 0) * 100;
-  if (elDD) {
-    elDD.textContent = formatSignedPct(ddPct);
-    elDD.className = 'kpi-value ' + (ddPct < -2.0 ? 'val-red' : (ddPct < 0 ? 'val-yellow' : 'val-green'));
-  }
-  if (elDDSub) {
-    const maxDD = Math.abs(data.max_daily_drawdown_pct || 0.03);
-    const maxDDPct = (maxDD < 1 ? maxDD * 100 : maxDD).toFixed(2);
-    elDDSub.textContent = data.circuit_breaker ? 'CIRCUIT BREAKER TRIPPED' : `Breaker: Max ${maxDDPct}%`;
-    elDDSub.classList.toggle('val-red', !!data.circuit_breaker);
-  }
-
-  // Active Slots
-  const elSlots = document.getElementById('kpi-slots');
-  const elSlotsSub = document.getElementById('kpi-slots-sub');
-  const maxSlots = data.max_slots !== undefined ? data.max_slots : 3;
-  const activeSlots = data.active_slots || 0;
-  if (elSlots) elSlots.textContent = `${activeSlots} / ${maxSlots}`;
-  if (elSlotsSub) {
-    const avail = maxSlots - activeSlots;
-    elSlotsSub.textContent = `${avail} Slots Available`;
-  }
-
-  // Outcomes breakdown: Tampilkan 4 pilar lengkap (Full TP, Part TP, Pure BE, SL)
-  const elOutcomes = document.getElementById('kpi-outcomes');
-  const elOutcomesSub = document.getElementById('kpi-outcomes-sub');
-  if (elOutcomes) {
-    const fullTP = stats.full_wins_count || 0;
-    const partTP = stats.partial_wins_count || 0;
-    const pureBE = stats.break_even_count || 0;
-    const sl = stats.losses_count || 0;
-    elOutcomes.innerHTML = `
-      <span class="val-green" title="Full Target Win (TP2 / Trailing / Profit Lock)">${fullTP} Full TP</span> &bull; 
-      <span class="val-blue" title="Partial Scale-Out Win (TP1 Hit + Runner BE)">${partTP} Part TP</span> &bull; 
-      <span class="val-yellow" title="Pure Break-Even (Rem Dini Tier 1 ~$0.00)">${pureBE} BE</span> &bull; 
-      <span class="val-red" title="Full Stop Loss">${sl} SL</span>
-    `;
-  }
-  if (elOutcomesSub) {
-    const pf = stats.profit_factor ? stats.profit_factor.toFixed(2) : '—';
-    const adjWR = stats.adjusted_win_rate_pct ? stats.adjusted_win_rate_pct.toFixed(1) : (stats.win_rate_pct ? stats.win_rate_pct.toFixed(1) : '—');
-    elOutcomesSub.textContent = `Pure WR: ${adjWR}% • Profit Factor: ${pf}`;
-  }
-
-  // Render Strategy Attribution Strip
-  const stratStrip = document.getElementById('strategy-attribution-strip');
-  if (stratStrip) {
-    const stratStats = Array.isArray(data.strategy_stats) ? data.strategy_stats : [];
-    if (stratStats.length === 0) {
-      stratStrip.classList.add('hidden');
-      stratStrip.innerHTML = '';
-    } else {
-      stratStrip.classList.remove('hidden');
-      stratStrip.innerHTML = stratStats.map((st) => {
-        const pnlCls = st.total_net_pnl_usdt > 0 ? 'val-green' : (st.total_net_pnl_usdt < 0 ? 'val-red' : '');
-        const wr = (st.adjusted_win_rate_pct > 0 ? st.adjusted_win_rate_pct : (st.win_rate_pct || 0)).toFixed(1);
-        const pf = typeof st.profit_factor === 'number' ? st.profit_factor.toFixed(2) : '0.00';
-        return `
-          <div class="strategy-chip">
-            ${renderStrategyBadge(st.strategy_id)}
-            <div class="strategy-chip-metrics">
-              <span><strong>${st.total_trades || 0}</strong> trades</span>
-              <span>WR <strong>${wr}%</strong></span>
-              <span>Net PF <strong>${pf}</strong></span>
-              <span class="${pnlCls}"><strong>${formatSignedUSD(st.total_net_pnl_usdt || 0)}</strong></span>
-            </div>
-          </div>
-        `;
-      }).join('');
-    }
-  }
-
-  // Render Active Positions
-  renderActivePositions(data.positions || []);
-}
-
-function renderActivePositions(positions) {
-  const container = document.getElementById('positions-container');
-  const badge = document.getElementById('pos-count-badge');
-  if (badge) badge.textContent = `${positions.length} Open`;
-
-  if (!container) return;
-
-  if (!positions || positions.length === 0) {
-    container.classList.add('is-empty');
-    container.innerHTML = `
-      <div class="empty-state">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <circle cx="12" cy="12" r="10"/>
-          <path d="M12 6v6l4 2"/>
-        </svg>
-        <div>No active positions open. Scanner is monitoring top liquid coins for high-conviction retests.</div>
-      </div>
-    `;
-    return;
-  }
-
-  container.classList.remove('is-empty');
-
-  // Urutkan posisi secara stabil & deterministik: koin yang paling baru dibuka berada di urutan teratas/depan
-  const sortedPositions = [...positions].sort((a, b) => {
-    const timeA = new Date(a.open_time_utc || 0).getTime();
-    const timeB = new Date(b.open_time_utc || 0).getTime();
-    if (timeA !== timeB) return timeB - timeA;
-    return (a.symbol || '').localeCompare(b.symbol || '');
+function sanitizeMarkdown(md) {
+  if (!md) return '';
+  const escaped = escapeHtml(md);
+  const blocks = [];
+  const withPlaceholders = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
+    const idx = blocks.length;
+    blocks.push(`<pre><code>${code.trim()}</code></pre>`);
+    return `\n@@CODEBLOCK_${idx}@@\n`;
   });
 
+  const lines = withPlaceholders.split('\n');
   let html = '';
-  for (const pos of sortedPositions) {
-    const sideClass = pos.side === 'LONG' ? 'pos-side-long' : 'pos-side-short';
-    const pnlClass = pos.unrealized_pnl >= 0 ? 'val-green' : 'val-red';
-    let beBadge = '';
-    if (pos.protection_tier === 3) {
-      beBadge = '<span class="badge badge-tp" style="margin-left: 6px; background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4);">TRAILING</span>';
-    } else if (pos.protection_tier === 2) {
-      beBadge = '<span class="badge badge-tp" style="margin-left: 6px;">PROFIT LOCK</span>';
-    } else if (pos.is_break_even) {
-      beBadge = '<span class="badge badge-be" style="margin-left: 6px;">BE MOVED</span>';
+  let inList = false;
+
+  const closeList = () => {
+    if (inList) {
+      html += '</ul>';
+      inList = false;
     }
+  };
 
-    html += `
-      <div class="position-card">
-        <div class="pos-header">
-          <div class="pos-symbol">
-            <span>${escapeHtml(pos.symbol)}</span>
-            <span class="pos-side-pill ${sideClass}">${escapeHtml(pos.side)}</span>
-            ${renderStrategyBadge(pos.strategy_id)}
-            ${beBadge}
-          </div>
-          <div style="display:flex; align-items:center; gap:8px;">
-            <div class="pos-pnl-pill ${pnlClass}">
-              ${formatSignedUSD(pos.unrealized_pnl)} (${formatSignedPct(pos.unrealized_roe_pct)})
-            </div>
-            <button class="btn-ai-action btn-ai-position" data-symbol="${escapeHtml(pos.symbol)}" title="In-Flight Position Health Check" aria-label="In-Flight Position Health Check">
-              <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
-                <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="pos-details-grid">
-          <div class="pos-metric">
-            <span class="pos-metric-label">Entry Price</span>
-            <span class="pos-metric-val">${pos.entry_price}</span>
-          </div>
-          <div class="pos-metric">
-            <span class="pos-metric-label">Mark Price</span>
-            <span class="pos-metric-val">${pos.mark_price > 0 ? pos.mark_price : '--'}</span>
-          </div>
-          <div class="pos-metric">
-            <span class="pos-metric-label">Size / Qty</span>
-            <span class="pos-metric-val">${pos.qty}</span>
-          </div>
-          <div class="pos-metric">
-            <span class="pos-metric-label">Hold Duration</span>
-            <span class="pos-metric-val">${formatDuration(pos.duration_sec)}</span>
-          </div>
-        </div>
-
-        <div class="pos-targets">
-          <span class="target-badge">SL: <span class="val-red">${pos.sl_price || '--'}</span></span>
-          <span class="target-badge">TP: <span class="val-green">${pos.tp_price || '--'}</span></span>
-          <span class="target-badge" style="margin-left: auto; color: var(--text-secondary); font-size: 10px;">
-            ${formatTimeUTC(pos.open_time_utc)}
-          </span>
-        </div>
-      </div>
-    `;
-  }
-  container.innerHTML = html;
-}
-
-// 2. Fetch Scanner Radar
-async function fetchScanner() {
-  try {
-    const res = await authFetch('/api/scanner');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    renderScanner(data);
-  } catch (err) {
-    console.warn('Failed to fetch scanner radar:', err);
-  }
-}
-
-function renderScanner(data) {
-  const tbody = document.getElementById('radar-tbody');
-  const lastScanEl = document.getElementById('radar-last-scan');
-  if (lastScanEl && data.scanned_at_utc) {
-    lastScanEl.textContent = `Last Scan: ${formatTimeUTC(data.scanned_at_utc)}`;
-  }
-
-  const countBadge = document.getElementById('radar-count-badge');
-  const coins = data.coins || [];
-  if (countBadge) {
-    countBadge.textContent = coins.length > 0 ? `Top ${coins.length} Scanner` : '0 Watched';
-  }
-
-  if (!tbody) return;
-  if (coins.length === 0) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 24px;">
-          No watched coins available yet. Scanner is bootstrapping...
-        </td>
-      </tr>
-    `;
-    return;
-  }
-
-  let html = '';
-  for (const c of coins) {
-    // Add symbol to known list for signals filter
-    if (c.symbol && !state.knownSymbols.has(c.symbol)) {
-      state.knownSymbols.add(c.symbol);
-      updateSymbolDropdown();
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      closeList();
+      continue;
     }
-
-    const dist = c.dist_vwap_pct || 0;
-    const distClass = dist >= 0 ? 'val-green' : 'val-red';
-    const barFillWidth = Math.min(Math.abs(dist) * 20, 100);
-    const barFillColor = dist >= 0 ? 'var(--buy-green)' : 'var(--sell-red)';
-    const rvolBadge = c.rvol >= 1.8 ? '<span class="badge badge-tp" style="font-size:10px;">HOT</span>' : '';
-
-    html += `
-      <tr>
-        <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(c.symbol)}</strong></td>
-        <td>${c.mark_price ? c.mark_price.toFixed(4) : '--'}</td>
-
-        <td>${c.session_vwap ? c.session_vwap.toFixed(4) : '--'}</td>
-        <td>
-          <div class="vwap-bar-cell">
-            <div class="vwap-bar-track">
-              <div class="vwap-bar-fill" style="width: ${barFillWidth}%; background: ${barFillColor};"></div>
-            </div>
-            <span class="${distClass}">${formatSignedPct(dist)}</span>
-          </div>
-        </td>
-        <td>${c.natr_pct ? c.natr_pct.toFixed(2) + '%' : '--'}</td>
-        <td>${c.rvol ? c.rvol.toFixed(2) : '--'} ${rvolBadge}</td>
-        <td>${c.spread_pct != null ? Number(c.spread_pct).toFixed(3) + '%' : '--'}</td>
-        <td class="${(c.funding_rate || 0) > 0 ? 'val-red' : 'val-green'}">
-          ${c.funding_rate ? (c.funding_rate * 100).toFixed(4) + '%' : '0.0000%'}
-        </td>
-      </tr>
-    `;
-  }
-  tbody.innerHTML = html;
-}
-
-function updateSymbolDropdown() {
-  const select = document.getElementById('signal-symbol-select');
-  if (!select) return;
-  const currentVal = select.value;
-
-  let opts = '<option value="ALL">All Symbols</option>';
-  const sorted = Array.from(state.knownSymbols).sort();
-  for (const sym of sorted) {
-    opts += `<option value="${escapeHtml(sym)}">${escapeHtml(sym)}</option>`;
-  }
-  select.innerHTML = opts;
-  select.value = currentVal;
-}
-
-// 3. Fetch Paginated Trade Ledger
-async function fetchTrades() {
-  try {
-    const params = new URLSearchParams({
-      page: state.trades.page,
-      limit: state.trades.limit,
-      status: state.trades.filter,
-      strategy: state.trades.strategy
-    });
-    const res = await authFetch(`/api/trades?${params.toString()}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    state.trades.total = data.total || 0;
-    state.trades.totalPages = Math.max(1, Math.ceil(state.trades.total / state.trades.limit));
-    renderTrades(data.trades || []);
-  } catch (err) {
-    console.warn('Failed to fetch trades:', err);
-  }
-}
-
-function renderTrades(trades) {
-  const tbody = document.getElementById('trades-tbody');
-  const mobileStream = document.getElementById('trades-mobile-stream');
-  const pageInfo = document.getElementById('trades-page-info');
-  const totalBadge = document.getElementById('trades-total-badge');
-  const btnPrev = document.getElementById('trades-btn-prev');
-  const btnNext = document.getElementById('trades-btn-next');
-
-  if (totalBadge) totalBadge.textContent = `${state.trades.total} Records`;
-  if (pageInfo) pageInfo.textContent = `Page ${state.trades.page} of ${state.trades.totalPages} (${state.trades.total} Total)`;
-  if (btnPrev) btnPrev.disabled = state.trades.page <= 1;
-  if (btnNext) btnNext.disabled = state.trades.page >= state.trades.totalPages;
-
-  if (!trades || trades.length === 0) {
-    const emptyRow = `
-      <tr>
-        <td colspan="12" style="text-align: center; color: var(--text-secondary); padding: 24px;">
-          No trade records match current filter.
-        </td>
-      </tr>
-    `;
-    if (tbody) tbody.innerHTML = emptyRow;
-    if (mobileStream) {
-      mobileStream.innerHTML = `<div class="empty-state">No trade records match current filter.</div>`;
+    if (line.startsWith('@@CODEBLOCK_') && line.endsWith('@@')) {
+      closeList();
+      const idx = Number(line.slice(12, -2));
+      html += blocks[idx] || '';
+      continue;
     }
-    return;
-  }
-
-  let tableHtml = '';
-  let streamHtml = '';
-
-  for (const t of trades) {
-    const pnlClass = t.net_pnl_usdt > 0 ? 'val-green' : (t.net_pnl_usdt < 0 ? 'val-red' : '');
-    const sideClass = t.side === 'LONG' ? 'pos-side-long' : 'pos-side-short';
-
-    let reasonBadge = '<span class="badge badge-time">' + escapeHtml(t.exit_reason) + '</span>';
-    if (t.exit_reason === 'TAKE_PROFIT') {
-      reasonBadge = '<span class="badge badge-tp">TAKE PROFIT</span>';
-    } else if (t.exit_reason === 'PROFIT_LOCK') {
-      reasonBadge = '<span class="badge badge-tp">PROFIT LOCK</span>';
-    } else if (t.exit_reason === 'TRAILING_STOP') {
-      reasonBadge = '<span class="badge badge-tp" style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4);">TRAILING STOP</span>';
-    } else if (t.exit_reason === 'PARTIAL_TAKE_PROFIT') {
-      reasonBadge = '<span class="badge badge-tp">PARTIAL TP</span>';
-    } else if (t.exit_reason === 'BREAK_EVEN') {
-      reasonBadge = '<span class="badge badge-be">BREAK EVEN</span>';
-    } else if (t.exit_reason === 'STOP_LOSS') {
-      reasonBadge = '<span class="badge badge-sl">STOP LOSS</span>';
+    if (line.startsWith('### ')) {
+      closeList();
+      html += `<h3>${inlineMd(line.slice(4))}</h3>`;
+      continue;
     }
-
-    const roeVal = typeof t.roe_pct === 'number' && !isNaN(t.roe_pct) ? t.roe_pct : 0;
-
-    // Desktop Row
-    tableHtml += `
-      <tr>
-        <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(t.symbol)}</strong></td>
-        <td>${formatTimeUTC(t.closed_at_utc)}</td>
-        <td><span class="pos-side-pill ${sideClass}">${escapeHtml(t.side)}</span></td>
-        <td>${renderStrategyBadge(t.strategy_id)}</td>
-        <td>${escapeHtml(t.qty)}</td>
-        <td>${escapeHtml(t.entry_price)}</td>
-        <td>${escapeHtml(t.exit_price)}</td>
-        <td class="${pnlClass}">
-          <strong>${formatSignedUSD(t.net_pnl_usdt)}</strong>
-          <span style="font-size: 11px; opacity: 0.85; margin-left: 3px;">(${formatSignedPct(roeVal)})</span>
-        </td>
-        <td>-${(t.mae_pct || 0).toFixed(2)}% / +${(t.mfe_pct || 0).toFixed(2)}%</td>
-        <td>${formatDuration(t.duration_sec)}</td>
-        <td>${reasonBadge}</td>
-        <td style="text-align: center;">
-          <button class="btn-ai-action btn-ai-autopsy" data-order-id="${escapeHtml(t.client_order_id)}" title="Post-Trade AI Autopsy" aria-label="Post-Trade AI Autopsy">
-            <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
-              <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
-            </svg>
-          </button>
-        </td>
-      </tr>
-    `;
-
-    // Mobile Card Stream
-    streamHtml += `
-      <div class="stream-card">
-        <div class="stream-card-row">
-          <div style="display:flex; align-items:center; gap:6px;">
-            <strong>${escapeHtml(t.symbol)}</strong>
-            <span class="pos-side-pill ${sideClass}">${escapeHtml(t.side)}</span>
-            ${renderStrategyBadge(t.strategy_id)}
-          </div>
-          <div style="display:flex; align-items:center; gap:8px;">
-            ${reasonBadge}
-            <button class="btn-ai-action btn-ai-autopsy" data-order-id="${escapeHtml(t.client_order_id)}" title="Post-Trade AI Autopsy" aria-label="Post-Trade AI Autopsy">
-              <svg class="ai-sparkle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"/>
-                <path d="M20 3L20.5 5.5L23 6L20.5 6.5L20 9L19.5 6.5L17 6L19.5 5.5L20 3Z"/>
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="stream-card-row">
-          <span class="stream-card-label">Net PnL</span>
-          <span class="${pnlClass}" style="font-size:15px; font-weight:700;">
-            ${formatSignedUSD(t.net_pnl_usdt)} <span style="font-size:12px; font-weight:500; opacity:0.85;">(${formatSignedPct(roeVal)})</span>
-          </span>
-        </div>
-
-        <div class="stream-card-row">
-          <span class="stream-card-label">Entry &rarr; Exit</span>
-          <span>${escapeHtml(t.entry_price)} &rarr; ${escapeHtml(t.exit_price)}</span>
-        </div>
-
-        <div class="stream-card-row">
-          <span class="stream-card-label">Hold / Excursions</span>
-          <span>${formatDuration(t.duration_sec)} (MAE: -${(t.mae_pct||0).toFixed(2)}% / MFE: +${(t.mfe_pct||0).toFixed(2)}%)</span>
-        </div>
-
-        <div class="stream-card-row" style="font-size:11px; color:var(--text-secondary); border-top:1px dashed var(--border-subtle); padding-top:6px;">
-          <span>Closed: ${formatTimeUTC(t.closed_at_utc)}</span>
-          <span>Qty: ${escapeHtml(t.qty)}</span>
-        </div>
-      </div>
-    `;
+    if (line.startsWith('## ')) {
+      closeList();
+      html += `<h2>${inlineMd(line.slice(3))}</h2>`;
+      continue;
+    }
+    if (line.startsWith('# ')) {
+      closeList();
+      html += `<h1>${inlineMd(line.slice(2))}</h1>`;
+      continue;
+    }
+    if (line.startsWith('- ') || line.startsWith('* ')) {
+      if (!inList) {
+        html += '<ul>';
+        inList = true;
+      }
+      html += `<li>${inlineMd(line.slice(2))}</li>`;
+      continue;
+    }
+    closeList();
+    html += `<p>${inlineMd(line)}</p>`;
   }
-
-  if (tbody) tbody.innerHTML = tableHtml;
-  if (mobileStream) mobileStream.innerHTML = streamHtml;
+  closeList();
+  return html;
 }
 
-// 4. Fetch Paginated Signal Audit Log
-async function fetchSignals() {
-  try {
-    const params = new URLSearchParams({
-      page: state.signals.page,
-      limit: state.signals.limit,
-      decision: state.signals.decision,
-      symbol: state.signals.symbol,
-      strategy: state.signals.strategy
-    });
-    const res = await authFetch(`/api/signals?${params.toString()}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    state.signals.total = data.total || 0;
-    state.signals.totalPages = Math.max(1, Math.ceil(state.signals.total / state.signals.limit));
-    renderSignals(data.signals || []);
-  } catch (err) {
-    console.warn('Failed to fetch signals:', err);
-  }
+function inlineMd(s) {
+  return s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>');
 }
 
-function formatAuditReason(decision, code, subReason, strategyID) {
-  const isApp = decision === 'APPROVE' || decision === 'APPROVED';
-  if (isApp) {
-    const stratNorm = (strategyID || '').trim().toUpperCase();
-    const appText = stratNorm === 'LIQUIDITY_SWEEP_SHORT'
-      ? 'Sweep &amp; Delta Validated'
-      : 'Retest &amp; Delta Validated';
-    return `
-      <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-        <span class="badge badge-approved" style="font-size:11px;">✓ CRITERIA MET</span>
-        <span class="audit-pill audit-pill-app">${appText}</span>
-      </div>
-    `;
-  }
-
-  // Strip internal telemetry tags like |OI_BOOTSTRAPPED
-  let cleaned = (subReason || '')
-    .replace(/\|?OI_BOOTSTRAPPED/g, '')
-    .trim();
-
+function parseSignalReasonTokens(raw) {
   const labelMap = {
-    'NO_PRIOR_IMPULSE': 'No Prior Impulse (18b)',
-    'VWAP_NOT_TESTED': 'VWAP Not Retested',
-    'CANDLE_NOT_BULLISH': 'Candle Not Bullish',
-    'CANDLE_NOT_BEARISH': 'Candle Not Bearish',
-    'WEAK_DELTA_ZSCORE': 'Weak Delta Z-Score',
-    'LOW_OI_DELTA': 'Low OI Delta (< +0.05%)',
-    'ADVERSE_FUNDING': 'Adverse Funding Rate',
-    'CLOSE_ABOVE_VWAP': 'Close Above VWAP',
-    'CLOSE_BELOW_VWAP': 'Close Below VWAP',
-    'BTC_GATE_VETO': 'BTC Macro Veto Active',
-    'BTC_CHOP_LONG_VETO': 'BTC High-Vol Chop (Long Veto)',
-    'BTC_CHOP_SHORT_VETO': 'BTC High-Vol Chop (Short Veto)',
-    'UTC_HOUR_BLOCKED': 'Blocked UTC Whipsaw Hour',
-    'SLOTS_FULL': 'Slots Full',
-    'SYMBOL_ALREADY_ACTIVE': 'Symbol Already Active',
-    'NATR_OUT_OF_BOUNDS': 'NATR Out of Bounds',
-    'SPREAD_EXCEEDED': 'Spread Exceeded',
-    'ENTRY_TOO_FAR_FROM_VWAP': 'Entry Too Far From VWAP',
-    'ENTRY_TOO_FAR_FROM_EMA200': 'Entry Too Far From EMA200 (Overextended)',
-    'STALE_MARK_PRICE_FEED': 'Stale Mark Price Feed',
-    'INVALID_OI_INTERVAL': 'Invalid OI Interval',
-    'MISSING_OI_DATA': 'Missing OI Data',
-    'SWEEP_CONDITIONS_NOT_MET': 'Sweep Criteria Not Met',
-    'SWEEP_INSUFFICIENT_HISTORY': 'Sweep Insufficient History',
-    'NO_HIGH_SWEEP_RECLAIM': 'No 12-Bar High Sweep & Reclaim',
-    'WEAK_REJECTION_CANDLE': 'Weak Bearish Rejection Wick',
-    'NO_SWEEP_HIGH': 'No 12-Bar High Sweep',
-    'SWEEP_REJECTION_WICK': 'Weak Sweep Rejection Wick',
-    'EMA200_CHOP_ZONE': 'Too Close To EMA200',
-    'TREND_ABOVE_EMA200': 'Above EMA200 (Short Disabled)',
-    'HTF_EMA_WARMING_UP': 'HTF 1H EMA200 Masih Warmup',
-    'HTF_EMA_TREND_MISMATCH': 'Tren HTF 1H Tidak Searah',
-    'HTF_EMA_RISING_BLOCK_SHORT': 'Slope HTF EMA Naik (Blokir Short)',
-    'MARKET_BREADTH_TOO_LOW': 'Breadth Pasar Altcoin Terlalu Lemah',
-    'RS4H_TOO_STRONG_FOR_SHORT': 'Relative Strength 4H Terlalu Kuat untuk Short',
-    'PORTFOLIO_CLUSTER_SL_COOLDOWN': 'Jeda Portofolio (Cluster Stop Loss)',
-    'BAR_ENTRY_CAP_REACHED': 'Batas Entry Baru per Bar Tercapai',
-    'DD_THROTTLE_HALT': 'Drawdown Portofolio Memicu Penghentian Entry',
-    'VOL_BREAKOUT_NO_BREAK': 'Vol Breakout Belum Menembus Range',
-    'EMA_PULLBACK_NO_SETUP': 'Setup EMA Pullback Belum Terbentuk',
-    'VWAP_BREAKDOWN_NO_SETUP': 'Setup VWAP Breakdown Belum Terbentuk',
-    'STRUCTURE_BREAK_NO_SETUP': 'Setup Structure Break Belum Terbentuk',
-    'REL_RESIDUAL_NO_SETUP': 'Residual Relatif terhadap BTC Belum Ekstrem',
-    'BTC_CHOP_LONG_BLOCKED': 'BTC Choppy High-Vol (Long Diblokir)',
-    'BTC_CHOP_SHORT_BLOCKED': 'BTC Choppy High-Vol (Short Diblokir)',
-    'BTC_MACRO_BEAR_LONG_BLOCKED': 'Rezim Makro BTC Bear (Long Diblokir)',
-    'BTC_MACRO_BULL_SHORT_BLOCKED': 'Rezim Makro BTC Bull (Short Diblokir)'
+    EXECUTED: 'Order Executed',
+    COOLDOWN_ACTIVE: 'Post-Exit Cooldown',
+    SLOT_FULL: 'Max Slots Reached',
+    CIRCUIT_BREAKER_ACTIVE: 'Circuit Breaker Halt',
+    DAILY_DD_EXCEEDED: 'Daily Drawdown Limit',
+    CLUSTER_SL_COOLDOWN: 'Cluster SL Cooldown',
+    BTC_DUMP_BLOCK: 'BTC Dump Gate',
+    BTC_PUMP_BLOCK: 'BTC Pump Gate',
+    BTC_CHOP_BLOCK: 'BTC Chop Filter',
+    SPREAD_TOO_WIDE: 'Wide Spread Gate',
+    LOW_NATR: 'Insufficient NATR',
+    HIGH_NATR: 'Excessive NATR',
+    LOW_RVOL: 'Low Relative Volume',
+    FRENZY_RVOL_BLOCK: 'Frenzy RVOL Cap',
+    HIGH_ADVERSE_FUNDING: 'Adverse Funding Gate',
+    CROWDED_FUNDING_BLOCK: 'Crowded Funding Filter',
+    NEGATIVE_OI_DELTA: 'OI Delta Gate',
+    STALE_BOOK_TICKER: 'Stale Book Ticker',
+    STALE_MARK_PRICE: 'Stale Mark Price',
+    OUTSIDE_UTC_HOURS: 'Blocked UTC Hour',
+    MACRO_REGIME_BLOCK: 'Macro Regime Gate',
+    WEAK_HTF_TREND: 'Weak HTF Trend',
+    NO_PULLBACK_SETUP: 'No Pullback Setup',
+    WEAK_BOUNCE_DELTA: 'Weak Orderflow Delta'
   };
-
-  if (cleaned.includes('|')) {
-    const parts = cleaned.split('|').map(p => p.trim()).filter(p => p.length > 0);
-    const pills = parts.map(p => {
-      const label = labelMap[p] || formatSubParam(p);
-      return `<span class="audit-pill">${escapeHtml(label)}</span>`;
-    }).join('');
-    return `<div class="audit-reason-wrap">${pills}</div>`;
-  }
-
-  if (cleaned.length > 0) {
-    const label = labelMap[cleaned] || formatSubParam(cleaned);
-    return `<div class="audit-reason-wrap"><span class="audit-pill">${escapeHtml(label)}</span></div>`;
-  }
-
-  const codeLabel = labelMap[code] || (code ? code.replace(/_/g, ' ') : 'Setup Incomplete');
-  return `<div class="audit-reason-wrap"><span class="audit-pill">${escapeHtml(codeLabel)}</span></div>`;
+  return String(raw || '')
+    .split('|')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const colonIdx = part.indexOf(':');
+      const code = colonIdx > 0 ? part.slice(0, colonIdx).trim() : part;
+      const detail = colonIdx > 0 ? part.slice(colonIdx + 1).trim() : '';
+      return {
+        raw: part,
+        code,
+        label: labelMap[code] || code.replace(/_/g, ' '),
+        detail
+      };
+    });
 }
 
-function formatSubParam(str) {
-  if (str.startsWith('DIST_')) {
-    const match = str.match(/DIST_([0-9.]+)_ATR_MAX_([0-9.]+)_ATR/);
-    if (match) {
-      return `Dist: ${match[1]} ATR (Max ${match[2]})`;
-    }
+// -------------------------------------------------------------------------
+// Network Layer (with PIN auth handling)
+// -------------------------------------------------------------------------
+async function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (state.pinRequired && state.storedPin) {
+    headers.set('X-TRML-PIN', state.storedPin);
   }
-  if (str.startsWith('SPREAD_')) {
-    const match = str.match(/SPREAD_([0-9.]+%?)_MAX_([0-9.]+%?)/);
-    if (match) {
-      return `Spread: ${match[1]} > Max ${match[2]}`;
-    }
+  const resp = await fetch(url, { ...options, headers });
+  if (resp.status === 401 && state.pinRequired) {
+    state.pinVerified = false;
+    state.storedPin = '';
+    try { localStorage.removeItem('trml_pin'); } catch (e) {}
+    showPinScreen('Session locked or PIN rejected. Re-enter PIN.');
+    throw new Error('Unauthorized (PIN required)');
   }
-  if (str.startsWith('NATR_')) {
-    const match = str.match(/NATR_([0-9.]+%?)_OUTSIDE_([0-9.]+%?)_([0-9.]+%?)/);
-    if (match) {
-      return `NATR: ${match[1]} outside [${match[2]}, ${match[3]}]`;
-    }
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => resp.statusText);
+    throw new Error(errText || `HTTP ${resp.status}`);
   }
-  return str.replace(/_/g, ' ');
+  return resp.json();
 }
 
-function renderSignals(signals) {
-  const tbody = document.getElementById('signals-tbody');
-  const mobileStream = document.getElementById('signals-mobile-stream');
-  const pageInfo = document.getElementById('signals-page-info');
-  const totalBadge = document.getElementById('signals-total-badge');
-  const btnPrev = document.getElementById('signals-btn-prev');
-  const btnNext = document.getElementById('signals-btn-next');
-
-  if (totalBadge) totalBadge.textContent = `${state.signals.total} Signals`;
-  if (pageInfo) pageInfo.textContent = `Page ${state.signals.page} of ${state.signals.totalPages} (${state.signals.total} Total)`;
-  if (btnPrev) btnPrev.disabled = state.signals.page <= 1;
-  if (btnNext) btnNext.disabled = state.signals.page >= state.signals.totalPages;
-
-  if (!signals || signals.length === 0) {
-    const emptyRow = `
-      <tr>
-        <td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 24px;">
-          No signals match current filter.
-        </td>
-      </tr>
-    `;
-    if (tbody) tbody.innerHTML = emptyRow;
-    if (mobileStream) {
-      mobileStream.innerHTML = `<div class="empty-state">No signals match current filter.</div>`;
-    }
-    return;
-  }
-
-  let tableHtml = '';
-  let streamHtml = '';
-
-  for (const s of signals) {
-    const isApp = s.decision === 'APPROVE' || s.decision === 'APPROVED';
-    const decBadge = isApp 
-      ? '<span class="badge badge-approved">APPROVED</span>' 
-      : '<span class="badge badge-rejected">REJECTED</span>';
-    const sideClass = s.side === 'LONG' ? 'pos-side-long' : 'pos-side-short';
-    const zScoreClass = Math.abs(s.bar_delta_zscore) >= 1.5 ? 'val-green' : '';
-
-    const reasonHtml = formatAuditReason(s.decision, s.reject_reason_code, s.reject_sub_reason, s.strategy_id);
-
-    // Also populate known symbols
-    if (s.symbol && !state.knownSymbols.has(s.symbol)) {
-      state.knownSymbols.add(s.symbol);
-      updateSymbolDropdown();
-    }
-
-    // Desktop Row
-    tableHtml += `
-      <tr>
-        <td class="col-sticky-symbol sticky-col"><strong>${escapeHtml(s.symbol)}</strong></td>
-        <td>${formatTimeUTC(s.candle_open_time_utc)}</td>
-        <td><span class="pos-side-pill ${sideClass}">${escapeHtml(s.side)}</span></td>
-        <td>${renderStrategyBadge(s.strategy_id)}</td>
-        <td>${s.close_price ? s.close_price.toFixed(4) : '--'}</td>
-        <td>${s.session_vwap ? s.session_vwap.toFixed(4) : '--'}</td>
-        <td class="${zScoreClass}">${s.bar_delta_zscore ? s.bar_delta_zscore.toFixed(2) : '--'}</td>
-        <td>${s.oi_delta_pct ? formatSignedPct(s.oi_delta_pct) : '--'}</td>
-        <td>${s.rvol ? s.rvol.toFixed(2) : '--'}</td>
-        <td>${decBadge}</td>
-        <td class="col-audit-reason">${reasonHtml}</td>
-      </tr>
-    `;
-
-    // Mobile Card Stream
-    streamHtml += `
-      <div class="stream-card">
-        <div class="stream-card-row">
-          <div style="display:flex; align-items:center; gap:6px;">
-            <strong style="font-size:15px;">${escapeHtml(s.symbol)}</strong>
-            <span class="pos-side-pill ${sideClass}">${escapeHtml(s.side)}</span>
-            ${renderStrategyBadge(s.strategy_id)}
-          </div>
-          <div>${decBadge}</div>
-        </div>
-
-        <div class="stream-card-row">
-          <span class="stream-card-label">Price / VWAP</span>
-          <span style="font-family:var(--font-mono); font-weight:600;">
-            ${s.close_price ? s.close_price.toFixed(4) : '--'} <span style="color:var(--text-secondary);">&bull;</span> VWAP: ${s.session_vwap ? s.session_vwap.toFixed(4) : '--'}
-          </span>
-        </div>
-
-        <div class="stream-card-row">
-          <span class="stream-card-label">Metrics</span>
-          <span style="font-family:var(--font-mono); font-size:12px;">
-            Z: <strong class="${zScoreClass}">${s.bar_delta_zscore ? s.bar_delta_zscore.toFixed(2) : '--'}</strong> &bull; 
-            OI: <strong>${s.oi_delta_pct ? formatSignedPct(s.oi_delta_pct) : '--'}</strong> &bull; 
-            RVOL: <strong>${s.rvol ? s.rvol.toFixed(2) : '--'}</strong>
-          </span>
-        </div>
-
-        <div style="border-top:1px dashed var(--border-subtle); padding-top:8px; margin-top:2px;">
-          <div class="stream-card-label" style="margin-bottom:4px;">Evaluation:</div>
-          <div style="display:flex; flex-wrap:wrap; gap:4px;">${reasonHtml}</div>
-        </div>
-
-        <div class="stream-card-row" style="font-size:11px; color:var(--text-secondary); padding-top:4px;">
-          <span>Candle: ${formatTimeUTC(s.candle_open_time_utc)}</span>
-          <span>Signal #${s.id}</span>
-        </div>
-      </div>
-    `;
-  }
-
-  if (tbody) tbody.innerHTML = tableHtml;
-  if (mobileStream) mobileStream.innerHTML = streamHtml;
+function setConnectionState(online, label) {
+  const badge = document.getElementById('conn-badge');
+  const text = document.getElementById('conn-text');
+  if (badge) badge.dataset.state = online ? 'online' : 'error';
+  if (text) text.textContent = label;
 }
 
-
-// 5. Setup Event Listeners
-function setupEvents() {
-  // Manual Refresh
-  const btnRefresh = document.getElementById('btn-refresh');
-  if (btnRefresh) {
-    btnRefresh.addEventListener('click', async () => {
-      btnRefresh.classList.add('spinning');
-      await Promise.all([fetchSummary(), fetchScanner(), fetchTrades(), fetchSignals()]);
-      setTimeout(() => btnRefresh.classList.remove('spinning'), 500);
-    });
-  }
-
-  // Trade Filter Pills
-  document.querySelectorAll('[data-filter-trade]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('[data-filter-trade]').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      state.trades.filter = btn.getAttribute('data-filter-trade');
-      state.trades.page = 1;
-      fetchTrades();
-    });
-  });
-
-  // Trade Strategy Dropdown
-  const tradeStrategySelect = document.getElementById('trade-strategy-select');
-  if (tradeStrategySelect) {
-    tradeStrategySelect.addEventListener('change', (e) => {
-      state.trades.strategy = e.target.value;
-      state.trades.page = 1;
-      fetchTrades();
-    });
-  }
-
-  // Trade Limit
-  const tradeLimitSelect = document.getElementById('trade-limit-select');
-  if (tradeLimitSelect) {
-    tradeLimitSelect.addEventListener('change', (e) => {
-      state.trades.limit = parseInt(e.target.value, 10) || 10;
-      state.trades.page = 1;
-      fetchTrades();
-    });
-  }
-
-  // Trade Pagination Buttons
-  const tradePrev = document.getElementById('trades-btn-prev');
-  const tradeNext = document.getElementById('trades-btn-next');
-  if (tradePrev) {
-    tradePrev.addEventListener('click', () => {
-      if (state.trades.page > 1) {
-        state.trades.page--;
-        fetchTrades();
-      }
-    });
-  }
-  if (tradeNext) {
-    tradeNext.addEventListener('click', () => {
-      if (state.trades.page < state.trades.totalPages) {
-        state.trades.page++;
-        fetchTrades();
-      }
-    });
-  }
-
-  // Signal Decision Pills
-  document.querySelectorAll('[data-filter-signal]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('[data-filter-signal]').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      state.signals.decision = btn.getAttribute('data-filter-signal');
-      state.signals.page = 1;
-      fetchSignals();
-    });
-  });
-
-  // Signal Symbol Dropdown
-  const signalSymbolSelect = document.getElementById('signal-symbol-select');
-  if (signalSymbolSelect) {
-    signalSymbolSelect.addEventListener('change', (e) => {
-      state.signals.symbol = e.target.value;
-      state.signals.page = 1;
-      fetchSignals();
-    });
-  }
-
-  // Signal Strategy Dropdown
-  const signalStrategySelect = document.getElementById('signal-strategy-select');
-  if (signalStrategySelect) {
-    signalStrategySelect.addEventListener('change', (e) => {
-      state.signals.strategy = e.target.value;
-      state.signals.page = 1;
-      fetchSignals();
-    });
-  }
-
-  // Signal Limit
-  const signalLimitSelect = document.getElementById('signal-limit-select');
-  if (signalLimitSelect) {
-    signalLimitSelect.addEventListener('change', (e) => {
-      state.signals.limit = parseInt(e.target.value, 10) || 15;
-      state.signals.page = 1;
-      fetchSignals();
-    });
-  }
-
-  // Signal Pagination Buttons
-  const signalPrev = document.getElementById('signals-btn-prev');
-  const signalNext = document.getElementById('signals-btn-next');
-  if (signalPrev) {
-    signalPrev.addEventListener('click', () => {
-      if (state.signals.page > 1) {
-        state.signals.page--;
-        fetchSignals();
-      }
-    });
-  }
-  if (signalNext) {
-    signalNext.addEventListener('click', () => {
-      if (state.signals.page < state.signals.totalPages) {
-        state.signals.page++;
-        fetchSignals();
-      }
-    });
-  }
+// -------------------------------------------------------------------------
+// Theme Management (Light Default, Synced with window.basecoat.theme)
+// -------------------------------------------------------------------------
+function syncThemeUI() {
+  const isDark = document.documentElement.classList.contains('dark');
+  const sun = document.getElementById('theme-icon-sun');
+  const moon = document.getElementById('theme-icon-moon');
+  if (sun) sun.classList.toggle('hidden', !isDark);
+  if (moon) moon.classList.toggle('hidden', isDark);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', isDark ? '#0b1017' : '#f6f8fa');
 }
 
-// 6. Real-time UTC Clock
-function startClock() {
-  const clockEl = document.getElementById('utc-clock');
-  function tick() {
-    const now = new Date();
-    const hh = String(now.getUTCHours()).padStart(2, '0');
-    const mm = String(now.getUTCMinutes()).padStart(2, '0');
-    const ss = String(now.getUTCSeconds()).padStart(2, '0');
-    if (clockEl) {
-      clockEl.textContent = `${hh}:${mm}:${ss} UTC`;
-    }
+function toggleTheme() {
+  if (window.basecoat?.theme) {
+    window.basecoat.theme.toggle();
+  } else {
+    const isDark = !document.documentElement.classList.contains('dark');
+    document.documentElement.classList.toggle('dark', isDark);
+    try { localStorage.setItem('themeMode', isDark ? 'dark' : 'light'); } catch (e) {}
   }
-  tick();
-  setInterval(tick, 1000);
+  syncThemeUI();
 }
 
-// 7. AI Copilot Controller & Universal Modal
-let currentAITriggerBtn = null;
-let currentModalTitle = '';
-let currentModalBaseUrl = '';
-let aiModalRequestSeq = 0;
-let lastExecutiveSummaryData = null;
-let lastExecutiveSummaryTime = 0;
-let lastPatternMinerData = null;
-let lastPatternMinerTime = 0;
-
-function stripRefreshParam(rawUrl) {
-  try {
-    const parsed = new URL(rawUrl, window.location.origin);
-    parsed.searchParams.delete('refresh');
-    return parsed.pathname + parsed.search;
-  } catch (_) {
-    return rawUrl.replace(/([?&])refresh=true(&|$)/g, (_, p1, p2) => (p2 ? p1 : '')).replace(/[?&]$/, '');
-  }
-}
-
-async function openAIModal(title, url, triggerBtn) {
-  const modal = document.getElementById('ai-modal');
-  const titleEl = document.getElementById('ai-modal-title');
-  const loadingEl = document.getElementById('ai-modal-loading');
-  const contentEl = document.getElementById('ai-modal-content');
-  const badgeEl = document.getElementById('ai-modal-badge');
-
-  if (!modal) return;
-
-  const reqSeq = ++aiModalRequestSeq;
-  currentModalTitle = title;
-  currentModalBaseUrl = stripRefreshParam(url);
-  currentAITriggerBtn = triggerBtn;
-
-  if (triggerBtn) {
-    triggerBtn.classList.add('is-loading');
-    triggerBtn.disabled = true;
-  }
-
-  const activeModel = state.geminiModel || 'gemini-2.5-flash';
-  if (titleEl) titleEl.textContent = title;
-  if (badgeEl) badgeEl.textContent = activeModel;
-
-  // Check in-memory cache for executive debrief (30s) or pattern miner (3m) if not force refresh
-  const isExecutive = currentModalBaseUrl.includes('/api/ai/executive-summary');
-  const isPatternMiner = currentModalBaseUrl.includes('/api/ai/pattern-miner');
-  const isForceRefresh = url.includes('refresh=true');
-
-  if (isExecutive && !isForceRefresh && lastExecutiveSummaryData && (Date.now() - lastExecutiveSummaryTime < 30000)) {
-    const cachedModel = lastExecutiveSummaryData.model || activeModel;
-    if (loadingEl) {
-      loadingEl.classList.add('hidden');
-      loadingEl.style.display = 'none';
-    }
-    if (contentEl) {
-      contentEl.innerHTML = renderMarkdown(lastExecutiveSummaryData.text);
-      contentEl.classList.remove('hidden');
-      contentEl.style.display = 'block';
-    }
-    state.currentAIMarkdown = lastExecutiveSummaryData.text || '';
-    if (badgeEl) badgeEl.textContent = `${cachedModel} | In-Memory (30s)`;
-    modal.classList.remove('hidden');
-    modal.setAttribute('aria-hidden', 'false');
-    if (triggerBtn) {
-      triggerBtn.classList.remove('is-loading');
-      triggerBtn.disabled = false;
-    }
-    return;
-  }
-
-  if (isPatternMiner && !isForceRefresh && lastPatternMinerData && (Date.now() - lastPatternMinerTime < 180000)) {
-    const cachedModel = lastPatternMinerData.model || activeModel;
-    if (loadingEl) {
-      loadingEl.classList.add('hidden');
-      loadingEl.style.display = 'none';
-    }
-    if (contentEl) {
-      contentEl.innerHTML = renderMarkdown(lastPatternMinerData.text);
-      contentEl.classList.remove('hidden');
-      contentEl.style.display = 'block';
-    }
-    state.currentAIMarkdown = lastPatternMinerData.text || '';
-    if (badgeEl) badgeEl.textContent = `${cachedModel} | In-Memory (3m)`;
-    modal.classList.remove('hidden');
-    modal.setAttribute('aria-hidden', 'false');
-    if (triggerBtn) {
-      triggerBtn.classList.remove('is-loading');
-      triggerBtn.disabled = false;
-    }
-    return;
-  }
-
-  // Ensure loading spinner is visible and content is hidden during fetch
-  if (loadingEl) {
-    loadingEl.classList.remove('hidden');
-    loadingEl.style.display = 'flex';
-  }
-  if (contentEl) {
-    contentEl.classList.add('hidden');
-    contentEl.style.display = 'none';
-    contentEl.innerHTML = '';
-  }
-
-  modal.classList.remove('hidden');
-  modal.setAttribute('aria-hidden', 'false');
-
-  try {
-    const res = await authFetch(url);
-    const data = await res.json();
-    if (reqSeq !== aiModalRequestSeq) return; // Ignore stale response from prior modal
-
-    if (data.model) {
-      state.geminiModel = data.model;
-    }
-    const respModel = data.model || state.geminiModel || 'gemini-2.5-flash';
-
-    if (!res.ok || data.error) {
-      let errMsg = data.message || data.error || 'Gagal memuat analisis AI.';
-      if (data.error === 'RATE_LIMITED' || res.status === 429) {
-        errMsg = 'Batas panggilan tercapai (10 req/menit). Silakan tunggu 1 menit sebelum mencoba kembali.';
-      } else if (data.error === 'GEMINI_TIMEOUT') {
-        errMsg = 'Waktu permintaan AI habis (timeout 25 detik). Silakan coba kembali.';
-      } else if (data.error === 'GEMINI_API_KEY_NOT_CONFIGURED') {
-        errMsg = 'GEMINI_API_KEY belum dikonfigurasi di file .env server bot.';
-      } else if (data.error === 'POSITION_NOT_FOUND') {
-        errMsg = 'Posisi aktif tidak ditemukan atau sudah ditutup.';
-      } else if (data.error === 'TRADE_NOT_FOUND') {
-        errMsg = 'Data trade tidak ditemukan di database.';
-      }
-
-      state.currentAIMarkdown = errMsg;
-      if (contentEl) {
-        contentEl.innerHTML = `<div style="color:var(--sell-red); padding:10px 0;"><strong>Error:</strong> ${escapeHtml(errMsg)}</div>`;
-      }
-      if (badgeEl) badgeEl.textContent = 'Error';
-    } else {
-      state.currentAIMarkdown = data.text || '';
-      if (contentEl) {
-        contentEl.innerHTML = renderMarkdown(data.text);
-      }
-      if (badgeEl) {
-        badgeEl.textContent = data.source === 'cache' ? `${respModel} | Local Cache` : `${respModel} | Live`;
-      }
-      if (isExecutive && data.text) {
-        lastExecutiveSummaryData = data;
-        lastExecutiveSummaryTime = Date.now();
-      }
-      if (isPatternMiner && data.text) {
-        lastPatternMinerData = data;
-        lastPatternMinerTime = Date.now();
-      }
-    }
-  } catch (err) {
-    if (reqSeq !== aiModalRequestSeq) return;
-    console.error('AI modal fetch error:', err);
-    state.currentAIMarkdown = 'Gagal menghubungi server TRML.';
-    if (contentEl) {
-      contentEl.innerHTML = `<div style="color:var(--sell-red); padding:10px 0;">Gagal menghubungi server. Pastikan koneksi bot aktif.</div>`;
-    }
-    if (badgeEl) badgeEl.textContent = 'Offline';
-  } finally {
-    if (reqSeq === aiModalRequestSeq) {
-      if (loadingEl) {
-        loadingEl.classList.add('hidden');
-        loadingEl.style.display = 'none';
-      }
-      if (contentEl) {
-        contentEl.classList.remove('hidden');
-        contentEl.style.display = 'block';
-      }
-    }
-    if (triggerBtn) {
-      triggerBtn.classList.remove('is-loading');
-      triggerBtn.disabled = false;
-    }
-    if (currentAITriggerBtn === triggerBtn) {
-      currentAITriggerBtn = null;
-    }
-  }
-}
-
-function closeAIModal() {
-  aiModalRequestSeq++;
-  const modal = document.getElementById('ai-modal');
-  if (modal) {
-    modal.classList.add('hidden');
-    modal.setAttribute('aria-hidden', 'true');
-  }
-  if (currentAITriggerBtn) {
-    currentAITriggerBtn.classList.remove('is-loading');
-    currentAITriggerBtn.disabled = false;
-    currentAITriggerBtn = null;
-  }
-}
-
-function setupAIEvents() {
-  // 1. Header AI Button (Executive Debrief)
-  const headerAIBtn = document.getElementById('btn-ai-executive');
-  if (headerAIBtn) {
-    headerAIBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openAIModal('📊 AI Executive Debrief (24 Jam)', '/api/ai/executive-summary', headerAIBtn);
-    });
-  }
-
-  // 1b. Trade Ledger Header AI Button (Pattern Miner)
-  const patternMinerBtn = document.getElementById('btn-pattern-miner');
-  if (patternMinerBtn) {
-    patternMinerBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      openAIModal('🔬 Pattern Miner: Audit Pola Kelemahan', '/api/ai/pattern-miner', patternMinerBtn);
-    });
-  }
-
-  // 2. Delegated Click on Active Position Health Button
-  const posContainer = document.getElementById('positions-container');
-  if (posContainer) {
-    posContainer.addEventListener('click', (e) => {
-      const btn = e.target.closest('.btn-ai-position');
-      if (btn) {
-        e.stopPropagation();
-        const symbol = btn.dataset.symbol;
-        if (symbol) {
-          openAIModal(`🩺 In-Flight Health Check: ${symbol}`, `/api/ai/position-health?symbol=${encodeURIComponent(symbol)}`, btn);
-        }
-      }
-    });
-  }
-
-  // 3. Delegated Click on Trade Ledger Autopsy Button (Desktop & Mobile)
-  const tradeTbody = document.getElementById('trades-tbody');
-  if (tradeTbody) {
-    tradeTbody.addEventListener('click', (e) => {
-      const btn = e.target.closest('.btn-ai-autopsy');
-      if (btn) {
-        e.stopPropagation();
-        const orderId = btn.dataset.orderId;
-        if (orderId) {
-          openAIModal(`🔬 Post-Trade Autopsy: ${orderId}`, `/api/ai/trade-autopsy?client_order_id=${encodeURIComponent(orderId)}`, btn);
-        }
-      }
-    });
-  }
-
-  const tradeStream = document.getElementById('trades-mobile-stream');
-  if (tradeStream) {
-    tradeStream.addEventListener('click', (e) => {
-      const btn = e.target.closest('.btn-ai-autopsy');
-      if (btn) {
-        e.stopPropagation();
-        const orderId = btn.dataset.orderId;
-        if (orderId) {
-          openAIModal(`🔬 Post-Trade Autopsy: ${orderId}`, `/api/ai/trade-autopsy?client_order_id=${encodeURIComponent(orderId)}`, btn);
-        }
-      }
-    });
-  }
-
-  // 4. Modal Close & Copy Events
-  const closeBtn = document.getElementById('ai-modal-close');
-  if (closeBtn) {
-    closeBtn.addEventListener('click', closeAIModal);
-  }
-
-  const modal = document.getElementById('ai-modal');
-  if (modal) {
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) {
-        closeAIModal();
-      }
-    });
-  }
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      closeAIModal();
-    }
-  });
-
-  const copyBtn = document.getElementById('ai-modal-copy-btn');
-  if (copyBtn) {
-    copyBtn.addEventListener('click', async () => {
-      if (!state.currentAIMarkdown) return;
-      try {
-        await navigator.clipboard.writeText(state.currentAIMarkdown);
-        const origHtml = copyBtn.innerHTML;
-        copyBtn.innerHTML = '<span>Tersalin!</span>';
-        setTimeout(() => {
-          copyBtn.innerHTML = origHtml;
-        }, 2000);
-      } catch (err) {
-        console.warn('Failed to copy to clipboard:', err);
-      }
-    });
-  }
-
-  const refreshBtn = document.getElementById('ai-modal-refresh-btn');
-  if (refreshBtn) {
-    refreshBtn.addEventListener('click', () => {
-      if (!currentModalBaseUrl) return;
-      const base = stripRefreshParam(currentModalBaseUrl);
-      const sep = base.includes('?') ? '&' : '?';
-      const refreshUrl = base + sep + 'refresh=true';
-      if (base.includes('executive-summary')) {
-        lastExecutiveSummaryData = null;
-        lastExecutiveSummaryTime = 0;
-      }
-      if (base.includes('pattern-miner')) {
-        lastPatternMinerData = null;
-        lastPatternMinerTime = 0;
-      }
-      openAIModal(currentModalTitle, refreshUrl, currentAITriggerBtn);
-    });
-  }
-}
-
-// 8. PIN Security Authentication Controller
-let enteredPinDigits = '';
-
-function showPinScreen(errMsg) {
-  state.pin = '';
-  localStorage.removeItem('trml_pin');
+// -------------------------------------------------------------------------
+// Auth / PIN Screen (Basecoat .input-otp + Touch Keypad)
+// -------------------------------------------------------------------------
+function showPinScreen(errorMsg = '') {
+  stopPolling();
   const pinScreen = document.getElementById('pin-screen');
+  const appShell = document.getElementById('app-shell');
   const errEl = document.getElementById('pin-error-msg');
+  const input = document.getElementById('pin-otp-input');
+
+  if (appShell) appShell.classList.add('hidden');
   if (pinScreen) {
     pinScreen.classList.remove('hidden');
     pinScreen.setAttribute('aria-hidden', 'false');
   }
-  if (errEl) {
-    if (errMsg) {
-      errEl.textContent = errMsg;
-      errEl.classList.remove('hidden');
-    } else {
-      errEl.classList.add('hidden');
-    }
+  if (errEl) errEl.textContent = errorMsg;
+  if (input) {
+    input.value = '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    requestAnimationFrame(() => input.focus());
   }
-  enteredPinDigits = '';
-  updatePinDots();
 }
 
-function hidePinScreen() {
+function showAppShell() {
   const pinScreen = document.getElementById('pin-screen');
+  const appShell = document.getElementById('app-shell');
   if (pinScreen) {
     pinScreen.classList.add('hidden');
     pinScreen.setAttribute('aria-hidden', 'true');
   }
+  if (appShell) appShell.classList.remove('hidden');
 }
 
-function updatePinDots() {
-  const dots = document.querySelectorAll('#pin-dots .pin-dot');
-  dots.forEach((dot, idx) => {
-    if (idx < enteredPinDigits.length) {
-      dot.classList.add('filled');
-    } else {
-      dot.classList.remove('filled');
-    }
-  });
-}
-
-let isVerifyingPIN = false;
-
-async function verifyEnteredPIN() {
-  if (isVerifyingPIN) return;
-  isVerifyingPIN = true;
+async function verifyPIN(pin, fromStored = false) {
+  if (state.pinSubmitting || !pin || pin.length !== 6) return;
+  state.pinSubmitting = true;
   const errEl = document.getElementById('pin-error-msg');
+  if (errEl && !fromStored) errEl.textContent = 'Verifying…';
+
   try {
-    const res = await fetch('/api/auth/verify', {
+    const resp = await fetch('/api/auth/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin: enteredPinDigits })
+      body: JSON.stringify({ pin })
     });
-    const data = await res.json();
-    if (res.ok && data.status === 'ok') {
-      state.pin = enteredPinDigits;
-      localStorage.setItem('trml_pin', enteredPinDigits);
-      hidePinScreen();
-      // Start initial polling
-      fetchSummary();
-      fetchScanner();
-      fetchTrades();
-      fetchSignals();
-    } else {
-      enteredPinDigits = '';
-      updatePinDots();
-      if (errEl) {
-        errEl.textContent = data.message || 'PIN yang dimasukkan salah.';
-        errEl.classList.remove('hidden');
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      if (fromStored) {
+        try { localStorage.removeItem('trml_pin'); } catch (e) {}
+        showPinScreen('');
+      } else {
+        showPinScreen(body.error || 'Invalid PIN. Try again.');
       }
-    }
-  } catch (err) {
-    if (errEl) {
-      errEl.textContent = 'Gagal verifikasi PIN ke server.';
-      errEl.classList.remove('hidden');
-    }
-  } finally {
-    isVerifyingPIN = false;
-  }
-}
-
-function setupPINKeypad() {
-  const keypad = document.querySelector('.pin-keypad');
-  if (!keypad) return;
-
-  keypad.addEventListener('click', (e) => {
-    const btn = e.target.closest('.pin-key');
-    if (!btn) return;
-    const key = btn.dataset.key;
-
-    if (key === 'clear') {
-      enteredPinDigits = '';
-      updatePinDots();
-    } else if (key === 'backspace') {
-      if (enteredPinDigits.length > 0) {
-        enteredPinDigits = enteredPinDigits.slice(0, -1);
-        updatePinDots();
-      }
-    } else if (key && key.length === 1 && enteredPinDigits.length < 6) {
-      enteredPinDigits += key;
-      updatePinDots();
-      if (enteredPinDigits.length === 6) {
-        verifyEnteredPIN();
-      }
-    }
-  });
-
-  // Support keyboard numeric typing on desktop
-  document.addEventListener('keydown', (e) => {
-    const pinScreen = document.getElementById('pin-screen');
-    if (pinScreen && !pinScreen.classList.contains('hidden')) {
-      if (e.key >= '0' && e.key <= '9') {
-        if (enteredPinDigits.length < 6) {
-          enteredPinDigits += e.key;
-          updatePinDots();
-          if (enteredPinDigits.length === 6) {
-            verifyEnteredPIN();
-          }
-        }
-      } else if (e.key === 'Backspace') {
-        if (enteredPinDigits.length > 0) {
-          enteredPinDigits = enteredPinDigits.slice(0, -1);
-          updatePinDots();
-        }
-      } else if (e.key === 'Escape' || e.key === 'c' || e.key === 'C') {
-        enteredPinDigits = '';
-        updatePinDots();
-      }
-    }
-  });
-}
-
-async function checkAuthAndStart() {
-  try {
-    const res = await fetch('/api/auth/status');
-    const data = await res.json();
-    state.pinRequired = !!data.pin_required;
-
-    if (state.pinRequired) {
-      const storedPin = localStorage.getItem('trml_pin');
-      if (storedPin) {
-        const verifyRes = await fetch('/api/auth/verify', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pin: storedPin })
-        });
-        if (verifyRes.ok) {
-          state.pin = storedPin;
-          hidePinScreen();
-          fetchSummary();
-          fetchScanner();
-          fetchTrades();
-          fetchSignals();
-          return;
-        }
-      }
-      showPinScreen();
       return;
     }
 
-    // No PIN required -> start immediately
-    hidePinScreen();
-    fetchSummary();
-    fetchScanner();
-    fetchTrades();
-    fetchSignals();
+    state.pinVerified = true;
+    state.storedPin = pin;
+    try { localStorage.setItem('trml_pin', pin); } catch (e) {}
+    showAppShell();
+    startDeskDataCycle(true);
   } catch (err) {
-    console.warn('Auth status check failed, starting in fallback mode:', err);
-    fetchSummary();
-    fetchScanner();
-    fetchTrades();
-    fetchSignals();
+    if (fromStored) {
+      showPinScreen('Failed to connect for session check.');
+    } else {
+      showPinScreen('Network error verifying PIN.');
+    }
+  } finally {
+    state.pinSubmitting = false;
   }
 }
 
-// 9. Initialize Application
+function initPinControls() {
+  const input = document.getElementById('pin-otp-input');
+  const keypad = document.getElementById('pin-keypad');
+
+  if (input) {
+    input.addEventListener('input', () => {
+      const clean = input.value.replace(/\D/g, '').slice(0, 6);
+      if (clean !== input.value) {
+        input.value = clean;
+      }
+      const errEl = document.getElementById('pin-error-msg');
+      if (errEl && errEl.textContent && clean.length < 6) errEl.textContent = '';
+      if (clean.length === 6) {
+        verifyPIN(clean, false);
+      }
+    });
+  }
+
+  if (keypad && input) {
+    keypad.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-key]');
+      if (!btn || state.pinSubmitting) return;
+      const key = btn.dataset.key;
+      let val = input.value.replace(/\D/g, '');
+      if (key === 'CLEAR') {
+        val = '';
+      } else if (key === 'DEL') {
+        val = val.slice(0, -1);
+      } else if (val.length < 6) {
+        val += key;
+      }
+      input.value = val;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+}
+
+// -------------------------------------------------------------------------
+// Render Summary, Risk Bars, Strategy Stats & Point 3 Telemetry
+// -------------------------------------------------------------------------
+function renderSummary(data) {
+  state.lastSummaryData = data;
+  state.activeSlotsCount = Number(data.active_slots || 0);
+
+  // Env & Model badges
+  const envBadge = document.getElementById('env-badge');
+  if (envBadge) {
+    const isLive = String(data.env || '').toUpperCase() === 'LIVE';
+    envBadge.textContent = isLive ? 'LIVE' : 'DRY-RUN';
+    envBadge.className = `badge ${isLive ? 'trml-badge-neg' : 'trml-badge-info'}`;
+  }
+  const sheetModel = document.getElementById('ai-sheet-model');
+  if (sheetModel && data.gemini_model) {
+    sheetModel.textContent = data.gemini_model;
+  }
+
+  // Account Capital
+  const equityEl = document.getElementById('kpi-equity');
+  const balEl = document.getElementById('kpi-balance');
+  const deltaEl = document.getElementById('kpi-equity-delta');
+  if (equityEl) equityEl.textContent = fmtMoney(data.equity);
+  if (balEl) balEl.textContent = fmtMoney(data.balance);
+
+  const realizedNet = Number(data.stats?.total_net_pnl_usdt || 0);
+  if (deltaEl) {
+    deltaEl.textContent = `${fmtMoney(realizedNet, true)} Realized`;
+    deltaEl.className = `badge trml-mono ${
+      realizedNet > 0 ? 'trml-badge-pos' : realizedNet < 0 ? 'trml-badge-neg' : ''
+    }`;
+  }
+
+  // Daily Drawdown Bar (daily_drawdown_pct is negative or 0; max_daily_drawdown_pct e.g. 0.05)
+  const ddAbsPct = Math.abs(Number(data.daily_drawdown_pct || 0)) * 100;
+  const maxDdRaw = Number(data.max_daily_drawdown_pct || 0);
+  const maxDdPct = maxDdRaw > 1 ? maxDdRaw : maxDdRaw * 100;
+  const ddUtil = maxDdPct > 0 ? Math.min(100, (ddAbsPct / maxDdPct) * 100) : 0;
+
+  const ddValEl = document.getElementById('kpi-dd-val');
+  const ddMaxEl = document.getElementById('kpi-dd-max');
+  const ddBar = document.getElementById('kpi-dd-bar');
+  const ddWrap = ddBar?.parentElement;
+  if (ddValEl) ddValEl.textContent = `-${ddAbsPct.toFixed(2)}%`;
+  if (ddMaxEl && maxDdPct > 0) ddMaxEl.textContent = `/ -${maxDdPct.toFixed(1)}% cap`;
+  if (ddBar) ddBar.style.width = `${ddUtil.toFixed(1)}%`;
+  if (ddWrap) {
+    ddWrap.setAttribute('aria-valuenow', ddUtil.toFixed(0));
+    ddWrap.dataset.tone = ddUtil >= 75 ? 'neg' : ddUtil >= 45 ? 'warn' : 'pos';
+  }
+
+  // Slots Bar
+  const activeSlots = Number(data.active_slots || 0);
+  const maxSlots = Math.max(1, Number(data.max_slots || 1));
+  const slotPct = Math.min(100, (activeSlots / maxSlots) * 100);
+  const slotsValEl = document.getElementById('kpi-slots-val');
+  const slotsPctEl = document.getElementById('kpi-slots-pct');
+  const slotsBar = document.getElementById('kpi-slots-bar');
+  const slotsWrap = slotsBar?.parentElement;
+  if (slotsValEl) slotsValEl.textContent = `${activeSlots} / ${data.max_slots || 0}`;
+  if (slotsPctEl) slotsPctEl.textContent = `(${slotPct.toFixed(0)}%)`;
+  if (slotsBar) slotsBar.style.width = `${slotPct.toFixed(1)}%`;
+  if (slotsWrap) {
+    slotsWrap.setAttribute('aria-valuenow', slotPct.toFixed(0));
+    slotsWrap.dataset.tone = slotPct >= 100 ? 'warn' : 'info';
+  }
+
+  // Outcomes
+  const stats = data.stats || {};
+  const setText = (id, txt) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  };
+  setText('stat-trades', String(stats.total_trades || 0));
+  setText('stat-winrate', fmtPct(stats.win_rate_pct || 0, 1));
+  const pf = Number(stats.profit_factor || 0);
+  setText('stat-pf', pf > 99 ? '99+' : pf.toFixed(2));
+  setText('stat-avgwin', fmtMoney(stats.avg_win_usdt || 0, true));
+  setText('stat-avgloss', fmtMoney(-Math.abs(Number(stats.avg_loss_usdt || 0))));
+  const avgR = Number(stats.avg_r || 0);
+  const avgREl = document.getElementById('stat-avgr');
+  if (avgREl) {
+    avgREl.textContent = `${avgR >= 0 ? '+' : ''}${avgR.toFixed(2)} R`;
+    avgREl.className = `badge trml-mono ${avgR > 0 ? 'trml-badge-pos' : avgR < 0 ? 'trml-badge-neg' : ''}`;
+  }
+
+  // Strategy Attribution
+  renderStrategyStats(data.strategy_stats || []);
+
+  // Point 3 Telemetry & Alerts
+  renderTelemetry(data.telemetry || null, Boolean(data.circuit_breaker));
+
+  // Active Positions
+  renderPositions(data.positions || []);
+
+  // Tab counter
+  const deskBadge = document.getElementById('tab-desk-count');
+  if (deskBadge) deskBadge.textContent = String(activeSlots);
+
+  refreshCommandSymbols();
+}
+
+function renderStrategyStats(items) {
+  const host = document.getElementById('strategy-stats-list');
+  if (!host) return;
+  if (!items || items.length === 0) {
+    host.innerHTML = '<div class="trml-muted-text">No strategy trades recorded in this mode yet.</div>';
+    return;
+  }
+  host.innerHTML = items
+    .map((item) => {
+      const net = Number(item.total_net_pnl_usdt || 0);
+      const cls = net > 0 ? 'trml-pos' : net < 0 ? 'trml-neg' : '';
+      return `
+        <div class="trml-strat-row">
+          <span class="trml-strat-name" title="${escapeHtml(item.strategy_id)}">${escapeHtml(item.strategy_id)}</span>
+          <span class="trml-mono trml-muted-text">${Number(item.total_trades || 0)} trd</span>
+          <span class="trml-mono">${Number(item.win_rate_pct || 0).toFixed(1)}%</span>
+          <span class="trml-mono trml-strat-pnl ${cls}">${fmtMoney(net, true)}</span>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function renderTelemetry(telem, circuitBreaker) {
+  const chipLabel = document.getElementById('telemetry-chip-label');
+  const popWrap = document.getElementById('telemetry-popover');
+  const popBody = document.getElementById('telemetry-popover-body');
+  const inlineSummary = document.getElementById('telemetry-inline-summary');
+  const alertStack = document.getElementById('alert-stack');
+
+  const regime = telem?.macro_regime || 'UNKNOWN';
+  const breadthTxt = telem?.market_breadth_valid ? `${Number(telem.market_breadth_pct || 0).toFixed(0)}% B` : 'B:n/a';
+  const tfTxt = telem?.timeframe || '—';
+
+  if (popWrap) popWrap.dataset.regime = regime;
+  if (chipLabel) chipLabel.textContent = telem ? `${regime} · ${tfTxt} · ${breadthTxt}` : 'Engine: RAM n/a';
+  if (inlineSummary) inlineSummary.textContent = telem ? `${regime} / ${tfTxt}` : '—';
+
+  if (popBody) {
+    if (!telem) {
+      popBody.innerHTML = '<span class="trml-muted-text">Telemetry callback unavailable in standalone mode.</span>';
+    } else {
+      const kvs = [
+        ['Macro Regime', escapeHtml(regime)],
+        ['BTC 24h Return', fmtPct(telem.macro_return_24h_pct, 2, true)],
+        ['Efficiency Ratio', Number(telem.macro_er || 0).toFixed(3)],
+        ['Vol Ratio (1h)', Number(telem.macro_vol_ratio || 0).toFixed(2) + 'x'],
+        ['Market Breadth', telem.market_breadth_valid ? fmtPct(telem.market_breadth_pct, 1) : 'Warmup'],
+        ['Range Risk Mult', Number(telem.range_risk_mult || 0).toFixed(2) + 'x'],
+        ['Vol Exp Ratio / Mult', `${Number(telem.vol_expansion_ratio || 0).toFixed(2)} / ${Number(telem.vol_expansion_risk_mult || 0).toFixed(2)}x`],
+        ['Cadence / Side', `${escapeHtml(telem.timeframe)} · ${escapeHtml(telem.allowed_side || 'BOTH')}`],
+        ['Scan Interval', escapeHtml(telem.scanner_interval || '—')],
+        ['Cluster SL Guard', telem.cluster_sl_paused ? `PAUSED (${fmtUTC(telem.cluster_sl_until_utc)})` : 'ARMED']
+      ];
+      popBody.innerHTML = kvs
+        .map(([k, v]) => `<div class="trml-telem-kv"><span>${k}</span><strong>${v}</strong></div>`)
+        .join('');
+    }
+  }
+
+  // Conditional Alerts
+  if (alertStack) {
+    const alerts = [];
+    if (circuitBreaker) {
+      alerts.push(`
+        <div class="alert" data-variant="destructive" role="alert">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+          <h2>Circuit Breaker Tripped</h2>
+          <section><p>New entries halted after daily drawdown limit triggered.</p></section>
+        </div>
+      `);
+    }
+    if (telem?.cluster_sl_paused) {
+      alerts.push(`
+        <div class="alert" role="status">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          <h2>Portfolio Cluster SL Cooldown Active</h2>
+          <section><p>Correlated entries temporarily paused until ${escapeHtml(fmtUTC(telem.cluster_sl_until_utc))} UTC.</p></section>
+        </div>
+      `);
+    }
+    if (state.consecutiveErrors >= 2) {
+      alerts.push(`
+        <div class="alert" data-variant="destructive" role="alert">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 2 20 20"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/></svg>
+          <h2>Telemetry Sync Interrupted</h2>
+          <section><p>Retrying connection to bot HTTP endpoint automatically.</p></section>
+        </div>
+      `);
+    }
+    alertStack.innerHTML = alerts.join('');
+    alertStack.classList.toggle('hidden', alerts.length === 0);
+  }
+}
+
+// -------------------------------------------------------------------------
+// Active Positions Renderer
+// -------------------------------------------------------------------------
+function calcSlTpTrackPct(pos) {
+  const sl = Number(pos.sl_price || 0);
+  const tp = Number(pos.tp_price || 0);
+  const mark = Number(pos.mark_price || 0);
+  if (sl <= 0 || tp <= 0 || mark <= 0 || sl === tp) return { pct: 50, tone: 'info' };
+  const isLong = String(pos.side).toUpperCase() === 'LONG';
+  const raw = isLong ? ((mark - sl) / (tp - sl)) * 100 : ((sl - mark) / (sl - tp)) * 100;
+  const pct = Math.max(2, Math.min(98, raw));
+  const tone = pct >= 50 ? 'pos' : pct <= 28 ? 'neg' : 'warn';
+  return { pct, tone };
+}
+
+function renderPositions(positions) {
+  const countBadge = document.getElementById('positions-count-badge');
+  const tableWrap = document.getElementById('positions-table-wrap');
+  const tbody = document.getElementById('positions-tbody');
+  const mobileList = document.getElementById('positions-mobile-list');
+  const emptyEl = document.getElementById('positions-empty');
+
+  if (countBadge) countBadge.textContent = `${positions.length} open`;
+
+  if (!positions || positions.length === 0) {
+    tableWrap?.classList.add('hidden');
+    mobileList?.classList.add('hidden');
+    emptyEl?.classList.remove('hidden');
+    if (tbody) tbody.innerHTML = '';
+    if (mobileList) mobileList.innerHTML = '';
+    return;
+  }
+
+  emptyEl?.classList.add('hidden');
+  tableWrap?.classList.remove('hidden');
+  mobileList?.classList.remove('hidden');
+
+  if (tbody) {
+    tbody.innerHTML = positions
+      .map((p) => {
+        const isLong = String(p.side).toUpperCase() === 'LONG';
+        const pnl = Number(p.unrealized_pnl || 0);
+        const roe = Number(p.unrealized_roe_pct || 0);
+        const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
+        const track = calcSlTpTrackPct(p);
+        const beChip = p.is_break_even ? '<span class="badge trml-badge-info">BE</span>' : '';
+        const stratShort = formatStrategyLabel(p.strategy_id);
+        const hlCls = state.highlightSymbol === p.symbol ? 'trml-row-highlight' : '';
+
+        return `
+          <tr class="${hlCls}" data-symbol="${escapeHtml(p.symbol)}">
+            <td class="col-sticky trml-mono">${escapeHtml(p.symbol)} ${beChip}</td>
+            <td>
+              <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(p.side)}</span>
+              <span class="badge" data-variant="secondary" title="${escapeHtml(p.strategy_id)}">${escapeHtml(stratShort)}</span>
+            </td>
+            <td class="num trml-mono">${escapeHtml(p.qty)} @ ${fmtPrice(p.entry_price)}</td>
+            <td class="num trml-mono">${fmtPrice(p.mark_price)}</td>
+            <td>
+              <div class="trml-range-track">
+                <div class="trml-range-nums trml-mono">
+                  <span class="trml-neg">SL ${fmtPrice(p.sl_price)}</span>
+                  <span class="trml-pos">TP ${fmtPrice(p.tp_price)}</span>
+                </div>
+                <div class="progress trml-progress" data-tone="${track.tone}">
+                  <span style="width: ${track.pct.toFixed(1)}%"></span>
+                </div>
+              </div>
+            </td>
+            <td class="num trml-mono ${pnlCls}">
+              <strong>${fmtMoney(pnl, true)}</strong>
+              <div class="trml-muted-text">(${fmtPct(roe, 2, true)})</div>
+            </td>
+            <td class="num trml-mono trml-muted-text">${fmtDuration(p.duration_sec)}</td>
+            <td class="num">
+              <button type="button" class="btn" data-variant="outline" data-size="xs" onclick="inspectPositionAI('${escapeHtml(p.symbol)}')">Health</button>
+            </td>
+          </tr>
+        `;
+      })
+      .join('');
+  }
+
+  if (mobileList) {
+    mobileList.innerHTML = positions
+      .map((p) => {
+        const isLong = String(p.side).toUpperCase() === 'LONG';
+        const pnl = Number(p.unrealized_pnl || 0);
+        const roe = Number(p.unrealized_roe_pct || 0);
+        const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
+        const track = calcSlTpTrackPct(p);
+        return `
+          <div class="trml-mobile-item">
+            <div class="trml-mobile-head">
+              <div class="trml-panel-title-wrap">
+                <strong class="trml-mono">${escapeHtml(p.symbol)}</strong>
+                <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(p.side)}</span>
+                <span class="badge" data-variant="secondary">${escapeHtml(formatStrategyLabel(p.strategy_id))}</span>
+                ${p.is_break_even ? '<span class="badge trml-badge-info">BE</span>' : ''}
+              </div>
+              <strong class="trml-mono ${pnlCls}">${fmtMoney(pnl, true)} (${fmtPct(roe, 2, true)})</strong>
+            </div>
+            <div class="trml-mobile-grid trml-mono">
+              <div class="trml-mobile-kv"><span>Entry / Qty</span><strong>${fmtPrice(p.entry_price)} (${escapeHtml(p.qty)})</strong></div>
+              <div class="trml-mobile-kv"><span>Mark</span><strong>${fmtPrice(p.mark_price)}</strong></div>
+              <div class="trml-mobile-kv"><span>Hold</span><strong>${fmtDuration(p.duration_sec)}</strong></div>
+              <div class="trml-mobile-kv"><span>SL</span><strong class="trml-neg">${fmtPrice(p.sl_price)}</strong></div>
+              <div class="trml-mobile-kv"><span>TP</span><strong class="trml-pos">${fmtPrice(p.tp_price)}</strong></div>
+              <div class="trml-mobile-kv">
+                <span>AI Check</span>
+                <button type="button" class="btn" data-variant="outline" data-size="xs" onclick="inspectPositionAI('${escapeHtml(p.symbol)}')">Health</button>
+              </div>
+            </div>
+            <div class="progress trml-progress" data-tone="${track.tone}">
+              <span style="width: ${track.pct.toFixed(1)}%"></span>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+  }
+}
+
+// -------------------------------------------------------------------------
+// Scanner Radar Renderer (Tab-Aware)
+// -------------------------------------------------------------------------
+function renderScanner(coins, scannedAtUTC) {
+  state.lastScannerCoins = coins || [];
+  const countBadge = document.getElementById('scanner-count-badge');
+  const updatedEl = document.getElementById('scanner-updated');
+  const tbody = document.getElementById('scanner-tbody');
+  const mobileList = document.getElementById('scanner-mobile-list');
+  const tableWrap = document.getElementById('scanner-table-wrap');
+  const emptyEl = document.getElementById('scanner-empty');
+
+  const query = state.scannerFilter.trim().toUpperCase();
+  const filtered = query
+    ? state.lastScannerCoins.filter((c) => String(c.symbol).toUpperCase().includes(query))
+    : state.lastScannerCoins;
+
+  if (countBadge) {
+    countBadge.textContent = query
+      ? `${filtered.length} / ${state.lastScannerCoins.length} coins`
+      : `${state.lastScannerCoins.length} coins`;
+  }
+  if (updatedEl && scannedAtUTC) updatedEl.textContent = `Sync ${fmtUTC(scannedAtUTC)}`;
+
+  if (filtered.length === 0) {
+    tableWrap?.classList.add('hidden');
+    mobileList?.classList.add('hidden');
+    emptyEl?.classList.remove('hidden');
+    if (tbody) tbody.innerHTML = '';
+    if (mobileList) mobileList.innerHTML = '';
+    return;
+  }
+
+  emptyEl?.classList.add('hidden');
+  tableWrap?.classList.remove('hidden');
+  mobileList?.classList.remove('hidden');
+
+  if (tbody) {
+    tbody.innerHTML = filtered
+      .map((c) => {
+        const dist = Number(c.dist_vwap_pct || 0);
+        const distCls = dist > 0 ? 'trml-pos' : dist < 0 ? 'trml-neg' : '';
+        const hlCls = state.highlightSymbol === c.symbol ? 'trml-row-highlight' : '';
+        return `
+          <tr class="${hlCls}" data-symbol="${escapeHtml(c.symbol)}">
+            <td class="col-sticky trml-mono">${escapeHtml(c.symbol)}</td>
+            <td class="num trml-mono">${fmtPrice(c.mark_price)}</td>
+            <td class="num trml-mono trml-muted-text">${fmtPrice(c.session_vwap)}</td>
+            <td class="num trml-mono ${distCls}">${fmtPct(dist, 2, true)}</td>
+            <td class="num trml-mono">${Number(c.spread_pct || 0).toFixed(3)}%</td>
+            <td class="num trml-mono">${fmtFunding(c.funding_rate)}</td>
+            <td class="num trml-mono">${Number(c.natr_pct || 0).toFixed(2)}%</td>
+            <td class="num trml-mono">${Number(c.rvol || 0).toFixed(2)}x</td>
+          </tr>
+        `;
+      })
+      .join('');
+  }
+
+  if (mobileList) {
+    mobileList.innerHTML = filtered
+      .map((c) => {
+        const dist = Number(c.dist_vwap_pct || 0);
+        const distCls = dist > 0 ? 'trml-pos' : dist < 0 ? 'trml-neg' : '';
+        return `
+          <div class="trml-mobile-item">
+            <div class="trml-mobile-head">
+              <strong class="trml-mono">${escapeHtml(c.symbol)}</strong>
+              <span class="trml-mono ${distCls}">VWAP ${fmtPct(dist, 2, true)}</span>
+            </div>
+            <div class="trml-mobile-grid trml-mono">
+              <div class="trml-mobile-kv"><span>Mark</span><strong>${fmtPrice(c.mark_price)}</strong></div>
+              <div class="trml-mobile-kv"><span>NATR / RVOL</span><strong>${Number(c.natr_pct || 0).toFixed(2)}% / ${Number(c.rvol || 0).toFixed(2)}x</strong></div>
+              <div class="trml-mobile-kv"><span>Funding</span><strong>${fmtFunding(c.funding_rate)}</strong></div>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+  }
+  refreshCommandSymbols();
+}
+
+// -------------------------------------------------------------------------
+// Trade Ledger & Pagination
+// -------------------------------------------------------------------------
+async function fetchTrades(page = state.tradesPage) {
+  state.tradesPage = Math.max(1, page);
+  try {
+    const url = `/api/trades?page=${state.tradesPage}&limit=${state.tradesLimit}&strategy=${encodeURIComponent(state.tradesStrategy)}`;
+    const data = await apiFetch(url);
+    renderTrades(data);
+  } catch (err) {
+    showToast('error', 'Failed to load Trade Ledger', err.message);
+  }
+}
+
+function renderTrades(data) {
+  const trades = data.trades || [];
+  state.tradesTotal = Number(data.total || 0);
+
+  const summaryEl = document.getElementById('trades-summary');
+  const tableWrap = document.getElementById('trades-table-wrap');
+  const tbody = document.getElementById('trades-tbody');
+  const mobileList = document.getElementById('trades-mobile-list');
+  const emptyEl = document.getElementById('trades-empty');
+  const pagEl = document.getElementById('trades-pagination');
+
+  if (summaryEl) summaryEl.textContent = `${state.tradesTotal} trades (${state.tradesStrategy})`;
+
+  if (trades.length === 0) {
+    tableWrap?.classList.add('hidden');
+    mobileList?.classList.add('hidden');
+    emptyEl?.classList.remove('hidden');
+    if (tbody) tbody.innerHTML = '';
+    if (mobileList) mobileList.innerHTML = '';
+  } else {
+    emptyEl?.classList.add('hidden');
+    tableWrap?.classList.remove('hidden');
+    mobileList?.classList.remove('hidden');
+
+    if (tbody) {
+      tbody.innerHTML = trades
+        .map((t) => {
+          const isLong = String(t.side).toUpperCase() === 'LONG';
+          const pnl = Number(t.net_pnl_usdt || 0);
+          const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
+          const cachedTag = t.has_autopsy ? 'Cached' : 'Autopsy';
+          const btnVariant = t.has_autopsy ? 'secondary' : 'outline';
+          return `
+            <tr>
+              <td class="trml-mono trml-muted-text">${fmtUTC(t.closed_at_utc)}</td>
+              <td class="col-sticky trml-mono">${escapeHtml(t.symbol)}</td>
+              <td>
+                <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(t.side)}</span>
+                <span class="badge" data-variant="secondary" title="${escapeHtml(t.strategy_id)}">${escapeHtml(formatStrategyLabel(t.strategy_id))}</span>
+              </td>
+              <td class="num trml-mono">${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</td>
+              <td><span class="badge" data-variant="outline">${escapeHtml(t.exit_reason)}</span></td>
+              <td class="num trml-mono trml-muted-text">${Number(t.mae_pct || 0).toFixed(2)}% / ${Number(t.mfe_pct || 0).toFixed(2)}%</td>
+              <td class="num trml-mono ${pnlCls}"><strong>${fmtMoney(pnl, true)}</strong></td>
+              <td class="num">
+                <button type="button" class="btn" data-variant="${btnVariant}" data-size="xs" onclick="inspectTradeAutopsy('${escapeHtml(t.client_order_id)}', '${escapeHtml(t.symbol)}')">${cachedTag}</button>
+              </td>
+            </tr>
+          `;
+        })
+        .join('');
+    }
+
+    if (mobileList) {
+      mobileList.innerHTML = trades
+        .map((t) => {
+          const isLong = String(t.side).toUpperCase() === 'LONG';
+          const pnl = Number(t.net_pnl_usdt || 0);
+          const pnlCls = pnl > 0 ? 'trml-pos' : pnl < 0 ? 'trml-neg' : '';
+          return `
+            <div class="trml-mobile-item">
+              <div class="trml-mobile-head">
+                <div class="trml-panel-title-wrap">
+                  <strong class="trml-mono">${escapeHtml(t.symbol)}</strong>
+                  <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(t.side)}</span>
+                  <span class="badge" data-variant="outline">${escapeHtml(t.exit_reason)}</span>
+                </div>
+                <strong class="trml-mono ${pnlCls}">${fmtMoney(pnl, true)}</strong>
+              </div>
+              <div class="trml-mobile-grid trml-mono">
+                <div class="trml-mobile-kv"><span>Entry → Exit</span><strong>${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</strong></div>
+                <div class="trml-mobile-kv"><span>MAE / MFE</span><strong>${Number(t.mae_pct || 0).toFixed(2)}% / ${Number(t.mfe_pct || 0).toFixed(2)}%</strong></div>
+                <div class="trml-mobile-kv"><span>AI</span><button type="button" class="btn" data-variant="outline" data-size="xs" onclick="inspectTradeAutopsy('${escapeHtml(t.client_order_id)}', '${escapeHtml(t.symbol)}')">${t.has_autopsy ? 'Cached' : 'Autopsy'}</button></div>
+              </div>
+            </div>
+          `;
+        })
+        .join('');
+    }
+  }
+
+  renderPagination(pagEl, state.tradesPage, state.tradesLimit, state.tradesTotal, 'fetchTrades');
+}
+
+// -------------------------------------------------------------------------
+// Signal Audit Log & Detail Inspector Dialog
+// -------------------------------------------------------------------------
+async function fetchSignals(page = state.signalsPage) {
+  state.signalsPage = Math.max(1, page);
+  try {
+    const url = `/api/signals?page=${state.signalsPage}&limit=${state.signalsLimit}&status=${encodeURIComponent(state.signalsFilter)}`;
+    const data = await apiFetch(url);
+    renderSignals(data);
+  } catch (err) {
+    showToast('error', 'Failed to load Signal Audit', err.message);
+  }
+}
+
+function renderSignals(data) {
+  const signals = data.signals || [];
+  state.signalsTotal = Number(data.total || 0);
+  state.signalRecordsById.clear();
+  signals.forEach((s) => state.signalRecordsById.set(String(s.id), s));
+
+  const summaryEl = document.getElementById('signals-summary');
+  const tableWrap = document.getElementById('signals-table-wrap');
+  const tbody = document.getElementById('signals-tbody');
+  const mobileList = document.getElementById('signals-mobile-list');
+  const emptyEl = document.getElementById('signals-empty');
+  const pagEl = document.getElementById('signals-pagination');
+
+  if (summaryEl) summaryEl.textContent = `${state.signalsTotal} signals (${state.signalsFilter})`;
+
+  if (signals.length === 0) {
+    tableWrap?.classList.add('hidden');
+    mobileList?.classList.add('hidden');
+    emptyEl?.classList.remove('hidden');
+    if (tbody) tbody.innerHTML = '';
+    if (mobileList) mobileList.innerHTML = '';
+  } else {
+    emptyEl?.classList.add('hidden');
+    tableWrap?.classList.remove('hidden');
+    mobileList?.classList.remove('hidden');
+
+    if (tbody) {
+      tbody.innerHTML = signals
+        .map((sig) => {
+          const isLong = String(sig.side).toUpperCase() === 'LONG';
+          const tokens = parseSignalReasonTokens(sig.reject_reason);
+          const summaryNote = tokens.map((t) => (t.detail ? `${t.label} (${t.detail})` : t.label)).join(' · ') || '—';
+          return `
+            <tr>
+              <td class="trml-mono trml-muted-text">${fmtUTC(sig.candle_open_time_utc)}</td>
+              <td class="col-sticky trml-mono">${escapeHtml(sig.symbol)}</td>
+              <td>
+                <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(sig.side)}</span>
+                <span class="badge" data-variant="secondary">${escapeHtml(formatStrategyLabel(sig.strategy_id))}</span>
+              </td>
+              <td>
+                <span class="badge ${sig.is_executed ? 'trml-badge-pos' : 'trml-badge-warn'}">${sig.is_executed ? 'EXECUTED' : 'REJECTED'}</span>
+              </td>
+              <td><div class="trml-audit-note" title="${escapeHtml(summaryNote)}">${escapeHtml(summaryNote)}</div></td>
+              <td class="num">
+                <button type="button" class="btn" data-variant="outline" data-size="xs" onclick="openSignalInspector('${escapeHtml(String(sig.id))}')">Metrics</button>
+              </td>
+            </tr>
+          `;
+        })
+        .join('');
+    }
+
+    if (mobileList) {
+      mobileList.innerHTML = signals
+        .map((sig) => {
+          const isLong = String(sig.side).toUpperCase() === 'LONG';
+          const tokens = parseSignalReasonTokens(sig.reject_reason);
+          const summaryNote = tokens.map((t) => t.label).join(' · ') || '—';
+          return `
+            <div class="trml-mobile-item">
+              <div class="trml-mobile-head">
+                <div class="trml-panel-title-wrap">
+                  <strong class="trml-mono">${escapeHtml(sig.symbol)}</strong>
+                  <span class="badge ${isLong ? 'trml-badge-pos' : 'trml-badge-neg'}">${escapeHtml(sig.side)}</span>
+                  <span class="badge ${sig.is_executed ? 'trml-badge-pos' : 'trml-badge-warn'}">${sig.is_executed ? 'EXEC' : 'REJ'}</span>
+                </div>
+                <button type="button" class="btn" data-variant="outline" data-size="xs" onclick="openSignalInspector('${escapeHtml(String(sig.id))}')">Metrics</button>
+              </div>
+              <div class="trml-muted-text">${fmtUTC(sig.candle_open_time_utc)} · ${escapeHtml(summaryNote)}</div>
+            </div>
+          `;
+        })
+        .join('');
+    }
+  }
+
+  renderPagination(pagEl, state.signalsPage, state.signalsLimit, state.signalsTotal, 'fetchSignals');
+}
+
+function openSignalInspector(signalId) {
+  const sig = state.signalRecordsById.get(String(signalId));
+  const dialog = document.getElementById('signal-detail-dialog');
+  const titleEl = document.getElementById('signal-detail-title');
+  const subEl = document.getElementById('signal-detail-subtitle');
+  const bodyEl = document.getElementById('signal-detail-body');
+  if (!sig || !dialog || !bodyEl) return;
+
+  if (titleEl) titleEl.textContent = `${sig.symbol} · ${sig.side} (${formatStrategyLabel(sig.strategy_id)})`;
+  if (subEl) subEl.textContent = `${fmtUTC(sig.candle_open_time_utc)} · ${sig.is_executed ? 'EXECUTED' : 'REJECTED'}`;
+
+  const tokens = parseSignalReasonTokens(sig.reject_reason);
+  const chipsHtml = tokens
+    .map((t) => {
+      const text = t.detail ? `${t.label}: ${t.detail}` : t.label;
+      return `<span class="badge ${sig.is_executed ? 'trml-badge-pos' : 'trml-badge-warn'}">${escapeHtml(text)}</span>`;
+    })
+    .join('');
+
+  const metrics = [
+    ['Close Price', fmtPrice(sig.close_price)],
+    ['EMA 200', fmtPrice(sig.ema200)],
+    ['Session VWAP', fmtPrice(sig.session_vwap)],
+    ['ATR (14)', fmtPrice(sig.atr14)],
+    ['Bar Delta Z', Number(sig.bar_delta_zscore || 0).toFixed(2)],
+    ['OI Delta %', fmtPct(sig.oi_delta_pct, 2, true)],
+    ['Funding Rate', fmtFunding(sig.funding_rate)],
+    ['Strategy Module', escapeHtml(sig.strategy_id || 'VWAP_PULLBACK')]
+  ];
+
+  bodyEl.innerHTML = `
+    <div class="trml-reason-chips">${chipsHtml || '<span class="badge">No reason tags</span>'}</div>
+    <div class="trml-signal-metrics-grid">
+      ${metrics.map(([k, v]) => `<div class="trml-telem-kv"><span>${k}</span><strong>${v}</strong></div>`).join('')}
+    </div>
+  `;
+
+  if (!dialog.open) dialog.showModal();
+}
+
+function renderPagination(container, page, limit, total, fnName) {
+  if (!container) return;
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+  const start = total === 0 ? 0 : (page - 1) * limit + 1;
+  const end = Math.min(total, page * limit);
+  container.innerHTML = `
+    <span class="trml-mono trml-muted-text">Showing ${start}–${end} of ${total} (Page ${page}/${totalPages})</span>
+    <div class="trml-page-btns">
+      <button type="button" class="btn" data-variant="outline" data-size="xs" ${page <= 1 ? 'disabled' : ''} onclick="${fnName}(${page - 1})">Prev</button>
+      <button type="button" class="btn" data-variant="outline" data-size="xs" ${page >= totalPages ? 'disabled' : ''} onclick="${fnName}(${page + 1})">Next</button>
+    </div>
+  `;
+}
+
+// -------------------------------------------------------------------------
+// AI Copilot Slide-Over Sheet
+// -------------------------------------------------------------------------
+function openAISheetLoading(title, subtitle) {
+  const sheet = document.getElementById('ai-sheet');
+  const titleEl = document.getElementById('ai-sheet-title');
+  const subEl = document.getElementById('ai-sheet-subtitle');
+  const bodyEl = document.getElementById('ai-sheet-body');
+  if (!sheet || !bodyEl) return;
+
+  state.aiRawMarkdown = '';
+  if (titleEl) titleEl.textContent = title;
+  if (subEl) subEl.textContent = subtitle;
+
+  bodyEl.innerHTML = `
+    <div class="trml-skeleton-stack">
+      <div class="trml-ai-loading-head">
+        <span class="trml-spinner" aria-hidden="true"></span>
+        <span>Analyzing execution telemetry &amp; trade history…</span>
+      </div>
+      <div class="skeleton" style="height: 16px; width: 70%;"></div>
+      <div class="skeleton" style="height: 14px; width: 100%;"></div>
+      <div class="skeleton" style="height: 14px; width: 92%;"></div>
+      <div class="skeleton" style="height: 84px; width: 100%;"></div>
+      <div class="skeleton" style="height: 14px; width: 85%;"></div>
+    </div>
+  `;
+
+  if (!sheet.open) sheet.showModal();
+}
+
+function finishAISheet(seq, title, subtitle, markdown, cached = false) {
+  if (seq !== state.aiRequestSeq) return;
+  const titleEl = document.getElementById('ai-sheet-title');
+  const subEl = document.getElementById('ai-sheet-subtitle');
+  const bodyEl = document.getElementById('ai-sheet-body');
+  if (!bodyEl) return;
+
+  state.aiRawMarkdown = markdown || '';
+  if (titleEl) titleEl.textContent = title;
+  if (subEl) subEl.textContent = cached ? `${subtitle} · Cached` : subtitle;
+  bodyEl.innerHTML = `<div class="trml-ai-markdown">${sanitizeMarkdown(markdown)}</div>`;
+}
+
+function failAISheet(seq, errMsg) {
+  if (seq !== state.aiRequestSeq) return;
+  const bodyEl = document.getElementById('ai-sheet-body');
+  if (!bodyEl) return;
+  bodyEl.innerHTML = `
+    <div class="alert" data-variant="destructive" role="alert">
+      <h2>AI Evaluation Failed</h2>
+      <section><p>${escapeHtml(errMsg)}</p></section>
+    </div>
+  `;
+}
+
+async function runExecutiveSummaryAI() {
+  const seq = ++state.aiRequestSeq;
+  openAISheetLoading('Executive Daily Debrief', 'Account performance & macro alignment');
+  try {
+    const res = await apiFetch('/api/ai/executive-summary');
+    finishAISheet(seq, 'Executive Daily Debrief', 'Generated by Gemini', res.analysis || res.markdown || res.summary || 'No summary returned.');
+  } catch (err) {
+    failAISheet(seq, err.message);
+  }
+}
+
+async function inspectPositionAI(symbol) {
+  const seq = ++state.aiRequestSeq;
+  openAISheetLoading(`Position Health: ${symbol}`, 'Live mark-to-market & structure check');
+  try {
+    const res = await apiFetch(`/api/ai/position-health?symbol=${encodeURIComponent(symbol)}`);
+    finishAISheet(seq, `Position Health: ${symbol}`, 'Real-time position assessment', res.analysis || res.markdown || 'No assessment returned.');
+  } catch (err) {
+    failAISheet(seq, err.message);
+  }
+}
+
+async function inspectTradeAutopsy(clientOrderId, symbol) {
+  const seq = ++state.aiRequestSeq;
+  openAISheetLoading(`Trade Autopsy: ${symbol}`, `Order ${clientOrderId}`);
+  try {
+    const res = await apiFetch(`/api/ai/trade-autopsy?client_order_id=${encodeURIComponent(clientOrderId)}`);
+    finishAISheet(seq, `Trade Autopsy: ${symbol}`, `Order ${clientOrderId}`, res.analysis || res.autopsy || res.markdown || 'No autopsy available.', Boolean(res.cached));
+  } catch (err) {
+    failAISheet(seq, err.message);
+  }
+}
+
+async function runPatternMinerAI() {
+  const seq = ++state.aiRequestSeq;
+  openAISheetLoading('AI Pattern Miner', 'Cluster audit of recent losing & edge trades');
+  try {
+    const res = await apiFetch('/api/ai/pattern-miner');
+    finishAISheet(seq, 'AI Pattern Miner', 'Recurring failure & setup attribution', res.analysis || res.markdown || 'No patterns detected.');
+  } catch (err) {
+    failAISheet(seq, err.message);
+  }
+}
+
+// -------------------------------------------------------------------------
+// Command Palette (⌘K) & Dialog Backdrop Wiring
+// -------------------------------------------------------------------------
+function refreshCommandSymbols() {
+  const grp = document.getElementById('cmd-symbols-group');
+  const menu = document.getElementById('cmd-menu');
+  if (!grp) return;
+
+  const syms = new Set();
+  (state.lastSummaryData?.positions || []).forEach((p) => syms.add(p.symbol));
+  (state.lastScannerCoins || []).forEach((c) => syms.add(c.symbol));
+
+  const heading = '<div role="heading" id="cmd-grp-symbols">Active &amp; Scanned Symbols</div>';
+  const items = Array.from(syms)
+    .sort()
+    .slice(0, 25)
+    .map((sym) => `<div role="menuitem" data-cmd="symbol:${escapeHtml(sym)}" data-keywords="coin pair radar">${escapeHtml(sym)}</div>`)
+    .join('');
+
+  grp.innerHTML = heading + items;
+  if (menu && typeof menu.refresh === 'function') menu.refresh();
+}
+
+function handleCommandAction(cmd) {
+  if (!cmd) return;
+  if (cmd === 'tab:desk') selectTab('tab-desk');
+  else if (cmd === 'tab:ledger') selectTab('tab-ledger');
+  else if (cmd === 'tab:audit') selectTab('tab-audit');
+  else if (cmd === 'action:refresh') forceRefreshNow();
+  else if (cmd === 'action:theme') toggleTheme();
+  else if (cmd === 'action:ai-debrief') runExecutiveSummaryAI();
+  else if (cmd === 'action:ai-miner') runPatternMinerAI();
+  else if (cmd.startsWith('symbol:')) {
+    const sym = cmd.slice(7);
+    state.highlightSymbol = sym;
+    state.scannerFilter = '';
+    const filterEl = document.getElementById('scanner-filter');
+    if (filterEl) filterEl.value = '';
+    selectTab('tab-desk');
+    if (state.lastSummaryData) renderPositions(state.lastSummaryData.positions || []);
+    renderScanner(state.lastScannerCoins, null);
+    setTimeout(() => {
+      const targetRow = document.querySelector(`tr[data-symbol="${CSS.escape(sym)}"]`);
+      targetRow?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 60);
+  }
+}
+
+function setupDialogDismiss(dialogEl) {
+  if (!dialogEl) return;
+  let pressedOutside = false;
+  dialogEl.addEventListener('pointerdown', (e) => {
+    pressedOutside = e.target === dialogEl;
+  });
+  dialogEl.addEventListener('click', (e) => {
+    if (pressedOutside && e.target === dialogEl) {
+      dialogEl.close();
+    }
+    pressedOutside = false;
+  });
+}
+
+// -------------------------------------------------------------------------
+// Tab-Aware Polling Engine
+// -------------------------------------------------------------------------
+function selectTab(tabBtnId) {
+  const tabsEl = document.getElementById('workspace-tabs');
+  const btn = document.getElementById(tabBtnId);
+  if (tabsEl && btn && typeof tabsEl.select === 'function') {
+    tabsEl.select(btn, false);
+  }
+  onTabActivated(tabBtnId);
+}
+
+function onTabActivated(tabBtnId) {
+  const map = { 'tab-desk': 'desk', 'tab-ledger': 'ledger', 'tab-audit': 'audit' };
+  const nextTab = map[tabBtnId] || 'desk';
+  const changed = state.activeTab !== nextTab;
+  state.activeTab = nextTab;
+
+  if (nextTab === 'desk') {
+    if (changed) pollScannerOnce();
+    scheduleNextScannerPoll();
+  } else {
+    clearTimeout(state.scannerTimer);
+    if (nextTab === 'ledger') fetchTrades(state.tradesPage);
+    if (nextTab === 'audit') fetchSignals(state.signalsPage);
+  }
+}
+
+async function pollSummaryOnce() {
+  if (state.summaryInFlight || (state.pinRequired && !state.pinVerified)) return;
+  state.summaryInFlight = true;
+  try {
+    const data = await apiFetch('/api/summary');
+    state.consecutiveErrors = 0;
+    setConnectionState(true, 'Live');
+    renderSummary(data);
+  } catch (err) {
+    state.consecutiveErrors++;
+    setConnectionState(false, 'Reconnecting');
+    if (state.lastSummaryData) {
+      renderTelemetry(state.lastSummaryData.telemetry || null, Boolean(state.lastSummaryData.circuit_breaker));
+    }
+  } finally {
+    state.summaryInFlight = false;
+  }
+}
+
+async function pollScannerOnce() {
+  if (state.scannerInFlight || state.activeTab !== 'desk' || (state.pinRequired && !state.pinVerified)) return;
+  state.scannerInFlight = true;
+  try {
+    const data = await apiFetch('/api/scanner');
+    renderScanner(data.coins || [], data.scanned_at_utc);
+  } catch (err) {
+    // Summary poller owns connection alert state
+  } finally {
+    state.scannerInFlight = false;
+  }
+}
+
+function scheduleNextSummaryPoll() {
+  clearTimeout(state.summaryTimer);
+  if (document.visibilityState === 'hidden' || (state.pinRequired && !state.pinVerified)) return;
+  const interval = state.activeSlotsCount > 0 ? POLL_SUMMARY_ACTIVE_MS : POLL_SUMMARY_IDLE_MS;
+  state.summaryTimer = setTimeout(async () => {
+    await pollSummaryOnce();
+    scheduleNextSummaryPoll();
+  }, interval);
+}
+
+function scheduleNextScannerPoll() {
+  clearTimeout(state.scannerTimer);
+  if (document.visibilityState === 'hidden' || state.activeTab !== 'desk' || (state.pinRequired && !state.pinVerified)) return;
+  state.scannerTimer = setTimeout(async () => {
+    await pollScannerOnce();
+    scheduleNextScannerPoll();
+  }, POLL_SCANNER_MS);
+}
+
+function stopPolling() {
+  clearTimeout(state.summaryTimer);
+  clearTimeout(state.scannerTimer);
+}
+
+function startDeskDataCycle(immediate = true) {
+  stopPolling();
+  if (immediate) {
+    pollSummaryOnce().then(scheduleNextSummaryPoll);
+    if (state.activeTab === 'desk') {
+      pollScannerOnce().then(scheduleNextScannerPoll);
+    } else if (state.activeTab === 'ledger') {
+      fetchTrades(state.tradesPage);
+    } else if (state.activeTab === 'audit') {
+      fetchSignals(state.signalsPage);
+    }
+  } else {
+    scheduleNextSummaryPoll();
+    scheduleNextScannerPoll();
+  }
+}
+
+function forceRefreshNow() {
+  startDeskDataCycle(true);
+  if (state.activeTab === 'ledger') fetchTrades(state.tradesPage);
+  if (state.activeTab === 'audit') fetchSignals(state.signalsPage);
+  showToast('info', 'Telemetry refreshed', 'Synchronized with bot state.');
+}
+
+// -------------------------------------------------------------------------
+// Bootstrap & Event Bindings
+// -------------------------------------------------------------------------
+function startClock() {
+  const el = document.getElementById('utc-clock');
+  if (!el) return;
+  const tick = () => {
+    const now = new Date();
+    const pad = (x) => String(x).padStart(2, '0');
+    el.textContent = `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())} UTC`;
+  };
+  tick();
+  setInterval(tick, 1000);
+}
+
+async function initAuthAndBoot() {
+  try {
+    const status = await fetch('/api/auth/status').then((r) => r.json());
+    state.pinRequired = Boolean(status.pin_required);
+
+    if (!state.pinRequired) {
+      state.pinVerified = true;
+      showAppShell();
+      startDeskDataCycle(true);
+      return;
+    }
+
+    let saved = '';
+    try { saved = localStorage.getItem('trml_pin') || ''; } catch (e) {}
+    if (/^\d{6}$/.test(saved)) {
+      await verifyPIN(saved, true);
+    } else {
+      showPinScreen('');
+    }
+  } catch (err) {
+    showAppShell();
+    setConnectionState(false, 'Offline');
+    showToast('error', 'Server unreachable', 'Could not fetch /api/auth/status.');
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  syncThemeUI();
   startClock();
-  setupEvents();
-  setupAIEvents();
-  setupPINKeypad();
+  initPinControls();
 
-  // Initial Auth & Boot
-  checkAuthAndStart();
+  // Keep icons & meta in sync when Basecoat toggles theme
+  document.addEventListener('basecoat:themechange', syncThemeUI);
 
-  // Background Polling
-  // High-frequency polling (every 3 seconds for summary & positions)
-  setInterval(() => {
-    if (state.isPollingActive && (!state.pinRequired || (state.pin && localStorage.getItem('trml_pin')))) {
-      fetchSummary();
-    }
-  }, 3000);
+  document.getElementById('theme-toggle-btn')?.addEventListener('click', toggleTheme);
+  document.getElementById('refresh-btn')?.addEventListener('click', forceRefreshNow);
+  document.getElementById('ai-exec-btn')?.addEventListener('click', runExecutiveSummaryAI);
+  document.getElementById('ai-miner-btn')?.addEventListener('click', runPatternMinerAI);
 
-  // Scanner radar polling (every 5 seconds)
-  setInterval(() => {
-    if (state.isPollingActive && (!state.pinRequired || (state.pin && localStorage.getItem('trml_pin')))) {
-      fetchScanner();
-    }
-  }, 5000);
-
-  // Page visibility awareness: pause polling when tab is hidden, resume immediately when visible
-  document.addEventListener('visibilitychange', () => {
-    state.isPollingActive = !document.hidden;
-    if (state.isPollingActive && (!state.pinRequired || (state.pin && localStorage.getItem('trml_pin')))) {
-      fetchSummary();
-      fetchScanner();
+  // Sheet copy & close
+  document.getElementById('ai-sheet-close-btn')?.addEventListener('click', () => {
+    document.getElementById('ai-sheet')?.close();
+  });
+  document.getElementById('ai-sheet-copy-btn')?.addEventListener('click', async () => {
+    if (!state.aiRawMarkdown) return;
+    try {
+      await navigator.clipboard.writeText(state.aiRawMarkdown);
+      showToast('success', 'Copied to clipboard', 'AI report copied as Markdown.');
+    } catch (e) {
+      showToast('warning', 'Copy unavailable', 'Clipboard permission denied.');
     }
   });
 
-  // Register PWA Service Worker
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js?v=6').then((reg) => {
-        reg.update();
-      }).catch((err) => {
-        console.warn('Service worker registration failed:', err);
-      });
+  setupDialogDismiss(document.getElementById('ai-sheet'));
+  setupDialogDismiss(document.getElementById('signal-detail-dialog'));
+  setupDialogDismiss(document.getElementById('cmd-dialog'));
+
+  // Command palette open triggers (Button & Cmd+K / Ctrl+K)
+  const openCmdPalette = () => {
+    const dlg = document.getElementById('cmd-dialog');
+    const inp = document.getElementById('cmd-input');
+    if (!dlg) return;
+    refreshCommandSymbols();
+    if (inp) {
+      inp.value = '';
+      document.getElementById('cmd-menu')?.refresh?.();
+    }
+    if (!dlg.open) dlg.showModal();
+    requestAnimationFrame(() => inp?.focus());
+  };
+
+  document.getElementById('cmd-trigger-btn')?.addEventListener('click', openCmdPalette);
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      if (!state.pinRequired || state.pinVerified) openCmdPalette();
+    }
+  });
+  document.getElementById('cmd-menu-list')?.addEventListener('click', (e) => {
+    const item = e.target.closest('[role="menuitem"][data-cmd]');
+    if (item) handleCommandAction(item.dataset.cmd);
+  });
+
+  // Tab switch hook
+  document.getElementById('workspace-tabs')?.addEventListener('click', (e) => {
+    const tabBtn = e.target.closest('[role="tab"]');
+    if (tabBtn?.id) onTabActivated(tabBtn.id);
+  });
+
+  // Scanner live filter
+  document.getElementById('scanner-filter')?.addEventListener('input', (e) => {
+    state.scannerFilter = e.target.value || '';
+    renderScanner(state.lastScannerCoins, null);
+  });
+
+  // Trades strategy segmented control
+  document.getElementById('trades-strat-group')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-strategy]');
+    if (!btn) return;
+    state.tradesStrategy = btn.dataset.strategy || 'ALL';
+    document.querySelectorAll('#trades-strat-group button[data-strategy]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b === btn));
     });
+    fetchTrades(1);
+  });
+
+  // Signals decision segmented control
+  document.getElementById('signals-filter-group')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-status]');
+    if (!btn) return;
+    state.signalsFilter = btn.dataset.status || 'ALL';
+    document.querySelectorAll('#signals-filter-group button[data-status]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b === btn));
+    });
+    fetchSignals(1);
+  });
+
+  // Pause background polling when tab is hidden
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      stopPolling();
+    } else if (!state.pinRequired || state.pinVerified) {
+      startDeskDataCycle(true);
+    }
+  });
+
+  // Register Service Worker
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
+
+  initAuthAndBoot();
 });

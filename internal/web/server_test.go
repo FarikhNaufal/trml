@@ -950,3 +950,81 @@ func TestServer_NilReaderClampedPageAndCachedAutopsyNoRateLimit(t *testing.T) {
 		t.Fatalf("expected cached trade autopsy to bypass AI rate limit, got HTTP %d: %s", recCache.Code, recCache.Body.String())
 	}
 }
+
+func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
+	srv, err := NewServer(ServerConfig{
+		Port:   "8080",
+		Env:    "DRY-RUN",
+		Broker: &mockBroker{},
+		GetTelemetryFn: func() *TelemetryDTO {
+			return &TelemetryDTO{
+				MacroRegime:          "TREND_UP",
+				MacroER:              0.42,
+				MacroVolRatio:        1.12,
+				MacroReturn24hPct:    2.85,
+				RangeRiskMult:        0.5,
+				VolExpansionRatio:    1.15,
+				VolExpansionRiskMult: 0.75,
+				MarketBreadthPct:     68.0,
+				MarketBreadthValid:   true,
+				ClusterSLPaused:      true,
+				ClusterSLUntilUTC:    "2026-11-26T04:00:00Z",
+				Timeframe:            "5m",
+				ScannerInterval:      "15m",
+				AllowedSide:          "BOTH",
+				DisableOIFilter:      false,
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// 1. /api/summary exposes telemetry without touching storage
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest("GET", "/api/summary", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/summary, got %d", rec.Code)
+	}
+	var sum map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	telem, ok := sum["telemetry"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected telemetry object in summary, got %#v", sum["telemetry"])
+	}
+	if telem["macro_regime"] != "TREND_UP" || telem["cluster_sl_paused"] != true || telem["timeframe"] != "5m" {
+		t.Fatalf("unexpected telemetry payload: %#v", telem)
+	}
+
+	// 2. Embedded /vendor/ Basecoat assets load cleanly with immutable cache header
+	for _, asset := range []string{
+		"/vendor/basecoat-mira.cdn.min.css",
+		"/vendor/basecoat.min.js",
+		"/vendor/tabs.min.js",
+		"/vendor/toast.min.js",
+		"/vendor/popover.min.js",
+		"/vendor/input-otp.min.js",
+		"/vendor/command.min.js",
+	} {
+		recAsset := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(recAsset, httptest.NewRequest("GET", asset, nil))
+		if recAsset.Code != http.StatusOK || recAsset.Body.Len() == 0 {
+			t.Fatalf("expected non-empty 200 for %s, got %d (%d bytes)", asset, recAsset.Code, recAsset.Body.Len())
+		}
+		if cc := recAsset.Header().Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+			t.Fatalf("expected immutable Cache-Control for %s, got %q", asset, cc)
+		}
+	}
+
+	// 3. Root HTML preserves no-store Cache-Control
+	recHTML := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recHTML, httptest.NewRequest("GET", "/", nil))
+	if recHTML.Code != http.StatusOK {
+		t.Fatalf("expected 200 /, got %d", recHTML.Code)
+	}
+	if cc := recHTML.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Fatalf("expected no-store Cache-Control for /, got %q", cc)
+	}
+}
