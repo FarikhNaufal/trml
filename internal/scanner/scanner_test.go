@@ -956,3 +956,203 @@ func TestRunBulkMarketScannerPartitioned_RollingVWAPAndHighKlineLimit(t *testing
 		t.Fatalf("expected RollingVWAPBars=50 to reject 108 vs ~100.3 rolling VWAP, got %+v", res)
 	}
 }
+
+func TestScannerAllowedSideEMA200Filter(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+	filters := map[string]model.ExchangeFilter{"UPUSDT": f, "DOWNUSDT": f, "NEAREMAUSDT": f}
+	volMap := map[string]float64{"UPUSDT": 100_000_000, "DOWNUSDT": 100_000_000, "NEAREMAUSDT": 100_000_000}
+	bookMap := map[string]model.BookQuote{
+		"UPUSDT":      {BestBid: 309.0, BestAsk: 309.05},
+		"DOWNUSDT":    {BestBid: 90.0, BestAsk: 90.02},
+		"NEAREMAUSDT": {BestBid: 100.5, BestAsk: 100.52},
+	}
+
+	buildTrend := func(up bool) []model.Candle {
+		const totalBars = 840 // > 200 completed 1h bars so IsAboveHourlyEMA200 is valid
+		c := make([]model.Candle, totalBars)
+		for i := 0; i < totalBars; i++ {
+			tOpen := now.Add(time.Duration(i-totalBars) * 15 * time.Minute)
+			p := 300.0 - float64(i)*0.25
+			if up {
+				p = 100.0 + float64(i)*0.25
+			}
+			vol := 100.0
+			if i == totalBars-1 {
+				vol = 200.0
+			}
+			c[i] = model.Candle{
+				OpenTime:        tOpen,
+				CloseTime:       tOpen.Add(15*time.Minute - time.Millisecond),
+				Open:            p,
+				High:            p + 0.5,
+				Low:             p - 0.5,
+				Close:           p,
+				VolumeBase:      vol,
+				QuoteVolumeUSDT: vol * p,
+			}
+		}
+		return c
+	}
+	buildNearEMA := func() []model.Candle {
+		const totalBars = 840
+		c := make([]model.Candle, totalBars)
+		for i := 0; i < totalBars; i++ {
+			tOpen := now.Add(time.Duration(i-totalBars) * 15 * time.Minute)
+			p := 100.0
+			vol := 100.0
+			if i == totalBars-1 {
+				p = 100.5 // ~0.25 ATR above EMA200 (~100.005 when ATR14 ~ 2.0): kept within 1.0 ATR headroom
+				vol = 200.0
+			}
+			c[i] = model.Candle{
+				OpenTime:        tOpen,
+				CloseTime:       tOpen.Add(15*time.Minute - time.Millisecond),
+				Open:            p,
+				High:            p + 1.0,
+				Low:             p - 1.0,
+				Close:           p,
+				VolumeBase:      vol,
+				QuoteVolumeUSDT: vol * p,
+			}
+		}
+		return c
+	}
+	upCandles := buildTrend(true)
+	downCandles := buildTrend(false)
+	nearCandles := buildNearEMA()
+	fetchFn := func(sym string, limit int) []model.Candle {
+		switch sym {
+		case "UPUSDT":
+			return upCandles
+		case "NEAREMAUSDT":
+			return nearCandles
+		default:
+			return downCandles
+		}
+	}
+
+	baseCfg := ScannerConfig{
+		MinVolume24hUSDT:      25_000_000,
+		MaxSpreadPct:          0.08,
+		MinRVOL:               1.20,
+		MinFallbackRVOL:       0.50,
+		RVOLLookback:          20,
+		MinNATRPct:            0.10,
+		MaxNATRPct:            5.00,
+		MaxScannerVWAPDistATR: 20.0,
+		ATRPeriod:             14,
+		EMAPeriod:             200,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        840,
+		DeltaWindow:           50,
+		Timeframe:             "15m",
+		CandleDuration:        15 * time.Minute,
+		RankingMode:           "pullback",
+		ComputeMarketBreadth:  true,
+	}
+
+	// 1. SHORT_ONLY keeps DOWNUSDT & crossover-zone NEAREMAUSDT (<= EMA200 + 1.0 ATR), rejects UPUSDT via SideRejected, preserves Breadth total=3.
+	cfgShort := baseCfg
+	cfgShort.AllowedSide = "SHORT_ONLY"
+	resShort := RunBulkMarketScannerPartitioned(cfgShort, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if len(resShort.Primary) != 2 {
+		t.Fatalf("SHORT_ONLY expected 2 symbols [DOWNUSDT, NEAREMAUSDT], got %v", resShort.Primary)
+	}
+	for _, s := range resShort.Primary {
+		if s == "UPUSDT" {
+			t.Fatalf("SHORT_ONLY should reject UPUSDT far above EMA200, got %v", resShort.Primary)
+		}
+	}
+	if resShort.Stats.SideRejected != 1 {
+		t.Fatalf("SHORT_ONLY expected SideRejected=1, got %d", resShort.Stats.SideRejected)
+	}
+	if resShort.MarketBreadthTotal != 3 {
+		t.Fatalf("expected MarketBreadthTotal=3 even when UPUSDT rejected by AllowedSide, got %d", resShort.MarketBreadthTotal)
+	}
+
+	// 2. LONG_ONLY keeps UPUSDT & NEAREMAUSDT and rejects DOWNUSDT.
+	cfgLong := baseCfg
+	cfgLong.AllowedSide = "LONG_ONLY"
+	resLong := RunBulkMarketScannerPartitioned(cfgLong, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if len(resLong.Primary) != 2 {
+		t.Fatalf("LONG_ONLY expected 2 symbols [UPUSDT, NEAREMAUSDT], got %v", resLong.Primary)
+	}
+	for _, s := range resLong.Primary {
+		if s == "DOWNUSDT" {
+			t.Fatalf("LONG_ONLY should reject DOWNUSDT far below EMA200, got %v", resLong.Primary)
+		}
+	}
+	if resLong.Stats.SideRejected != 1 {
+		t.Fatalf("LONG_ONLY expected SideRejected=1, got %d", resLong.Stats.SideRejected)
+	}
+
+	// 3. AUTO / empty allows all 3 symbols cleanly.
+	cfgAuto := baseCfg
+	cfgAuto.AllowedSide = "AUTO"
+	resAuto := RunBulkMarketScannerPartitioned(cfgAuto, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if len(resAuto.Primary) != 3 || resAuto.Stats.SideRejected != 0 {
+		t.Fatalf("AUTO expected 3 symbols and SideRejected=0, got %+v", resAuto)
+	}
+}
+
+func TestScannerFromAppConfigDefaultsAndTelemetrySeparation(t *testing.T) {
+	// 1. FromAppConfig must enforce safe non-zero fallbacks even when non-nil config has zeroed scanner fields.
+	zeroSc := FromAppConfig(&config.Config{}, 0)
+	if zeroSc.MaxWatchedCoins != defaultScannerMaxWatchedCoins ||
+		zeroSc.MaxSpreadPct != defaultScannerMaxSpreadPct ||
+		zeroSc.MinNATRPct != defaultScannerMinNATRPct ||
+		zeroSc.MaxNATRPct != defaultScannerMaxNATRPct ||
+		zeroSc.MinFallbackRVOL != defaultScannerFallbackRVOL ||
+		zeroSc.MinVolume24hUSDT != defaultScannerMinVolume24h ||
+		zeroSc.MinRVOL != defaultScannerMinRVOL ||
+		zeroSc.EMAPeriod != defaultScannerEMAPeriod ||
+		zeroSc.Timeframe != "5m" {
+		t.Fatalf("expected safe defaults for zero-initialized Config, got %+v", zeroSc)
+	}
+
+	// 2. BookMissing, SpreadRejected, KlineFetchFailed, and KlineFetchOrShort are tracked separately.
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+	filters := map[string]model.ExchangeFilter{
+		"NOBOOKUSDT":     f,
+		"WIDESPREADUSDT": f,
+		"FETCHERRUSDT":   f,
+		"SHORTKLINEUSDT": f,
+	}
+	volMap := map[string]float64{
+		"NOBOOKUSDT":     100_000_000,
+		"WIDESPREADUSDT": 100_000_000,
+		"FETCHERRUSDT":   100_000_000,
+		"SHORTKLINEUSDT": 100_000_000,
+	}
+	bookMap := map[string]model.BookQuote{
+		"WIDESPREADUSDT": {BestBid: 100.0, BestAsk: 102.0}, // 2% > max spread
+		"FETCHERRUSDT":   {BestBid: 100.0, BestAsk: 100.01},
+		"SHORTKLINEUSDT": {BestBid: 100.0, BestAsk: 100.01},
+	}
+	fetchFn := func(sym string, limit int) []model.Candle {
+		if sym == "FETCHERRUSDT" {
+			return nil
+		}
+		// Non-nil short candle slice (< EMAPeriod+1)
+		return []model.Candle{{
+			OpenTime:  now.Add(-15 * time.Minute),
+			CloseTime: now.Add(-time.Millisecond),
+			Open:      100, High: 101, Low: 99, Close: 100,
+		}}
+	}
+
+	cfg := ScannerConfig{
+		MinVolume24hUSDT: 25_000_000,
+		MaxSpreadPct:     0.10,
+		ATRPeriod:        14,
+		EMAPeriod:        50,
+		MaxWatchedCoins:  10,
+		CandleDuration:   15 * time.Minute,
+	}
+	res := RunBulkMarketScannerPartitioned(cfg, make(map[string]*model.SymbolState), filters, volMap, bookMap, fetchFn, now)
+	if res.Stats.BookMissing != 1 || res.Stats.SpreadRejected != 1 || res.Stats.KlineFetchFailed != 1 || res.Stats.KlineFetchOrShort != 1 {
+		t.Fatalf("expected BookMissing=1, SpreadRejected=1, KlineFetchFailed=1, KlineFetchOrShort=1; got %+v", res.Stats)
+	}
+}

@@ -33,6 +33,7 @@ const (
 	BenchmarkSymbol = "BTCUSDT"
 
 	scannerSpreadSafetyRatio = 0.80 // Require 20% spread headroom during scanning vs execution cutoff.
+	scannerSideEMAHeadroomATR = 1.0 // Allow symbols near EMA200 crossover within 1.0 ATR across 30m scan gaps.
 	maxScannerKlineLimit     = 4500 // Support 15m/5m HTF EMA200 + 24h slope bootstrap via REST pagination.
 	scannerWorkerConcurrency = 5    // Bound concurrent kline REST fetches to respect exchange rate limits.
 
@@ -76,6 +77,7 @@ type ScannerConfig struct {
 	BreakoutMaxScannerVWAPDistATR float64
 	RollingVWAPBars               int
 	ComputeMarketBreadth          bool
+	AllowedSide                   string
 }
 
 // FromAppConfig builds a ScannerConfig from application config while applying safe defaults.
@@ -124,19 +126,54 @@ func FromAppConfig(cfg *config.Config, bootstrapCount int) ScannerConfig {
 	if rankingMode == "" {
 		rankingMode = defaultScannerRankingMode
 	}
+	allowedSide := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
+	if cfg.RelResidual.Enabled && strings.ToUpper(strings.TrimSpace(cfg.RelResidual.Mode)) != "MOMENTUM" {
+		allowedSide = ""
+	}
+	minVol := cfg.MinVolume24hUSDT
+	if minVol <= 0 {
+		minVol = defaultScannerMinVolume24h
+	}
+	maxSpread := cfg.MaxSpreadPct
+	if maxSpread <= 0 {
+		maxSpread = defaultScannerMaxSpreadPct
+	}
+	minFallbackRVOL := cfg.MinFallbackRVOL
+	if minFallbackRVOL <= 0 {
+		minFallbackRVOL = defaultScannerFallbackRVOL
+	}
+	minNATR := cfg.MinNATRPct
+	if minNATR <= 0 {
+		minNATR = defaultScannerMinNATRPct
+	}
+	maxNATR := cfg.MaxNATRPct
+	if maxNATR <= 0 {
+		maxNATR = defaultScannerMaxNATRPct
+	}
+	if maxNATR < minNATR {
+		maxNATR = minNATR
+	}
+	maxWatched := cfg.MaxWatchedCoins
+	if maxWatched <= 0 {
+		maxWatched = defaultScannerMaxWatchedCoins
+	}
+	maxVWAPDist := cfg.MaxScannerVWAPDistATR
+	if maxVWAPDist < 0 {
+		maxVWAPDist = defaultScannerVWAPDistATR
+	}
 
 	return ScannerConfig{
-		MinVolume24hUSDT:      cfg.MinVolume24hUSDT,
-		MaxSpreadPct:          cfg.MaxSpreadPct,
+		MinVolume24hUSDT:      minVol,
+		MaxSpreadPct:          maxSpread,
 		MinRVOL:               minRVOL,
-		MinFallbackRVOL:       cfg.MinFallbackRVOL,
+		MinFallbackRVOL:       minFallbackRVOL,
 		RVOLLookback:          defaultScannerRVOLLookback,
-		MinNATRPct:            cfg.MinNATRPct,
-		MaxNATRPct:            cfg.MaxNATRPct,
-		MaxScannerVWAPDistATR: cfg.MaxScannerVWAPDistATR,
+		MinNATRPct:            minNATR,
+		MaxNATRPct:            maxNATR,
+		MaxScannerVWAPDistATR: maxVWAPDist,
 		ATRPeriod:             defaultScannerATRPeriod,
 		EMAPeriod:             emaPeriod,
-		MaxWatchedCoins:       cfg.MaxWatchedCoins,
+		MaxWatchedCoins:       maxWatched,
 		BootstrapCount:        bootstrapCount,
 		DeltaWindow:           defaultScannerDeltaWindow,
 		Timeframe:             timeframe,
@@ -154,6 +191,7 @@ func FromAppConfig(cfg *config.Config, bootstrapCount int) ScannerConfig {
 		BreakoutMaxScannerVWAPDistATR: cfg.VolBreakout.MaxScannerVWAPDistATR,
 		RollingVWAPBars:               cfg.RollingVWAPBars,
 		ComputeMarketBreadth:          cfg.MarketBreadthLowThreshold > 0,
+		AllowedSide:                   allowedSide,
 	}
 }
 
@@ -161,12 +199,15 @@ func FromAppConfig(cfg *config.Config, bootstrapCount int) ScannerConfig {
 type ScanStats struct {
 	TotalPerpUSDT     int
 	VolRejected       int
+	BookMissing       int
 	SpreadRejected    int
 	PreFilterPassed   int
+	KlineFetchFailed  int
 	KlineFetchOrShort int
 	KlineGapOrInvalid int
 	ATRInvalid        int
 	NATRRejected      int
+	SideRejected      int
 	VWAPDistRejected  int
 	CandidatesValid   int
 	PrimaryPassed     int
@@ -191,10 +232,12 @@ type scanRejectKind uint8
 
 const (
 	scanValid scanRejectKind = iota
+	scanRejectKlineFetch
 	scanRejectKlineShort
 	scanRejectKlineInvalid
 	scanRejectATR
 	scanRejectNATR
+	scanRejectSide
 	scanRejectVWAPDist
 )
 
@@ -344,6 +387,7 @@ func RunBulkMarketScannerPartitioned(
 	var breakoutCandidates []Candidate
 	var sweepCandidates []Candidate
 	rankMode := strings.ToLower(strings.TrimSpace(cfg.RankingMode))
+	sideFilter := strings.ToUpper(strings.TrimSpace(cfg.AllowedSide))
 
 	excludedTopVol := buildTopVolExclusion(perpetualFilters, vol24hMap, cfg.ExcludeTopVolRank)
 	boEnabled := cfg.BreakoutScannerEnabled
@@ -398,7 +442,15 @@ func RunBulkMarketScannerPartitioned(
 			continue
 		}
 		bk, ok := bookMap[sym]
-		spreadOK := ok && !math.IsNaN(bk.BestBid) && !math.IsNaN(bk.BestAsk) && !math.IsInf(bk.BestBid, 0) && !math.IsInf(bk.BestAsk, 0) && bk.BestBid > 0 && bk.BestAsk > bk.BestBid
+		if !ok {
+			stats.BookMissing++
+			if includeBreadth {
+				preFlags[sym] = preScreenFlags{includeBreadth: true}
+				symbolsToScan = append(symbolsToScan, sym)
+			}
+			continue
+		}
+		spreadOK := !math.IsNaN(bk.BestBid) && !math.IsNaN(bk.BestAsk) && !math.IsInf(bk.BestBid, 0) && !math.IsInf(bk.BestAsk, 0) && bk.BestBid > 0 && bk.BestAsk > bk.BestBid
 		if spreadOK {
 			spreadPct := ((bk.BestAsk - bk.BestBid) / bk.BestBid) * 100.0
 			maxScanSpread := cfg.MaxSpreadPct * scannerSpreadSafetyRatio
@@ -463,6 +515,14 @@ func RunBulkMarketScannerPartitioned(
 			var rawKlines []model.Candle
 			if fetchKlinesFn != nil {
 				rawKlines = fetchKlinesFn(symbol, klineLimit)
+			}
+			if rawKlines == nil {
+				if !flags.allowPrimary && !flags.allowBreakout {
+					resultsChan <- scanResult{breadthOnly: true}
+					return
+				}
+				resultsChan <- scanResult{reject: scanRejectKlineFetch}
+				return
 			}
 			if len(rawKlines) < cfg.EMAPeriod+1 {
 				if !flags.allowPrimary && !flags.allowBreakout {
@@ -541,6 +601,22 @@ func RunBulkMarketScannerPartitioned(
 				return
 			}
 
+			var ema200 float64
+			var hasEMA200 bool
+			if sideFilter == "SHORT_ONLY" || sideFilter == "LONG_ONLY" {
+				ema200 = indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
+				hasEMA200 = !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0
+				sideHeadroom := scannerSideEMAHeadroomATR * atr14
+				if hasEMA200 && ((sideFilter == "SHORT_ONLY" && lastClose > ema200+sideHeadroom) || (sideFilter == "LONG_ONLY" && lastClose < ema200-sideHeadroom)) {
+					resultsChan <- scanResult{
+						reject:         scanRejectSide,
+						breadthCounted: breadthCounted,
+						breadthAbove:   breadthAbove,
+					}
+					return
+				}
+			}
+
 			var distVWAPATR float64
 			var sessionVWAP float64
 			needVWAP := ((cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") && pNATROK) || (cfg.BreakoutMaxScannerVWAPDistATR > 0 && bNATROK)
@@ -561,8 +637,11 @@ func RunBulkMarketScannerPartitioned(
 				} else if cfg.MaxScannerVWAPDistATR > 0 && distVWAPATR > cfg.MaxScannerVWAPDistATR {
 					pVWAPOK = false
 					if cfg.SweepExtendedVWAP && lastClose <= sessionVWAP {
-						ema200 := indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
-						if !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0 && lastClose < ema200 {
+						if !hasEMA200 {
+							ema200 = indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
+							hasEMA200 = !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0
+						}
+						if hasEMA200 && lastClose < ema200 {
 							rvolExt := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
 							if !math.IsNaN(rvolExt) && !math.IsInf(rvolExt, 0) {
 								liqB := computeLiquidityLogBonus(vol24hMap[symbol], cfg.MinVolume24hUSDT)
@@ -690,6 +769,8 @@ func RunBulkMarketScannerPartitioned(
 			continue
 		}
 		switch res.reject {
+		case scanRejectKlineFetch:
+			stats.KlineFetchFailed++
 		case scanRejectKlineShort:
 			stats.KlineFetchOrShort++
 		case scanRejectKlineInvalid:
@@ -698,6 +779,8 @@ func RunBulkMarketScannerPartitioned(
 			stats.ATRInvalid++
 		case scanRejectNATR:
 			stats.NATRRejected++
+		case scanRejectSide:
+			stats.SideRejected++
 		case scanRejectVWAPDist:
 			stats.VWAPDistRejected++
 			if res.sweepCand != nil {

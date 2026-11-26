@@ -1464,9 +1464,18 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		return
 	}
 
+	var klineFetchFailures atomic.Int64
+	var klineSampleMu sync.Mutex
+	var klineErrorSamples []string
 	fetchKlinesFn := func(symbol string, limit int) []model.Candle {
 		k, err := e.client.FetchKlines(scanCtx, symbol, e.cfg.Timeframe, limit)
 		if err != nil {
+			klineFetchFailures.Add(1)
+			klineSampleMu.Lock()
+			if len(klineErrorSamples) < 3 {
+				klineErrorSamples = append(klineErrorSamples, fmt.Sprintf("%s: %v", symbol, err))
+			}
+			klineSampleMu.Unlock()
 			slog.Debug("failed to fetch klines for symbol", "symbol", symbol, "err", err)
 			return nil
 		}
@@ -1495,15 +1504,22 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	)
 	scanStats := scanRes.Stats
 
+	if failCnt := klineFetchFailures.Load(); failCnt > 0 {
+		slog.Warn("scanner: kline fetch errors during scan", "failedCount", failCnt, "samples", klineErrorSamples)
+	}
+
 	slog.Info("scanner diagnostics",
 		"totalPerpUSDT", scanStats.TotalPerpUSDT,
 		"volRejected", scanStats.VolRejected,
+		"bookMissing", scanStats.BookMissing,
 		"spreadRejected", scanStats.SpreadRejected,
 		"preFilterPassed", scanStats.PreFilterPassed,
+		"klineFetchFailed", scanStats.KlineFetchFailed,
 		"klineShort", scanStats.KlineFetchOrShort,
 		"klineInvalidOrGap", scanStats.KlineGapOrInvalid,
 		"atrInvalid", scanStats.ATRInvalid,
 		"natrRejected", scanStats.NATRRejected,
+		"sideRejected", scanStats.SideRejected,
 		"vwapDistRejected", scanStats.VWAPDistRejected,
 		"candidatesValid", scanStats.CandidatesValid,
 		"primaryPassed", scanStats.PrimaryPassed,
