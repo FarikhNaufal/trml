@@ -1401,6 +1401,115 @@ func TestSimBroker_Batch3TimeNormalizationZeroOverridesAndMarketBarTP(t *testing
 	}
 }
 
+func TestSimBroker_ExpiredLimitGapDoesNotFillAndIsolatedLiquidation(t *testing.T) {
+	t0 := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+
+	// 1. Expired LIMIT order must expire as TimedOut if a candle gap skips past TimeoutTime (c.OpenTime >= TimeoutTime).
+	bGap := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		EntryOrderType:    "LIMIT",
+		CandleDuration:    15 * time.Minute,
+		SignalDelayBars:   1,
+		LimitOrderTimeout: 30 * time.Minute,
+		PenetrationTicks:  1,
+		PenetrationTicksSet: true,
+	})
+	bGap.SetExchangeFilter("ETHUSDT", f)
+	if ok, err := bGap.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "GAP_LIMIT",
+		Symbol:        "ETHUSDT",
+		Side:          model.SideShort,
+		LimitPrice:    decimal.NewFromFloat(100.0),
+		Qty:           decimal.NewFromFloat(1.0),
+		SLPrice:       decimal.NewFromFloat(105.0),
+		TPPrice:       decimal.NewFromFloat(90.0),
+		CreatedAt:     t0, // TimeoutTime = 10:30 UTC (after 1 bar SignalDelayBars=1 at 10:15? CreatedAt+30m = 10:30)
+	}); !ok || err != nil {
+		t.Fatalf("submit failed: ok=%v err=%v", ok, err)
+	}
+	// Missing 10:15..10:45 bars; next candle opens at 10:45 UTC (>= 10:30 TimeoutTime) and shoots past LimitPrice 100.
+	bGap.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0.Add(45 * time.Minute),
+		CloseTime: t0.Add(60*time.Minute - time.Millisecond),
+		Symbol:    "ETHUSDT",
+		Open:      99.0,
+		High:      101.0,
+		Low:       98.0,
+		Close:     99.5,
+	}, 3)
+	if bGap.Stats.Filled != 0 || bGap.Stats.TimedOut != 1 || bGap.HasActiveOrderOrPosition("ETHUSDT") {
+		t.Fatalf("expected expired LIMIT order across candle gap to time out with 0 fills, got stats=%+v active=%v", bGap.Stats, bGap.HasActiveOrderOrPosition("ETHUSDT"))
+	}
+
+	// 2. CheckIsolatedMarginLiquidation liquidates ONLY the breached isolated position even with large total equity.
+	bIso := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT:       decimal.NewFromFloat(10000.0),
+		AccountLeverage:         10.0,
+		EntryOrderType:          "MARKET",
+		SlippageRate:            decimal.Zero,
+		SlippageSet:             true,
+		MakerFeeSet:             true,
+		TakerFeeSet:             true,
+		IntrabarConflictSLFirst: true,
+		MaxHoldingDuration:      24 * time.Hour,
+	})
+	bIso.SetExchangeFilter("BADUSDT", f)
+	bIso.SetExchangeFilter("GOODUSDT", f)
+	// BADUSDT SHORT at 100, Qty=1 -> initial margin 10 USDT; SL intentionally far (130) to simulate gap past SL.
+	_, _ = bIso.SubmitLimitEntry(model.OrderIntent{
+		Symbol:     "BADUSDT",
+		Side:       model.SideShort,
+		Qty:        decimal.NewFromFloat(1.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(130.0),
+		TPPrice:    decimal.NewFromFloat(70.0),
+		CreatedAt:  t0,
+	})
+	_, _ = bIso.SubmitLimitEntry(model.OrderIntent{
+		Symbol:     "GOODUSDT",
+		Side:       model.SideShort,
+		Qty:        decimal.NewFromFloat(1.0),
+		LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice:    decimal.NewFromFloat(110.0),
+		TPPrice:    decimal.NewFromFloat(80.0),
+		CreatedAt:  t0,
+	})
+	// BADUSDT wicks to High=111 (-11 USDT unrealized < +10 initMargin - 0.55 maintMargin), Close settles back to 101.
+	bIso.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0,
+		CloseTime: t0.Add(15*time.Minute - time.Millisecond),
+		Symbol:    "BADUSDT",
+		Open:      100.0,
+		High:      111.0,
+		Low:       99.5,
+		Close:     101.0,
+	}, 1)
+	bIso.ProcessCandle(data.HistoricalCandle{
+		OpenTime:  t0,
+		CloseTime: t0.Add(15*time.Minute - time.Millisecond),
+		Symbol:    "GOODUSDT",
+		Open:      100.0,
+		High:      101.0,
+		Low:       99.0,
+		Close:     99.5,
+	}, 1)
+
+	liqCnt := bIso.CheckIsolatedMarginLiquidation(0.005, t0.Add(15*time.Minute), 1)
+	if liqCnt != 1 || bIso.Stats.LiquidatedCount != 1 {
+		t.Fatalf("expected exactly 1 isolated liquidation, got liqCnt=%d stats=%+v", liqCnt, bIso.Stats)
+	}
+	if bIso.HasActiveOrderOrPosition("BADUSDT") {
+		t.Fatalf("expected BADUSDT liquidated and removed from OpenPositions")
+	}
+	if !bIso.HasActiveOrderOrPosition("GOODUSDT") {
+		t.Fatalf("expected healthy GOODUSDT position to remain open under ISOLATED margin")
+	}
+	if len(bIso.ClosedTrades) != 1 || bIso.ClosedTrades[0].ExitReason != "LIQUIDATION" || bIso.ClosedTrades[0].Symbol != "BADUSDT" {
+		t.Fatalf("unexpected closed trade after isolated liquidation: %+v", bIso.ClosedTrades)
+	}
+}
+
 
 
 

@@ -44,6 +44,7 @@ type BotEngine struct {
 	primaryWatchedSet      map[string]bool
 	breakoutWatchedSet     map[string]bool
 	sweepExtraWatchedSet   map[string]bool
+	hasCompletedScan       bool
 	marketBreadthPct       float64
 	marketBreadthValid     bool
 	marketBreadthUpdatedAt time.Time
@@ -415,35 +416,83 @@ func main() {
 		engine.liveBroker.MarketCloseFn = client.PlaceMarketClose
 		engine.liveBroker.PlaceLimitCloseFn = client.PlaceLimitClose
 		engine.liveBroker.CancelOrderFn = client.CancelOrder
+		engine.liveBroker.CancelOrderWithResultFn = client.CancelOrderWithResult
 		engine.liveBroker.CancelAlgoOrderFn = client.CancelAlgoOrder
-		engine.liveBroker.VerifyAlgoOrderFn = func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (bool, bool, error) {
+		engine.liveBroker.VerifyAlgoOrderDetailsFn = func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (broker.AlgoOrderVerifyResult, error) {
+			var res broker.AlgoOrderVerifyResult
 			algoOrds, err := client.GetOpenAlgoOrders(ctx, symbol)
 			if err != nil {
-				return false, false, err
+				return res, err
 			}
-			var slFound, tpFound bool
 			for _, ao := range algoOrds {
 				if slAlgoID != 0 && (ao.AlgoID == slAlgoID || (clientSLID != "" && ao.ClientAlgoID == clientSLID)) {
-					slFound = true
+					res.SLAlive = true
+					res.SLClosePosition = ao.ClosePosition
+					if q, qErr := decimal.NewFromString(strings.TrimSpace(ao.Quantity)); qErr == nil && q.GreaterThan(decimal.Zero) {
+						res.SLQty = q
+					}
 				}
 				if tpAlgoID != 0 && (ao.AlgoID == tpAlgoID || (clientTPID != "" && ao.ClientAlgoID == clientTPID)) {
-					tpFound = true
+					res.TPAlive = true
+					res.TPClosePosition = ao.ClosePosition
+					if q, qErr := decimal.NewFromString(strings.TrimSpace(ao.Quantity)); qErr == nil && q.GreaterThan(decimal.Zero) {
+						res.TPQty = q
+					}
 				}
 			}
-			if slAlgoID != 0 && !slFound {
+			if slAlgoID != 0 && !res.SLAlive {
 				if openOrds, ordErr := client.GetOpenOrders(ctx, symbol); ordErr == nil {
 					for _, oo := range openOrds {
 						if oo.OrderID == slAlgoID || (clientSLID != "" && oo.ClientOrderID == clientSLID) {
-							slFound = true
+							res.SLAlive = true
+							res.SLClosePosition = oo.ClosePosition
+							origQ, errOrig := decimal.NewFromString(strings.TrimSpace(oo.OrigQty))
+							execQ, errExec := decimal.NewFromString(strings.TrimSpace(oo.ExecutedQty))
+							if errOrig == nil {
+								remQ := origQ
+								if errExec == nil && execQ.GreaterThan(decimal.Zero) {
+									remQ = origQ.Sub(execQ)
+								}
+								if remQ.GreaterThan(decimal.Zero) {
+									res.SLQty = remQ
+								}
+							}
 							break
 						}
 					}
 				}
 			}
-			return slFound, tpFound, nil
+			return res, nil
+		}
+		engine.liveBroker.VerifyAlgoOrderFn = func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (bool, bool, error) {
+			details, err := engine.liveBroker.VerifyAlgoOrderDetailsFn(ctx, symbol, slAlgoID, tpAlgoID, clientSLID, clientTPID)
+			if err != nil {
+				return false, false, err
+			}
+			return details.SLAlive, details.TPAlive, nil
 		}
 		engine.liveBroker.QueryOrderFn = client.QueryOrder
 		engine.liveBroker.FetchAccountFn = client.FetchAccountBalance
+		engine.liveBroker.ConfirmPositionZeroFn = func(ctx context.Context, symbol string) (bool, error) {
+			posRisks, err := client.GetPositionRisk(ctx, symbol)
+			if err != nil {
+				return false, err
+			}
+			matched := false
+			for _, pr := range posRisks {
+				if pr.Symbol != symbol {
+					continue
+				}
+				matched = true
+				if pr.PositionAmt.Abs().GreaterThan(decimal.Zero) {
+					return false, nil
+				}
+			}
+			if !matched {
+				return false, fmt.Errorf("symbol %s missing from positionRisk response", symbol)
+			}
+			return true, nil
+		}
 		engine.liveBroker.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
 			engine.filtersMu.RLock()
 			defer engine.filtersMu.RUnlock()
@@ -580,10 +629,12 @@ func main() {
 		initCancel()
 
 		slog.Info("reconciling live open positions with Binance exchange...")
-		storedLivePositions, err := repo.GetAllLivePositions(ctx)
-		if err != nil {
-			slog.Error("failed to load stored live positions from database", "err", err)
+		storedLivePositions, storedPositionsLoadErr := repo.GetAllLivePositions(ctx)
+		if storedPositionsLoadErr != nil {
+			slog.Error("failed to load stored live positions from database; orphan emergency auto-close disabled", "err", storedPositionsLoadErr)
 		}
+
+		var err error
 
 		var exchangePositions []exchange.PositionRiskResponse
 		for posAttempt := 1; posAttempt <= 2; posAttempt++ {
@@ -608,6 +659,7 @@ func main() {
 					StrategyID:     sp.StrategyID,
 					Qty:            sp.Qty,
 					InitialQty:     sp.InitialQty,
+					ProtectedQty:   sp.Qty,
 					EntryPrice:     sp.EntryPrice,
 					SLOrderID:      sp.SLOrderID,
 					SLClientAlgoID: sp.SLClientAlgoID,
@@ -798,6 +850,7 @@ func main() {
 						StrategyID:       sp.StrategyID,
 						Qty:              ep.PositionAmt.Abs(),
 						InitialQty:       sp.InitialQty,
+						ProtectedQty:     sp.Qty,
 						EntryPrice:       ep.EntryPrice,
 						SLOrderID:        sp.SLOrderID,
 						SLClientAlgoID:   sp.SLClientAlgoID,
@@ -901,7 +954,7 @@ func main() {
 						}
 					}
 
-					if !hasActiveSL && algoErr == nil && ordErr == nil && cfg.OrphanPositionPolicy == "CLOSE" {
+					if shouldEmergencyCloseOrphanPosition(storedPositionsLoadErr, hasActiveSL, algoErr, ordErr, cfg.OrphanPositionPolicy) {
 						// OPSI B (Default): Posisi unmanaged yang terkonfirmasi tanpa Stop Loss aktif ditutup seketika untuk melindungi modal
 						slog.Error("CRITICAL: UNMANAGED LIVE POSITION HAS NO ACTIVE STOP LOSS ORDER ON BINANCE - EXECUTING EMERGENCY MARKET CLOSE (Option B)",
 							"symbol", sym, "side", side, "qty", ep.PositionAmt.Abs())
@@ -929,10 +982,13 @@ func main() {
 							engine.liveBroker.ClearSymbolState(sym)
 						}
 					} else {
-						// Posisi memiliki SL aktif, verifikasi gagal (fail-safe: jangan blind close), atau policy=ADOPT
+						// Posisi memiliki SL aktif, DB gagal dimuat, verifikasi gagal (fail-safe: jangan blind close), atau policy=ADOPT
 						if hasActiveSL {
 							slog.Info("unmanaged live position has active SL on Binance; adopting with existing protection",
 								"symbol", sym, "slOrderID", slAlgoID, "slPrice", activeSLPrice)
+						} else if storedPositionsLoadErr != nil {
+							slog.Error("failed to load stored live positions from database; skipping orphan emergency close and adopting safely for SL protection",
+								"symbol", sym, "dbErr", storedPositionsLoadErr)
 						} else if algoErr != nil || ordErr != nil {
 							slog.Error("failed to verify open SL/algo orders for unmanaged live position; adopting safely for SL repair instead of blind emergency close",
 								"symbol", sym, "algoErr", algoErr, "ordErr", ordErr)
@@ -1429,6 +1485,13 @@ func (e *BotEngine) verifyLiveWatchlist(ctx context.Context, candidates []string
 	return verifiedWatched
 }
 
+func shouldRetainWatchlistOnFetchOutage(hadPriorWatchlist, noScannedCandidates bool, stats scanner.ScanStats) bool {
+	return hadPriorWatchlist && noScannedCandidates &&
+		stats.PreFilterPassed > 0 &&
+		stats.KlineFetchFailed > 0 &&
+		(stats.KlineFetchFailed+stats.KlineFetchOrShort) == stats.PreFilterPassed
+}
+
 func (e *BotEngine) runMarketScan(ctx context.Context) {
 	scanCtx, scanCancel := context.WithTimeout(ctx, scanFetchTimeout)
 	defer scanCancel()
@@ -1544,6 +1607,13 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 
 	for k, v := range localStates {
 		if existing, exists := e.activeStates[k]; !exists {
+			if v != nil {
+				v.Mu.Lock()
+				if v.LastEvaluatedCandleOpenTime.IsZero() && !v.LastProcessedCandleOpenTime.IsZero() {
+					v.LastEvaluatedCandleOpenTime = v.LastProcessedCandleOpenTime
+				}
+				v.Mu.Unlock()
+			}
 			e.activeStates[k] = v
 			e.cooldownMu.RLock()
 			if exitRec, ok := e.cooldownExits[k]; ok {
@@ -1591,18 +1661,30 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		}
 	}
 
-	allKlinesFailed := hadPriorWatchlist && len(finalWatched) == 0 &&
-		scanStats.PreFilterPassed > 0 && scanStats.KlineFetchOrShort == scanStats.PreFilterPassed
+	noScannedCandidates := len(primarySet) == 0 && len(breakoutSet) == 0 && len(sweepExtraSet) == 0
+	allKlinesFailed := shouldRetainWatchlistOnFetchOutage(hadPriorWatchlist, noScannedCandidates, scanStats)
 	var prunedSymbols []string
 	if allKlinesFailed {
 		slog.Warn("all pre-filtered kline fetches failed; retaining prior watchlist",
-			"preFilterPassed", scanStats.PreFilterPassed, "klineShort", scanStats.KlineFetchOrShort)
-		finalWatched = oldWatched
+			"preFilterPassed", scanStats.PreFilterPassed,
+			"klineFetchFailed", scanStats.KlineFetchFailed,
+			"klineShort", scanStats.KlineFetchOrShort)
+		retained := slices.Clone(oldWatched)
+		if e.broker != nil {
+			for _, sym := range e.broker.GetMonitoredSymbols() {
+				if !slices.Contains(retained, sym) {
+					retained = append(retained, sym)
+				}
+			}
+		}
+		finalWatched = retained
+		e.watchedCoins = finalWatched
 	} else {
 		e.watchedCoins = finalWatched
 		e.primaryWatchedSet = primarySet
 		e.breakoutWatchedSet = breakoutSet
 		e.sweepExtraWatchedSet = sweepExtraSet
+		e.hasCompletedScan = true
 		// M3 FIX: Pangkas simbol lama dari activeStates yang sudah tidak di-watch dan tidak memiliki posisi/order aktif
 		watchedSet := make(map[string]bool, len(finalWatched)+1)
 		for _, sym := range finalWatched {
@@ -1982,53 +2064,7 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 			if !isClosed {
 				return
 			}
-			slog.Info("candle closed received", "symbol", symbol, "close", candle.Close, "openTime", candle.OpenTime.Format(time.RFC3339), "timeframe", timeframe)
-			e.statesMu.RLock()
-			st := e.activeStates[symbol]
-			e.statesMu.RUnlock()
-			if st == nil {
-				return
-			}
-
-			expectedStep := 5 * time.Minute
-			if e.cfg != nil && e.cfg.CandleDuration > 0 {
-				expectedStep = e.cfg.CandleDuration
-			}
-
-			st.Mu.Lock()
-			hasGap := !st.LastProcessedCandleOpenTime.IsZero() && candle.OpenTime.Sub(st.LastProcessedCandleOpenTime) > expectedStep
-			var okApplied bool
-			if !hasGap {
-				okApplied = st.ApplyClosedCandleLocked(candle, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
-			}
-			st.Mu.Unlock()
-
-			if hasGap {
-				e.evalWg.Add(1)
-				go func(c model.Candle, s *model.SymbolState, sym string) {
-					defer e.evalWg.Done()
-					e.handleGappedClosedCandle(streamCtx, sym, s, c)
-				}(candle, st, symbol)
-				return
-			}
-
-			if !okApplied {
-				slog.Debug("closed candle skipped by monotonic deduplication", "symbol", symbol, "openTime", candle.OpenTime)
-				return
-			}
-
-			if symbol == BenchmarkSymbol {
-				// State BTCUSDT telah terbarui sebagai benchmark makro, bangunkan altcoin evaluator yang menunggu bar sama
-				e.notifyBTCCandleClosed(candle.OpenTime)
-				return
-			}
-
-			// Lepas evaluasi sinyal dan penulisan SQLite audit log dari read-loop WebSocket
-			e.evalWg.Add(1)
-			go func(c model.Candle, s *model.SymbolState) {
-				defer e.evalWg.Done()
-				e.evaluateAndLogClosedCandle(c, s)
-			}(candle, st)
+			e.processClosedKlineWS(streamCtx, symbol, candle, timeframe)
 		},
 	}
 	handlers.OnKline5m = handlers.OnKlineClosed
@@ -2054,10 +2090,75 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 	}()
 }
 
+func (e *BotEngine) processClosedKlineWS(streamCtx context.Context, symbol string, candle model.Candle, timeframe string) {
+	slog.Info("candle closed received", "symbol", symbol, "close", candle.Close, "openTime", candle.OpenTime.Format(time.RFC3339), "timeframe", timeframe)
+	e.statesMu.RLock()
+	st := e.activeStates[symbol]
+	e.statesMu.RUnlock()
+	if st == nil {
+		return
+	}
+
+	expectedStep := 5 * time.Minute
+	if e.cfg != nil && e.cfg.CandleDuration > 0 {
+		expectedStep = e.cfg.CandleDuration
+	}
+
+	st.Mu.Lock()
+	hasGap := !st.LastProcessedCandleOpenTime.IsZero() && candle.OpenTime.Sub(st.LastProcessedCandleOpenTime) > expectedStep
+	var okApplied bool
+	var alreadyIngestedLatest bool
+	if !hasGap {
+		okApplied = st.ApplyClosedCandleLocked(candle, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
+		if !okApplied && !st.LastProcessedCandleOpenTime.IsZero() && candle.OpenTime.Equal(st.LastProcessedCandleOpenTime) && !st.HasRecentGapLocked(expectedStep) {
+			alreadyIngestedLatest = true
+		}
+	}
+	shouldDispatch := false
+	if !hasGap && (okApplied || alreadyIngestedLatest) {
+		shouldDispatch = st.MarkCandleEvaluatedLocked(candle.OpenTime)
+	}
+	st.Mu.Unlock()
+
+	if hasGap {
+		e.evalWg.Add(1)
+		go func(c model.Candle, s *model.SymbolState, sym string) {
+			defer e.evalWg.Done()
+			e.handleGappedClosedCandle(streamCtx, sym, s, c)
+		}(candle, st, symbol)
+		return
+	}
+
+	if !shouldDispatch {
+		slog.Debug("closed candle skipped by monotonic deduplication", "symbol", symbol, "openTime", candle.OpenTime)
+		return
+	}
+
+	if symbol == BenchmarkSymbol {
+		// State BTCUSDT telah terbarui sebagai benchmark makro, bangunkan altcoin evaluator yang menunggu bar sama
+		e.notifyBTCCandleClosed(candle.OpenTime)
+		return
+	}
+
+	// Lepas evaluasi sinyal dan penulisan SQLite audit log dari read-loop WebSocket
+	e.evalWg.Add(1)
+	go func(c model.Candle, s *model.SymbolState) {
+		defer e.evalWg.Done()
+		e.evaluateAndLogClosedCandle(c, s)
+	}(candle, st)
+}
+
 const (
 	maxBookTickerStreamsPerConn = 10
 	maxMarketStreamsPerConn     = 90
 )
+
+func shouldEmergencyCloseOrphanPosition(storedDBLoadErr error, hasActiveSL bool, algoErr, ordErr error, orphanPolicy string) bool {
+	if storedDBLoadErr != nil {
+		return false
+	}
+	return !hasActiveSL && algoErr == nil && ordErr == nil && orphanPolicy == "CLOSE"
+}
 
 func resolveBrokerRepegAttempts(attempts int) int {
 	if attempts <= 0 {
@@ -2126,16 +2227,29 @@ func (e *BotEngine) handleGappedClosedCandle(ctx context.Context, symbol string,
 
 	st.Mu.Lock()
 	prevOpen := st.LastProcessedCandleOpenTime
-	if prevOpen.IsZero() || !triggerCandle.OpenTime.After(prevOpen) {
+	if prevOpen.IsZero() || triggerCandle.OpenTime.Before(prevOpen) {
 		st.Mu.Unlock()
+		return
+	}
+	if triggerCandle.OpenTime.Equal(prevOpen) {
+		shouldDispatch := !st.HasRecentGapLocked(expectedStep) && st.MarkCandleEvaluatedLocked(triggerCandle.OpenTime)
+		st.Mu.Unlock()
+		if !shouldDispatch {
+			return
+		}
+		if symbol == BenchmarkSymbol {
+			e.notifyBTCCandleClosed(triggerCandle.OpenTime)
+			return
+		}
+		e.evaluateAndLogClosedCandle(triggerCandle, st)
 		return
 	}
 	gapStep := triggerCandle.OpenTime.Sub(prevOpen)
 	if gapStep <= expectedStep {
 		okApplied := gapStep == expectedStep && st.ApplyClosedCandleLocked(triggerCandle, bootCap, deltaCap)
-		contiguous := okApplied && !st.HasRecentGapLocked(expectedStep)
+		shouldDispatch := okApplied && !st.HasRecentGapLocked(expectedStep) && st.MarkCandleEvaluatedLocked(triggerCandle.OpenTime)
 		st.Mu.Unlock()
-		if !contiguous {
+		if !shouldDispatch {
 			return
 		}
 		if symbol == BenchmarkSymbol {
@@ -2188,6 +2302,7 @@ func (e *BotEngine) handleGappedClosedCandle(ctx context.Context, symbol string,
 		st.ApplyClosedCandleLocked(triggerCandle, bootCap, deltaCap)
 	}
 	contiguous := !st.LastProcessedCandleOpenTime.Before(triggerCandle.OpenTime) && !st.HasRecentGapLocked(expectedStep)
+	shouldDispatch := contiguous && st.MarkCandleEvaluatedLocked(triggerCandle.OpenTime)
 	lastOpen := st.LastProcessedCandleOpenTime
 	st.Mu.Unlock()
 
@@ -2198,6 +2313,9 @@ func (e *BotEngine) handleGappedClosedCandle(ctx context.Context, symbol string,
 	}
 
 	slog.Info("ws kline gap repaired via REST backfill", "symbol", symbol, "triggerOpen", triggerCandle.OpenTime.Format(time.RFC3339))
+	if !shouldDispatch {
+		return
+	}
 	if symbol == BenchmarkSymbol {
 		e.notifyBTCCandleClosed(triggerCandle.OpenTime)
 		return
@@ -2271,16 +2389,16 @@ func (e *BotEngine) notifyBTCCandleClosed(openTime time.Time) {
 	e.btcSyncMu.Unlock()
 }
 
-func (e *BotEngine) waitForBTCCandle(targetOpenTime time.Time, maxWait time.Duration) {
+func (e *BotEngine) waitForBTCCandle(targetOpenTime time.Time, maxWait time.Duration) bool {
 	if e == nil || targetOpenTime.IsZero() || maxWait <= 0 {
-		return
+		return false
 	}
 	deadline := time.Now().Add(maxWait)
 	for {
 		e.btcSyncMu.Lock()
 		if !e.lastBTCOpen.Before(targetOpenTime) {
 			e.btcSyncMu.Unlock()
-			return
+			return true
 		}
 		if e.btcBarCh == nil {
 			e.btcBarCh = make(chan struct{})
@@ -2290,14 +2408,14 @@ func (e *BotEngine) waitForBTCCandle(targetOpenTime time.Time, maxWait time.Dura
 
 		rem := time.Until(deadline)
 		if rem <= 0 {
-			return
+			return false
 		}
 		timer := time.NewTimer(rem)
 		select {
 		case <-ch:
 			timer.Stop()
 		case <-timer.C:
-			return
+			return false
 		}
 	}
 }
@@ -2352,7 +2470,7 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 
 	scope := strategy.DefaultSymbolScope()
 	e.statesMu.RLock()
-	if len(e.primaryWatchedSet) > 0 || len(e.breakoutWatchedSet) > 0 || len(e.sweepExtraWatchedSet) > 0 {
+	if e.hasCompletedScan || len(e.primaryWatchedSet) > 0 || len(e.breakoutWatchedSet) > 0 || len(e.sweepExtraWatchedSet) > 0 {
 		inSweepExtra := e.sweepExtraWatchedSet[symName]
 		inPrimary := e.primaryWatchedSet[symName]
 		inBreakout := e.breakoutWatchedSet[symName]
@@ -2418,6 +2536,23 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		e.statesMu.RUnlock()
 	}
 
+	btcStaleOrMissing := false
+	btcStaleSubReason := ""
+	if strategy.NeedsBTCMacroSnapshot(e.evaluatorCfg) && symName != BenchmarkSymbol {
+		if btcSnap == nil || len(btcSnap.ClosedCandles) == 0 {
+			btcStaleOrMissing = true
+			btcStaleSubReason = "BTC_SNAPSHOT_EMPTY"
+		} else {
+			latestBTCOpen := btcSnap.ClosedCandles[len(btcSnap.ClosedCandles)-1].OpenTime
+			if latestBTCOpen.Before(candle.OpenTime) {
+				btcStaleOrMissing = true
+				btcStaleSubReason = fmt.Sprintf("BTC_LATEST_%s_BEFORE_ALT_%s",
+					latestBTCOpen.UTC().Format(time.RFC3339),
+					candle.OpenTime.UTC().Format(time.RFC3339))
+			}
+		}
+	}
+
 	activeSlots := e.broker.GetActiveSlotCount()
 	availBal := e.broker.GetAvailableBalanceUSDT()
 	totEq := e.broker.GetEffectiveTotalEquityUSDT()
@@ -2447,6 +2582,9 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		subReason = fmt.Sprintf("PAUSED_UNTIL_%s", until.UTC().Format(time.RFC3339))
 	} else if e.barEntries != nil && !e.barEntries.CanEnter(candle.OpenTime) {
 		reason = "BAR_ENTRY_CAP_REACHED"
+	} else if btcStaleOrMissing {
+		reason = "STALE_BTC_MACRO_CANDLE"
+		subReason = btcStaleSubReason
 	} else {
 		dec := strategy.EvaluatePortfolio(
 			snap,

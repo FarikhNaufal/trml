@@ -595,13 +595,10 @@ func (d *DryRunBroker) OnRealtimeTick(
 				}
 			}
 			delete(d.PendingOrders, symbol)
-			return
-		}
-
-		// Aggressor-Side Matching:
-		// Buy Limit di Bid hanya terisi jika agresor adalah penjual (isBuyerMaker == true)
-		// Sell Limit di Ask hanya terisi jika agresor adalah pembeli (isBuyerMaker == false)
-		if tradePrice > 0 && tradeQty > 0 {
+		} else if tradePrice > 0 && tradeQty > 0 {
+			// Aggressor-Side Matching:
+			// Buy Limit di Bid hanya terisi jika agresor adalah penjual (isBuyerMaker == true)
+			// Sell Limit di Ask hanya terisi jika agresor adalah pembeli (isBuyerMaker == false)
 			tpDec := decimal.NewFromFloat(tradePrice)
 			tqDec := decimal.NewFromFloat(tradeQty)
 
@@ -673,11 +670,11 @@ func (d *DryRunBroker) OnRealtimeTick(
 		if pos.Side == model.SideLong {
 			slTouched = !pos.CurrentSLPrice.IsZero() && triggerRefPrice.LessThanOrEqual(pos.CurrentSLPrice)
 			tp1Touched = !pos.TP1Price.IsZero() && (triggerRefPrice.GreaterThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TP1Price)))
-			tpFullTouched = !pos.TPPrice.IsZero() && (triggerRefPrice.GreaterThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice)))
+			tpFullTouched = !pos.TPPrice.IsZero() && !chartPriceDec.IsZero() && chartPriceDec.GreaterThanOrEqual(pos.TPPrice)
 		} else {
 			slTouched = !pos.CurrentSLPrice.IsZero() && triggerRefPrice.GreaterThanOrEqual(pos.CurrentSLPrice)
 			tp1Touched = !pos.TP1Price.IsZero() && (triggerRefPrice.LessThanOrEqual(pos.TP1Price) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TP1Price)))
-			tpFullTouched = !pos.TPPrice.IsZero() && (triggerRefPrice.LessThanOrEqual(pos.TPPrice) || (!chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice)))
+			tpFullTouched = !pos.TPPrice.IsZero() && !chartPriceDec.IsZero() && chartPriceDec.LessThanOrEqual(pos.TPPrice)
 		}
 
 		// 1. Stop Loss FIRST (pessimistic intrabar conflict parity with SimBroker, plus SL Gap-Fill support)
@@ -1239,12 +1236,15 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 
 	if d.Cfg.MaxHoldingDuration > 0 || d.Cfg.StaleLossExitDuration > 0 {
 		for sym, pos := range d.OpenPositions {
+			markFresh := d.Cfg.MaxMarkStaleness <= 0 || pos.MarkUpdatedAt.IsZero() || now.Sub(pos.MarkUpdatedAt) <= d.Cfg.MaxMarkStaleness
+			if !markFresh {
+				continue
+			}
 			reason := ""
 			if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
 				reason = "TIME_STOP_MAX_HOLDING"
 			} else if d.Cfg.StaleLossExitDuration > 0 {
-				markFresh := d.Cfg.MaxMarkStaleness <= 0 || pos.MarkUpdatedAt.IsZero() || now.Sub(pos.MarkUpdatedAt) <= d.Cfg.MaxMarkStaleness
-				if markFresh && protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, pos.LastMarkPrice, pos.OpenTime, now, d.Cfg.StaleLossExitDuration) {
+				if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, pos.LastMarkPrice, pos.OpenTime, now, d.Cfg.StaleLossExitDuration) {
 					reason = "TIME_STOP_STALE_LOSS"
 				}
 			}

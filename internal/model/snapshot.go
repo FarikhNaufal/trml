@@ -37,6 +37,7 @@ type SymbolState struct {
 	CurrentSessionVWAP      float64
 
 	LastProcessedCandleOpenTime time.Time
+	LastEvaluatedCandleOpenTime time.Time
 	ClosedCandles               []Candle
 	ClosedBarDeltasUSDT         []float64
 	LastExitTime                time.Time
@@ -251,6 +252,19 @@ func (s *SymbolState) SeedOpenInterestBootstrapLocked(samples []OISample, now ti
 
 	s.resolvePrevOpenInterestLocked()
 	return len(validSamples)
+}
+
+// MarkCandleEvaluatedLocked menandai timestamp candle terakhir yang sudah dikirim ke evaluator sinyal
+// secara terpisah dari histori candle agar backfill/bootstrap REST tidak menggagalkan evaluasi WS yang terlambat.
+func (s *SymbolState) MarkCandleEvaluatedLocked(candleOpenTime time.Time) bool {
+	if candleOpenTime.IsZero() {
+		return false
+	}
+	if !s.LastEvaluatedCandleOpenTime.IsZero() && !candleOpenTime.After(s.LastEvaluatedCandleOpenTime) {
+		return false
+	}
+	s.LastEvaluatedCandleOpenTime = candleOpenTime
+	return true
 }
 
 func (s *SymbolState) ApplyClosedCandleLocked(candle Candle, bootstrapCap int, deltaCap int) bool {

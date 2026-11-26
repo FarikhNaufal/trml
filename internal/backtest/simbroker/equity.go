@@ -183,3 +183,78 @@ func (s *SimBroker) CheckCrossMarginLiquidation(mmr float64, simTime time.Time, 
 	}
 	return true
 }
+
+// CheckIsolatedMarginLiquidation evaluates each open position independently against its isolated initial margin
+// (matching Binance ISOLATED margin mode in Live), liquidating only breached positions at worst intrabar wick.
+func (s *SimBroker) CheckIsolatedMarginLiquidation(mmr float64, simTime time.Time, barIdx int64) int {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	if len(s.OpenPositions) == 0 {
+		return 0
+	}
+	if mmr <= 0 {
+		mmr = 0.005
+	}
+	lev := s.Cfg.AccountLeverage
+	if lev <= 0 {
+		lev = 1.0
+	}
+	levDec := decimal.NewFromFloat(lev)
+	mmrDec := decimal.NewFromFloat(mmr)
+	slipDec := s.Cfg.SlippageRate
+	if slipDec.LessThan(decimal.Zero) {
+		slipDec = decimal.Zero
+	}
+	penalty := slipDec.Add(mmrDec)
+	useWorstWick := s.Cfg.IntrabarConflictSLFirst
+
+	symbols := make([]string, 0, len(s.OpenPositions))
+	for sym := range s.OpenPositions {
+		symbols = append(symbols, sym)
+	}
+	sort.Strings(symbols)
+
+	liquidated := 0
+	for _, sym := range symbols {
+		pos := s.OpenPositions[sym]
+		if pos == nil || pos.Qty.LessThanOrEqual(decimal.Zero) {
+			continue
+		}
+		mark := positionLiquidationMark(pos, barIdx, useWorstWick)
+		if !mark.GreaterThan(decimal.Zero) {
+			continue
+		}
+		initMargin := pos.EntryPrice.Mul(pos.Qty).Div(levDec)
+		var unrealized decimal.Decimal
+		if pos.Side == model.SideLong {
+			unrealized = mark.Sub(pos.EntryPrice).Mul(pos.Qty)
+		} else {
+			unrealized = pos.EntryPrice.Sub(mark).Mul(pos.Qty)
+		}
+		maintMargin := mark.Mul(pos.Qty).Mul(mmrDec)
+		if initMargin.Add(unrealized).GreaterThan(maintMargin) {
+			continue
+		}
+
+		var exitPrice decimal.Decimal
+		if pos.Side == model.SideLong {
+			exitPrice = mark.Mul(decimal.NewFromFloat(1.0).Sub(penalty))
+		} else {
+			exitPrice = mark.Mul(decimal.NewFromFloat(1.0).Add(penalty))
+		}
+		if exitPrice.LessThan(decimal.Zero) {
+			exitPrice = decimal.Zero
+		}
+		holdingBars := int(barIdx - pos.OpenBarIndex)
+		if holdingBars < 0 {
+			holdingBars = 0
+		}
+		s.recordClosedTradeLocked(pos, pos.Qty, exitPrice, "LIQUIDATION", simTime, holdingBars)
+		delete(s.OpenPositions, sym)
+		delete(s.PendingOrders, sym)
+		s.Stats.LiquidatedCount++
+		liquidated++
+	}
+	return liquidated
+}

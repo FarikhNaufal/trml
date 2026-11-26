@@ -766,3 +766,232 @@ func TestDynamicStream_ConcurrentUpdateStreamsDuringDialAndActiveSync(t *testing
 	defer subsMu.Unlock()
 	t.Fatalf("server subscriptions %v did not converge to final target %v", serverSubs, finalTarget)
 }
+
+func TestDynamicStream_ControlErrorTriggersRollbackAndReconnect(t *testing.T) {
+	var connCount atomic.Int32
+	reconnectedCh := make(chan string, 4)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := connCount.Add(1)
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+		if n >= 2 {
+			select {
+			case reconnectedCh <- r.URL.RawQuery:
+			default:
+			}
+		}
+
+		for {
+			_, raw, err := c.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				Method string   `json:"method"`
+				Params []string `json:"params"`
+				ID     int64    `json:"id"`
+			}
+			if json.Unmarshal(raw, &req) == nil && req.Method == "SUBSCRIBE" {
+				if n == 1 {
+					reply, _ := json.Marshal(map[string]any{
+						"error": map[string]any{"code": 2, "msg": "Invalid stream"},
+						"id":    req.ID,
+					})
+					_ = c.Write(r.Context(), websocket.MessageText, reply)
+				} else {
+					reply, _ := json.Marshal(map[string]any{
+						"result": nil,
+						"id":     req.ID,
+					})
+					_ = c.Write(r.Context(), websocket.MessageText, reply)
+				}
+			}
+		}
+	}))
+	defer ts.Close()
+
+	wsBase := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream"
+	mgr := NewStreamManager(EventHandlers{})
+	mgr.IdleTimeout = 5 * time.Second
+	mgr.PingInterval = 2 * time.Second
+	ds := NewDynamicStream(mgr, wsBase, []string{"btcusdt@bookTicker"})
+	ds.ControlAckTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ds.Start(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ds.mu.Lock()
+		connected := ds.conn != nil
+		ds.mu.Unlock()
+		if connected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := ds.UpdateStreams(ctx, []string{"btcusdt@bookTicker", "invalidusdt@bookTicker"}); err != nil {
+		t.Fatalf("UpdateStreams failed: %v", err)
+	}
+
+	select {
+	case q := <-reconnectedCh:
+		if !strings.Contains(q, "btcusdt@bookTicker") || !strings.Contains(q, "invalidusdt@bookTicker") {
+			t.Fatalf("expected reconnect URL to include updated target streams, got %q", q)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatalf("timed out waiting for reconnect after SUBSCRIBE error frame (connCount=%d)", connCount.Load())
+	}
+}
+
+func TestDynamicStream_ControlAckTimeoutTriggersReconnect(t *testing.T) {
+	t.Run("silent control reply triggers timeout reconnect", func(t *testing.T) {
+		var connCount atomic.Int32
+		reconnected := make(chan struct{}, 4)
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := connCount.Add(1)
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+			if n >= 2 {
+				select {
+				case reconnected <- struct{}{}:
+				default:
+				}
+			}
+			for {
+				if _, _, err := c.Read(r.Context()); err != nil {
+					return
+				}
+				// Intentionally do not send ACK
+			}
+		}))
+		defer ts.Close()
+
+		wsBase := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream"
+		mgr := NewStreamManager(EventHandlers{})
+		mgr.IdleTimeout = 5 * time.Second
+		mgr.PingInterval = 2 * time.Second
+		ds := NewDynamicStream(mgr, wsBase, []string{"btcusdt@bookTicker"})
+		ds.ControlAckTimeout = 80 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go ds.Start(ctx)
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			ds.mu.Lock()
+			connected := ds.conn != nil
+			ds.mu.Unlock()
+			if connected {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if err := ds.UpdateStreams(ctx, []string{"btcusdt@bookTicker", "ethusdt@bookTicker"}); err != nil {
+			t.Fatalf("UpdateStreams failed: %v", err)
+		}
+
+		select {
+		case <-reconnected:
+		case <-time.After(4 * time.Second):
+			t.Fatalf("expected reconnect after missing control ACK, connCount=%d", connCount.Load())
+		}
+	})
+
+	t.Run("valid control ACK clears pending request and keeps connection alive", func(t *testing.T) {
+		var connCount atomic.Int32
+		ackSent := make(chan struct{}, 2)
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			connCount.Add(1)
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
+
+			go func() {
+				ticker := time.NewTicker(40 * time.Millisecond)
+				defer ticker.Stop()
+				payload := []byte(`{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","s":"BTCUSDT","b":"65000.0","a":"65001.0"}}`)
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-ticker.C:
+						_ = c.Write(r.Context(), websocket.MessageText, payload)
+					}
+				}
+			}()
+
+			for {
+				_, raw, err := c.Read(r.Context())
+				if err != nil {
+					return
+				}
+				var req struct {
+					Method string `json:"method"`
+					ID     int64  `json:"id"`
+				}
+				if json.Unmarshal(raw, &req) == nil && req.Method == "SUBSCRIBE" {
+					reply, _ := json.Marshal(map[string]any{"result": nil, "id": req.ID})
+					if err := c.Write(r.Context(), websocket.MessageText, reply); err == nil {
+						select {
+						case ackSent <- struct{}{}:
+						default:
+						}
+					}
+				}
+			}
+		}))
+		defer ts.Close()
+
+		wsBase := "ws" + strings.TrimPrefix(ts.URL, "http") + "/stream"
+		mgr := NewStreamManager(EventHandlers{})
+		ds := NewDynamicStream(mgr, wsBase, []string{"btcusdt@bookTicker"})
+		ds.ControlAckTimeout = 120 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go ds.Start(ctx)
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			ds.mu.Lock()
+			connected := ds.conn != nil
+			ds.mu.Unlock()
+			if connected {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if err := ds.UpdateStreams(ctx, []string{"btcusdt@bookTicker", "ethusdt@bookTicker"}); err != nil {
+			t.Fatalf("UpdateStreams failed: %v", err)
+		}
+
+		select {
+		case <-ackSent:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for server ACK send")
+		}
+
+		time.Sleep(300 * time.Millisecond)
+		if got := connCount.Load(); got != 1 {
+			t.Fatalf("expected connection to remain open (connCount=1) after valid ACK, got %d", got)
+		}
+	})
+}

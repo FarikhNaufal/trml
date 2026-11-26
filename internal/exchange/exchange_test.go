@@ -800,3 +800,67 @@ func TestFetchOpenInterestHistWithPeriod_AndResolvePeriod(t *testing.T) {
 		t.Fatalf("expected period=15m and 1 item, got period=%q len=%d err=%v", gotPeriod, len(res), err)
 	}
 }
+
+func TestFetchAccountBalance_RejectsMissingOrCorruptPositions(t *testing.T) {
+	var body string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	ctx := context.Background()
+
+	// 1. Missing positions key -> error
+	body = `{"totalWalletBalance":"1000","availableBalance":"900","assets":[{"asset":"USDT","walletBalance":"1000","unrealizedProfit":"0","availableBalance":"900"}]}`
+	if _, _, _, _, err := client.FetchAccountBalance(ctx); err == nil {
+		t.Fatalf("expected error when positions field is missing")
+	}
+
+	// 2. Null positions -> error
+	body = `{"totalWalletBalance":"1000","availableBalance":"900","assets":[{"asset":"USDT","walletBalance":"1000","unrealizedProfit":"0","availableBalance":"900"}],"positions":null}`
+	if _, _, _, _, err := client.FetchAccountBalance(ctx); err == nil {
+		t.Fatalf("expected error when positions field is null")
+	}
+
+	// 3. Corrupt positionAmt string -> error (must NOT silently skip!)
+	body = `{"totalWalletBalance":"1000","availableBalance":"900","assets":[{"asset":"USDT","walletBalance":"1000","unrealizedProfit":"0","availableBalance":"900"}],"positions":[{"symbol":"SOLUSDT","positionAmt":"not-a-number"}]}`
+	if _, _, _, _, err := client.FetchAccountBalance(ctx); err == nil {
+		t.Fatalf("expected error when positionAmt is unparseable")
+	}
+
+	// 4. Valid empty positions array -> succeeds cleanly
+	body = `{"totalWalletBalance":"1000","availableBalance":"900","assets":[{"asset":"USDT","walletBalance":"1000","unrealizedProfit":"0","availableBalance":"900"}],"positions":[]}`
+	wb, _, ab, pos, err := client.FetchAccountBalance(ctx)
+	if err != nil || !wb.Equal(decimal.RequireFromString("1000")) || !ab.Equal(decimal.RequireFromString("900")) || len(pos) != 0 {
+		t.Fatalf("expected valid empty positions parse, got err=%v wb=%s ab=%s pos=%v", err, wb, ab, pos)
+	}
+}
+
+func TestCancelOrderWithResult_ParsesExecutedQtyAndAvgPrice(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/fapi/v1/order" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"orderId": 445566,
+			"clientOrderId": "ENTRY_SOL_1",
+			"status": "CANCELED",
+			"executedQty": "4.0",
+			"avgPrice": "100.5"
+		}`))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "KEY", "SECRET")
+	rec, err := client.CancelOrderWithResult(context.Background(), "SOLUSDT", 445566, "ENTRY_SOL_1")
+	if err != nil {
+		t.Fatalf("CancelOrderWithResult failed: %v", err)
+	}
+	if rec == nil || rec.Status != model.StatusCanceled || !rec.CumulativeFilledQty.Equal(decimal.RequireFromString("4.0")) || !rec.AvgPrice.Equal(decimal.RequireFromString("100.5")) {
+		t.Fatalf("unexpected CancelOrderWithResult record: %+v", rec)
+	}
+}

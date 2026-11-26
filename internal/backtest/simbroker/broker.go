@@ -278,8 +278,14 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			} else {
 				// Validasi Post-Only GTX saat pembukaan bar pertama menggunakan SSOT protection.WouldCrossMakerBook / RepegLimitEntryIntent
 				// (hanya repeg ketika order menyeberang spread; jika harga menjauh/tetap pasif, biarkan resting hingga terisi atau timeout).
+				// Expired limit orders (e.g., across a missing-candle gap) cannot fill on a candle opening at or after TimeoutTime.
 				shouldEvalFill := true
-				if !pending.GTXValidated && openDec.GreaterThan(decimal.Zero) {
+				if !pending.TimeoutTime.IsZero() && !c.OpenTime.Before(pending.TimeoutTime) {
+					delete(s.PendingOrders, c.Symbol)
+					s.Stats.TimedOut++
+					shouldEvalFill = false
+				}
+				if shouldEvalFill && !pending.GTXValidated && openDec.GreaterThan(decimal.Zero) {
 					gappedThrough := (pending.Intent.Side == model.SideLong && openDec.LessThan(pending.Intent.LimitPrice)) ||
 						(pending.Intent.Side == model.SideShort && openDec.GreaterThan(pending.Intent.LimitPrice))
 					if gappedThrough {

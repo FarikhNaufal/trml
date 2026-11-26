@@ -550,3 +550,55 @@ func TestExchangeFilter_EffectiveMarketLotSizeAndMaxQty(t *testing.T) {
 		t.Fatalf("expected tightest MaxQty 200 across LOT_SIZE & MARKET_LOT_SIZE, got %s", got)
 	}
 }
+
+func TestSymbolState_MarkCandleEvaluatedAndResetPreservesEvaluated(t *testing.T) {
+	step := 5 * time.Minute
+	t0 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(step)
+	t2 := t1.Add(step)
+
+	makeCandle := func(open time.Time) Candle {
+		return Candle{
+			OpenTime:        open,
+			CloseTime:       open.Add(step - time.Millisecond),
+			Open:            100,
+			High:            101,
+			Low:             99,
+			Close:           100.5,
+			VolumeBase:      10,
+			QuoteVolumeUSDT: 1000,
+		}
+	}
+
+	st := NewSymbolState("ETHUSDT", ExchangeFilter{}, 20, 20)
+	if st.MarkCandleEvaluatedLocked(time.Time{}) {
+		t.Fatalf("expected zero OpenTime to return false")
+	}
+	if !st.ApplyClosedCandleLocked(makeCandle(t0), 20, 20) || !st.ApplyClosedCandleLocked(makeCandle(t1), 20, 20) {
+		t.Fatalf("expected t0 and t1 ingested cleanly")
+	}
+	if !st.MarkCandleEvaluatedLocked(t1) {
+		t.Fatalf("expected first evaluation of t1 to return true")
+	}
+	if st.MarkCandleEvaluatedLocked(t1) {
+		t.Fatalf("expected duplicate evaluation of t1 to return false")
+	}
+	if st.MarkCandleEvaluatedLocked(t0) {
+		t.Fatalf("expected older t0 evaluation to return false")
+	}
+
+	// ResetAndApplyCandlesLocked rebuilds history/LastProcessedCandleOpenTime without wiping LastEvaluatedCandleOpenTime.
+	st.ResetAndApplyCandlesLocked([]Candle{makeCandle(t0), makeCandle(t1)}, 20, 20)
+	if !st.LastProcessedCandleOpenTime.Equal(t1) {
+		t.Fatalf("expected LastProcessedCandleOpenTime == t1, got %v", st.LastProcessedCandleOpenTime)
+	}
+	if st.MarkCandleEvaluatedLocked(t1) {
+		t.Fatalf("expected LastEvaluatedCandleOpenTime preserved across ResetAndApplyCandlesLocked")
+	}
+	if !st.ApplyClosedCandleLocked(makeCandle(t2), 20, 20) {
+		t.Fatalf("expected t2 ingested after reset")
+	}
+	if !st.MarkCandleEvaluatedLocked(t2) {
+		t.Fatalf("expected newer t2 evaluation to return true")
+	}
+}

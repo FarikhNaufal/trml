@@ -191,6 +191,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		}
 
 		if !r.cfg.UnconstrainedMode {
+			r.broker.CheckIsolatedMarginLiquidation(0.005, simTime, int64(barIdx))
 			r.broker.CheckCrossMarginLiquidation(0.005, simTime, int64(barIdx))
 		}
 
@@ -218,20 +219,19 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 				}
 			}
 
-			// Retain prior watchlist if scan produced nothing (matching BotEngine behavior).
-			if len(nextWatch) > 0 || len(nextBreakout) > 0 || len(nextSweepExtra) > 0 || len(watchedSymbols) == 0 {
+			// Synchronize entry watchlist cleanly with BotEngine once warmup has completed
+			// (a valid scan returning 0 candidates clears entry watchlists, while open positions continue stepping via stepSymbolAtTime).
+			emaReq := r.cfg.ScannerCfg.EMAPeriod
+			if emaReq <= 0 {
+				emaReq = 200
+			}
+			scanWarmedUp := !lastScanTime.IsZero() || len(nextWatch) > 0 || len(nextBreakout) > 0 || len(nextSweepExtra) > 0 || barIdx >= emaReq
+			if scanWarmedUp {
 				watchedSymbols = nextWatch
 				sweepExtraSymbols = nextSweepExtra
 				primaryOrder = nextPrimaryOrder
 				breakoutOrder = nextBreakoutOrder
 				breakoutSymbols = nextBreakout
-			}
-			// If first scan still lacks EMAPeriod+1 warmup bars, allow retrying on next closed bar instead of waiting ScannerInterval.
-			emaReq := r.cfg.ScannerCfg.EMAPeriod
-			if emaReq <= 0 {
-				emaReq = 200
-			}
-			if !lastScanTime.IsZero() || len(watchedSymbols) > 0 || len(breakoutSymbols) > 0 || len(sweepExtraSymbols) > 0 || barIdx >= emaReq {
 				lastScanTime = simTime
 			}
 		}

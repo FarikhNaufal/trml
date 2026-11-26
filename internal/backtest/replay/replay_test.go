@@ -530,4 +530,75 @@ func TestReplayEngine_BuildBTCMacro_EnabledForMacroAndRel(t *testing.T) {
 	}
 }
 
+func TestReplayEngine_ZeroCandidateScanClearsWatchlist(t *testing.T) {
+	t0 := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	step := 15 * time.Minute
+	totalBars := 75
+	candles := make([]data.HistoricalCandle, totalBars)
+	for i := 0; i < totalBars; i++ {
+		oT := t0.Add(time.Duration(i) * step)
+		halfRange := 1.0 // 2.0% NATR on price 100 during bars 0..44
+		if i >= 45 {
+			halfRange = 0.05 // 0.1% NATR on price 100 during bars 45..74 (healthy scan rejects NATR < 1.0%)
+		}
+		candles[i] = data.HistoricalCandle{
+			OpenTime:          oT,
+			CloseTime:         oT.Add(step - time.Millisecond),
+			Symbol:            "ALTUSDT",
+			Open:              100.0,
+			High:              100.0 + halfRange,
+			Low:               100.0 - halfRange,
+			Close:             100.0,
+			Volume:              2000.0,
+			QuoteVolume:         200000.0,
+			TakerBuyQuoteVolume: 100000.0,
+		}
+	}
+
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		CandleDuration:    step,
+		MaxSlots:          2,
+	})
+	eng := NewReplayEngine(ReplayConfig{
+		WarmupBars:            40,
+		DynamicScannerEnabled: true,
+		ScannerInterval:       step,
+		SpreadPct:             0.05,
+		ScannerCfg: scanner.ScannerConfig{
+			MinVolume24hUSDT:      1_000_000,
+			MaxSpreadPct:          0.10,
+			MinRVOL:               0.50,
+			MinFallbackRVOL:       0.10,
+			RVOLLookback:          20,
+			MinNATRPct:            1.00,
+			MaxNATRPct:            3.00,
+			MaxScannerVWAPDistATR: 10.0,
+			ATRPeriod:             14,
+			EMAPeriod:             30,
+			MaxWatchedCoins:       10,
+			BootstrapCount:        40,
+			DeltaWindow:           20,
+			CandleDuration:        step,
+			RankingMode:           "pullback",
+		},
+	}, strategy.EvaluatorConfig{
+		CandleDuration: step,
+		EMAPeriod:      30,
+		ATRPeriod:      14,
+		MaxSpreadPct:   0.10,
+		DisableOIFilter: true,
+	}, sim, map[string][]data.HistoricalCandle{"ALTUSDT": candles}, map[string]model.ExchangeFilter{"ALTUSDT": f})
+
+	if err := eng.Run(context.Background()); err != nil {
+		t.Fatalf("replay run failed: %v", err)
+	}
+	// Bars evaluated window is 40..74 (35 bars). Once NATR drops below MinNATRPct around bar 56,
+	// a healthy 0-candidate scan must clear watchedSymbols instead of retaining stale ALTUSDT for all 35 bars.
+	if eng.TotalSignalsEvaluated == 0 || eng.TotalSignalsEvaluated >= 25 {
+		t.Fatalf("expected ALTUSDT evaluated only while valid (<25 of 35 bars), got TotalSignalsEvaluated=%d", eng.TotalSignalsEvaluated)
+	}
+}
+
 

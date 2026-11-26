@@ -1347,3 +1347,325 @@ func TestPollSymbolOpenInterest_Uses15mPeriodAndExchangeClock(t *testing.T) {
 		t.Fatalf("expected exchange-clock-aligned OI pair 1000->1030, got prev=%v curr=%v", st.PrevOpenInterest, st.CurrOpenInterest)
 	}
 }
+
+func TestShouldRetainWatchlistOnFetchOutage(t *testing.T) {
+	// Retain prior watchlist when all pre-filtered kline fetches failed (even if open positions kept finalWatched non-empty).
+	outage := scanner.ScanStats{PreFilterPassed: 50, KlineFetchFailed: 50, KlineFetchOrShort: 0}
+	if !shouldRetainWatchlistOnFetchOutage(true, true, outage) {
+		t.Fatalf("expected retention when KlineFetchFailed == PreFilterPassed")
+	}
+	mixed := scanner.ScanStats{PreFilterPassed: 50, KlineFetchFailed: 45, KlineFetchOrShort: 5}
+	if !shouldRetainWatchlistOnFetchOutage(true, true, mixed) {
+		t.Fatalf("expected retention when all pre-filtered symbols failed fetch or short")
+	}
+
+	// Do NOT retain on a healthy scan where all symbols merely returned short candles (KlineFetchFailed == 0).
+	healthyShortOnly := scanner.ScanStats{PreFilterPassed: 50, KlineFetchFailed: 0, KlineFetchOrShort: 50}
+	if shouldRetainWatchlistOnFetchOutage(true, true, healthyShortOnly) {
+		t.Fatalf("expected NO retention when KlineFetchFailed == 0")
+	}
+	// Do NOT retain when at least one scanned candidate succeeded.
+	if shouldRetainWatchlistOnFetchOutage(true, false, outage) {
+		t.Fatalf("expected NO retention when scanned candidates exist")
+	}
+}
+
+func TestBotEngine_EmptyScanBlocksDefaultSymbolScope(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/fapi/v1/exchangeInfo":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"symbols": []map[string]any{
+					{"symbol": "SOLUSDT", "contractType": "PERPETUAL", "status": "TRADING", "filters": []map[string]string{{"filterType": "PRICE_FILTER", "tickSize": "0.01"}, {"filterType": "LOT_SIZE", "stepSize": "0.1", "minQty": "0.1"}}},
+					{"symbol": "BTCUSDT", "contractType": "PERPETUAL", "status": "TRADING", "filters": []map[string]string{{"filterType": "PRICE_FILTER", "tickSize": "0.1"}, {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"}}},
+				},
+			})
+		case "/fapi/v1/ticker/24hr":
+			_ = json.NewEncoder(w).Encode([]map[string]string{{"symbol": "SOLUSDT", "quoteVolume": "1000"}})
+		case "/fapi/v1/ticker/bookTicker":
+			_ = json.NewEncoder(w).Encode([]map[string]string{{"symbol": "SOLUSDT", "bidPrice": "100", "askPrice": "100.01"}})
+		case "/fapi/v1/klines":
+			_ = json.NewEncoder(w).Encode([][]any{})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	now := time.Now().UTC().Truncate(5 * time.Minute)
+	count := 80
+	candles := make([]model.Candle, count)
+	deltas := make([]float64, count)
+	for i := 0; i < count; i++ {
+		tClose := now.Add(-time.Duration(count-1-i) * 5 * time.Minute)
+		tOpen := tClose.Add(-5 * time.Minute)
+		closeP := 120.0 - float64(i)*0.20
+		openP := closeP + 0.08
+		candles[i] = model.Candle{
+			OpenTime: tOpen, CloseTime: tClose.Add(-time.Millisecond),
+			Open: openP, High: openP + 0.15, Low: closeP - 0.15, Close: closeP,
+			VolumeBase: 1000, QuoteVolumeUSDT: 1000 * closeP,
+		}
+		if i%2 == 0 {
+			deltas[i] = 100
+		} else {
+			deltas[i] = -100
+		}
+	}
+	priorHigh := 0.0
+	for i := count - 1 - 12; i < count-1; i++ {
+		if candles[i].High > priorHigh {
+			priorHigh = candles[i].High
+		}
+	}
+	latest := &candles[count-1]
+	latest.Open = priorHigh - 0.30
+	latest.Close = priorHigh - 1.20
+	latest.High = priorHigh + 0.60
+	latest.Low = latest.Close - 0.10
+	deltas[count-1] = -80
+
+	filter := model.ExchangeFilter{
+		TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1),
+		MinQty: decimal.NewFromFloat(0.1), MinNotional: decimal.NewFromFloat(5.0),
+	}
+	st := model.NewSymbolState("SOLUSDT", filter, count+10, count+10)
+	st.IsLeverageIsolatedVerified = true
+	st.BestBid = latest.Close - 0.01
+	st.BestAsk = latest.Close + 0.01
+	st.BookUpdatedAt = time.Now().UTC()
+	st.MarkPrice = latest.Close
+	st.MarkPriceUpdatedAt = time.Now().UTC()
+	st.FundingRate = 0.0001
+	st.FundingUpdatedAt = time.Now().UTC()
+	st.CurrentSessionVWAP = priorHigh + 5.0
+	st.ClosedCandles = candles
+	st.ClosedBarDeltasUSDT = deltas
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(500), broker.DryRunConfig{
+		MaxSlots: 3, MaxDailyDrawdownPct: -0.05, AccountLeverage: 8.0,
+	})
+	defer dry.Close()
+
+	client := exchange.NewClient(ts.URL, "", "")
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun: true, Timeframe: "5m", CandleDuration: 5 * time.Minute,
+			DisableOIFilter: true, MaxDailyDrawdown: -0.05,
+			WSPublicURL: "wss://invalid.example.test", WSMarketURL: "wss://invalid.example.test",
+		},
+		repo: repo, client: client, broker: dry, dryRunBroker: dry,
+		activeStates: map[string]*model.SymbolState{
+			"SOLUSDT":       st,
+			BenchmarkSymbol: model.NewSymbolState(BenchmarkSymbol, filter, 10, 10),
+		},
+		exchangeFilters: make(map[string]model.ExchangeFilter),
+		cooldownExits:   make(map[string]storage.RecentExitRecord),
+		verifiedSymbols: make(map[string]bool),
+		oiBootAttemptAt: make(map[string]time.Time),
+		scannerCfg: scanner.ScannerConfig{
+			MinVolume24hUSDT: 50_000_000, MaxSpreadPct: 0.10, EMAPeriod: 50,
+			Timeframe: "5m", CandleDuration: 5 * time.Minute, BootstrapCount: 100, DeltaWindow: 50,
+		},
+		evaluatorCfg: strategy.EvaluatorConfig{
+			CandleDuration: 5 * time.Minute, MaxSlots: 3, MaxBookStaleness: 5 * time.Second,
+			MaxMarkStaleness: 15 * time.Second, MaxDataStaleness: 330 * time.Second, MaxSpreadPct: 0.05,
+			MinNATRPct: 0.10, MaxNATRPct: 5.0, EMAPeriod: 50, ATRPeriod: 14, DeltaZScoreWindow: 50,
+			DisableOIFilter: true, MaxAdverseFundingRate: 0.0005, AllowedSide: "AUTO",
+			MaxFrenzyRVOL: 2.5, MaxCounterImpulseATR: 1.5, EntryOrderType: "LIMIT",
+			Sweep: strategy.SweepConfig{Enabled: true, LookbackBars: 12, MinUpperWickRatio: 0.25, MaxLowerWickRatio: 0.45, MaxDeltaZScore: -0.25},
+			Sizing: strategy.SizingConfig{
+				RiskPerTradePct: decimal.NewFromFloat(0.015), MaxSlotMarginFraction: decimal.NewFromFloat(0.20),
+				AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90), AccountLeverage: 8.0,
+				SLMultiplier: 1.65, TPMultiplier: 3.60, MinSLDistancePct: decimal.NewFromFloat(0.01),
+				MakerFeeRate: decimal.NewFromFloat(0.0002), TakerFeeRate: decimal.NewFromFloat(0.0005), SlippageRate: decimal.NewFromFloat(0.0002),
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	eng.runMarketScan(ctx)
+	cancel()
+	if eng.streamCancel != nil {
+		eng.streamCancel()
+	}
+	eng.streamWg.Wait()
+
+	eng.statesMu.RLock()
+	completed := eng.hasCompletedScan
+	eng.statesMu.RUnlock()
+	if !completed {
+		t.Fatalf("expected hasCompletedScan == true after clean zero-candidate scan")
+	}
+
+	// Simulate SOLUSDT still held in memory (e.g., pending order canceled right after scan).
+	// Because a scan completed with zero candidates, DefaultSymbolScope must NOT re-enable entries.
+	eng.evaluateAndLogClosedCandle(*latest, st)
+	var decision, reason string
+	if err := db.RawConn().QueryRow("SELECT decision, reject_reason_code FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&decision, &reason); err != nil {
+		t.Fatalf("failed to query signal_audit_log: %v", err)
+	}
+	if decision != "REJECT" || dry.HasActiveOrderOrPosition("SOLUSDT") {
+		t.Fatalf("expected REJECT without opening order on clean empty scan, got decision=%q reason=%q hasActive=%v", decision, reason, dry.HasActiveOrderOrPosition("SOLUSDT"))
+	}
+}
+
+func TestBotEngine_LateWSCandleEvaluatedAfterRESTBootstrap(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(500), broker.DryRunConfig{MaxSlots: 3})
+	defer dry.Close()
+
+	step := 5 * time.Minute
+	now := time.Now().UTC().Truncate(step)
+	prevBar := model.Candle{OpenTime: now.Add(-2 * step), CloseTime: now.Add(-step - time.Millisecond), Open: 100, High: 101, Low: 99, Close: 100.5, VolumeBase: 10, QuoteVolumeUSDT: 1000}
+	lateBar := model.Candle{OpenTime: now.Add(-step), CloseTime: now.Add(-time.Millisecond), Open: 100.5, High: 102, Low: 100, Close: 101, VolumeBase: 12, QuoteVolumeUSDT: 1200}
+
+	st := model.NewSymbolState("SOLUSDT", model.ExchangeFilter{}, 50, 50)
+	st.IsLeverageIsolatedVerified = true
+	st.ApplyClosedCandleLocked(prevBar, 50, 50)
+	st.MarkCandleEvaluatedLocked(prevBar.OpenTime)
+	// REST bootstrap ingests lateBar before late WS event arrives.
+	if !st.ApplyClosedCandleLocked(lateBar, 50, 50) {
+		t.Fatalf("expected REST bootstrap to ingest lateBar")
+	}
+
+	eng := &BotEngine{
+		cfg:          &config.Config{DryRun: true, Timeframe: "5m", CandleDuration: step, MaxDailyDrawdown: -0.05},
+		repo:         repo,
+		broker:       dry,
+		dryRunBroker: dry,
+		activeStates: map[string]*model.SymbolState{"SOLUSDT": st},
+		primaryWatchedSet: map[string]bool{"SOLUSDT": true},
+		cooldownExits:     make(map[string]storage.RecentExitRecord),
+		verifiedSymbols:   make(map[string]bool),
+		scannerCfg:        scanner.ScannerConfig{BootstrapCount: 50, DeltaWindow: 49},
+		evaluatorCfg:      strategy.EvaluatorConfig{CandleDuration: step, MaxSlots: 3},
+	}
+
+	// Late WS arrives for lateBar -> MUST evaluate once even though LastProcessedCandleOpenTime == lateBar.OpenTime.
+	eng.processClosedKlineWS(context.Background(), "SOLUSDT", lateBar, "5m")
+	eng.evalWg.Wait()
+
+	var cnt1 int
+	if err := db.RawConn().QueryRow("SELECT COUNT(*) FROM signal_audit_log WHERE symbol = 'SOLUSDT'").Scan(&cnt1); err != nil {
+		t.Fatalf("count signal_audit_log failed: %v", err)
+	}
+	if cnt1 != 1 {
+		t.Fatalf("expected late WS bar evaluated once after REST ingestion, got audit rows=%d", cnt1)
+	}
+
+	// Duplicate WS close for same lateBar -> MUST NOT re-evaluate.
+	eng.processClosedKlineWS(context.Background(), "SOLUSDT", lateBar, "5m")
+	eng.evalWg.Wait()
+
+	var cnt2 int
+	if err := db.RawConn().QueryRow("SELECT COUNT(*) FROM signal_audit_log WHERE symbol = 'SOLUSDT'").Scan(&cnt2); err != nil {
+		t.Fatalf("count signal_audit_log failed: %v", err)
+	}
+	if cnt2 != 1 {
+		t.Fatalf("expected duplicate WS bar skipped, got audit rows=%d", cnt2)
+	}
+}
+
+func TestBotEngine_StaleOrMissingBTCCandleFailClosed(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(500), broker.DryRunConfig{MaxSlots: 3})
+	defer dry.Close()
+
+	// 1. waitForBTCCandle returns true on arrival and false on timeout.
+	engWait := &BotEngine{}
+	openT := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if engWait.waitForBTCCandle(openT, 20*time.Millisecond) {
+		t.Fatalf("expected waitForBTCCandle to return false on timeout")
+	}
+	engWait.notifyBTCCandleClosed(openT)
+	if !engWait.waitForBTCCandle(openT, 20*time.Millisecond) {
+		t.Fatalf("expected waitForBTCCandle to return true after BTC candle arrival")
+	}
+
+	// 2. Empty BTC snapshot fails closed with STALE_BTC_MACRO_CANDLE.
+	step := 5 * time.Minute
+	now := time.Now().UTC().Truncate(step)
+	altCandle := model.Candle{OpenTime: now.Add(-step), CloseTime: now.Add(-time.Millisecond), Open: 100, High: 101, Low: 99, Close: 100.5, VolumeBase: 10, QuoteVolumeUSDT: 1000}
+	altSt := model.NewSymbolState("SOLUSDT", model.ExchangeFilter{}, 20, 20)
+	altSt.IsLeverageIsolatedVerified = true
+	altSt.ApplyClosedCandleLocked(altCandle, 20, 20)
+
+	eng := &BotEngine{
+		cfg:             &config.Config{DryRun: true, MaxDailyDrawdown: -0.05},
+		repo:            repo,
+		broker:          dry,
+		dryRunBroker:    dry,
+		activeStates:    map[string]*model.SymbolState{"SOLUSDT": altSt},
+		cooldownExits:   make(map[string]storage.RecentExitRecord),
+		verifiedSymbols: make(map[string]bool),
+		evaluatorCfg:    strategy.EvaluatorConfig{CandleDuration: step, MaxSlots: 3, BTCGateEnabled: true},
+	}
+
+	eng.evaluateAndLogClosedCandle(altCandle, altSt)
+	var r1 string
+	if err := db.RawConn().QueryRow("SELECT reject_reason_code FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&r1); err != nil {
+		t.Fatalf("query audit log failed: %v", err)
+	}
+	if r1 != "STALE_BTC_MACRO_CANDLE" {
+		t.Fatalf("expected STALE_BTC_MACRO_CANDLE on empty BTC snapshot, got %q", r1)
+	}
+
+	// 3. Stale BTC snapshot (1 bar behind altCandle.OpenTime) also fails closed with STALE_BTC_MACRO_CANDLE.
+	btcSt := model.NewSymbolState(BenchmarkSymbol, model.ExchangeFilter{}, 20, 20)
+	btcCandle := altCandle
+	btcCandle.OpenTime = altCandle.OpenTime.Add(-step)
+	btcCandle.CloseTime = altCandle.CloseTime.Add(-step)
+	btcSt.ApplyClosedCandleLocked(btcCandle, 20, 20)
+	eng.statesMu.Lock()
+	eng.activeStates[BenchmarkSymbol] = btcSt
+	eng.statesMu.Unlock()
+
+	eng.evaluateAndLogClosedCandle(altCandle, altSt)
+	var r2 string
+	if err := db.RawConn().QueryRow("SELECT reject_reason_code FROM signal_audit_log ORDER BY id DESC LIMIT 1").Scan(&r2); err != nil {
+		t.Fatalf("query audit log failed: %v", err)
+	}
+	if r2 != "STALE_BTC_MACRO_CANDLE" {
+		t.Fatalf("expected STALE_BTC_MACRO_CANDLE on stale BTC snapshot, got %q", r2)
+	}
+}
+
+func TestShouldEmergencyCloseOrphanPosition_DisabledOnDBError(t *testing.T) {
+	dbErr := fmt.Errorf("sqlite disk I/O error")
+	if shouldEmergencyCloseOrphanPosition(dbErr, false, nil, nil, "CLOSE") {
+		t.Fatalf("expected orphan emergency close DISABLED whenever DB read fails")
+	}
+	if shouldEmergencyCloseOrphanPosition(nil, true, nil, nil, "CLOSE") {
+		t.Fatalf("expected NO orphan emergency close when active SL exists")
+	}
+	if shouldEmergencyCloseOrphanPosition(nil, false, fmt.Errorf("algo err"), nil, "CLOSE") {
+		t.Fatalf("expected NO orphan emergency close when algo verification errored")
+	}
+	if shouldEmergencyCloseOrphanPosition(nil, false, nil, nil, "ADOPT") {
+		t.Fatalf("expected NO orphan emergency close when policy is ADOPT")
+	}
+	if !shouldEmergencyCloseOrphanPosition(nil, false, nil, nil, "CLOSE") {
+		t.Fatalf("expected orphan emergency close ONLY when DB ok, no SL, no verify err, and policy==CLOSE")
+	}
+}

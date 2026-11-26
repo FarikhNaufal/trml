@@ -1,7 +1,9 @@
 package exchange
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,6 +37,7 @@ type QueryOrderResponse struct {
 	OrigQty       string `json:"origQty"`
 	ExecutedQty   string `json:"executedQty"`
 	ReduceOnly    bool   `json:"reduceOnly"`
+	ClosePosition bool   `json:"closePosition"`
 	Price         string `json:"price"`
 	AvgPrice      string `json:"avgPrice"`
 	StopPrice     string `json:"stopPrice"`
@@ -56,11 +59,12 @@ type QueryAlgoOrderResponse struct {
 	OrderType    string `json:"orderType"`
 	Symbol       string `json:"symbol"`
 	Side         string `json:"side"`
-	Quantity     string `json:"quantity"`
-	AlgoStatus   string `json:"algoStatus"`
-	TriggerPrice string `json:"triggerPrice"`
-	Price        string `json:"price"`
-	ReduceOnly   bool   `json:"reduceOnly"`
+	Quantity      string `json:"quantity"`
+	AlgoStatus    string `json:"algoStatus"`
+	TriggerPrice  string `json:"triggerPrice"`
+	Price         string `json:"price"`
+	ReduceOnly    bool   `json:"reduceOnly"`
+	ClosePosition bool   `json:"closePosition"`
 }
 
 type DualSidePositionResponse struct {
@@ -171,8 +175,28 @@ func (c *Client) PlaceAlgoOrder(
 	return resp.AlgoID, nil
 }
 
-// CancelOrder membatalkan pesanan reguler (DELETE /fapi/v1/order)
-func (c *Client) CancelOrder(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error {
+func mapExchangeOrderStatus(raw string) model.OrderLifecycleStatus {
+	switch raw {
+	case "NEW":
+		return model.StatusNew
+	case "PARTIALLY_FILLED":
+		return model.StatusPartiallyFilled
+	case "FILLED":
+		return model.StatusFilled
+	case "CANCELED":
+		return model.StatusCanceled
+	case "REJECTED":
+		return model.StatusRejected
+	case "EXPIRED", "EXPIRED_IN_MATCH":
+		return model.StatusExpired
+	default:
+		slog.Warn("exchange: unknown order status encountered, defaulting to EXPIRED", "rawStatus", raw)
+		return model.StatusExpired
+	}
+}
+
+// CancelOrderWithResult membatalkan pesanan reguler (DELETE /fapi/v1/order) dan mengembalikan status serta executedQty terkini.
+func (c *Client) CancelOrderWithResult(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) (*model.LiveOrderRecord, error) {
 	params := url.Values{}
 	params.Set("symbol", symbol)
 	if exchangeOrderID != 0 {
@@ -181,11 +205,49 @@ func (c *Client) CancelOrder(ctx context.Context, symbol string, exchangeOrderID
 		params.Set("origClientOrderId", clientOrderID)
 	}
 
-	_, err := c.DoRequest(ctx, http.MethodDelete, "/fapi/v1/order", params, true)
+	respBytes, err := c.DoRequest(ctx, http.MethodDelete, "/fapi/v1/order", params, true)
 	if err != nil {
-		return fmt.Errorf("cancel order: %w", err)
+		return nil, fmt.Errorf("cancel order: %w", err)
 	}
-	return nil
+	if len(bytes.TrimSpace(respBytes)) == 0 {
+		return nil, nil
+	}
+
+	var resp OrderResponse
+	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
+		return nil, fmt.Errorf("cancel order decode: %w", err)
+	}
+
+	cumQty, _ := decimal.NewFromString(strings.TrimSpace(resp.ExecutedQty))
+	avgP, _ := decimal.NewFromString(strings.TrimSpace(resp.AvgPrice))
+	cid := strings.TrimSpace(resp.ClientOrderID)
+	if cid == "" {
+		cid = clientOrderID
+	}
+	oid := resp.OrderID
+	if oid == 0 {
+		oid = exchangeOrderID
+	}
+	status := model.StatusCanceled
+	if strings.TrimSpace(resp.Status) != "" {
+		status = mapExchangeOrderStatus(resp.Status)
+	}
+
+	return &model.LiveOrderRecord{
+		ClientOrderID:       cid,
+		ExchangeOrderID:     oid,
+		Symbol:              symbol,
+		IsEntry:             true,
+		Status:              status,
+		CumulativeFilledQty: cumQty,
+		AvgPrice:            avgP,
+	}, nil
+}
+
+// CancelOrder membatalkan pesanan reguler (DELETE /fapi/v1/order)
+func (c *Client) CancelOrder(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error {
+	_, err := c.CancelOrderWithResult(ctx, symbol, exchangeOrderID, clientOrderID)
+	return err
 }
 
 // CancelAlgoOrder membatalkan pesanan algo conditional (DELETE /fapi/v1/algoOrder)
@@ -411,24 +473,7 @@ func (c *Client) QueryOrder(ctx context.Context, symbol, clientOrderID string) (
 		side = model.SideShort
 	}
 
-	var status model.OrderLifecycleStatus
-	switch resp.Status {
-	case "NEW":
-		status = model.StatusNew
-	case "PARTIALLY_FILLED":
-		status = model.StatusPartiallyFilled
-	case "FILLED":
-		status = model.StatusFilled
-	case "CANCELED":
-		status = model.StatusCanceled
-	case "REJECTED":
-		status = model.StatusRejected
-	case "EXPIRED", "EXPIRED_IN_MATCH":
-		status = model.StatusExpired
-	default:
-		slog.Warn("exchange: unknown order status encountered, defaulting to EXPIRED", "rawStatus", resp.Status)
-		status = model.StatusExpired
-	}
+	status := mapExchangeOrderStatus(resp.Status)
 
 	origQty, _ := decimal.NewFromString(resp.OrigQty)
 	cumQty, _ := decimal.NewFromString(resp.ExecutedQty)
@@ -530,6 +575,14 @@ func (c *Client) GetOpenOrders(ctx context.Context, symbol string) ([]QueryOrder
 	return resp, nil
 }
 
+type accountPositionEntry struct {
+	Symbol           string `json:"symbol"`
+	PositionAmt      string `json:"positionAmt"`
+	EntryPrice       string `json:"entryPrice"`
+	UnrealizedProfit string `json:"unrealizedProfit"`
+	PositionSide     string `json:"positionSide"`
+}
+
 type BinanceAccountResponse struct {
 	FeeTier               int    `json:"feeTier"`
 	CanTrade              bool   `json:"canTrade"`
@@ -542,13 +595,7 @@ type BinanceAccountResponse struct {
 		UnrealizedProfit string `json:"unrealizedProfit"`
 		AvailableBalance string `json:"availableBalance"`
 	} `json:"assets"`
-	Positions []struct {
-		Symbol           string `json:"symbol"`
-		PositionAmt      string `json:"positionAmt"`
-		EntryPrice       string `json:"entryPrice"`
-		UnrealizedProfit string `json:"unrealizedProfit"`
-		PositionSide     string `json:"positionSide"`
-	} `json:"positions"`
+	Positions json.RawMessage `json:"positions"`
 }
 
 // FetchAccountBalance mengambil informasi saldo dompet riil, margin tersedia, unrealized PnL,
@@ -563,6 +610,18 @@ func (c *Client) FetchAccountBalance(ctx context.Context) (walletBal, unrealized
 	var resp BinanceAccountResponse
 	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
 		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account decode: %w (body: %s)", err, string(respBytes))
+	}
+
+	rawPositions := bytes.TrimSpace(resp.Positions)
+	if len(rawPositions) == 0 || bytes.Equal(rawPositions, []byte("null")) {
+		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account: missing or null positions field in exchange response")
+	}
+	var parsedPositions []accountPositionEntry
+	if err := sonic.Unmarshal(rawPositions, &parsedPositions); err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account: decode positions: %w", err)
+	}
+	if len(resp.Assets) == 0 && strings.TrimSpace(resp.TotalWalletBalance) == "" {
+		return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account: incomplete account balance payload")
 	}
 
 	// 1. Utamakan basis aset USDT agar selaras dengan ACCOUNT_UPDATE WebSocket (cegah fake drawdown jika ada saldo BNB/lainnya)
@@ -595,11 +654,18 @@ func (c *Client) FetchAccountBalance(ctx context.Context) (walletBal, unrealized
 		}
 	}
 
-	// 2. Ekstrak posisi terbuka aktif (non-zero positionAmt)
+	// 2. Ekstrak posisi terbuka aktif (non-zero positionAmt) secara fail-closed
 	positions = make(map[string]model.LivePosition)
-	for _, p := range resp.Positions {
-		amt, err := decimal.NewFromString(p.PositionAmt)
-		if err != nil || amt.IsZero() {
+	for _, p := range parsedPositions {
+		sym := strings.TrimSpace(p.Symbol)
+		if sym == "" {
+			return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account: empty symbol in positions entry")
+		}
+		amt, amtErr := decimal.NewFromString(strings.TrimSpace(p.PositionAmt))
+		if amtErr != nil {
+			return decimal.Zero, decimal.Zero, decimal.Zero, nil, fmt.Errorf("fetch account: invalid positionAmt %q for %s: %w", p.PositionAmt, sym, amtErr)
+		}
+		if amt.IsZero() {
 			continue
 		}
 		var side model.Side
@@ -617,8 +683,8 @@ func (c *Client) FetchAccountBalance(ctx context.Context) (walletBal, unrealized
 			up = pUp
 		}
 
-		positions[p.Symbol] = model.LivePosition{
-			Symbol:        p.Symbol,
+		positions[sym] = model.LivePosition{
+			Symbol:        sym,
 			Side:          side,
 			Qty:           amt.Abs(),
 			EntryPrice:    ep,

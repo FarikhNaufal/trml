@@ -123,6 +123,17 @@ func (m *StreamManager) StartSupervisedStream(ctx context.Context, streamURL str
 }
 
 func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, connStart time.Time) error {
+	return m.readLoopWithControl(ctx, conn, connStart, nil, nil, 0)
+}
+
+func (m *StreamManager) readLoopWithControl(
+	ctx context.Context,
+	conn *websocket.Conn,
+	connStart time.Time,
+	onControlFrame func([]byte) bool,
+	onWatchdogTick func(now time.Time) bool,
+	watchdogOverride time.Duration,
+) error {
 	idleTimeout := m.IdleTimeout
 	if idleTimeout <= 0 {
 		idleTimeout = defaultWSIdleTimeout
@@ -148,6 +159,12 @@ func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, conn
 	} else if watchdogInterval > 10*time.Second {
 		watchdogInterval = 10 * time.Second
 	}
+	if watchdogOverride > 0 && watchdogOverride < watchdogInterval {
+		watchdogInterval = watchdogOverride
+		if watchdogInterval < 10*time.Millisecond {
+			watchdogInterval = 10 * time.Millisecond
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -163,11 +180,16 @@ func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, conn
 			case <-readCtx.Done():
 				return
 			case <-watchdogTicker.C:
+				now := time.Now()
 				lastAt := time.Unix(0, lastFrameNano.Load())
-				if time.Since(lastAt) > idleTimeout {
+				if now.Sub(lastAt) > idleTimeout {
 					slog.Warn("ws: idle watchdog timeout triggered",
 						"connAge", time.Since(connStart).Round(time.Millisecond),
-						"idleFor", time.Since(lastAt).Round(time.Millisecond))
+						"idleFor", now.Sub(lastAt).Round(time.Millisecond))
+					readCancel()
+					return
+				}
+				if onWatchdogTick != nil && onWatchdogTick(now) {
 					readCancel()
 					return
 				}
@@ -200,6 +222,9 @@ func (m *StreamManager) readLoop(ctx context.Context, conn *websocket.Conn, conn
 		}
 		lastFrameNano.Store(time.Now().UnixNano())
 		if typ == websocket.MessageText {
+			if onControlFrame != nil && onControlFrame(msg) {
+				continue
+			}
 			m.ProcessMessage(msg)
 		}
 	}
@@ -227,11 +252,21 @@ func (m *StreamManager) ConnectAndStream(ctx context.Context, streamURL string) 
 	return m.readLoop(ctx, conn, connStart)
 }
 
+const defaultWSControlAckTimeout = 15 * time.Second
+
+type pendingControlReq struct {
+	id     int64
+	method string
+	params []string
+	sentAt time.Time
+}
+
 // DynamicStream mengelola koneksi WebSocket gabungan dengan pembaruan SUBSCRIBE/UNSUBSCRIBE diferensial
 // tanpa memutus koneksi untuk simbol yang tetap berada di watchlist.
 type DynamicStream struct {
-	mgr     *StreamManager
-	baseURL string
+	mgr               *StreamManager
+	baseURL           string
+	ControlAckTimeout time.Duration
 
 	sendMu        sync.Mutex // Strict lock order: sendMu -> mu
 	mu            sync.Mutex
@@ -239,6 +274,9 @@ type DynamicStream struct {
 	conn          *websocket.Conn
 	syncedConn    *websocket.Conn
 	syncedStreams []string
+	pendingReqs   map[int64]pendingControlReq
+	connCancel    context.CancelFunc
+	connAborted   bool
 	reqID         atomic.Int64
 }
 
@@ -246,10 +284,157 @@ func NewDynamicStream(mgr *StreamManager, baseURL string, initialStreams []strin
 	copied := make([]string, len(initialStreams))
 	copy(copied, initialStreams)
 	return &DynamicStream{
-		mgr:     mgr,
-		baseURL: baseURL,
-		streams: copied,
+		mgr:         mgr,
+		baseURL:     baseURL,
+		streams:     copied,
+		pendingReqs: make(map[int64]pendingControlReq),
 	}
+}
+
+func (d *DynamicStream) effectiveControlAckTimeout() time.Duration {
+	if d.ControlAckTimeout > 0 {
+		return d.ControlAckTimeout
+	}
+	return defaultWSControlAckTimeout
+}
+
+func removeStreamsFromSlice(cur []string, toRemove []string) []string {
+	removeSet := make(map[string]bool, len(toRemove))
+	for _, s := range toRemove {
+		removeSet[s] = true
+	}
+	kept := make([]string, 0, len(cur))
+	for _, s := range cur {
+		if !removeSet[s] {
+			kept = append(kept, s)
+		}
+	}
+	return kept
+}
+
+func addStreamsToSlice(cur []string, toAdd []string) []string {
+	existing := make(map[string]bool, len(cur))
+	out := make([]string, 0, len(cur)+len(toAdd))
+	for _, s := range cur {
+		if !existing[s] {
+			existing[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, s := range toAdd {
+		if !existing[s] {
+			existing[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (d *DynamicStream) rollbackControlReqLocked(req pendingControlReq) {
+	switch req.method {
+	case "SUBSCRIBE":
+		d.syncedStreams = removeStreamsFromSlice(d.syncedStreams, req.params)
+	case "UNSUBSCRIBE":
+		d.syncedStreams = addStreamsToSlice(d.syncedStreams, req.params)
+	default:
+		d.syncedStreams = nil
+	}
+}
+
+func (d *DynamicStream) handleControlFrame(raw []byte) bool {
+	var envelope struct {
+		Stream string          `json:"stream"`
+		Data   json.RawMessage `json:"data"`
+		Event  string          `json:"e"`
+		ID     *int64          `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+		} `json:"error"`
+		Code *int   `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := sonic.Unmarshal(raw, &envelope); err != nil {
+		return false
+	}
+	if envelope.Stream != "" || len(envelope.Data) > 0 || envelope.Event != "" {
+		return false
+	}
+	hasErr := envelope.Error != nil || (envelope.Code != nil && *envelope.Code != 0)
+	if envelope.ID == nil && !hasErr && len(envelope.Result) == 0 {
+		return false
+	}
+
+	d.mu.Lock()
+	var req pendingControlReq
+	var found bool
+	var reqID int64
+	if envelope.ID != nil {
+		reqID = *envelope.ID
+		req, found = d.pendingReqs[reqID]
+		if found {
+			delete(d.pendingReqs, reqID)
+		}
+	}
+	if !hasErr {
+		d.mu.Unlock()
+		return true
+	}
+
+	errCode := 0
+	errMsg := envelope.Msg
+	if envelope.Error != nil {
+		errCode = envelope.Error.Code
+		errMsg = envelope.Error.Msg
+	} else if envelope.Code != nil {
+		errCode = *envelope.Code
+	}
+	if found {
+		d.rollbackControlReqLocked(req)
+	} else {
+		d.syncedStreams = nil
+	}
+	d.connAborted = true
+	cancel := d.connCancel
+	d.mu.Unlock()
+
+	slog.Warn("ws: control request rejected by server; rolling back synced streams and reconnecting",
+		"baseURL", d.baseURL, "reqID", reqID, "method", req.method, "code", errCode, "msg", errMsg)
+	if cancel != nil {
+		cancel()
+	}
+	return true
+}
+
+func (d *DynamicStream) checkControlAckTimeout(now time.Time) bool {
+	timeout := d.effectiveControlAckTimeout()
+	d.mu.Lock()
+	if len(d.pendingReqs) == 0 {
+		d.mu.Unlock()
+		return false
+	}
+	var expiredIDs []int64
+	for id, req := range d.pendingReqs {
+		if now.Sub(req.sentAt) > timeout {
+			expiredIDs = append(expiredIDs, id)
+		}
+	}
+	if len(expiredIDs) == 0 {
+		d.mu.Unlock()
+		return false
+	}
+	for _, id := range expiredIDs {
+		req := d.pendingReqs[id]
+		d.rollbackControlReqLocked(req)
+		delete(d.pendingReqs, id)
+	}
+	d.connAborted = true
+	d.mu.Unlock()
+
+	slog.Warn("ws: control ACK timeout exceeded; forcing dynamic stream reconnect",
+		"baseURL", d.baseURL, "timeout", timeout, "expiredRequests", len(expiredIDs))
+	return true
 }
 
 func diffStreams(current, target []string) (added, removed []string) {
@@ -326,15 +511,21 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ws: dial error for %s: %w", streamURL, err)
 	}
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	defer func() {
 		d.sendMu.Lock()
 		d.mu.Lock()
 		if d.conn == conn {
 			d.conn = nil
+			d.connCancel = nil
 		}
 		if d.syncedConn == conn {
 			d.syncedConn = nil
 			d.syncedStreams = nil
+			d.pendingReqs = make(map[int64]pendingControlReq)
+			d.connAborted = false
 		}
 		d.mu.Unlock()
 		d.sendMu.Unlock()
@@ -344,12 +535,15 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 	d.sendMu.Lock()
 	d.mu.Lock()
 	d.conn = conn
+	d.connCancel = connCancel
+	d.syncedConn = conn
+	d.syncedStreams = append([]string(nil), dialed...)
+	d.pendingReqs = make(map[int64]pendingControlReq)
+	d.connAborted = false
 	latest := make([]string, len(d.streams))
 	copy(latest, d.streams)
 	d.mu.Unlock()
-	d.syncedConn = conn
-	d.syncedStreams = dialed
-	_, _, syncErr := d.syncConnStreamsLocked(ctx, conn, latest)
+	_, _, syncErr := d.syncConnStreamsLocked(connCtx, conn, latest)
 	d.sendMu.Unlock()
 	if syncErr != nil {
 		return fmt.Errorf("ws: failed to sync initial stream diff: %w", syncErr)
@@ -357,14 +551,20 @@ func (d *DynamicStream) connectAndStreamOnce(ctx context.Context) error {
 
 	connStart := time.Now()
 	slog.Info("ws: dynamic stream connected", "baseURL", d.baseURL, "streamCount", len(latest))
-	return d.mgr.readLoop(ctx, conn, connStart)
+	ackWatchInterval := d.effectiveControlAckTimeout() / 4
+	return d.mgr.readLoopWithControl(connCtx, conn, connStart, d.handleControlFrame, d.checkControlAckTimeout, ackWatchInterval)
 }
 
 // UpdateStreams memperbarui langganan secara diferensial via SUBSCRIBE/UNSUBSCRIBE tanpa memutus soket aktif.
 func (d *DynamicStream) UpdateStreams(ctx context.Context, newStreams []string) error {
 	d.mu.Lock()
 	addedTarget, removedTarget := diffStreams(d.streams, newStreams)
-	if len(addedTarget) == 0 && len(removedTarget) == 0 {
+	needResync := d.conn != nil && d.syncedConn == d.conn
+	if needResync {
+		addedSynced, removedSynced := diffStreams(d.syncedStreams, newStreams)
+		needResync = len(addedSynced) > 0 || len(removedSynced) > 0
+	}
+	if len(addedTarget) == 0 && len(removedTarget) == 0 && !needResync {
 		d.mu.Unlock()
 		return nil
 	}
@@ -378,11 +578,12 @@ func (d *DynamicStream) UpdateStreams(ctx context.Context, newStreams []string) 
 
 	d.mu.Lock()
 	conn := d.conn
+	synced := d.syncedConn
 	target := make([]string, len(d.streams))
 	copy(target, d.streams)
 	d.mu.Unlock()
 
-	if conn == nil || d.syncedConn != conn {
+	if conn == nil || synced != conn {
 		return nil
 	}
 
@@ -397,31 +598,32 @@ func (d *DynamicStream) UpdateStreams(ctx context.Context, newStreams []string) 
 }
 
 func (d *DynamicStream) syncConnStreamsLocked(ctx context.Context, conn *websocket.Conn, target []string) (int, int, error) {
-	added, removed := diffStreams(d.syncedStreams, target)
+	d.mu.Lock()
+	curSynced := make([]string, len(d.syncedStreams))
+	copy(curSynced, d.syncedStreams)
+	d.mu.Unlock()
+
+	added, removed := diffStreams(curSynced, target)
 	if len(removed) > 0 {
 		if err := d.writeControlMsgLocked(ctx, conn, "UNSUBSCRIBE", removed); err != nil {
 			return 0, 0, err
 		}
-		removedSet := make(map[string]bool, len(removed))
-		for _, s := range removed {
-			removedSet[s] = true
+		d.mu.Lock()
+		if d.syncedConn == conn && !d.connAborted {
+			d.syncedStreams = removeStreamsFromSlice(d.syncedStreams, removed)
 		}
-		kept := make([]string, 0, len(d.syncedStreams))
-		for _, s := range d.syncedStreams {
-			if !removedSet[s] {
-				kept = append(kept, s)
-			}
-		}
-		d.syncedStreams = kept
+		d.mu.Unlock()
 	}
 	if len(added) > 0 {
 		if err := d.writeControlMsgLocked(ctx, conn, "SUBSCRIBE", added); err != nil {
 			return 0, len(removed), err
 		}
+		d.mu.Lock()
+		if d.syncedConn == conn && !d.connAborted {
+			d.syncedStreams = addStreamsToSlice(d.syncedStreams, added)
+		}
+		d.mu.Unlock()
 	}
-	syncedCopy := make([]string, len(target))
-	copy(syncedCopy, target)
-	d.syncedStreams = syncedCopy
 	return len(added), len(removed), nil
 }
 
@@ -435,6 +637,7 @@ func (d *DynamicStream) writeControlMsgLocked(ctx context.Context, conn *websock
 	if len(params) == 0 {
 		return nil
 	}
+	id := d.reqID.Add(1)
 	payload := struct {
 		Method string   `json:"method"`
 		Params []string `json:"params"`
@@ -442,16 +645,38 @@ func (d *DynamicStream) writeControlMsgLocked(ctx context.Context, conn *websock
 	}{
 		Method: method,
 		Params: params,
-		ID:     d.reqID.Add(1),
+		ID:     id,
 	}
 	raw, err := sonic.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
+	paramsCopy := make([]string, len(params))
+	copy(paramsCopy, params)
+	d.mu.Lock()
+	if d.pendingReqs == nil {
+		d.pendingReqs = make(map[int64]pendingControlReq)
+	}
+	if d.syncedConn == conn {
+		d.pendingReqs[id] = pendingControlReq{
+			id:     id,
+			method: method,
+			params: paramsCopy,
+			sentAt: time.Now(),
+		}
+	}
+	d.mu.Unlock()
+
 	wCtx, wCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wCancel()
-	return conn.Write(wCtx, websocket.MessageText, raw)
+	if err := conn.Write(wCtx, websocket.MessageText, raw); err != nil {
+		d.mu.Lock()
+		delete(d.pendingReqs, id)
+		d.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 type streamShard struct {

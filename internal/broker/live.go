@@ -53,6 +53,7 @@ type LiveOpenPosition struct {
 	StrategyID     string
 	Qty            decimal.Decimal
 	InitialQty     decimal.Decimal
+	ProtectedQty   decimal.Decimal
 	EntryPrice     decimal.Decimal
 	SLOrderID      int64
 	SLClientAlgoID string
@@ -73,6 +74,15 @@ type LiveOpenPosition struct {
 	MaxMFE         float64
 	PeakPrice      decimal.Decimal
 	UpdatedAt      time.Time
+}
+
+type AlgoOrderVerifyResult struct {
+	SLAlive         bool
+	SLQty           decimal.Decimal
+	SLClosePosition bool
+	TPAlive         bool
+	TPQty           decimal.Decimal
+	TPClosePosition bool
 }
 
 type BinanceLiveBroker struct {
@@ -129,17 +139,21 @@ type BinanceLiveBroker struct {
 	LastClosingAttempt     map[string]time.Time       // symbol -> last successful EmergencyMarketClose dispatch timestamp
 	TP1FallbackAttempts    map[string]int             // symbol -> count of TP1 market fallback attempts
 	LastTP1FallbackTime    map[string]time.Time       // symbol -> last TP1 market fallback attempt timestamp
+	LastAccountPosPrevQty  map[string]decimal.Decimal // symbol -> pre-reduction position qty observed in ACCOUNT_UPDATE
 	lastAsyncRefresh       time.Time                  // debounce timestamp for background RefreshAccount
 
-	PlaceEntryFn           func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
-	PlaceMarketEntryFn     func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
-	PlaceAlgoOrderFn       func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (algoID int64, err error)
-	MarketCloseFn          func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (orderID int64, avgPrice, executedQty decimal.Decimal, err error)
-	PlaceLimitCloseFn      func(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (orderID int64, actualClientOrderID string, err error)
-	CancelOrderFn          func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error
-	CancelAlgoOrderFn      func(ctx context.Context, symbol string, algoID int64) error
-	VerifyAlgoOrderFn      func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (slAlive, tpAlive bool, err error)
-	EmergencyMarketCloseFn func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error
+	PlaceEntryFn             func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
+	PlaceMarketEntryFn       func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
+	PlaceAlgoOrderFn         func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (algoID int64, err error)
+	MarketCloseFn            func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (orderID int64, avgPrice, executedQty decimal.Decimal, err error)
+	PlaceLimitCloseFn        func(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (orderID int64, actualClientOrderID string, err error)
+	CancelOrderFn            func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error
+	CancelOrderWithResultFn  func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) (*model.LiveOrderRecord, error)
+	CancelAlgoOrderFn        func(ctx context.Context, symbol string, algoID int64) error
+	VerifyAlgoOrderFn        func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (slAlive, tpAlive bool, err error)
+	VerifyAlgoOrderDetailsFn func(ctx context.Context, symbol string, slAlgoID, tpAlgoID int64, clientSLID, clientTPID string) (AlgoOrderVerifyResult, error)
+	ConfirmPositionZeroFn    func(ctx context.Context, symbol string) (isZero bool, err error)
+	EmergencyMarketCloseFn   func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, reason string) error
 	QueryOrderFn           func(ctx context.Context, symbol string, clientOrderID string) (*model.LiveOrderRecord, error)
 	GetExchangeFilterFn    func(symbol string) (model.ExchangeFilter, bool)
 	GetBestQuoteFn         func(symbol string) (bestBid, bestAsk float64, ok bool)
@@ -253,6 +267,7 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		LastClosingAttempt:     make(map[string]time.Time),
 		TP1FallbackAttempts:    make(map[string]int),
 		LastTP1FallbackTime:    make(map[string]time.Time),
+		LastAccountPosPrevQty:  make(map[string]decimal.Decimal),
 	}
 	b.eventCond = sync.NewCond(&b.eventMu)
 	b.startEventWorker()
@@ -350,6 +365,7 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 	partialTPEnabled := b.Cfg.PartialTPEnabled
 	trailingEnabled := b.Cfg.TrailingEnabled
 	verifyFn := b.VerifyAlgoOrderFn
+	verifyDetailsFn := b.VerifyAlgoOrderDetailsFn
 	b.Mu.Unlock()
 
 	slStatus := model.ProtectionAcked
@@ -361,13 +377,57 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 		tpStatus = model.ProtectionFailed
 	}
 
+	protectedQty := pos.Qty
+	if pos.ProtectedQty.GreaterThan(decimal.Zero) && pos.ProtectedQty.LessThan(pos.Qty) {
+		protectedQty = pos.ProtectedQty
+	}
+
 	slOrderID := pos.SLOrderID
 	slClientAlgoID := pos.SLClientAlgoID
 	tpOrderID := pos.TPOrderID
 	tpClientAlgoID := pos.TPClientAlgoID
 
 	// Verifikasi aktual ke Binance DI LUAR b.Mu agar lock tidak pernah tertahan blocking network I/O 5 detik.
-	if verifyFn != nil && (slStatus == model.ProtectionAcked || tpStatus == model.ProtectionAcked) {
+	if verifyDetailsFn != nil && (slStatus == model.ProtectionAcked || tpStatus == model.ProtectionAcked) {
+		ctxV, cancelV := context.WithTimeout(context.Background(), 5*time.Second)
+		res, err := verifyDetailsFn(ctxV, pos.Symbol, slOrderID, tpOrderID, slClientAlgoID, tpClientAlgoID)
+		cancelV()
+		if err == nil {
+			if slOrderID != 0 {
+				if !res.SLAlive {
+					slog.Warn("live: stored SL order not alive on Binance; marking ProtectionFailed for repair", "symbol", pos.Symbol, "slOrderID", slOrderID)
+					slStatus = model.ProtectionFailed
+					slOrderID = 0
+					slClientAlgoID = ""
+					protectedQty = decimal.Zero
+				} else if !res.SLClosePosition && (res.SLQty.LessThanOrEqual(decimal.Zero) || res.SLQty.LessThan(pos.Qty)) {
+					slog.Warn("live: stored SL order quantity is smaller than live position quantity; marking ProtectionFailed to upgrade SL",
+						"symbol", pos.Symbol, "slOrderID", slOrderID, "slQty", res.SLQty, "posQty", pos.Qty)
+					slStatus = model.ProtectionFailed
+					protectedQty = res.SLQty
+				} else {
+					protectedQty = pos.Qty
+				}
+			}
+			if tpOrderID != 0 {
+				if !res.TPAlive {
+					slog.Warn("live: stored TP order not alive on Binance; marking ProtectionFailed for repair", "symbol", pos.Symbol, "tpOrderID", tpOrderID)
+					tpStatus = model.ProtectionFailed
+					tpOrderID = 0
+					tpClientAlgoID = ""
+				} else if !res.TPClosePosition && (res.TPQty.LessThanOrEqual(decimal.Zero) || res.TPQty.LessThan(pos.Qty)) {
+					slog.Warn("live: stored TP order quantity is smaller than live position quantity; marking ProtectionFailed to upgrade TP",
+						"symbol", pos.Symbol, "tpOrderID", tpOrderID, "tpQty", res.TPQty, "posQty", pos.Qty)
+					tpStatus = model.ProtectionFailed
+				}
+			}
+		} else if pos.ProtectedQty.GreaterThan(decimal.Zero) && pos.ProtectedQty.LessThan(pos.Qty) {
+			slog.Warn("live: failed to verify stored SL order details and position qty grew since snapshot; marking ProtectionFailed to upgrade SL",
+				"symbol", pos.Symbol, "slOrderID", slOrderID, "storedQty", pos.ProtectedQty, "posQty", pos.Qty, "err", err)
+			slStatus = model.ProtectionFailed
+			protectedQty = pos.ProtectedQty
+		}
+	} else if verifyFn != nil && (slStatus == model.ProtectionAcked || tpStatus == model.ProtectionAcked) {
 		ctxV, cancelV := context.WithTimeout(context.Background(), 5*time.Second)
 		slAlive, tpAlive, err := verifyFn(ctxV, pos.Symbol, slOrderID, tpOrderID, slClientAlgoID, tpClientAlgoID)
 		cancelV()
@@ -377,6 +437,7 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 				slStatus = model.ProtectionFailed
 				slOrderID = 0
 				slClientAlgoID = ""
+				protectedQty = decimal.Zero
 			}
 			if tpOrderID != 0 && !tpAlive {
 				slog.Warn("live: stored TP order not alive on Binance; marking ProtectionFailed for repair", "symbol", pos.Symbol, "tpOrderID", tpOrderID)
@@ -384,7 +445,17 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 				tpOrderID = 0
 				tpClientAlgoID = ""
 			}
+		} else if pos.ProtectedQty.GreaterThan(decimal.Zero) && pos.ProtectedQty.LessThan(pos.Qty) {
+			slStatus = model.ProtectionFailed
+			protectedQty = pos.ProtectedQty
 		}
+	} else if pos.ProtectedQty.GreaterThan(decimal.Zero) && pos.ProtectedQty.LessThan(pos.Qty) {
+		slStatus = model.ProtectionFailed
+		protectedQty = pos.ProtectedQty
+	}
+
+	if slStatus == model.ProtectionFailed && slOrderID == 0 {
+		protectedQty = decimal.Zero
 	}
 
 	b.Mu.Lock()
@@ -427,7 +498,7 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 		Symbol:           pos.Symbol,
 		Side:             pos.Side,
 		PlanGeneration:   1,
-		ProtectedQty:     pos.Qty,
+		ProtectedQty:     protectedQty,
 		InitialQty:       pos.InitialQty,
 		SLOrderID:        slOrderID,
 		SLClientAlgoID:   slClientAlgoID,
@@ -1048,6 +1119,7 @@ func (b *BinanceLiveBroker) clearSymbolTransientMetadataLocked(symbol string) {
 	delete(b.LastClosingAttempt, symbol)
 	delete(b.TP1FallbackAttempts, symbol)
 	delete(b.LastTP1FallbackTime, symbol)
+	delete(b.LastAccountPosPrevQty, symbol)
 }
 
 // RefreshAccount mengambil data saldo dompet dan posisi aktif terkini via REST API Binance (FetchAccountFn)
@@ -1143,6 +1215,8 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 		trackedSymbols[sym] = true
 	}
 
+	confirmFn := b.ConfirmPositionZeroFn
+	var missingCandidates []string
 	for sym := range trackedSymbols {
 		if pos, exists := positions[sym]; exists && pos.Qty.GreaterThan(decimal.Zero) {
 			continue
@@ -1151,6 +1225,10 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 			continue
 		}
 		if openTime, hasOpen := b.PositionOpenTimes[sym]; hasOpen && now.Sub(openTime) < offlineReconcileGrace {
+			continue
+		}
+		if confirmFn != nil {
+			missingCandidates = append(missingCandidates, sym)
 			continue
 		}
 		var slAlgoID, tpAlgoID, tp1OrderID int64
@@ -1169,6 +1247,52 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 		})
 	}
 	b.Mu.Unlock()
+
+	if confirmFn != nil && len(missingCandidates) > 0 {
+		var confirmedZero []string
+		for _, sym := range missingCandidates {
+			cCtx, cCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			isZero, cErr := confirmFn(cCtx, sym)
+			cCancel()
+			if cErr != nil || !isZero {
+				slog.Warn("live: offline-close confirmation aborted (position still open or confirm failed); retaining local state and SL/TP",
+					"symbol", sym, "isZero", isZero, "err", cErr)
+				continue
+			}
+			confirmedZero = append(confirmedZero, sym)
+		}
+		if len(confirmedZero) > 0 {
+			b.Mu.Lock()
+			for _, sym := range confirmedZero {
+				if b.ClosingInFlight[sym] {
+					continue
+				}
+				if openTime, hasOpen := b.PositionOpenTimes[sym]; hasOpen && now.Sub(openTime) < offlineReconcileGrace {
+					continue
+				}
+				_, hasActive := b.ActivePositions[sym]
+				_, hasProt := b.Protections[sym]
+				if !hasActive && !hasProt {
+					continue
+				}
+				var slAlgoID, tpAlgoID, tp1OrderID int64
+				if prot := b.Protections[sym]; prot != nil {
+					slAlgoID = prot.SLOrderID
+					tpAlgoID = prot.TPOrderID
+					tp1OrderID = prot.TP1OrderID
+				}
+				entryOrdersToCancel := b.cleanupClosedPositionLocked(sym)
+				closedCleanups = append(closedCleanups, offlineCloseCleanup{
+					symbol:      sym,
+					slAlgoID:    slAlgoID,
+					tpAlgoID:    tpAlgoID,
+					tp1OrderID:  tp1OrderID,
+					entryOrders: entryOrdersToCancel,
+				})
+			}
+			b.Mu.Unlock()
+		}
+	}
 
 	for _, plan := range plans {
 		p := plan
@@ -1367,10 +1491,18 @@ func (b *BinanceLiveBroker) HandleAccountUpdateEvent(evt model.AccountUpdateEven
 	b.LastAccountUpdateTime = evt.EventTime
 
 	hasDecreasedOrClosed := false
+	if b.LastAccountPosPrevQty == nil {
+		b.LastAccountPosPrevQty = make(map[string]decimal.Decimal)
+	}
 	for sym, pos := range evt.Positions {
 		if pos.Qty.GreaterThan(decimal.Zero) {
 			if prevQty, existed := b.ActivePositions[sym]; existed && pos.Qty.LessThan(prevQty) {
 				hasDecreasedOrClosed = true
+				if existingPrev := b.LastAccountPosPrevQty[sym]; existingPrev.LessThan(prevQty) {
+					b.LastAccountPosPrevQty[sym] = prevQty
+				}
+			} else if existed && pos.Qty.GreaterThan(prevQty) {
+				delete(b.LastAccountPosPrevQty, sym)
 			}
 			if _, exists := b.PositionOpenTimes[sym]; !exists {
 				b.PositionOpenTimes[sym] = evt.EventTime
@@ -1381,6 +1513,7 @@ func (b *BinanceLiveBroker) HandleAccountUpdateEvent(evt model.AccountUpdateEven
 			b.PositionUnrealizedPnLs[sym] = pos.UnrealizedPnL
 		} else {
 			hasDecreasedOrClosed = true
+			delete(b.LastAccountPosPrevQty, sym)
 			delete(b.ActivePositions, sym)
 			delete(b.PositionUnrealizedPnLs, sym)
 			if _, hasProt := b.Protections[sym]; !hasProt {
@@ -1800,18 +1933,25 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdateDetailed(evt model.OrderTra
 		isSystemClose := isTrackedSL || isTrackedTP || b.ClosingInFlight[symbol] || strings.HasPrefix(clientOrderID, "live_emg_")
 		prevPosQty, hadPos := b.ActivePositions[symbol]
 
-		// Jika close eksternal (misal manual partial close di UI Binance) ukurannya lebih kecil dari posisi terbuka,
-		// kurangi sisa qty lokal dan pertahankan proteksi SL/TP untuk sisa posisi.
-		if !isSystemClose && hadPos && cumFilledQty.GreaterThan(decimal.Zero) && prevPosQty.GreaterThan(cumFilledQty) {
+		// Jika close eksternal (misal manual partial close di UI Binance), tangani ketiga kasus pengurutan event:
+		// 1) ACCOUNT_UPDATE tiba lebih dulu dengan pengurangan >50% atau <=50% sementara posisi tersisa > 0,
+		// 2) ORDER_TRADE_UPDATE tiba lebih dulu sehingga prevPosQty > deltaSub,
+		// 3) Ambigu (prevPosQty < deltaSub tanpa jejak LastAccountPosPrevQty) -> konfirmasi REST PositionRisk dulu sebelum membatalkan SL/TP.
+		if !isSystemClose && hadPos && cumFilledQty.GreaterThan(decimal.Zero) {
 			deltaSub := deltaFilled
 			if deltaSub.LessThanOrEqual(decimal.Zero) {
 				deltaSub = cumFilledQty
 			}
-			remAfterManual := prevPosQty.Sub(deltaSub)
-			if remAfterManual.GreaterThan(decimal.Zero) {
-				b.ActivePositions[symbol] = remAfterManual
+			lastPrev := b.LastAccountPosPrevQty[symbol]
+			if prevPosQty.GreaterThan(decimal.Zero) && lastPrev.GreaterThan(prevPosQty) && lastPrev.Sub(prevPosQty).GreaterThanOrEqual(deltaSub) {
+				newPrev := lastPrev.Sub(deltaSub)
+				if newPrev.GreaterThan(prevPosQty) {
+					b.LastAccountPosPrevQty[symbol] = newPrev
+				} else {
+					delete(b.LastAccountPosPrevQty, symbol)
+				}
 				if hasProt && prot != nil {
-					prot.ProtectedQty = remAfterManual
+					prot.ProtectedQty = prevPosQty
 				}
 				delete(b.OrdersByClient, rec.ClientOrderID)
 				if exchangeOrderID != 0 {
@@ -1820,6 +1960,58 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdateDetailed(evt model.OrderTra
 				b.notifyPositionSavedLocked(symbol)
 				b.Mu.Unlock()
 				return
+			}
+			if prevPosQty.GreaterThan(deltaSub) {
+				remAfterManual := prevPosQty.Sub(deltaSub)
+				if remAfterManual.GreaterThan(decimal.Zero) {
+					b.ActivePositions[symbol] = remAfterManual
+					if hasProt && prot != nil {
+						prot.ProtectedQty = remAfterManual
+					}
+					delete(b.OrdersByClient, rec.ClientOrderID)
+					if exchangeOrderID != 0 {
+						delete(b.OrdersByExchangeID, exchangeOrderID)
+					}
+					b.notifyPositionSavedLocked(symbol)
+					b.Mu.Unlock()
+					return
+				}
+			}
+			if prevPosQty.GreaterThan(decimal.Zero) && prevPosQty.LessThan(deltaSub) && b.ConfirmPositionZeroFn != nil {
+				confirmFn := b.ConfirmPositionZeroFn
+				fetchFn := b.FetchAccountFn
+				recClientID := rec.ClientOrderID
+				b.Mu.Unlock()
+
+				cCtx, cCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				isZero, cErr := confirmFn(cCtx, symbol)
+				cCancel()
+				if cErr != nil || !isZero {
+					slog.Warn("live: manual close size exceeded local qty; REST confirmation shows open/unknown position so retaining SL/TP",
+						"symbol", symbol, "prevPosQty", prevPosQty, "cumFilledQty", cumFilledQty, "isZero", isZero, "err", cErr)
+					b.Mu.Lock()
+					delete(b.OrdersByClient, recClientID)
+					if exchangeOrderID != 0 {
+						delete(b.OrdersByExchangeID, exchangeOrderID)
+					}
+					b.Mu.Unlock()
+					if fetchFn != nil {
+						b.goAsync(func() {
+							rCtx, rCancel := context.WithTimeout(context.Background(), 5*time.Second)
+							defer rCancel()
+							_ = b.RefreshAccount(rCtx)
+						})
+					}
+					return
+				}
+
+				b.Mu.Lock()
+				prot, hasProt = b.Protections[symbol]
+				prevPosQty, hadPos = b.ActivePositions[symbol]
+				if !hadPos && !hasProt {
+					b.Mu.Unlock()
+					return
+				}
 			}
 		}
 
@@ -2460,24 +2652,74 @@ func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
 	}
 	b.Mu.Unlock()
 
-	if len(expiredOrders) == 0 || b.CancelOrderFn == nil {
+	if len(expiredOrders) == 0 || (b.CancelOrderFn == nil && b.CancelOrderWithResultFn == nil) {
 		return
 	}
 
 	for _, ord := range expiredOrders {
+		var canceledRec *model.LiveOrderRecord
+		var err error
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := b.CancelOrderFn(ctx, ord.Symbol, ord.ExchangeOrderID, ord.ClientOrderID)
+		if b.CancelOrderWithResultFn != nil {
+			canceledRec, err = b.CancelOrderWithResultFn(ctx, ord.Symbol, ord.ExchangeOrderID, ord.ClientOrderID)
+		} else {
+			err = b.CancelOrderFn(ctx, ord.Symbol, ord.ExchangeOrderID, ord.ClientOrderID)
+		}
 		cancel()
 
 		if err == nil {
+			var exchangeFilledQty, exchangeAvgPrice decimal.Decimal
+			if canceledRec != nil {
+				exchangeFilledQty = canceledRec.CumulativeFilledQty
+				exchangeAvgPrice = canceledRec.AvgPrice
+			} else if b.QueryOrderFn != nil && ord.CumulativeFilledQty.LessThanOrEqual(decimal.Zero) {
+				qCtx, qCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				qRec, qErr := b.QueryOrderFn(qCtx, ord.Symbol, ord.ClientOrderID)
+				qCancel()
+				if qErr == nil && qRec != nil && qRec.CumulativeFilledQty.GreaterThan(decimal.Zero) {
+					exchangeFilledQty = qRec.CumulativeFilledQty
+					exchangeAvgPrice = qRec.AvgPrice
+				}
+			}
+
+			var plan model.ProtectionPlanAction
+			var needPlanExec bool
 			b.Mu.Lock()
 			if rec, exists := b.OrdersByClient[ord.ClientOrderID]; exists {
-				if rec.CumulativeFilledQty.LessThanOrEqual(decimal.Zero) {
+				effectiveFilled := rec.CumulativeFilledQty
+				if exchangeFilledQty.GreaterThan(effectiveFilled) {
+					effectiveFilled = exchangeFilledQty
+				}
+				if effectiveFilled.LessThanOrEqual(decimal.Zero) && b.ActivePositions[ord.Symbol].GreaterThan(decimal.Zero) {
+					effectiveFilled = b.ActivePositions[ord.Symbol]
+				}
+
+				effectiveAvg := exchangeAvgPrice
+				if effectiveAvg.LessThanOrEqual(decimal.Zero) {
+					effectiveAvg = rec.AvgPrice
+				}
+				if effectiveAvg.LessThanOrEqual(decimal.Zero) {
+					effectiveAvg = b.PositionEntryPrices[ord.Symbol]
+				}
+				if effectiveAvg.LessThanOrEqual(decimal.Zero) {
+					effectiveAvg = rec.LimitPrice
+				}
+
+				if effectiveFilled.LessThanOrEqual(decimal.Zero) {
 					delete(b.OrdersByExchangeID, rec.ExchangeOrderID)
 					b.rollbackReservedEntryLocked(ord.Symbol, ord.ClientOrderID)
 				} else {
 					rec.Status = model.StatusExpired
-					b.InitialQtys[ord.Symbol] = rec.CumulativeFilledQty
+					rec.CumulativeFilledQty = effectiveFilled
+					if effectiveAvg.GreaterThan(decimal.Zero) {
+						rec.AvgPrice = effectiveAvg
+					}
+					b.InitialQtys[ord.Symbol] = effectiveFilled
+					prot := b.Protections[ord.Symbol]
+					needArm := prot == nil || prot.SLStatus == model.ProtectionFailed || prot.ProtectedQty.LessThan(effectiveFilled)
+					if needArm {
+						plan, needPlanExec = b.applyEntryFillLocked(rec, effectiveFilled, effectiveAvg, now)
+					}
 					delete(b.OrdersByClient, ord.ClientOrderID)
 					delete(b.ReservedEntryMargins, ord.ClientOrderID)
 					if rec.ExchangeOrderID != 0 {
@@ -2489,6 +2731,12 @@ func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
 				delete(b.OrdersByExchangeID, ord.ExchangeOrderID)
 			}
 			b.Mu.Unlock()
+			if needPlanExec {
+				slog.Warn("live: timeout cancel discovered missed partial fill; arming SL/TP protections",
+					"symbol", ord.Symbol, "clientOrderID", ord.ClientOrderID, "filledQty", plan.TargetQty)
+				p := plan
+				b.goAsync(func() { b.executeProtectionPlan(p) })
+			}
 			continue
 		}
 
@@ -2499,10 +2747,16 @@ func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
 				qCtx, qCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				qRec, qErr := b.QueryOrderFn(qCtx, ord.Symbol, ord.ClientOrderID)
 				qCancel()
+				if qErr != nil && !isDefinitiveExchangeReject(qErr) {
+					slog.Warn("live: QueryOrder failed ambiguously after -2011 timeout cancel; retaining entry record for retry",
+						"symbol", ord.Symbol, "clientOrderID", ord.ClientOrderID, "err", qErr)
+					continue
+				}
 				if qErr == nil && qRec != nil && qRec.CumulativeFilledQty.GreaterThan(decimal.Zero) {
+					var refreshErr error
 					if b.FetchAccountFn != nil {
 						rCtx, rCancel := context.WithTimeout(context.Background(), 5*time.Second)
-						_ = b.RefreshAccount(rCtx)
+						refreshErr = b.RefreshAccount(rCtx)
 						rCancel()
 					}
 					b.Mu.Lock()
@@ -2519,7 +2773,11 @@ func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
 							qRec.AvgPrice,
 							decimal.Zero,
 						)
-					} else if b.FetchAccountFn != nil && openQty.LessThanOrEqual(decimal.Zero) {
+					} else if b.FetchAccountFn != nil && refreshErr != nil {
+						slog.Warn("live: RefreshAccount failed after -2011 filled entry query; retaining entry record for retry",
+							"symbol", ord.Symbol, "clientOrderID", ord.ClientOrderID, "err", refreshErr)
+						continue
+					} else if b.FetchAccountFn != nil && refreshErr == nil && openQty.LessThanOrEqual(decimal.Zero) {
 						// Terisi dan sudah tertutup selama offline: bersihkan order lokal agar tidak leak slot atau loop tiap 2 detik
 						b.Mu.Lock()
 						delete(b.OrdersByClient, ord.ClientOrderID)
