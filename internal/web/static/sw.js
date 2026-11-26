@@ -1,18 +1,15 @@
-const CACHE_NAME = 'trml-shell-v10';
+const CACHE_NAME = 'trml-webtui-v16';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
-  '/style.css?v=10',
-  '/app.js?v=10',
+  '/style.css?v=16',
+  '/app.js?v=16',
   '/manifest.json',
   '/icon.svg',
-  '/vendor/basecoat-mira.cdn.min.css?v=10',
-  '/vendor/basecoat.min.js?v=10',
-  '/vendor/tabs.min.js?v=10',
-  '/vendor/toast.min.js?v=10',
-  '/vendor/popover.min.js?v=10',
-  '/vendor/input-otp.min.js?v=10',
-  '/vendor/command.min.js?v=10'
+  '/vendor/webtui-full.css',
+  '/vendor/webtui-theme-catppuccin.css',
+  '/vendor/webtui-theme-nord.css',
+  '/vendor/webtui-theme-gruvbox.css'
 ];
 
 self.addEventListener('install', (event) => {
@@ -41,7 +38,7 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Immutable cache-first for versioned vendored Basecoat assets
+  // Immutable cache-first for vendored WebTUI stylesheets
   if (url.pathname.startsWith('/vendor/')) {
     event.respondWith(
       caches.match(event.request).then(

@@ -1,11 +1,11 @@
 {
-  "name": "TRML Quant Execution Desk",
-  "short_name": "TRML Desk",
-  "description": "High-density institutional monitoring & AI execution desk for TRML futures engine.",
+  "name": "TRML Desk",
+  "short_name": "TRML",
+  "description": "Terminal-native execution & telemetry desk for TRML futures.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f6f8fa",
-  "theme_color": "#f6f8fa",
+  "background_color": "#050608",
+  "theme_color": "#050608",
   "orientation": "any",
   "icons": [
     {

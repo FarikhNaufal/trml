@@ -105,6 +105,13 @@ type RejectionStat struct {
 	Pct        float64 `json:"pct"`
 }
 
+type EquityCurvePoint struct {
+	TimestampUTC  string  `json:"timestamp_utc"`
+	CumulativePnL float64 `json:"cumulative_pnl"`
+	Equity        float64 `json:"equity"`
+	TradeCount    int     `json:"trade_count"`
+}
+
 type WebReader struct {
 	db       *sql.DB
 	leverage float64
@@ -723,4 +730,120 @@ func (r *WebReader) GetTradesForPatternMiner(ctx context.Context, limit int) ([]
 		items[i].AIAutopsy = ""
 	}
 	return items, nil
+}
+
+// GetEquityCurve membangun kurva ekuitas kronologis dari trade_ledger (terisolasi per mode)
+// dengan titik awal baseline = currentEquity - totalCumulativePnL.
+func (r *WebReader) GetEquityCurve(ctx context.Context, currentEquity float64, maxPoints int) ([]EquityCurvePoint, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("reader: database not available")
+	}
+
+	whereSQL := ""
+	clause, args := r.modeFilterClause("")
+	if clause != "" {
+		whereSQL = " WHERE " + clause
+	}
+
+	query := `
+		SELECT closed_at_utc, net_pnl_usdt
+		FROM trade_ledger` + whereSQL + `
+		ORDER BY closed_at_utc ASC, rowid ASC;
+	`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query equity curve: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type rawTrade struct {
+		ts  string
+		pnl float64
+	}
+	var raw []rawTrade
+	totalCumPnL := 0.0
+	for rows.Next() {
+		var ts, pnlStr string
+		if err := rows.Scan(&ts, &pnlStr); err != nil {
+			return nil, fmt.Errorf("scan equity curve row: %w", err)
+		}
+		pnl, _ := strconv.ParseFloat(pnlStr, 64)
+		totalCumPnL += pnl
+		raw = append(raw, rawTrade{ts: ts, pnl: pnl})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate equity curve rows: %w", err)
+	}
+
+	if len(raw) == 0 {
+		return []EquityCurvePoint{}, nil
+	}
+
+	baselineEquity := currentEquity - totalCumPnL
+	points := make([]EquityCurvePoint, 0, len(raw)+1)
+	points = append(points, EquityCurvePoint{
+		TimestampUTC:  raw[0].ts,
+		CumulativePnL: 0,
+		Equity:        baselineEquity,
+		TradeCount:    0,
+	})
+
+	cumPnL := 0.0
+	for i, item := range raw {
+		cumPnL += item.pnl
+		points = append(points, EquityCurvePoint{
+			TimestampUTC:  item.ts,
+			CumulativePnL: cumPnL,
+			Equity:        baselineEquity + cumPnL,
+			TradeCount:    i + 1,
+		})
+	}
+
+	if maxPoints > 2 && len(points) > maxPoints {
+		points = downsampleEquityCurve(points, maxPoints)
+	}
+	return points, nil
+}
+
+func downsampleEquityCurve(points []EquityCurvePoint, maxPoints int) []EquityCurvePoint {
+	n := len(points)
+	if maxPoints <= 2 || n <= maxPoints {
+		return points
+	}
+
+	peakIdx, troughIdx := 0, 0
+	for i, pt := range points {
+		if pt.Equity > points[peakIdx].Equity {
+			peakIdx = i
+		}
+		if pt.Equity < points[troughIdx].Equity {
+			troughIdx = i
+		}
+	}
+
+	keep := make(map[int]bool, maxPoints+2)
+	keep[0] = true
+	keep[n-1] = true
+	keep[peakIdx] = true
+	keep[troughIdx] = true
+
+	step := float64(n-1) / float64(maxPoints-1)
+	for i := 1; i < maxPoints-1; i++ {
+		idx := int(math.Round(float64(i) * step))
+		if idx > 0 && idx < n-1 {
+			keep[idx] = true
+		}
+	}
+
+	indices := make([]int, 0, len(keep))
+	for idx := range keep {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+
+	out := make([]EquityCurvePoint, 0, len(indices))
+	for _, idx := range indices {
+		out = append(out, points[idx])
+	}
+	return out
 }

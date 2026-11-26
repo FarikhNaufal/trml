@@ -45,6 +45,9 @@ type BotEngine struct {
 	breakoutWatchedSet     map[string]bool
 	sweepExtraWatchedSet   map[string]bool
 	hasCompletedScan       bool
+	lastScanStats          scanner.ScanStats
+	lastScanAt             time.Time
+	hasScanStats           bool
 	marketBreadthPct       float64
 	marketBreadthValid     bool
 	marketBreadthUpdatedAt time.Time
@@ -1173,14 +1176,15 @@ func main() {
 			envStr = "LIVE"
 		}
 		webServer, err = web.NewServer(web.ServerConfig{
-			Port:              cfg.HTTPPort,
-			Env:               envStr,
-			MaxSlots:          cfg.MaxSlots,
-			MaxDailyDrawdown:  cfg.MaxDailyDrawdown,
-			Reader:            webReader,
-			Broker:            engine.broker,
-			GetScannerCoinsFn: engine.getScannerCoins,
-			GetTelemetryFn:    engine.getTelemetry,
+			Port:                 cfg.HTTPPort,
+			Env:                  envStr,
+			MaxSlots:             cfg.MaxSlots,
+			MaxDailyDrawdown:     cfg.MaxDailyDrawdown,
+			Reader:               webReader,
+			Broker:               engine.broker,
+			GetScannerCoinsFn:    engine.getScannerCoins,
+			GetTelemetryFn:       engine.getTelemetry,
+			GetScanDiagnosticsFn: engine.getScanDiagnostics,
 			IsCircuitBreaker: func() bool {
 				if engine.dryRunBroker != nil {
 					engine.dryRunBroker.Mu.Lock()
@@ -1349,6 +1353,44 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 		ScannerInterval:      e.cfg.ScannerInterval.String(),
 		AllowedSide:          e.cfg.AllowedSide,
 		DisableOIFilter:      e.cfg.DisableOIFilter,
+	}
+}
+
+func (e *BotEngine) getScanDiagnostics() *web.ScanDiagnosticsDTO {
+	e.statesMu.RLock()
+	has := e.hasScanStats
+	st := e.lastScanStats
+	scanAt := e.lastScanAt
+	rankingMode := e.scannerCfg.RankingMode
+	e.statesMu.RUnlock()
+	if !has {
+		return nil
+	}
+	scannedAtStr := ""
+	if !scanAt.IsZero() {
+		scannedAtStr = scanAt.UTC().Format(time.RFC3339)
+	}
+	return &web.ScanDiagnosticsDTO{
+		TotalPerpUSDT:     st.TotalPerpUSDT,
+		VolRejected:       st.VolRejected,
+		BookMissing:       st.BookMissing,
+		SpreadRejected:    st.SpreadRejected,
+		PreFilterPassed:   st.PreFilterPassed,
+		KlineFetchFailed:  st.KlineFetchFailed,
+		KlineShort:        st.KlineFetchOrShort,
+		KlineInvalidOrGap: st.KlineGapOrInvalid,
+		ATRInvalid:        st.ATRInvalid,
+		NATRRejected:      st.NATRRejected,
+		SideRejected:      st.SideRejected,
+		VWAPDistRejected:  st.VWAPDistRejected,
+		CandidatesValid:   st.CandidatesValid,
+		PrimaryPassed:     st.PrimaryPassed,
+		FallbackUsed:      st.FallbackUsed,
+		SelectedCount:     st.SelectedCount,
+		BreakoutCount:     st.BreakoutCount,
+		SweepExtraCount:   st.SweepExtraCount,
+		RankingMode:       rankingMode,
+		ScannedAtUTC:      scannedAtStr,
 	}
 }
 
@@ -1703,6 +1745,9 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 		e.marketBreadthValid = true
 		e.marketBreadthUpdatedAt = serverTime
 	}
+	e.lastScanStats = scanStats
+	e.lastScanAt = serverTime
+	e.hasScanStats = true
 	e.statesMu.Unlock()
 
 	if len(prunedSymbols) > 0 {

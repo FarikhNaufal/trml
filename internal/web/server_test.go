@@ -14,6 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 	"trml/internal/broker"
 	"trml/internal/model"
+	"trml/internal/storage"
 )
 
 type mockBroker struct{}
@@ -175,8 +176,12 @@ func TestServerEndpoints(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200 for /, got %d", rec.Code)
 	}
-	if !contains(rec.Body.String(), "TR<span>M</span>L FUTURES") {
-		t.Errorf("index.html missing brand header")
+	if !contains(rec.Body.String(), "TRML_DESK") {
+		t.Errorf("index.html missing TRML_DESK brand header")
+	}
+	lowerHTML := strings.ToLower(rec.Body.String())
+	if strings.Contains(lowerHTML, "v2.1") || strings.Contains(lowerHTML, "qmax") || strings.Contains(lowerHTML, "basecoat") {
+		t.Errorf("index.html should not contain legacy v2.1, qmax, or basecoat references")
 	}
 
 	// 2. Test Static CSS
@@ -998,15 +1003,12 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 		t.Fatalf("unexpected telemetry payload: %#v", telem)
 	}
 
-	// 2. Embedded /vendor/ Basecoat assets load cleanly with immutable cache header
+	// 2. Embedded /vendor/ WebTUI assets load cleanly with immutable cache header
 	for _, asset := range []string{
-		"/vendor/basecoat-mira.cdn.min.css",
-		"/vendor/basecoat.min.js",
-		"/vendor/tabs.min.js",
-		"/vendor/toast.min.js",
-		"/vendor/popover.min.js",
-		"/vendor/input-otp.min.js",
-		"/vendor/command.min.js",
+		"/vendor/webtui-full.css",
+		"/vendor/webtui-theme-catppuccin.css",
+		"/vendor/webtui-theme-nord.css",
+		"/vendor/webtui-theme-gruvbox.css",
 	} {
 		recAsset := httptest.NewRecorder()
 		srv.httpServer.Handler.ServeHTTP(recAsset, httptest.NewRequest("GET", asset, nil))
@@ -1018,7 +1020,14 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 		}
 	}
 
-	// 3. Root HTML preserves no-store Cache-Control
+	// Legacy Basecoat asset must be completely removed
+	recOld := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recOld, httptest.NewRequest("GET", "/vendor/basecoat-mira.cdn.min.css", nil))
+	if recOld.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed legacy Basecoat asset, got %d", recOld.Code)
+	}
+
+	// 3. Root HTML preserves no-store Cache-Control and clean static assets omit legacy branding
 	recHTML := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(recHTML, httptest.NewRequest("GET", "/", nil))
 	if recHTML.Code != http.StatusOK {
@@ -1026,5 +1035,94 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 	}
 	if cc := recHTML.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
 		t.Fatalf("expected no-store Cache-Control for /, got %q", cc)
+	}
+	for _, assetPath := range []string{"/style.css", "/app.js", "/manifest.json"} {
+		recStatic := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(recStatic, httptest.NewRequest("GET", assetPath, nil))
+		if recStatic.Code != http.StatusOK || recStatic.Body.Len() == 0 {
+			t.Fatalf("expected 200 for %s, got %d", assetPath, recStatic.Code)
+		}
+		lowerBody := strings.ToLower(recStatic.Body.String())
+		if strings.Contains(lowerBody, "v2.1") || strings.Contains(lowerBody, "qmax") || strings.Contains(lowerBody, "basecoat") {
+			t.Fatalf("static asset %s contains forbidden legacy text (v2.1/qmax/basecoat)", assetPath)
+		}
+	}
+}
+
+func TestWebReader_GetEquityCurveAndServerDiagnostics(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	_ = repo.LogTradeForMode(ctx, "DRY_RUN", "DRY_1", "SOLUSDT", "SHORT", decimal.NewFromInt(1), decimal.NewFromInt(100), decimal.NewFromInt(95), decimal.NewFromInt(102), decimal.NewFromInt(94), decimal.NewFromFloat(5.0), "TAKE_PROFIT", t0, t0.Add(15*time.Minute), 0.5, 5.0, 1, "VOL_BREAKOUT")
+	_ = repo.LogTradeForMode(ctx, "DRY_RUN", "DRY_2", "ETHUSDT", "SHORT", decimal.NewFromInt(1), decimal.NewFromInt(200), decimal.NewFromInt(202), decimal.NewFromInt(204), decimal.NewFromInt(190), decimal.NewFromFloat(-2.0), "STOP_LOSS", t0.Add(20*time.Minute), t0.Add(35*time.Minute), 1.0, 0.2, 2, "VWAP_PULLBACK")
+	// Separate LIVE mode row must NOT leak into DRY_RUN equity curve
+	_ = repo.LogTradeForMode(ctx, "LIVE", "LIVE_1", "BTCUSDT", "LONG", decimal.NewFromInt(1), decimal.NewFromInt(50000), decimal.NewFromInt(51000), decimal.NewFromInt(49000), decimal.NewFromInt(52000), decimal.NewFromFloat(1000.0), "TAKE_PROFIT", t0, t0.Add(10*time.Minute), 0.1, 2.0, 3, "VWAP_PULLBACK")
+
+	reader := &WebReader{db: db.RawConn(), leverage: 8.0, mode: "DRY_RUN"}
+	curve, err := reader.GetEquityCurve(ctx, 103.0, 120)
+	if err != nil {
+		t.Fatalf("GetEquityCurve failed: %v", err)
+	}
+	if len(curve) != 3 {
+		t.Fatalf("expected 3 curve points (baseline + 2 DRY_RUN trades), got %d: %+v", len(curve), curve)
+	}
+	if curve[0].TradeCount != 0 || math.Abs(curve[0].Equity-100.0) > 1e-6 || math.Abs(curve[1].Equity-105.0) > 1e-6 || math.Abs(curve[2].Equity-103.0) > 1e-6 {
+		t.Fatalf("unexpected equity curve progression: %+v", curve)
+	}
+
+	srv, err := NewServer(ServerConfig{
+		Port:   "0",
+		Env:    "DRY-RUN",
+		Reader: reader,
+		GetScanDiagnosticsFn: func() *ScanDiagnosticsDTO {
+			return &ScanDiagnosticsDTO{
+				PreFilterPassed:  68,
+				NATRRejected:     54,
+				SideRejected:     9,
+				VWAPDistRejected: 4,
+				KlineFetchFailed: 0,
+				SelectedCount:    0,
+				ScannedAtUTC:     "2026-11-26T18:42:34Z",
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	recSum := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recSum, httptest.NewRequest("GET", "/api/summary", nil))
+	if recSum.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/summary, got %d", recSum.Code)
+	}
+	var sumPayload map[string]any
+	if err := json.Unmarshal(recSum.Body.Bytes(), &sumPayload); err != nil {
+		t.Fatalf("decode /api/summary: %v", err)
+	}
+	if _, hasCurve := sumPayload["equity_curve"]; !hasCurve {
+		t.Fatalf("expected equity_curve in /api/summary")
+	}
+	if _, hasAudit := sumPayload["audit_summary"]; !hasAudit {
+		t.Fatalf("expected audit_summary in /api/summary")
+	}
+
+	recScan := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recScan, httptest.NewRequest("GET", "/api/scanner", nil))
+	if recScan.Code != http.StatusOK {
+		t.Fatalf("expected 200 /api/scanner, got %d", recScan.Code)
+	}
+	var scanPayload map[string]any
+	if err := json.Unmarshal(recScan.Body.Bytes(), &scanPayload); err != nil {
+		t.Fatalf("decode /api/scanner: %v", err)
+	}
+	diag, ok := scanPayload["diagnostics"].(map[string]any)
+	if !ok || int(diag["pre_filter_passed"].(float64)) != 68 || int(diag["natr_rejected"].(float64)) != 54 {
+		t.Fatalf("unexpected diagnostics in /api/scanner: %#v", scanPayload["diagnostics"])
 	}
 }

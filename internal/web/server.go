@@ -46,16 +46,40 @@ type TelemetryDTO struct {
 	DisableOIFilter      bool    `json:"disable_oi_filter"`
 }
 
+type ScanDiagnosticsDTO struct {
+	TotalPerpUSDT     int    `json:"total_perp_usdt"`
+	VolRejected       int    `json:"vol_rejected"`
+	BookMissing       int    `json:"book_missing"`
+	SpreadRejected    int    `json:"spread_rejected"`
+	PreFilterPassed   int    `json:"pre_filter_passed"`
+	KlineFetchFailed  int    `json:"kline_fetch_failed"`
+	KlineShort        int    `json:"kline_short"`
+	KlineInvalidOrGap int    `json:"kline_invalid_or_gap"`
+	ATRInvalid        int    `json:"atr_invalid"`
+	NATRRejected      int    `json:"natr_rejected"`
+	SideRejected      int    `json:"side_rejected"`
+	VWAPDistRejected  int    `json:"vwap_dist_rejected"`
+	CandidatesValid   int    `json:"candidates_valid"`
+	PrimaryPassed     int    `json:"primary_passed"`
+	FallbackUsed      int    `json:"fallback_used"`
+	SelectedCount     int    `json:"selected_count"`
+	BreakoutCount     int    `json:"breakout_count"`
+	SweepExtraCount   int    `json:"sweep_extra_count"`
+	RankingMode       string `json:"ranking_mode"`
+	ScannedAtUTC      string `json:"scanned_at_utc"`
+}
+
 type ServerConfig struct {
-	Port              string
-	Env               string
-	MaxSlots          int
-	MaxDailyDrawdown  float64
-	Reader            *WebReader
-	Broker            broker.ExecutionBroker
-	GetScannerCoinsFn func() []ScannerCoinDTO
-	GetTelemetryFn    func() *TelemetryDTO
-	IsCircuitBreaker  func() bool
+	Port                 string
+	Env                  string
+	MaxSlots             int
+	MaxDailyDrawdown     float64
+	Reader               *WebReader
+	Broker               broker.ExecutionBroker
+	GetScannerCoinsFn    func() []ScannerCoinDTO
+	GetTelemetryFn       func() *TelemetryDTO
+	GetScanDiagnosticsFn func() *ScanDiagnosticsDTO
+	IsCircuitBreaker     func() bool
 	Repo              storage.Repository
 	DashboardPIN      string
 	GeminiAPIKey      string
@@ -156,7 +180,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var equityF, balanceF float64
-	var ddPct float64
+	var ddPct, ddPeakPct float64
 	var activeSlots int
 	var positions []broker.ActivePositionDTO
 
@@ -168,12 +192,15 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		balanceF, _ = balDec.Float64()
 
 		ddPct = s.cfg.Broker.GetDailyTotalDrawdownPct()
+		ddPeakPct = s.cfg.Broker.GetDrawdownFromPeakPct()
 		activeSlots = s.cfg.Broker.GetActiveSlotCount()
 		positions = s.cfg.Broker.GetActivePositions()
 	}
 
 	var stats StatsItem
 	var strategyStats []StrategyStatsItem
+	var equityCurve []EquityCurvePoint
+	var auditSummary SignalAuditSummary
 	if s.cfg.Reader != nil {
 		var err error
 		if stats, err = s.cfg.Reader.GetOverallStats(ctx); err != nil {
@@ -181,6 +208,12 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		}
 		if strategyStats, err = s.cfg.Reader.GetStrategyStats(ctx); err != nil {
 			slog.Warn("web server: failed to load strategy stats", "err", err)
+		}
+		if equityCurve, err = s.cfg.Reader.GetEquityCurve(ctx, equityF, 120); err != nil {
+			slog.Warn("web server: failed to load equity curve", "err", err)
+		}
+		if auditSummary, err = s.cfg.Reader.GetSignalAuditSummary(ctx); err != nil {
+			slog.Warn("web server: failed to load signal audit summary", "err", err)
 		}
 	}
 
@@ -198,6 +231,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"equity":                 equityF,
 		"balance":                balanceF,
 		"daily_drawdown_pct":     ddPct,
+		"drawdown_from_peak_pct": ddPeakPct,
 		"max_daily_drawdown_pct": s.cfg.MaxDailyDrawdown,
 		"active_slots":           activeSlots,
 		"max_slots":              s.cfg.MaxSlots,
@@ -207,6 +241,8 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"positions":              positions,
 		"stats":                  stats,
 		"strategy_stats":         strategyStats,
+		"equity_curve":           equityCurve,
+		"audit_summary":          auditSummary,
 		"telemetry":              telemetry,
 	}
 
@@ -224,9 +260,20 @@ func (s *Server) handleScanner(w http.ResponseWriter, r *http.Request) {
 		coins = s.cfg.GetScannerCoinsFn()
 	}
 
+	var diagnostics *ScanDiagnosticsDTO
+	if s.cfg.GetScanDiagnosticsFn != nil {
+		diagnostics = s.cfg.GetScanDiagnosticsFn()
+	}
+
+	scannedAtUTC := time.Now().UTC().Format(time.RFC3339)
+	if diagnostics != nil && diagnostics.ScannedAtUTC != "" {
+		scannedAtUTC = diagnostics.ScannedAtUTC
+	}
+
 	resp := map[string]any{
 		"coins":          coins,
-		"scanned_at_utc": time.Now().UTC().Format(time.RFC3339),
+		"diagnostics":    diagnostics,
+		"scanned_at_utc": scannedAtUTC,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
