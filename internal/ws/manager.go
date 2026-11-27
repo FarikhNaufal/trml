@@ -459,7 +459,8 @@ func diffStreams(current, target []string) (added, removed []string) {
 
 // Start menjalankan supervisor loop reconnect dengan backoff dan jitter serta memakai daftar stream terbaru saat reconnect.
 func (d *DynamicStream) Start(ctx context.Context) {
-	backoff := 1 * time.Second
+	const initialBackoff = 300 * time.Millisecond
+	backoff := initialBackoff
 	for {
 		select {
 		case <-ctx.Done():
@@ -469,7 +470,7 @@ func (d *DynamicStream) Start(ctx context.Context) {
 			startTime := time.Now()
 			err := d.connectAndStreamOnce(ctx)
 			if time.Since(startTime) > 5*time.Second {
-				backoff = 1 * time.Second
+				backoff = initialBackoff
 			}
 			if err != nil && ctx.Err() == nil {
 				jitter := time.Duration(rand.Int64N(int64(backoff/3) + 1))

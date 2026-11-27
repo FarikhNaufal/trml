@@ -86,6 +86,9 @@ type BotEngine struct {
 	oiBootMu        sync.Mutex
 	oiBootAttemptAt map[string]time.Time
 
+	bookRefreshMu     sync.Mutex
+	lastBookRefreshAt time.Time
+
 	majorBatchMu         sync.Mutex
 	majorBatchHour       time.Time
 	majorBatchEntries    map[string]majorBatchEntry
@@ -2456,6 +2459,9 @@ func (e *BotEngine) restartMarketStream(parentCtx context.Context, symbols []str
 
 	publicMgr := ws.NewStreamManager(handlers)
 	publicMgr.NowFn = e.exchangeNow
+	publicMgr.IdleTimeout = 20 * time.Second
+	publicMgr.PingInterval = 8 * time.Second
+	publicMgr.PingTimeout = 4 * time.Second
 	publicDyn := ws.NewShardedDynamicStream(publicMgr, e.cfg.WSPublicURL, publicStreams, maxBookTickerStreamsPerConn)
 	e.publicDynStream = publicDyn
 	e.streamWg.Add(1)
@@ -2548,9 +2554,110 @@ func (e *BotEngine) dispatchEvaluationsForClosedCandle(symbol string, candle mod
 }
 
 const (
-	maxBookTickerStreamsPerConn = 10
+	maxBookTickerStreamsPerConn = 4
 	maxMarketStreamsPerConn     = 90
+	bookRefreshMinInterval      = 1 * time.Second
+	bookRefreshTimeout          = 2 * time.Second
 )
+
+func (e *BotEngine) maxBookStalenessDuration() time.Duration {
+	if e != nil && e.cfg != nil && e.cfg.MaxBookStaleness > 0 {
+		return e.cfg.MaxBookStaleness
+	}
+	return 5 * time.Second
+}
+
+func (e *BotEngine) isSymbolBookStale(sym string, now time.Time) bool {
+	if e == nil || sym == "" {
+		return false
+	}
+	e.statesMu.RLock()
+	st := e.activeStates[sym]
+	e.statesMu.RUnlock()
+	if st == nil {
+		return false
+	}
+	maxStale := e.maxBookStalenessDuration()
+	st.Mu.Lock()
+	stale := st.BestBid <= 0 || st.BestAsk <= st.BestBid || st.BookUpdatedAt.IsZero() || now.Sub(st.BookUpdatedAt) > maxStale
+	st.Mu.Unlock()
+	return stale
+}
+
+// refreshStaleBookQuotes coalesces a single REST /fapi/v1/ticker/bookTicker fallback when any
+// target symbol's WS @bookTicker state is stale, failing closed if REST errors or returns invalid quotes.
+func (e *BotEngine) refreshStaleBookQuotes(symbols []string) {
+	if e == nil || e.client == nil || len(symbols) == 0 {
+		return
+	}
+	nowCheck := e.exchangeNow()
+	hasStale := false
+	for _, sym := range symbols {
+		if e.isSymbolBookStale(sym, nowCheck) {
+			hasStale = true
+			break
+		}
+	}
+	if !hasStale {
+		return
+	}
+
+	e.bookRefreshMu.Lock()
+	defer e.bookRefreshMu.Unlock()
+
+	staleCount := 0
+	recheckNow := e.exchangeNow()
+	for _, sym := range symbols {
+		if e.isSymbolBookStale(sym, recheckNow) {
+			staleCount++
+		}
+	}
+	if staleCount == 0 {
+		return
+	}
+	if !e.lastBookRefreshAt.IsZero() && time.Since(e.lastBookRefreshAt) < bookRefreshMinInterval {
+		return
+	}
+	e.lastBookRefreshAt = time.Now()
+
+	rCtx, rCancel := context.WithTimeout(context.Background(), bookRefreshTimeout)
+	bookMap, err := e.client.FetchBookTickers(rCtx)
+	rCancel()
+	e.lastBookRefreshAt = time.Now()
+	if err != nil {
+		slog.Warn("stale BBO REST fallback failed (fail-closed)", "staleCount", staleCount, "err", err)
+		return
+	}
+
+	e.statesMu.RLock()
+	statesSnapshot := make([]*model.SymbolState, 0, len(e.activeStates))
+	for _, st := range e.activeStates {
+		if st != nil {
+			statesSnapshot = append(statesSnapshot, st)
+		}
+	}
+	e.statesMu.RUnlock()
+
+	refreshNow := e.exchangeNow()
+	updated := 0
+	for _, st := range statesSnapshot {
+		q, ok := bookMap[st.Symbol]
+		if !ok || math.IsNaN(q.BestBid) || math.IsInf(q.BestBid, 0) ||
+			math.IsNaN(q.BestAsk) || math.IsInf(q.BestAsk, 0) ||
+			q.BestBid <= 0 || q.BestAsk <= q.BestBid {
+			continue
+		}
+		st.Mu.Lock()
+		if st.BookUpdatedAt.IsZero() || st.BookUpdatedAt.Before(refreshNow) {
+			st.BestBid = q.BestBid
+			st.BestAsk = q.BestAsk
+			st.BookUpdatedAt = refreshNow
+			updated++
+		}
+		st.Mu.Unlock()
+	}
+	slog.Info("refreshed stale BBO quotes via REST fallback", "staleRequested", staleCount, "updatedSymbols", updated)
+}
 
 func shouldEmergencyCloseOrphanPosition(storedDBLoadErr error, hasActiveSL bool, algoErr, ordErr error, orphanPolicy string) bool {
 	if storedDBLoadErr != nil {
@@ -2900,6 +3007,7 @@ func (e *BotEngine) evaluateAndLogClosedCandle(candle model.Candle, st *model.Sy
 		_ = e.liveBroker.RefreshAccount(rCtx)
 		rCancel()
 	}
+	e.refreshStaleBookQuotes([]string{symName})
 
 	scope := strategy.DefaultSymbolScope()
 	e.statesMu.RLock()
@@ -3541,6 +3649,13 @@ func (e *BotEngine) flushMajorPodBatchEntries(batchHour time.Time, items []major
 		_ = e.liveBroker.RefreshAccount(rCtx)
 		rCancel()
 	}
+	batchSyms := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.state != nil {
+			batchSyms = append(batchSyms, it.state.Symbol)
+		}
+	}
+	e.refreshStaleBookQuotes(batchSyms)
 
 	slices.SortFunc(items, func(a, b majorBatchEntry) int {
 		return strings.Compare(a.state.Symbol, b.state.Symbol)

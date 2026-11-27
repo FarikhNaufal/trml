@@ -2007,3 +2007,212 @@ func TestBotEngine_AlreadyIngestedUpdatesHourly_And_CooldownLockOrdering(t *test
 	eng.triggerMajorBatchTimeout(hourBase.Add(time.Hour))
 	eng.evalWg.Wait()
 }
+
+func TestBotEngine_RefreshStaleBookQuotes_RestFallbackAndFailClosed(t *testing.T) {
+	var bookReqCount atomic.Int32
+	var returnErr atomic.Bool
+	var sendInvalidQuote atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fapi/v1/ticker/bookTicker" {
+			http.NotFound(w, r)
+			return
+		}
+		bookReqCount.Add(1)
+		if returnErr.Load() {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":-1100,"msg":"bad request"}`))
+			return
+		}
+		ethAsk := "1840.10"
+		if sendInvalidQuote.Load() {
+			ethAsk = "1839.00" // invalid crossed ask <= bid
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `[
+			{"symbol":"ETHUSDT","bidPrice":"1839.90","askPrice":"%s"},
+			{"symbol":"FRESHUSDT","bidPrice":"1.00","askPrice":"1.01"}
+		]`, ethAsk)
+	}))
+	defer srv.Close()
+
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed opening in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(1000.0), broker.DryRunConfig{
+		MaxSlots:       7,
+		EntryOrderType: "MARKET",
+	})
+	defer dry.Close()
+
+	endNow := time.Now().UTC()
+	ef := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.01),
+		MinQty:      decimal.NewFromFloat(0.01),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+
+	const hours = 260
+	t0 := endNow.Truncate(time.Hour).Add(-hours * time.Hour)
+	btcSeries := makeBot15mHourlySeries(BenchmarkSymbol, t0, hours, func(h int) float64 {
+		if h < 230 {
+			return 65000.0
+		}
+		return 64000.0 - float64(h-230)*10.0
+	}, nil)
+	negDeltaFn := func(h int) float64 {
+		if h == hours-1 {
+			return -5_000_000.0
+		}
+		if h%2 == 0 {
+			return 100_000.0
+		}
+		return -100_000.0
+	}
+	ethSeries := makeBot15mHourlySeries("ETHUSDT", t0, hours, func(h int) float64 {
+		if h == hours-1 {
+			return 1990.0 // -0.5% vs flat-ish BTC -> RS24h ~ +0.8%, rejected by MAJOR_SHORT_RS_NOT_WEAK (not STALE_BBO_FEED)
+		}
+		return 2000.0
+	}, negDeltaFn)
+
+	makeSymState := func(sym string, series []model.Candle, bid, ask float64, bookAt time.Time) *model.SymbolState {
+		st := model.NewSymbolState(sym, ef, 1500, 1500)
+		st.IsLeverageIsolatedVerified = true
+		st.BestBid = bid
+		st.BestAsk = ask
+		st.BookUpdatedAt = bookAt
+		st.MarkPrice = (bid + ask) / 2.0
+		st.MarkPriceUpdatedAt = endNow
+		st.FundingRate = 0.0001
+		st.FundingUpdatedAt = endNow
+		for _, c := range series {
+			st.ApplyClosedCandleLocked(c, 1500, 1500)
+		}
+		return st
+	}
+
+	btcSt := makeSymState(BenchmarkSymbol, btcSeries, 63700, 63701, endNow)
+	ethSt := makeSymState("ETHUSDT", ethSeries, 1835.0, 1835.2, endNow)
+	fresherFuture := endNow.Add(10 * time.Second)
+	freshSt := makeSymState("FRESHUSDT", nil, 2.00, 2.02, fresherFuture)
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:           true,
+			CandleDuration:   15 * time.Minute,
+			MaxSlots:         6,
+			MaxBookStaleness: 5 * time.Second,
+			MaxDailyDrawdown: -0.075,
+			InitialEquity:    decimal.NewFromFloat(1000.0),
+		},
+		repo:            repo,
+		client:          exchange.NewClient(srv.URL, "k", "s"),
+		broker:          dry,
+		dryRunBroker:    dry,
+		majorPodSymbols: []string{"ETHUSDT"},
+		majorPodSet:     map[string]bool{"ETHUSDT": true},
+		activeStates: map[string]*model.SymbolState{
+			BenchmarkSymbol: btcSt,
+			"ETHUSDT":       ethSt,
+			"FRESHUSDT":     freshSt,
+		},
+		cooldownExits:      make(map[string]storage.RecentExitRecord),
+		majorCooldownExits: make(map[string]storage.RecentExitRecord),
+		btcWaitTimeout:     200 * time.Millisecond,
+		majorBatchWindow:   50 * time.Millisecond,
+		evaluatorCfg: strategy.EvaluatorConfig{
+			CandleDuration:   15 * time.Minute,
+			MaxSlots:         6,
+			EMAPeriod:        200,
+			ATRPeriod:        14,
+			MaxSpreadPct:     0.20,
+			MaxBookStaleness: 5 * time.Second,
+			MaxMarkStaleness: 30 * time.Second,
+			MaxDataStaleness: 30 * time.Minute,
+			MajorPod: strategy.MajorPodConfig{
+				ShortEnabled:        true,
+				LongEnabled:         false,
+				Symbols:             []string{"ETHUSDT"},
+				MaxSlots:            3,
+				ShortRSMinPct:       3.0,
+				MinDeltaZ:           0.40,
+				ShortMinFundingRate: -1.0,
+				RSWindowHours:       24,
+				BreakoutLookbackHrs: 12,
+			},
+		},
+	}
+
+	// 1. Fresh BBO makes 0 HTTP requests
+	eng.refreshStaleBookQuotes([]string{"ETHUSDT", "FRESHUSDT"})
+	if got := bookReqCount.Load(); got != 0 {
+		t.Fatalf("expected 0 HTTP requests when all BBO quotes are fresh, got %d", got)
+	}
+
+	// 2. REST error fails closed: BookUpdatedAt remains stale and throttle blocks back-to-back retries within 1s
+	staleTime := endNow.Add(-20 * time.Second)
+	ethSt.Mu.Lock()
+	ethSt.BookUpdatedAt = staleTime
+	ethSt.Mu.Unlock()
+	returnErr.Store(true)
+	eng.refreshStaleBookQuotes([]string{"ETHUSDT"})
+	eng.refreshStaleBookQuotes([]string{"ETHUSDT"})
+	if got := bookReqCount.Load(); got != 1 {
+		t.Fatalf("expected 1 coalesced/throttled HTTP request on REST failure, got %d", got)
+	}
+	if !eng.isSymbolBookStale("ETHUSDT", time.Now().UTC()) {
+		t.Fatalf("expected ETHUSDT BBO to remain stale (fail-closed) after REST 500 error")
+	}
+
+	// 3. Invalid quote (ask <= bid) also fails closed
+	returnErr.Store(false)
+	sendInvalidQuote.Store(true)
+	eng.bookRefreshMu.Lock()
+	eng.lastBookRefreshAt = time.Time{}
+	eng.bookRefreshMu.Unlock()
+	eng.refreshStaleBookQuotes([]string{"ETHUSDT"})
+	if got := bookReqCount.Load(); got != 2 {
+		t.Fatalf("expected 2nd HTTP request after throttle reset, got %d", got)
+	}
+	if !eng.isSymbolBookStale("ETHUSDT", time.Now().UTC()) {
+		t.Fatalf("expected ETHUSDT BBO to remain stale (fail-closed) on invalid crossed REST quote")
+	}
+
+	// 4. Valid REST quote refreshes stale ETHUSDT without overwriting newer FRESHUSDT,
+	//    and MajorPod hour-close evaluation proceeds past BBO staleness gate to RS24h check.
+	sendInvalidQuote.Store(false)
+	eng.bookRefreshMu.Lock()
+	eng.lastBookRefreshAt = time.Time{}
+	eng.bookRefreshMu.Unlock()
+
+	eng.notifyBTCCandleClosed(btcSeries[len(btcSeries)-1].OpenTime)
+	lastEthCandle := ethSeries[len(ethSeries)-1]
+	batchHour := normalizeHourBatchTime(lastEthCandle.CloseTime)
+	eng.flushMajorPodBatchEntries(batchHour, []majorBatchEntry{{candle: lastEthCandle, state: ethSt}})
+
+	if got := bookReqCount.Load(); got != 3 {
+		t.Fatalf("expected 3rd HTTP request from flushMajorPodBatchEntries stale BBO fallback, got %d", got)
+	}
+	freshSt.Mu.Lock()
+	freshBid := freshSt.BestBid
+	freshAt := freshSt.BookUpdatedAt
+	freshSt.Mu.Unlock()
+	if freshBid != 2.00 || !freshAt.Equal(fresherFuture) {
+		t.Fatalf("expected fresher WS BBO not to be overwritten by older REST snapshot, got bid=%v at=%v", freshBid, freshAt)
+	}
+
+	var reason string
+	err = db.RawConn().QueryRow(`SELECT reject_reason_code FROM signal_audit_log WHERE symbol = 'ETHUSDT' ORDER BY id DESC LIMIT 1`).Scan(&reason)
+	if err != nil {
+		t.Fatalf("failed querying signal_audit_log for ETHUSDT: %v", err)
+	}
+	if reason == "STALE_BBO_FEED" || reason != "MAJOR_SHORT_RS_NOT_WEAK" {
+		t.Fatalf("expected MajorPod evaluation to pass BBO check and reject at RS24h (MAJOR_SHORT_RS_NOT_WEAK), got %q", reason)
+	}
+}
