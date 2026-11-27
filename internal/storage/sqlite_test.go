@@ -588,6 +588,8 @@ func TestGetPeakEquityForMode_And_GetRecentStopLossTimes(t *testing.T) {
 	_ = repo.LogTradeForMode(ctx, "LIVE", "T2", "ETHUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(102), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(-2), "STOP_LOSS", now.Add(-55*time.Minute), now.Add(-40*time.Minute), 0, 0, 2)
 	_ = repo.LogTradeForMode(ctx, "LIVE", "T3", "SOLUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(102), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(-2), "STOP_LOSS", now.Add(-30*time.Minute), now.Add(-10*time.Minute), 0, 0, 3)
 	_ = repo.LogTradeForMode(ctx, "DRY_RUN", "T_DRY", "DOGEUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(102), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(-2), "STOP_LOSS", now.Add(-25*time.Minute), now.Add(-8*time.Minute), 0, 0, 5)
+	_ = repo.LogTradeForMode(ctx, "LIVE", "T_MAJ_S", "ETHUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(103), decimal.NewFromFloat(103), decimal.NewFromFloat(95), decimal.NewFromFloat(-3), "STOP_LOSS", now.Add(-18*time.Minute), now.Add(-6*time.Minute), 0, 0, 6, "MAJOR_RSMOM_SHORT")
+	_ = repo.LogTradeForMode(ctx, "LIVE", "T_MAJ_L", "SOLUSDT", "LONG", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(97), decimal.NewFromFloat(97), decimal.NewFromFloat(105), decimal.NewFromFloat(-3), "STOP_LOSS", now.Add(-15*time.Minute), now.Add(-4*time.Minute), 0, 0, 7, "MAJOR_RSMOM_LONG")
 	_ = repo.LogTradeForMode(ctx, "LIVE", "T4", "XRPUSDT", "SHORT", qtyOne, decimal.NewFromFloat(100), decimal.NewFromFloat(99), decimal.NewFromFloat(102), decimal.NewFromFloat(95), decimal.NewFromFloat(1), "PARTIAL_TAKE_PROFIT", now.Add(-20*time.Minute), now.Add(-5*time.Minute), 0, 0, 4)
 
 	slLive, err := repo.GetRecentStopLossTimesForMode(ctx, "LIVE", now.Add(-60*time.Minute))
@@ -595,7 +597,18 @@ func TestGetPeakEquityForMode_And_GetRecentStopLossTimes(t *testing.T) {
 		t.Fatalf("GetRecentStopLossTimesForMode(LIVE) failed: %v", err)
 	}
 	if len(slLive) != 2 || !slLive[0].Equal(now.Add(-40*time.Minute)) || !slLive[1].Equal(now.Add(-10*time.Minute)) {
-		t.Fatalf("expected 2 LIVE STOP_LOSS timestamps ascending (-40m, -10m), got %v", slLive)
+		t.Fatalf("expected 2 Pod#1 LIVE STOP_LOSS timestamps ascending (-40m, -10m), got %v", slLive)
+	}
+	pod1Exits, err := repo.GetRecentExitsByPodForMode(ctx, "LIVE", false, now.Add(-60*time.Minute))
+	if err != nil || !pod1Exits["ETHUSDT"].ClosedAt.Equal(now.Add(-40*time.Minute)) {
+		t.Fatalf("expected Pod#1 exit for ETHUSDT at -40m unaffected by MajorPod exit, got %+v err=%v", pod1Exits["ETHUSDT"], err)
+	}
+	majExits, err := repo.GetRecentExitsByPodForMode(ctx, "LIVE", true, now.Add(-60*time.Minute))
+	if err != nil || !majExits["ETHUSDT"].ClosedAt.Equal(now.Add(-6*time.Minute)) || majExits["ETHUSDT"].StrategyID != "MAJOR_RSMOM_SHORT" {
+		t.Fatalf("expected MajorPod exit for ETHUSDT at -6m, got %+v err=%v", majExits["ETHUSDT"], err)
+	}
+	if _, leaked := majExits["BTCUSDT"]; leaked {
+		t.Fatalf("expected Pod#1 BTCUSDT not in MajorPod exits, got %+v", majExits)
 	}
 	slDry, err := repo.GetRecentStopLossTimesForMode(ctx, "DRY_RUN", now.Add(-60*time.Minute))
 	if err != nil || len(slDry) != 1 || !slDry[0].Equal(now.Add(-8*time.Minute)) {

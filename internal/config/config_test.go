@@ -618,8 +618,11 @@ func TestLoadConfig_DisableOIFilter_And_PromotedBacktestEnv(t *testing.T) {
 	}
 	if !qmaxCfg.DisableOIFilter || qmaxCfg.ResetPeakEquityOnBoot || qmaxCfg.Timeframe != "15m" || qmaxCfg.HTFEMAPeriod != 200 ||
 		qmaxCfg.MarketBreadthLowThreshold != 0.20 || qmaxCfg.StaleLossExitDuration != 6*time.Hour ||
-		qmaxCfg.PortfolioClusterSLCount != 3 || qmaxCfg.MaxEffectiveRiskPerTradePct != 0.038 {
-		t.Fatalf("unexpected parsed promoted QMAX config: %+v", qmaxCfg)
+		qmaxCfg.PortfolioClusterSLCount != 3 || qmaxCfg.RiskPerTradePct.String() != "0.02125" ||
+		qmaxCfg.MaxEffectiveRiskPerTradePct != 0.0323 || !qmaxCfg.MajorPod.ShortEnabled || !qmaxCfg.MajorPod.LongEnabled ||
+		qmaxCfg.MajorPod.ShortRiskPct.String() != "0.006" || qmaxCfg.MajorPod.LongRiskPct.String() != "0.0055" ||
+		qmaxCfg.MajorPod.MaxSlots != 3 || len(qmaxCfg.MajorPod.Symbols) != 15 {
+		t.Fatalf("unexpected parsed promoted 3POD_BAL config: %+v", qmaxCfg)
 	}
 
 	t.Setenv("RESET_PEAK_EQUITY_ON_BOOT", "true")
@@ -681,6 +684,67 @@ func TestZeroAndNegativeOverridesPreserved(t *testing.T) {
 	t.Setenv("MIN_BOUNCE_ZSCORE_LONG", "not_a_float")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatalf("expected invalid MIN_BOUNCE_ZSCORE_LONG to return config error")
+	}
+}
+
+func TestLoadConfig_MajorPodDefaultsOverridesAndValidation(t *testing.T) {
+	t.Setenv("DRY_RUN_MODE", "true")
+
+	defCfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading defaults: %v", err)
+	}
+	if defCfg.MajorPod.IsEnabled() || defCfg.MajorPod.ShortEnabled || defCfg.MajorPod.LongEnabled {
+		t.Fatalf("expected MajorPod disabled by default, got %+v", defCfg.MajorPod)
+	}
+	if len(defCfg.MajorPod.Symbols) != 15 || defCfg.MajorPod.MaxSlots != 3 {
+		t.Fatalf("unexpected default MajorPod symbols/slots: %d / %d", len(defCfg.MajorPod.Symbols), defCfg.MajorPod.MaxSlots)
+	}
+	if defCfg.MajorPod.ShortRSMinPct != 3.0 || defCfg.MajorPod.LongRSMinPct != 4.5 || defCfg.MajorPod.LongRSMaxPct != 20.0 {
+		t.Fatalf("unexpected RS thresholds: %+v", defCfg.MajorPod)
+	}
+	if defCfg.MajorPod.LongMaxFundingRate != 0.0001 || defCfg.MajorPod.MaxHoldingDuration != 48*time.Hour || defCfg.MajorPod.EntryOrderType != "MARKET" {
+		t.Fatalf("unexpected MajorPod execution defaults: %+v", defCfg.MajorPod)
+	}
+
+	t.Setenv("MAJOR_RSMOM_SHORT_ENABLED", "true")
+	t.Setenv("MAJOR_RSMOM_LONG_ENABLED", "true")
+	t.Setenv("MAJOR_POD_SYMBOLS", "ethusdt, solusdt, ETHUSDT , xrpUSDT")
+	t.Setenv("MAJOR_POD_MAX_SLOTS", "4")
+	t.Setenv("MAJOR_RSMOM_SHORT_RISK_PCT", "0.0075")
+	t.Setenv("MAJOR_RSMOM_LONG_RISK_PCT", "0.0065")
+	t.Setenv("MAJOR_POD_ENTRY_ORDER_TYPE", "limit")
+	t.Setenv("MAJOR_POD_MAX_HOLDING_DURATION", "72h")
+	t.Setenv("MAJOR_POD_STALE_LOSS_DURATION", "12h")
+
+	custom, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading custom MajorPod config: %v", err)
+	}
+	if !custom.MajorPod.IsEnabled() || !custom.MajorPod.ShortEnabled || !custom.MajorPod.LongEnabled {
+		t.Fatalf("expected MajorPod enabled")
+	}
+	if len(custom.MajorPod.Symbols) != 3 || custom.MajorPod.Symbols[0] != "ETHUSDT" || custom.MajorPod.MaxSlots != 4 {
+		t.Fatalf("expected deduplicated uppercase 3 symbols & 4 slots, got %+v", custom.MajorPod.Symbols)
+	}
+	if custom.MajorPod.EntryOrderType != "LIMIT" || custom.MajorPod.MaxHoldingDuration != 72*time.Hour || custom.MajorPod.StaleLossDuration != 12*time.Hour {
+		t.Fatalf("unexpected custom execution params: %+v", custom.MajorPod)
+	}
+
+	badVars := [][2]string{
+		{"MAJOR_RSMOM_SHORT_ENABLED", "maybe"},
+		{"MAJOR_POD_MAX_SLOTS", "25"},
+		{"MAJOR_RSMOM_SHORT_RISK_PCT", "0.20"},
+		{"MAJOR_RSMOM_LONG_RS_MAX_PCT", "2.0"},
+		{"MAJOR_POD_ENTRY_ORDER_TYPE", "STOP"},
+		{"MAJOR_POD_MAX_HOLDING_DURATION", "-5h"},
+	}
+	for _, pair := range badVars {
+		t.Setenv(pair[0], pair[1])
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error for invalid %s=%s", pair[0], pair[1])
+		}
+		_ = os.Unsetenv(pair[0])
 	}
 }
 

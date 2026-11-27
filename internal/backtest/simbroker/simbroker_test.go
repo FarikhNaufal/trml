@@ -6,6 +6,7 @@ import (
 
 	"github.com/shopspring/decimal"
 	"trml/internal/backtest/data"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -1507,6 +1508,92 @@ func TestSimBroker_ExpiredLimitGapDoesNotFillAndIsolatedLiquidation(t *testing.T
 	}
 	if len(bIso.ClosedTrades) != 1 || bIso.ClosedTrades[0].ExitReason != "LIQUIDATION" || bIso.ClosedTrades[0].Symbol != "BADUSDT" {
 		t.Fatalf("unexpected closed trade after isolated liquidation: %+v", bIso.ClosedTrades)
+	}
+}
+
+func TestSimBroker_StrategyExitProfilesAndFilteredSlots(t *testing.T) {
+	t0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	f := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinQty:      decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	b := NewSimBroker(SimBrokerConfig{
+		InitialEquityUSDT:     decimal.NewFromFloat(1000.0),
+		MaxSlots:              9,
+		AccountLeverage:       10.0,
+		EntryOrderType:        "MARKET",
+		SlippageRate:          decimal.Zero,
+		SlippageSet:           true,
+		MakerFeeSet:           true,
+		TakerFeeSet:           true,
+		TrailingEnabled:       true,
+		TrailingActivateATR:   2.5,
+		TrailingDistanceATR:   1.0,
+		StaleLossExitDuration: 6 * time.Hour,
+		MaxHoldingDuration:    18 * time.Hour,
+		StrategyExitProfiles: map[string]protection.StrategyExitProfile{
+			"MAJOR_RSMOM_SHORT": {
+				HasOverride:           true,
+				TrailingEnabled:       true,
+				TrailingActivateATR:   2.5,
+				TrailingDistanceATR:   1.2,
+				StaleLossExitDuration: 0,
+				MaxHoldingDuration:    48 * time.Hour,
+			},
+		},
+	})
+	b.SetExchangeFilter("ALTUSDT", f)
+	b.SetExchangeFilter("ETHUSDT", f)
+
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		Symbol: "ALTUSDT", Side: model.SideShort, StrategyID: "VWAP_PULLBACK",
+		Qty: decimal.NewFromFloat(1.0), LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice: decimal.NewFromFloat(120.0), TPPrice: decimal.NewFromFloat(70.0),
+		ATRAtEntry: decimal.NewFromFloat(2.0), CreatedAt: t0,
+	})
+	_, _ = b.SubmitLimitEntry(model.OrderIntent{
+		Symbol: "ETHUSDT", Side: model.SideShort, StrategyID: "MAJOR_RSMOM_SHORT",
+		Qty: decimal.NewFromFloat(1.0), LimitPrice: decimal.NewFromFloat(100.0),
+		SLPrice: decimal.NewFromFloat(120.0), TPPrice: decimal.NewFromFloat(70.0),
+		ATRAtEntry: decimal.NewFromFloat(2.0), CreatedAt: t0,
+	})
+
+	for _, sym := range []string{"ALTUSDT", "ETHUSDT"} {
+		b.ProcessCandle(data.HistoricalCandle{
+			Symbol: sym, OpenTime: t0, CloseTime: t0.Add(15*time.Minute - time.Millisecond),
+			Open: 100.0, High: 100.5, Low: 99.5, Close: 100.0,
+		}, 1)
+	}
+	if nonMaj := b.GetActiveSlotCountByFilter(func(s string) bool { return s != "MAJOR_RSMOM_SHORT" }); nonMaj != 1 {
+		t.Fatalf("expected 1 non-major slot, got %d", nonMaj)
+	}
+	if maj := b.GetActiveSlotCountByFilter(func(s string) bool { return s == "MAJOR_RSMOM_SHORT" }); maj != 1 {
+		t.Fatalf("expected 1 major slot, got %d", maj)
+	}
+
+	t7 := t0.Add(7 * time.Hour)
+	for _, sym := range []string{"ALTUSDT", "ETHUSDT"} {
+		b.ProcessCandle(data.HistoricalCandle{
+			Symbol: sym, OpenTime: t7, CloseTime: t7.Add(15*time.Minute - time.Millisecond),
+			Open: 100.5, High: 101.5, Low: 100.0, Close: 101.0,
+		}, 29)
+	}
+	if b.HasActiveOrderOrPosition("ALTUSDT") {
+		t.Fatalf("expected VWAP_PULLBACK ALTUSDT closed after 6h underwater stale-loss")
+	}
+	if !b.HasActiveOrderOrPosition("ETHUSDT") {
+		t.Fatalf("expected MAJOR_RSMOM_SHORT ETHUSDT to ignore 6h stale-loss via per-strategy profile")
+	}
+
+	t49 := t0.Add(49 * time.Hour)
+	b.ProcessCandle(data.HistoricalCandle{
+		Symbol: "ETHUSDT", OpenTime: t49, CloseTime: t49.Add(15*time.Minute - time.Millisecond),
+		Open: 99.0, High: 99.5, Low: 98.5, Close: 99.0,
+	}, 197)
+	if b.HasActiveOrderOrPosition("ETHUSDT") {
+		t.Fatalf("expected ETHUSDT closed after 48h max holding")
 	}
 }
 

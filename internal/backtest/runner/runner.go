@@ -513,7 +513,11 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 	}
 
 	if ds.AppCfg != nil && ds.AppCfg.MaxSlots > 0 {
-		brokerCfg.MaxSlots = ds.AppCfg.MaxSlots
+		totalSlots := ds.AppCfg.MaxSlots
+		if ds.AppCfg.MajorPod.IsEnabled() && ds.AppCfg.MajorPod.MaxSlots > 0 {
+			totalSlots += ds.AppCfg.MajorPod.MaxSlots
+		}
+		brokerCfg.MaxSlots = totalSlots
 	}
 	if opts.OverrideCompounding != nil {
 		brokerCfg.EquityModeCompounding = *opts.OverrideCompounding
@@ -539,6 +543,8 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		evalCfg.CooldownAfterExitMinutes = 0
 		evalCfg.CooldownLossMinutes = 0
 		evalCfg.CooldownProfitMinutes = 0
+		evalCfg.MajorPod.MaxSlots = 1000
+		evalCfg.MajorPod.CooldownMinutes = 0
 	}
 
 	warmup := opts.WarmupBars
@@ -1147,9 +1153,14 @@ func BuildSimBrokerConfigFromAppConfig(cfg *config.Config, equity float64) simbr
 		candleDur = 5 * time.Minute
 	}
 
+	totalSlots := cfg.MaxSlots
+	if cfg.MajorPod.IsEnabled() && cfg.MajorPod.MaxSlots > 0 {
+		totalSlots += cfg.MajorPod.MaxSlots
+	}
+
 	return simbroker.SimBrokerConfig{
 		InitialEquityUSDT:        eqDec,
-		MaxSlots:                 cfg.MaxSlots,
+		MaxSlots:                 totalSlots,
 		MaxDailyDrawdownPct:      maxDD,
 		AccountLeverage:          cfg.Leverage,
 		EntryOrderType:           entryOrderType,
@@ -1186,6 +1197,7 @@ func BuildSimBrokerConfigFromAppConfig(cfg *config.Config, equity float64) simbr
 		MaxHoldingDuration:       maxHold,
 		StaleLossExitDuration:    cfg.StaleLossExitDuration,
 		EquityModeCompounding:    cfg.EquityModeCompounding,
+		StrategyExitProfiles:     strategy.BuildMajorPodExitProfiles(cfg),
 	}
 }
 

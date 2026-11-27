@@ -40,6 +40,69 @@ type ProtectionConfig struct {
 	SlippageRate             decimal.Decimal
 }
 
+// StrategyExitProfile overrides exit & protection rules for a specific StrategyID (e.g., 1h MajorPod strategies)
+// without affecting the base QMAX strategy configuration.
+type StrategyExitProfile struct {
+	HasOverride            bool
+	PartialTPEnabled       bool
+	Tier1BEEnabled         bool
+	Tier2ProfitLockEnabled bool
+	TrailingEnabled        bool
+	TrailingActivateATR    float64
+	TrailingDistanceATR    float64
+	StaleLossExitDuration  time.Duration
+	MaxHoldingDuration     time.Duration
+}
+
+// ResolveProtectionConfig returns the effective ProtectionConfig for strategyID, preserving base untouched when no override exists.
+func ResolveProtectionConfig(base ProtectionConfig, profiles map[string]StrategyExitProfile, strategyID string) ProtectionConfig {
+	if len(profiles) == 0 {
+		return base
+	}
+	prof, ok := profiles[strategyID]
+	if !ok || !prof.HasOverride {
+		return base
+	}
+	out := base
+	out.PartialTPEnabled = prof.PartialTPEnabled
+	out.Tier1BEEnabled = prof.Tier1BEEnabled
+	out.Tier2ProfitLockEnabled = prof.Tier2ProfitLockEnabled
+	out.TrailingEnabled = prof.TrailingEnabled
+	out.TrailingActivateATR = prof.TrailingActivateATR
+	out.TrailingDistanceATR = prof.TrailingDistanceATR
+	return out
+}
+
+// ResolveMaxHoldingDuration returns the effective MaxHoldingDuration for strategyID.
+func ResolveMaxHoldingDuration(base time.Duration, profiles map[string]StrategyExitProfile, strategyID string) time.Duration {
+	if len(profiles) == 0 {
+		return base
+	}
+	prof, ok := profiles[strategyID]
+	if !ok || !prof.HasOverride {
+		return base
+	}
+	if prof.MaxHoldingDuration > 0 {
+		return prof.MaxHoldingDuration
+	}
+	return base
+}
+
+// ResolveStaleLossExitDuration returns the effective StaleLossExitDuration for strategyID (honoring explicit 0s when HasOverride is true).
+func ResolveStaleLossExitDuration(base time.Duration, profiles map[string]StrategyExitProfile, strategyID string) time.Duration {
+	if len(profiles) == 0 {
+		return base
+	}
+	prof, ok := profiles[strategyID]
+	if !ok || !prof.HasOverride {
+		return base
+	}
+	if prof.StaleLossExitDuration <= 0 {
+		return 0
+	}
+	return prof.StaleLossExitDuration
+}
+
 // PositionSnapshot adalah representasi netral dari posisi terbuka yang dievaluasi.
 type PositionSnapshot struct {
 	Symbol         string

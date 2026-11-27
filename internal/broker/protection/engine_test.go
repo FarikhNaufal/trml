@@ -269,3 +269,54 @@ func TestUpdatePeakAndDrawdownPct(t *testing.T) {
 	}
 }
 
+func TestResolveStrategyExitProfiles(t *testing.T) {
+	baseProt := ProtectionConfig{
+		Tier1BEEnabled:         true,
+		Tier2ProfitLockEnabled: true,
+		TrailingEnabled:        true,
+		TrailingActivateATR:    2.0,
+		TrailingDistanceATR:    1.0,
+		PartialTPEnabled:       true,
+	}
+	profiles := map[string]StrategyExitProfile{
+		"MAJOR_RSMOM_SHORT": {
+			HasOverride:            true,
+			PartialTPEnabled:       false,
+			Tier1BEEnabled:         false,
+			Tier2ProfitLockEnabled: false,
+			TrailingEnabled:        true,
+			TrailingActivateATR:    2.5,
+			TrailingDistanceATR:    1.2,
+			StaleLossExitDuration:  0,
+			MaxHoldingDuration:     48 * time.Hour,
+		},
+	}
+
+	// Base QMAX strategy retains base untouched
+	gotBase := ResolveProtectionConfig(baseProt, profiles, "VWAP_PULLBACK")
+	if !gotBase.PartialTPEnabled || !gotBase.Tier1BEEnabled || gotBase.TrailingActivateATR != 2.0 {
+		t.Fatalf("expected base QMAX protection untouched, got %+v", gotBase)
+	}
+	if d := ResolveMaxHoldingDuration(18*time.Hour, profiles, "VWAP_PULLBACK"); d != 18*time.Hour {
+		t.Fatalf("expected base max holding 18h, got %v", d)
+	}
+	if s := ResolveStaleLossExitDuration(6*time.Hour, profiles, "VWAP_PULLBACK"); s != 6*time.Hour {
+		t.Fatalf("expected base stale loss 6h, got %v", s)
+	}
+
+	// MajorPod strategy overrides cleanly, including explicit 0s stale loss
+	gotMaj := ResolveProtectionConfig(baseProt, profiles, "MAJOR_RSMOM_SHORT")
+	if gotMaj.PartialTPEnabled || gotMaj.Tier1BEEnabled || gotMaj.Tier2ProfitLockEnabled || !gotMaj.TrailingEnabled {
+		t.Fatalf("unexpected MajorPod protection override flags: %+v", gotMaj)
+	}
+	if gotMaj.TrailingActivateATR != 2.5 || gotMaj.TrailingDistanceATR != 1.2 {
+		t.Fatalf("unexpected MajorPod trailing params: %+v", gotMaj)
+	}
+	if d := ResolveMaxHoldingDuration(18*time.Hour, profiles, "MAJOR_RSMOM_SHORT"); d != 48*time.Hour {
+		t.Fatalf("expected MajorPod max holding 48h, got %v", d)
+	}
+	if s := ResolveStaleLossExitDuration(6*time.Hour, profiles, "MAJOR_RSMOM_SHORT"); s != 0 {
+		t.Fatalf("expected MajorPod stale loss 0, got %v", s)
+	}
+}
+

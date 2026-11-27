@@ -69,6 +69,7 @@ type StoredLivePosition struct {
 
 type RecentExitRecord struct {
 	Symbol     string
+	StrategyID string
 	ClosedAt   time.Time
 	ExitReason string
 }
@@ -94,6 +95,7 @@ type Repository interface {
 	GetTradeAutopsy(ctx context.Context, clientOrderID string) (string, error)
 	GetRecentExits(ctx context.Context, since time.Time) (map[string]RecentExitRecord, error)
 	GetRecentExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error)
+	GetRecentExitsByPodForMode(ctx context.Context, mode string, majorPodOnly bool, since time.Time) (map[string]RecentExitRecord, error)
 	GetPeakEquityForMode(ctx context.Context, mode string) (decimal.Decimal, bool, error)
 	GetRecentStopLossTimes(ctx context.Context, since time.Time) ([]time.Time, error)
 	GetRecentStopLossTimesForMode(ctx context.Context, mode string, since time.Time) ([]time.Time, error)
@@ -786,37 +788,54 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 // GetRecentExitsForMode mengambil record penutupan posisi terakhir untuk tiap simbol sejak waktu 'since',
 // terisolasi ke mode ('DRY_RUN' / 'LIVE') bila diisi dan selalu mengabaikan baris PARTIAL_TAKE_PROFIT pada outer join.
 func (r *SQLiteRepository) GetRecentExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error) {
+	return r.queryRecentExitsForMode(ctx, mode, nil, since)
+}
+
+// GetRecentExitsByPodForMode returns the latest closed-position exit per symbol scoped to either MajorPod strategies (majorPodOnly=true)
+// or Pod #1 strategies (majorPodOnly=false), ensuring restarts keep per-pod cooldown histories strictly isolated.
+func (r *SQLiteRepository) GetRecentExitsByPodForMode(ctx context.Context, mode string, majorPodOnly bool, since time.Time) (map[string]RecentExitRecord, error) {
+	return r.queryRecentExitsForMode(ctx, mode, &majorPodOnly, since)
+}
+
+func (r *SQLiteRepository) queryRecentExitsForMode(ctx context.Context, mode string, majorPodOnly *bool, since time.Time) (map[string]RecentExitRecord, error) {
 	sinceStr := formatSQLiteTime(since)
-	var rows *sql.Rows
-	var err error
+	whereClauses := []string{"exit_reason != 'PARTIAL_TAKE_PROFIT'", "closed_at_utc >= ?"}
+	outerClauses := []string{"t.exit_reason != 'PARTIAL_TAKE_PROFIT'"}
+	var innerArgs []any
+	innerArgs = append(innerArgs, sinceStr)
+	var outerArgs []any
+
 	if strings.TrimSpace(mode) != "" {
 		normMode := normalizeDailyStateMode(mode)
-		query := `
-		SELECT t.symbol, t.exit_reason, t.closed_at_utc
-		FROM trade_ledger t
-		INNER JOIN (
-			SELECT symbol, MAX(closed_at_utc) AS max_closed
-			FROM trade_ledger
-			WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND mode = ? AND closed_at_utc >= ?
-			GROUP BY symbol
-		) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed
-		WHERE t.exit_reason != 'PARTIAL_TAKE_PROFIT' AND t.mode = ?;
-		`
-		rows, err = r.db.conn.QueryContext(ctx, query, normMode, sinceStr, normMode)
-	} else {
-		query := `
-		SELECT t.symbol, t.exit_reason, t.closed_at_utc
-		FROM trade_ledger t
-		INNER JOIN (
-			SELECT symbol, MAX(closed_at_utc) AS max_closed
-			FROM trade_ledger
-			WHERE exit_reason != 'PARTIAL_TAKE_PROFIT' AND closed_at_utc >= ?
-			GROUP BY symbol
-		) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed
-		WHERE t.exit_reason != 'PARTIAL_TAKE_PROFIT';
-		`
-		rows, err = r.db.conn.QueryContext(ctx, query, sinceStr)
+		whereClauses = append(whereClauses, "mode = ?")
+		outerClauses = append(outerClauses, "t.mode = ?")
+		innerArgs = append(innerArgs, normMode)
+		outerArgs = append(outerArgs, normMode)
 	}
+	if majorPodOnly != nil {
+		if *majorPodOnly {
+			whereClauses = append(whereClauses, "strategy_id IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
+			outerClauses = append(outerClauses, "t.strategy_id IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
+		} else {
+			whereClauses = append(whereClauses, "COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
+			outerClauses = append(outerClauses, "COALESCE(t.strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
+		}
+	}
+
+	query := fmt.Sprintf(`
+		SELECT t.symbol, t.exit_reason, t.closed_at_utc, COALESCE(t.strategy_id, '')
+		FROM trade_ledger t
+		INNER JOIN (
+			SELECT symbol, MAX(closed_at_utc) AS max_closed
+			FROM trade_ledger
+			WHERE %s
+			GROUP BY symbol
+		) latest ON t.symbol = latest.symbol AND t.closed_at_utc = latest.max_closed
+		WHERE %s;
+	`, strings.Join(whereClauses, " AND "), strings.Join(outerClauses, " AND "))
+
+	args := append(innerArgs, outerArgs...)
+	rows, err := r.db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("storage: failed to query recent exits: %w", err)
 	}
@@ -824,8 +843,8 @@ func (r *SQLiteRepository) GetRecentExitsForMode(ctx context.Context, mode strin
 
 	exits := make(map[string]RecentExitRecord)
 	for rows.Next() {
-		var sym, reason, closedAtStr string
-		if err := rows.Scan(&sym, &reason, &closedAtStr); err != nil {
+		var sym, reason, closedAtStr, stratID string
+		if err := rows.Scan(&sym, &reason, &closedAtStr, &stratID); err != nil {
 			return nil, fmt.Errorf("storage: failed to scan recent exit row: %w", err)
 		}
 		t, err := time.Parse(time.RFC3339Nano, closedAtStr)
@@ -835,6 +854,7 @@ func (r *SQLiteRepository) GetRecentExitsForMode(ctx context.Context, mode strin
 		if err == nil {
 			exits[sym] = RecentExitRecord{
 				Symbol:     sym,
+				StrategyID: stratID,
 				ClosedAt:   t.UTC(),
 				ExitReason: reason,
 			}
@@ -911,13 +931,13 @@ func (r *SQLiteRepository) GetRecentStopLossTimesForMode(ctx context.Context, mo
 		normMode := normalizeDailyStateMode(mode)
 		rows, err = r.db.conn.QueryContext(
 			ctx,
-			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND mode = ? AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
+			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG') AND mode = ? AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
 			normMode, sinceStr,
 		)
 	} else {
 		rows, err = r.db.conn.QueryContext(
 			ctx,
-			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
+			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG') AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
 			sinceStr,
 		)
 	}

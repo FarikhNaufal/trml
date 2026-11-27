@@ -45,6 +45,7 @@ type LiveBrokerConfig struct {
 	EntryOrderType           string
 	MaxEntryRepegAttempts    int
 	MaxEntryRepegDriftPct    float64
+	StrategyExitProfiles     map[string]protection.StrategyExitProfile
 }
 
 type LiveOpenPosition struct {
@@ -157,8 +158,9 @@ type BinanceLiveBroker struct {
 	QueryOrderFn           func(ctx context.Context, symbol string, clientOrderID string) (*model.LiveOrderRecord, error)
 	GetExchangeFilterFn    func(symbol string) (model.ExchangeFilter, bool)
 	GetBestQuoteFn         func(symbol string) (bestBid, bestAsk float64, ok bool)
-	OnTradeClosedFn        func(rec TradeClosedRecord)
-	OnCooldownRecordedFn   func(symbol string, closedAt time.Time, exitReason string)
+	OnTradeClosedFn               func(rec TradeClosedRecord)
+	OnCooldownRecordedFn          func(symbol string, closedAt time.Time, exitReason string)
+	OnStrategyCooldownRecordedFn  func(symbol, strategyID string, closedAt time.Time, exitReason string)
 	OnPositionSavedFn      func(pos LiveOpenPosition)
 	OnPositionDeletedFn    func(symbol string)
 	FetchAccountFn         func(ctx context.Context) (walletBal, unrealizedPnL, availBal decimal.Decimal, positions map[string]model.LivePosition, err error)
@@ -362,8 +364,9 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 	}
 
 	b.Mu.Lock()
-	partialTPEnabled := b.Cfg.PartialTPEnabled
-	trailingEnabled := b.Cfg.TrailingEnabled
+	protCfg := b.toProtectionConfigFor(pos.StrategyID)
+	partialTPEnabled := protCfg.PartialTPEnabled
+	trailingEnabled := protCfg.TrailingEnabled
 	verifyFn := b.VerifyAlgoOrderFn
 	verifyDetailsFn := b.VerifyAlgoOrderDetailsFn
 	b.Mu.Unlock()
@@ -1145,6 +1148,7 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 	var plans []model.ProtectionPlanAction
 	type offlineCloseCleanup struct {
 		symbol      string
+		strategyID  string
 		slAlgoID    int64
 		tpAlgoID    int64
 		tp1OrderID  int64
@@ -1237,9 +1241,11 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 			tpAlgoID = prot.TPOrderID
 			tp1OrderID = prot.TP1OrderID
 		}
+		stratID := b.PositionStrategyIDs[sym]
 		entryOrdersToCancel := b.cleanupClosedPositionLocked(sym)
 		closedCleanups = append(closedCleanups, offlineCloseCleanup{
 			symbol:      sym,
+			strategyID:  stratID,
 			slAlgoID:    slAlgoID,
 			tpAlgoID:    tpAlgoID,
 			tp1OrderID:  tp1OrderID,
@@ -1281,9 +1287,11 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 					tpAlgoID = prot.TPOrderID
 					tp1OrderID = prot.TP1OrderID
 				}
+				stratID := b.PositionStrategyIDs[sym]
 				entryOrdersToCancel := b.cleanupClosedPositionLocked(sym)
 				closedCleanups = append(closedCleanups, offlineCloseCleanup{
 					symbol:      sym,
+					strategyID:  stratID,
 					slAlgoID:    slAlgoID,
 					tpAlgoID:    tpAlgoID,
 					tp1OrderID:  tp1OrderID,
@@ -1303,6 +1311,9 @@ func (b *BinanceLiveBroker) reconcileAfterAccountSnapshot(positions map[string]m
 		slog.Warn("live: reconciled offline-closed position from full account snapshot; cleaning stale local state",
 			"symbol", cl.symbol, "slAlgoID", cl.slAlgoID, "tpAlgoID", cl.tpAlgoID)
 		b.notifyPositionDeleted(cl.symbol)
+		if b.OnStrategyCooldownRecordedFn != nil {
+			b.OnStrategyCooldownRecordedFn(cl.symbol, cl.strategyID, now, "OFFLINE_CLOSED")
+		}
 		if b.OnCooldownRecordedFn != nil {
 			b.OnCooldownRecordedFn(cl.symbol, now, "OFFLINE_CLOSED")
 		}
@@ -2174,6 +2185,9 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdateDetailed(evt model.OrderTra
 
 	if tradeRec != nil {
 		b.notifyPositionDeleted(tradeRec.Symbol)
+		if b.OnStrategyCooldownRecordedFn != nil {
+			b.OnStrategyCooldownRecordedFn(tradeRec.Symbol, tradeRec.StrategyID, tradeRec.ClosedAt, tradeRec.ExitReason)
+		}
 		if b.OnCooldownRecordedFn != nil {
 			b.OnCooldownRecordedFn(tradeRec.Symbol, tradeRec.ClosedAt, tradeRec.ExitReason)
 		}
@@ -2251,7 +2265,13 @@ func (b *BinanceLiveBroker) planProtectionSyncLocked(entryRec *model.LiveOrderRe
 	slAlgoClientID := model.FormatClientID("ALGO_SL", entryRec.Symbol, now)
 	tpAlgoClientID := model.FormatClientID("ALGO_TP", entryRec.Symbol, now)
 
-	needTP := !b.Cfg.PartialTPEnabled || !b.Cfg.TrailingEnabled
+	stratID := strings.TrimSpace(entryRec.StrategyID)
+	if stratID == "" {
+		stratID = b.PositionStrategyIDs[entryRec.Symbol]
+	}
+	protCfg := b.toProtectionConfigFor(stratID)
+
+	needTP := !protCfg.PartialTPEnabled || !protCfg.TrailingEnabled
 	action := model.ProtectionPlanAction{
 		Symbol:            entryRec.Symbol,
 		Generation:        gen,
@@ -2270,7 +2290,7 @@ func (b *BinanceLiveBroker) planProtectionSyncLocked(entryRec *model.LiveOrderRe
 	}
 
 	// Persiapan resting Limit Maker TP1 jika PartialTPEnabled dan TP1Price valid (SSOT protection.PlanPartialTP1Split)
-	if b.Cfg.PartialTPEnabled && !b.IsTP1Hits[entryRec.Symbol] && entryRec.TP1Price.GreaterThan(decimal.Zero) {
+	if protCfg.PartialTPEnabled && !b.IsTP1Hits[entryRec.Symbol] && entryRec.TP1Price.GreaterThan(decimal.Zero) {
 		var ef model.ExchangeFilter
 		if b.GetExchangeFilterFn != nil {
 			ef, _ = b.GetExchangeFilterFn(entryRec.Symbol)
@@ -2846,7 +2866,7 @@ func (b *BinanceLiveBroker) CheckPendingEntryTimeouts(now time.Time) {
 
 // CheckMaxHoldingTimeouts memeriksa dan menutup posisi live yang melebihi batas durasi holding maksimal atau stale-loss duration
 func (b *BinanceLiveBroker) CheckMaxHoldingTimeouts(now time.Time) {
-	if (b.Cfg.MaxHoldingDuration <= 0 && b.Cfg.StaleLossExitDuration <= 0) || b.EmergencyMarketCloseFn == nil {
+	if (b.Cfg.MaxHoldingDuration <= 0 && b.Cfg.StaleLossExitDuration <= 0 && len(b.Cfg.StrategyExitProfiles) == 0) || b.EmergencyMarketCloseFn == nil {
 		return
 	}
 
@@ -2860,14 +2880,17 @@ func (b *BinanceLiveBroker) CheckMaxHoldingTimeouts(now time.Time) {
 
 	b.Mu.Lock()
 	for sym, openTime := range b.PositionOpenTimes {
+		stratID := b.PositionStrategyIDs[sym]
+		maxHoldDur := protection.ResolveMaxHoldingDuration(b.Cfg.MaxHoldingDuration, b.Cfg.StrategyExitProfiles, normalizeBrokerStrategyID(stratID))
+		staleDur := protection.ResolveStaleLossExitDuration(b.Cfg.StaleLossExitDuration, b.Cfg.StrategyExitProfiles, normalizeBrokerStrategyID(stratID))
 		reason := ""
-		if b.Cfg.MaxHoldingDuration > 0 && now.Sub(openTime) > b.Cfg.MaxHoldingDuration {
+		if maxHoldDur > 0 && now.Sub(openTime) > maxHoldDur {
 			reason = "TIME_STOP_MAX_HOLDING"
-		} else if b.Cfg.StaleLossExitDuration > 0 {
+		} else if staleDur > 0 {
 			markDec := b.LastMarkPrices[sym]
 			markAt := b.LastMarkUpdatedAt[sym]
 			markFresh := b.Cfg.MaxMarkStaleness <= 0 || (!markAt.IsZero() && now.Sub(markAt) <= b.Cfg.MaxMarkStaleness)
-			if markFresh && protection.ShouldTriggerStaleLossExit(b.PositionSides[sym], b.PositionEntryPrices[sym], markDec, openTime, now, b.Cfg.StaleLossExitDuration) {
+			if markFresh && protection.ShouldTriggerStaleLossExit(b.PositionSides[sym], b.PositionEntryPrices[sym], markDec, openTime, now, staleDur) {
 				reason = "TIME_STOP_STALE_LOSS"
 			}
 		}
@@ -3165,7 +3188,8 @@ func (b *BinanceLiveBroker) RepairFailedProtections(now time.Time) {
 
 	b.Mu.Lock()
 	for sym, prot := range b.Protections {
-		if b.Cfg.PartialTPEnabled && b.Cfg.TrailingEnabled {
+		symProtCfg := b.toProtectionConfigFor(b.PositionStrategyIDs[sym])
+		if symProtCfg.PartialTPEnabled && symProtCfg.TrailingEnabled {
 			continue
 		}
 		if prot.TPStatus != model.ProtectionFailed {
@@ -3461,6 +3485,9 @@ func (b *BinanceLiveBroker) dispatchTP1FullClose(
 	siblingAlgoIDs []int64,
 	entryOrdersToCancel []model.LiveOrderRecord,
 ) {
+	if b.OnStrategyCooldownRecordedFn != nil {
+		b.OnStrategyCooldownRecordedFn(tradeRec.Symbol, tradeRec.StrategyID, tradeRec.ClosedAt, tradeRec.ExitReason)
+	}
 	if b.OnCooldownRecordedFn != nil {
 		b.OnCooldownRecordedFn(tradeRec.Symbol, tradeRec.ClosedAt, tradeRec.ExitReason)
 	}
@@ -3868,7 +3895,7 @@ func (b *BinanceLiveBroker) processTP1ExecutedWithFee(
 		ATRAtEntry:     b.ATRAtEntry[symbol],
 		TickSize:       tickSize,
 	}
-	beSL := protection.CalculateBreakEvenSL(snap, b.toProtectionConfig())
+	beSL := protection.CalculateBreakEvenSL(snap, b.toProtectionConfigFor(b.PositionStrategyIDs[symbol]))
 
 	var oldSLID int64
 	var oldClientSLID string
@@ -3980,8 +4007,9 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 	}
 
 	// Partial Take Profit (Scale-Out Phase 2 untuk Live Broker)
+	symProtCfg := b.toProtectionConfigFor(b.PositionStrategyIDs[symbol])
 	tp1Price := b.TP1Prices[symbol]
-	if b.Cfg.PartialTPEnabled && !b.IsTP1Hits[symbol] && !tp1Price.IsZero() && !b.TP1InFlight[symbol] {
+	if symProtCfg.PartialTPEnabled && !b.IsTP1Hits[symbol] && !tp1Price.IsZero() && !b.TP1InFlight[symbol] {
 		markPriceDec := decimal.NewFromFloat(markPrice)
 		isTP1Hit := false
 		if side == model.SideLong {
@@ -4052,7 +4080,7 @@ func (b *BinanceLiveBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, mark
 					ATRAtEntry:     b.ATRAtEntry[symbol],
 					TickSize:       ef.TickSize,
 				}
-				beSL := protection.CalculateBreakEvenSL(snap, b.toProtectionConfig())
+				beSL := protection.CalculateBreakEvenSL(snap, b.toProtectionConfigFor(b.PositionStrategyIDs[symbol]))
 
 				var oldSLID int64
 				var oldClientSLID string
@@ -4349,7 +4377,7 @@ skipTP1Handling:
 				IsTP1Hit:       b.IsTP1Hits[symbol],
 				TickSize:       tickSize,
 			}
-			protDec := protection.EvaluatePositionProtection(snap, markPriceDec, b.toProtectionConfig())
+			protDec := protection.EvaluatePositionProtection(snap, markPriceDec, symProtCfg)
 
 			var newTargetTier int
 			var newSL decimal.Decimal
@@ -4648,6 +4676,43 @@ func (b *BinanceLiveBroker) GetActivePositions() []ActivePositionDTO {
 		return result[i].Symbol < result[j].Symbol
 	})
 	return result
+}
+
+// GetActiveSlotCountByFilter counts unique active symbols whose StrategyID satisfies match.
+func (b *BinanceLiveBroker) GetActiveSlotCountByFilter(match func(strategyID string) bool) int {
+	if match == nil {
+		return b.GetActiveSlotCount()
+	}
+	b.Mu.Lock()
+	defer b.Mu.Unlock()
+
+	activeSymbols := make(map[string]struct{})
+	for sym, posQty := range b.ActivePositions {
+		if posQty.GreaterThan(decimal.Zero) && match(normalizeBrokerStrategyID(b.PositionStrategyIDs[sym])) {
+			activeSymbols[sym] = struct{}{}
+		}
+	}
+	for _, ord := range b.OrdersByClient {
+		if ord == nil || !ord.IsEntry {
+			continue
+		}
+		if ord.Status == model.StatusNew || ord.Status == model.StatusPendingNew || ord.Status == model.StatusPartiallyFilled {
+			if _, hasPos := activeSymbols[ord.Symbol]; hasPos {
+				continue
+			}
+			if posQty := b.ActivePositions[ord.Symbol]; posQty.GreaterThan(decimal.Zero) {
+				continue
+			}
+			if match(normalizeBrokerStrategyID(ord.StrategyID)) {
+				activeSymbols[ord.Symbol] = struct{}{}
+			}
+		}
+	}
+	return len(activeSymbols)
+}
+
+func (b *BinanceLiveBroker) toProtectionConfigFor(strategyID string) protection.ProtectionConfig {
+	return protection.ResolveProtectionConfig(b.toProtectionConfig(), b.Cfg.StrategyExitProfiles, normalizeBrokerStrategyID(strategyID))
 }
 
 func (b *BinanceLiveBroker) toProtectionConfig() protection.ProtectionConfig {

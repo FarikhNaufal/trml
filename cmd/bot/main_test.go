@@ -1669,3 +1669,209 @@ func TestShouldEmergencyCloseOrphanPosition_DisabledOnDBError(t *testing.T) {
 		t.Fatalf("expected orphan emergency close ONLY when DB ok, no SL, no verify err, and policy==CLOSE")
 	}
 }
+
+func makeBot15mHourlySeries(
+	sym string,
+	start time.Time,
+	hours int,
+	closeAtHour func(h int) float64,
+	deltaAtHour func(h int) float64,
+) []model.Candle {
+	out := make([]model.Candle, 0, hours*4)
+	for h := 0; h < hours; h++ {
+		c := closeAtHour(h)
+		qv := 20_000_000.0
+		delta := 0.0
+		if deltaAtHour != nil {
+			delta = deltaAtHour(h)
+		}
+		tq := 0.5 * (delta + qv)
+		for q := 0; q < 4; q++ {
+			oT := start.Add(time.Duration(h)*time.Hour + time.Duration(q)*15*time.Minute)
+			out = append(out, model.Candle{
+				OpenTime:          oT,
+				CloseTime:         oT.Add(15*time.Minute - time.Millisecond),
+				Open:              c,
+				High:              c * 1.003,
+				Low:               c * 0.997,
+				Close:             c,
+				VolumeBase:        (qv / 4.0) / c,
+				QuoteVolumeUSDT:   qv / 4.0,
+				TakerBuyQuoteUSDT: tq / 4.0,
+			})
+		}
+	}
+	return out
+}
+
+func TestBotEngine_MajorPodHourCloseBatchRankingAndPod1Isolation(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("failed opening in-memory db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(1000.0), broker.DryRunConfig{
+		MaxSlots:       7,
+		EntryOrderType: "MARKET",
+	})
+	defer dry.Close()
+
+	const hours = 260
+	endNow := time.Now().UTC()
+	t0 := endNow.Truncate(time.Hour).Add(-hours * time.Hour)
+	btcSeries := makeBot15mHourlySeries(BenchmarkSymbol, t0, hours, func(h int) float64 {
+		if h < 230 {
+			return 65000.0
+		}
+		return 64000.0 - float64(h-230)*10.0
+	}, nil)
+	negDeltaFn := func(h int) float64 {
+		if h == hours-1 {
+			return -5_000_000.0
+		}
+		if h%2 == 0 {
+			return 100_000.0
+		}
+		return -100_000.0
+	}
+	ethSeries := makeBot15mHourlySeries("ETHUSDT", t0, hours, func(h int) float64 {
+		if h == hours-1 {
+			return 1840.0 // -8% vs flat-ish BTC -> higher |RS24h|
+		}
+		return 2000.0
+	}, negDeltaFn)
+	solSeries := makeBot15mHourlySeries("SOLUSDT", t0, hours, func(h int) float64 {
+		if h == hours-1 {
+			return 95.0 // -5%
+		}
+		return 100.0
+	}, negDeltaFn)
+
+	filter := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.01),
+		MinQty:      decimal.NewFromFloat(0.01),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	makeSymState := func(sym string, series []model.Candle, bid, ask float64) *model.SymbolState {
+		st := model.NewSymbolState(sym, filter, 1500, 1500)
+		st.IsLeverageIsolatedVerified = true
+		st.BestBid = bid
+		st.BestAsk = ask
+		st.BookUpdatedAt = endNow
+		st.MarkPrice = (bid + ask) / 2.0
+		st.MarkPriceUpdatedAt = endNow
+		st.FundingRate = 0.0001
+		st.FundingUpdatedAt = endNow
+		for _, c := range series {
+			st.ApplyClosedCandleLocked(c, 1500, 1500)
+		}
+		return st
+	}
+
+	btcSt := makeSymState(BenchmarkSymbol, btcSeries, 63700, 63701)
+	ethSt := makeSymState("ETHUSDT", ethSeries, 1839.9, 1840.1)
+	solSt := makeSymState("SOLUSDT", solSeries, 94.99, 95.01)
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:                  true,
+			InitialEquity:           decimal.NewFromFloat(1000.0),
+			EquityModeCompounding:   true,
+			MaxSlots:                6,
+			MaxDailyDrawdown:        -0.075,
+			Timeframe:               "15m",
+			CandleDuration:          15 * time.Minute,
+			PortfolioClusterSLCount: 2,
+		},
+		repo:              repo,
+		broker:            dry,
+		dryRunBroker:      dry,
+		majorPodSymbols:   []string{"ETHUSDT", "SOLUSDT"},
+		majorPodSet:       map[string]bool{"ETHUSDT": true, "SOLUSDT": true},
+		primaryWatchedSet: map[string]bool{},
+		hasCompletedScan:  true,
+		clusterSL:         strategy.NewClusterSLTracker(2, time.Hour),
+		activeStates: map[string]*model.SymbolState{
+			BenchmarkSymbol: btcSt,
+			"ETHUSDT":       ethSt,
+			"SOLUSDT":       solSt,
+		},
+		cooldownExits:    make(map[string]storage.RecentExitRecord),
+		verifiedSymbols:  make(map[string]bool),
+		btcWaitTimeout:   200 * time.Millisecond,
+		majorBatchWindow: 50 * time.Millisecond,
+		evaluatorCfg: strategy.EvaluatorConfig{
+			CandleDuration:   15 * time.Minute,
+			MaxSlots:         6,
+			EMAPeriod:        200,
+			ATRPeriod:        14,
+			MaxSpreadPct:     0.20,
+			MaxBookStaleness: 30 * time.Second,
+			MaxMarkStaleness: 30 * time.Second,
+			MaxDataStaleness: 30 * time.Minute,
+			MajorPod: strategy.MajorPodConfig{
+				ShortEnabled:        true,
+				LongEnabled:         false,
+				Symbols:             []string{"ETHUSDT", "SOLUSDT"},
+				MaxSlots:            1,
+				ShortRiskPct:        decimal.NewFromFloat(0.006),
+				LongRiskPct:         decimal.NewFromFloat(0.0055),
+				RSWindowHours:       24,
+				BreakoutLookbackHrs: 12,
+				ShortRSMinPct:       3.0,
+				LongRSMinPct:        4.5,
+				LongRSMaxPct:        20.0,
+				MinDeltaZ:           0.40,
+				LongMaxFundingRate:  0.0001,
+				ShortMinFundingRate: -1.0,
+				SLATRMultiplier:     2.0,
+				TPATRMultiplier:     6.0,
+				MinSLDistancePct:    decimal.NewFromFloat(0.01),
+				EntryOrderType:      "MARKET",
+			},
+			Sizing: strategy.SizingConfig{
+				MaxSlotMarginFraction:          decimal.NewFromFloat(0.25),
+				AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+				AccountLeverage:                10.0,
+				MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+				TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+				SlippageRate:                   decimal.NewFromFloat(0.0002),
+			},
+		},
+	}
+
+	eng.notifyBTCCandleClosed(btcSeries[len(btcSeries)-1].OpenTime)
+	// Submit weaker RS first (SOL), then stronger RS (ETH) into the same hour close batch
+	eng.dispatchEvaluationsForClosedCandle("SOLUSDT", solSeries[len(solSeries)-1], solSt)
+	eng.dispatchEvaluationsForClosedCandle("ETHUSDT", ethSeries[len(ethSeries)-1], ethSt)
+	eng.evalWg.Wait()
+
+	positions := dry.GetActivePositions()
+	if len(positions) != 1 || positions[0].Symbol != "ETHUSDT" || positions[0].StrategyID != strategy.StrategyIDMajorRSMomShort {
+		t.Fatalf("expected stronger |RS24h| ETHUSDT SHORT opened under MaxSlots=1, got %+v", positions)
+	}
+	if nonMaj := eng.getActiveNonMajorSlots(); nonMaj != 0 {
+		t.Fatalf("expected Pod #1 non-major slot count still 0 (isolated from MajorPod), got %d", nonMaj)
+	}
+	if maj := eng.getActiveMajorSlots(); maj != 1 {
+		t.Fatalf("expected MajorPod slot count 1, got %d", maj)
+	}
+
+	// Verify MajorPod exits do NOT trigger Pod #1 ClusterSLTracker and stay isolated from Pod #1 cooldowns
+	eng.recordSymbolExitForStrategy("ETHUSDT", strategy.StrategyIDMajorRSMomShort, endNow, "STOP_LOSS")
+	eng.recordSymbolExitForStrategy("SOLUSDT", strategy.StrategyIDMajorRSMomLong, endNow.Add(time.Minute), "STOP_LOSS")
+	if paused, _ := eng.clusterSL.IsPaused(endNow.Add(2 * time.Minute)); paused {
+		t.Fatalf("expected MajorPod exits not to pause Pod #1 ClusterSLTracker")
+	}
+	eng.cooldownMu.RLock()
+	if _, leaked := eng.cooldownExits["ETHUSDT"]; leaked {
+		t.Fatalf("expected MajorPod exit not to pollute Pod #1 cooldownExits")
+	}
+	if _, okMaj := eng.majorCooldownExits["ETHUSDT"]; !okMaj {
+		t.Fatalf("expected ETHUSDT MajorPod exit recorded in majorCooldownExits")
+	}
+	eng.cooldownMu.RUnlock()
+}

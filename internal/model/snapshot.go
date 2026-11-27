@@ -39,6 +39,7 @@ type SymbolState struct {
 	LastProcessedCandleOpenTime time.Time
 	LastEvaluatedCandleOpenTime time.Time
 	ClosedCandles               []Candle
+	ClosedHourlyCandles         []Candle
 	ClosedBarDeltasUSDT         []float64
 	LastExitTime                time.Time
 	LastExitReason              string
@@ -358,6 +359,7 @@ type MarketSnapshot struct {
 	IsOIBootstrapped    bool
 	CurrentSessionVWAP  float64
 	ClosedCandles       []Candle
+	ClosedHourlyCandles []Candle
 	ClosedBarDeltasUSDT []float64
 	LastExitTime        time.Time
 	LastExitReason       string
@@ -378,6 +380,12 @@ func (s *SymbolState) Snapshot(now time.Time) MarketSnapshot {
 
 	candlesCopy := make([]Candle, len(s.ClosedCandles))
 	copy(candlesCopy, s.ClosedCandles)
+
+	var hourlyCopy []Candle
+	if len(s.ClosedHourlyCandles) > 0 {
+		hourlyCopy = make([]Candle, len(s.ClosedHourlyCandles))
+		copy(hourlyCopy, s.ClosedHourlyCandles)
+	}
 
 	deltasCopy := make([]float64, len(s.ClosedBarDeltasUSDT))
 	copy(deltasCopy, s.ClosedBarDeltasUSDT)
@@ -400,10 +408,54 @@ func (s *SymbolState) Snapshot(now time.Time) MarketSnapshot {
 		IsOIBootstrapped:    s.IsOIBootstrapped,
 		CurrentSessionVWAP:  s.CurrentSessionVWAP,
 		ClosedCandles:       candlesCopy,
+		ClosedHourlyCandles: hourlyCopy,
 		ClosedBarDeltasUSDT: deltasCopy,
 		LastExitTime:        s.LastExitTime,
 		LastExitReason:      s.LastExitReason,
 	}
+}
+
+// SetHourlyCandlesLocked replaces the cached 1h candles cleanly (ascending OpenTime, capped to capBars).
+func (s *SymbolState) SetHourlyCandlesLocked(candles []Candle, capBars int) {
+	if len(candles) == 0 {
+		s.ClosedHourlyCandles = nil
+		return
+	}
+	out := make([]Candle, 0, len(candles))
+	for _, c := range candles {
+		if len(out) > 0 && !c.OpenTime.After(out[len(out)-1].OpenTime) {
+			if c.OpenTime.Equal(out[len(out)-1].OpenTime) {
+				out[len(out)-1] = c
+			}
+			continue
+		}
+		out = append(out, c)
+	}
+	if capBars > 0 && len(out) > capBars {
+		out = append([]Candle(nil), out[len(out)-capBars:]...)
+	}
+	s.ClosedHourlyCandles = out
+}
+
+// HasRecentHourlyGapLocked reports whether ClosedHourlyCandles has any >1h discontinuity within horizon.
+func (s *SymbolState) HasRecentHourlyGapLocked(horizon time.Duration) bool {
+	if len(s.ClosedHourlyCandles) < 2 {
+		return false
+	}
+	if horizon <= 0 {
+		horizon = 48 * time.Hour
+	}
+	lastOpen := s.ClosedHourlyCandles[len(s.ClosedHourlyCandles)-1].OpenTime
+	for i := 1; i < len(s.ClosedHourlyCandles); i++ {
+		prev := s.ClosedHourlyCandles[i-1]
+		cur := s.ClosedHourlyCandles[i]
+		if !lastOpen.IsZero() && lastOpen.Sub(cur.OpenTime) <= horizon {
+			if cur.OpenTime.Sub(prev.OpenTime) != time.Hour {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *SymbolState) SetLastExit(t time.Time, reason string) {

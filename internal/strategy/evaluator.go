@@ -102,6 +102,7 @@ type EvaluatorConfig struct {
 	EMAPullback     EMAPullbackConfig
 	VWAPBreakdown   VWAPBreakdownConfig
 	StructureBreak  StructureBreakConfig
+	MajorPod        MajorPodConfig
 	MacroRouter     MacroRegimeRouterConfig
 	FundingEnvelope           FundingEnvelopeConfig
 	RollingVWAPBars           int
@@ -262,6 +263,32 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 			MinDeltaZ:        cfg.StructureBreak.MinDeltaZ,
 			MaxEMA200DistATR: cfg.StructureBreak.MaxEMA200DistATR,
 			RiskMult:         cfg.StructureBreak.RiskMult,
+		},
+		MajorPod: MajorPodConfig{
+			ShortEnabled:        cfg.MajorPod.ShortEnabled,
+			LongEnabled:         cfg.MajorPod.LongEnabled,
+			Symbols:             append([]string(nil), cfg.MajorPod.Symbols...),
+			MaxSlots:            cfg.MajorPod.MaxSlots,
+			ShortRiskPct:        cfg.MajorPod.ShortRiskPct,
+			LongRiskPct:         cfg.MajorPod.LongRiskPct,
+			RSWindowHours:       cfg.MajorPod.RSWindowHours,
+			BreakoutLookbackHrs: cfg.MajorPod.BreakoutLookbackHrs,
+			ShortRSMinPct:       cfg.MajorPod.ShortRSMinPct,
+			LongRSMinPct:        cfg.MajorPod.LongRSMinPct,
+			LongRSMaxPct:        cfg.MajorPod.LongRSMaxPct,
+			MinDeltaZ:           cfg.MajorPod.MinDeltaZ,
+			LongMaxFundingRate:  cfg.MajorPod.LongMaxFundingRate,
+			ShortMinFundingRate: cfg.MajorPod.ShortMinFundingRate,
+			SLATRMultiplier:     cfg.MajorPod.SLATRMultiplier,
+			TPATRMultiplier:     cfg.MajorPod.TPATRMultiplier,
+			MinSLDistancePct:    cfg.MajorPod.MinSLDistancePct,
+			TrailingEnabled:     cfg.MajorPod.TrailingEnabled,
+			TrailingActivateATR: cfg.MajorPod.TrailingActivateATR,
+			TrailingDistanceATR: cfg.MajorPod.TrailingDistanceATR,
+			MaxHoldingDuration:  cfg.MajorPod.MaxHoldingDuration,
+			StaleLossDuration:   cfg.MajorPod.StaleLossDuration,
+			CooldownMinutes:     cfg.MajorPod.CooldownMinutes,
+			EntryOrderType:      cfg.MajorPod.EntryOrderType,
 		},
 		MacroRouter: MacroRegimeRouterConfig{
 			Enabled:              cfg.MacroRouter.Enabled,

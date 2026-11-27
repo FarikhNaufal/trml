@@ -8,6 +8,7 @@ import (
 	"github.com/shopspring/decimal"
 	"trml/internal/backtest/data"
 	"trml/internal/backtest/simbroker"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 	"trml/internal/scanner"
 	"trml/internal/strategy"
@@ -598,6 +599,292 @@ func TestReplayEngine_ZeroCandidateScanClearsWatchlist(t *testing.T) {
 	// a healthy 0-candidate scan must clear watchedSymbols instead of retaining stale ALTUSDT for all 35 bars.
 	if eng.TotalSignalsEvaluated == 0 || eng.TotalSignalsEvaluated >= 25 {
 		t.Fatalf("expected ALTUSDT evaluated only while valid (<25 of 35 bars), got TotalSignalsEvaluated=%d", eng.TotalSignalsEvaluated)
+	}
+}
+
+func make15mHourlyHistSeries(
+	sym string,
+	start time.Time,
+	hours int,
+	closeAtHour func(h int) float64,
+	deltaAtHour func(h int) float64,
+) []data.HistoricalCandle {
+	out := make([]data.HistoricalCandle, 0, hours*4)
+	for h := 0; h < hours; h++ {
+		c := closeAtHour(h)
+		qv := 20_000_000.0
+		delta := 0.0
+		if deltaAtHour != nil {
+			delta = deltaAtHour(h)
+		}
+		tq := 0.5 * (delta + qv)
+		for q := 0; q < 4; q++ {
+			oT := start.Add(time.Duration(h)*time.Hour + time.Duration(q)*15*time.Minute)
+			out = append(out, data.HistoricalCandle{
+				OpenTime:            oT,
+				CloseTime:           oT.Add(15*time.Minute - time.Millisecond),
+				Symbol:              sym,
+				Open:                c,
+				High:                c * 1.003,
+				Low:                 c * 0.997,
+				Close:               c,
+				Volume:              (qv / 4.0) / c,
+				QuoteVolume:         qv / 4.0,
+				TakerBuyQuoteVolume: tq / 4.0,
+				BarDeltaUSDT:        delta / 4.0,
+			})
+		}
+	}
+	return out
+}
+
+func TestReplayEngine_MajorPodHourCloseRankingAndSlotBudget(t *testing.T) {
+	t0 := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	const hours = 260
+	// BTC trending below EMA200 across trailing hours
+	btcBars := make15mHourlyHistSeries("BTCUSDT", t0, hours, func(h int) float64 {
+		if h < 230 {
+			return 65000.0
+		}
+		return 64000.0 - float64(h-230)*10.0
+	}, nil)
+
+	// Two majors both trigger SHORT at hour 255: SOL drops -4% vs BTC, ETH drops -8% vs BTC -> ETH ranked #1!
+	deltaNegFn := func(h int) float64 {
+		if h == 255 {
+			return -5_000_000.0
+		}
+		if h%2 == 0 {
+			return 100_000.0
+		}
+		return -100_000.0
+	}
+	ethBars := make15mHourlyHistSeries("ETHUSDT", t0, hours, func(h int) float64 {
+		if h == 255 {
+			return 1840.0 // -8% from 2000 -> stronger |RS|
+		}
+		if h > 255 {
+			return 1835.0
+		}
+		return 2000.0
+	}, deltaNegFn)
+	solBars := make15mHourlyHistSeries("SOLUSDT", t0, hours, func(h int) float64 {
+		if h == 255 {
+			return 96.0 // -4% from 100
+		}
+		if h > 255 {
+			return 95.8
+		}
+		return 100.0
+	}, deltaNegFn)
+
+	f := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.01),
+		MinQty:      decimal.NewFromFloat(0.01),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	evalCfg := strategy.EvaluatorConfig{
+		CandleDuration:   15 * time.Minute,
+		MaxSlots:         6,
+		EMAPeriod:        200,
+		ATRPeriod:        14,
+		MaxSpreadPct:     0.20,
+		DisableVWAP:      true,
+		DisableOIFilter:  true,
+		MaxBookStaleness: 5 * time.Second,
+		MaxMarkStaleness: 15 * time.Second,
+		MaxDataStaleness: 20 * time.Minute,
+		MajorPod: strategy.MajorPodConfig{
+			ShortEnabled:        true,
+			LongEnabled:         false,
+			Symbols:             []string{"BTCUSDT", "ETHUSDT", "SOLUSDT"},
+			MaxSlots:            1,
+			ShortRiskPct:        decimal.NewFromFloat(0.010),
+			LongRiskPct:         decimal.NewFromFloat(0.010),
+			RSWindowHours:       24,
+			BreakoutLookbackHrs: 12,
+			ShortRSMinPct:       3.0,
+			LongRSMinPct:        4.5,
+			LongRSMaxPct:        20.0,
+			MinDeltaZ:           0.40,
+			LongMaxFundingRate:  0.0001,
+			ShortMinFundingRate: -1.0,
+			SLATRMultiplier:     2.0,
+			TPATRMultiplier:     6.0,
+			MinSLDistancePct:    decimal.NewFromFloat(0.010),
+			TrailingEnabled:     true,
+			TrailingActivateATR: 2.5,
+			TrailingDistanceATR: 1.2,
+			MaxHoldingDuration:  48 * time.Hour,
+			StaleLossDuration:   0,
+			CooldownMinutes:     240,
+			EntryOrderType:      "MARKET",
+		},
+		Sizing: strategy.SizingConfig{
+			MaxSlotMarginFraction:          decimal.NewFromFloat(0.25),
+			AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+			AccountLeverage:                10.0,
+			MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+			TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+			SlippageRate:                   decimal.NewFromFloat(0.0002),
+		},
+	}
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT:     decimal.NewFromFloat(1000.0),
+		CandleDuration:        15 * time.Minute,
+		MaxSlots:              7,
+		AccountLeverage:       10.0,
+		EntryOrderType:        "MARKET",
+		StaleLossExitDuration: 6 * time.Hour,
+		MaxHoldingDuration:    18 * time.Hour,
+		StrategyExitProfiles: map[string]protection.StrategyExitProfile{
+			strategy.StrategyIDMajorRSMomShort: {
+				HasOverride:           true,
+				TrailingEnabled:       true,
+				TrailingActivateATR:   2.5,
+				TrailingDistanceATR:   1.2,
+				StaleLossExitDuration: 0,
+				MaxHoldingDuration:    48 * time.Hour,
+			},
+		},
+	})
+	eng := NewReplayEngine(ReplayConfig{
+		WarmupBars:               250 * 4,
+		DynamicScannerEnabled:    false,
+		SettleOpenPositionsAtEnd: true,
+	}, evalCfg, sim, map[string][]data.HistoricalCandle{
+		"BTCUSDT": btcBars,
+		"ETHUSDT": ethBars,
+		"SOLUSDT": solBars,
+	}, map[string]model.ExchangeFilter{
+		"BTCUSDT": f,
+		"ETHUSDT": f,
+		"SOLUSDT": f,
+	})
+	if err := eng.Run(context.Background()); err != nil {
+		t.Fatalf("replay run failed: %v", err)
+	}
+	if len(sim.ClosedTrades) != 1 {
+		t.Fatalf("expected exactly 1 filled MajorPod trade under MaxSlots=1, got %d (%+v)", len(sim.ClosedTrades), sim.ClosedTrades)
+	}
+	if sim.ClosedTrades[0].Symbol != "ETHUSDT" || sim.ClosedTrades[0].StrategyID != strategy.StrategyIDMajorRSMomShort {
+		t.Fatalf("expected stronger |RS24h| ETHUSDT SHORT chosen first, got %+v", sim.ClosedTrades[0])
+	}
+	if eng.RejectReasons["MAJOR_POD_SLOTS_FULL"] == 0 {
+		t.Fatalf("expected SOLUSDT rejected with MAJOR_POD_SLOTS_FULL, got %+v", eng.RejectReasons)
+	}
+}
+
+func TestReplayEngine_MajorPodRetainsOver320HourlyBars(t *testing.T) {
+	// Build 500 hours (2,000 15m bars) so rollingCandles (1,280 15m cap = 320h) truncates early history
+	// while majorHourlyCandles preserves all 500 1h bars and matches full-history EMA200 instead of 320-bar truncated EMA200.
+	totalH := 500
+	t0 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	btcBars := make15mHourlyHistSeries("BTCUSDT", t0, totalH, func(h int) float64 {
+		if h < 180 {
+			return 120000.0
+		}
+		if h < totalH-1 {
+			return 62000.0
+		}
+		// Final bar close = 63500: below 500h EMA200 (~64.4k, pulled up by 120k early bars) -> BEAR,
+		// yet ABOVE truncated 320h EMA200 (~62.0k) -> FALSE BULL if truncated!
+		return 63500.0
+	}, nil)
+	ethBars := make15mHourlyHistSeries("ETHUSDT", t0, totalH, func(h int) float64 {
+		if h < totalH-1 {
+			return 100.0
+		}
+		return 115.0 // +15% pump vs BTC
+	}, func(h int) float64 {
+		if h == totalH-1 {
+			return 3_000_000.0
+		}
+		if h%2 == 0 {
+			return 100_000.0
+		}
+		return -100_000.0
+	})
+
+	f := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.01),
+		MinNotional: decimal.NewFromFloat(5.0),
+		MinQty:      decimal.NewFromFloat(0.01),
+	}
+	evalCfg := strategy.EvaluatorConfig{
+		CandleDuration:      15 * time.Minute,
+		MaxSlots:            4,
+		MaxDailyDrawdownPct: -0.10,
+		EMAPeriod:           200,
+		ATRPeriod:           14,
+		MaxSpreadPct:        0.20,
+		DisableVWAP:         true,
+		DisableOIFilter:     true,
+		MaxBookStaleness:    5 * time.Second,
+		MaxMarkStaleness:    15 * time.Second,
+		MaxDataStaleness:    20 * time.Minute,
+		MajorPod: strategy.MajorPodConfig{
+			ShortEnabled:        true,
+			LongEnabled:         true,
+			Symbols:             []string{"BTCUSDT", "ETHUSDT"},
+			MaxSlots:            3,
+			ShortRiskPct:        decimal.NewFromFloat(0.010),
+			LongRiskPct:         decimal.NewFromFloat(0.010),
+			ShortRSMinPct:       3.0,
+			LongRSMinPct:        4.5,
+			LongRSMaxPct:        20.0,
+			RSWindowHours:       24,
+			BreakoutLookbackHrs: 12,
+			MinDeltaZ:           0.40,
+			LongMaxFundingRate:  0.001,
+			ShortMinFundingRate: -1.0,
+			SLATRMultiplier:     2.0,
+			TPATRMultiplier:     6.0,
+			MinSLDistancePct:    decimal.NewFromFloat(0.010),
+			TrailingEnabled:     true,
+			TrailingActivateATR: 2.5,
+			TrailingDistanceATR: 1.2,
+			MaxHoldingDuration:  48 * time.Hour,
+			CooldownMinutes:     240,
+			EntryOrderType:      "MARKET",
+		},
+		Sizing: strategy.SizingConfig{
+			MaxSlotMarginFraction:          decimal.NewFromFloat(0.25),
+			AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+			AccountLeverage:                10.0,
+			MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+			TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+			SlippageRate:                   decimal.NewFromFloat(0.0002),
+		},
+	}
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		CandleDuration:    15 * time.Minute,
+		MaxSlots:          7,
+		AccountLeverage:   10.0,
+		EntryOrderType:    "MARKET",
+	})
+	eng := NewReplayEngine(ReplayConfig{
+		WarmupBars:               (totalH - 2) * 4,
+		DynamicScannerEnabled:    false,
+		SettleOpenPositionsAtEnd: true,
+	}, evalCfg, sim, map[string][]data.HistoricalCandle{
+		"BTCUSDT": btcBars,
+		"ETHUSDT": ethBars,
+	}, map[string]model.ExchangeFilter{
+		"BTCUSDT": f,
+		"ETHUSDT": f,
+	})
+	if err := eng.Run(context.Background()); err != nil {
+		t.Fatalf("replay run failed: %v", err)
+	}
+	if len(sim.ClosedTrades) != 0 {
+		t.Fatalf("expected 0 LONG trades because full 500h BTC EMA200 > 63500 (whereas 320h truncated EMA200 was < 63500), got %+v", sim.ClosedTrades)
+	}
+	if eng.RejectReasons["MAJOR_SHORT_RS_NOT_WEAK"] == 0 {
+		t.Fatalf("expected BTC < full 500h EMA200 to route to SHORT check (MAJOR_SHORT_RS_NOT_WEAK), got %+v", eng.RejectReasons)
 	}
 }
 

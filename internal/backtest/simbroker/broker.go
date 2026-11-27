@@ -505,7 +505,8 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 	}
 
 	// B. Eksekusi Partial TP1 (Scale-Out + Pindahkan SL ke BE)
-	if tp1Touched && s.Cfg.PartialTPEnabled && !pos.IsTP1Hit {
+	protCfg := s.toProtectionConfigFor(pos.StrategyID)
+	if tp1Touched && protCfg.PartialTPEnabled && !pos.IsTP1Hit {
 		splitPlan := protection.PlanPartialTP1Split(pos.InitialQty, pos.Qty, decimal.Zero, pos.TP1Price, s.Cfg.PartialTP1Ratio, filter)
 		if splitPlan.SplitPossible {
 			s.recordClosedTradeLocked(pos, splitPlan.CloseQty, pos.TP1Price, "PARTIAL_TAKE_PROFIT", c.CloseTime, int(barIndex-pos.OpenBarIndex))
@@ -513,7 +514,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			pos.IsTP1Hit = true
 
 			// Geser SL ke Break-Even (+ Runner Cushion jika ada) via Unified Protection Engine tanpa downgrade tier/SL
-			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
+			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), protCfg)
 			if isMoreProtectiveSL(pos.Side, pos.CurrentSLPrice, beSL) {
 				pos.CurrentSLPrice = beSL
 			}
@@ -524,7 +525,7 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 			// Posisi terlalu kecil untuk dipecah (MinNotional / MinQty): transisikan 100% menjadi runner BE
 			s.Stats.UnsplittableTP1++
 			pos.IsTP1Hit = true
-			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), s.toProtectionConfig())
+			beSL := protection.CalculateBreakEvenSL(pos.toSnapshot(filter.TickSize), protCfg)
 			if isMoreProtectiveSL(pos.Side, pos.CurrentSLPrice, beSL) {
 				pos.CurrentSLPrice = beSL
 			}
@@ -536,14 +537,14 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 
 	// C. Eksekusi Full Take Profit
 	// Jika Trailing Stop aktif dan TP1 sudah tercapai, posisi runner dibiarkan trailing tanpa hard-cap kaku (selaras dengan Live & DryRun)
-	if tpFullTouched && (!s.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
+	if tpFullTouched && (!protCfg.TrailingEnabled || !pos.IsTP1Hit) {
 		s.recordClosedTradeLocked(pos, pos.Qty, pos.TPPrice, "TAKE_PROFIT", c.CloseTime, int(barIndex-pos.OpenBarIndex))
 		delete(s.OpenPositions, c.Symbol)
 		return
 	}
 
 	// D. Unified Position Protection Engine (Tier 1 Early BE, Tier 2 Profit Lock, Tier 3 Trailing Ratchet)
-	protDec := protection.EvaluatePositionProtection(pos.toSnapshot(filter.TickSize), decimal.NewFromFloat(c.Close), s.toProtectionConfig())
+	protDec := protection.EvaluatePositionProtection(pos.toSnapshot(filter.TickSize), decimal.NewFromFloat(c.Close), protCfg)
 	if protDec.ShouldUpdate {
 		pos.CurrentSLPrice = protDec.NewSLPrice
 		if int(protDec.NewTier) > pos.ProtectionTier {
@@ -553,7 +554,8 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 
 	// D2. Underwater Stale-Loss Time-Cut
 	closeDec := decimal.NewFromFloat(c.Close)
-	if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, closeDec, pos.OpenTime, evalCloseTime, s.Cfg.StaleLossExitDuration) {
+	staleDur := protection.ResolveStaleLossExitDuration(s.Cfg.StaleLossExitDuration, s.Cfg.StrategyExitProfiles, pos.StrategyID)
+	if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, closeDec, pos.OpenTime, evalCloseTime, staleDur) {
 		exitPrice := closeDec
 		if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
 			if pos.Side == model.SideLong {
@@ -567,8 +569,9 @@ func (s *SimBroker) ProcessCandle(c data.HistoricalCandle, barIndex int64) {
 		return
 	}
 
-	// E. Time-Stop Holding Timeout (4 Jam = 48 bar 5m)
-	if s.Cfg.MaxHoldingDuration > 0 && evalCloseTime.Sub(pos.OpenTime) > s.Cfg.MaxHoldingDuration {
+	// E. Time-Stop Holding Timeout
+	maxHoldDur := protection.ResolveMaxHoldingDuration(s.Cfg.MaxHoldingDuration, s.Cfg.StrategyExitProfiles, pos.StrategyID)
+	if maxHoldDur > 0 && evalCloseTime.Sub(pos.OpenTime) > maxHoldDur {
 		exitPrice := decimal.NewFromFloat(c.Close)
 		if s.Cfg.SlippageRate.GreaterThan(decimal.Zero) {
 			if pos.Side == model.SideLong {
@@ -781,6 +784,38 @@ func (s *SimBroker) GetActiveSlotCount() int {
 	return len(symbols)
 }
 
+// GetActiveSlotCountByFilter counts unique active symbols whose StrategyID satisfies match.
+func (s *SimBroker) GetActiveSlotCountByFilter(match func(strategyID string) bool) int {
+	if match == nil {
+		return s.GetActiveSlotCount()
+	}
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	symbols := make(map[string]struct{})
+	for sym, pos := range s.OpenPositions {
+		sid := strings.TrimSpace(pos.StrategyID)
+		if sid == "" {
+			sid = "VWAP_PULLBACK"
+		}
+		if match(sid) {
+			symbols[sym] = struct{}{}
+		}
+	}
+	for sym, ord := range s.PendingOrders {
+		if _, hasOpen := s.OpenPositions[sym]; hasOpen {
+			continue
+		}
+		sid := strings.TrimSpace(ord.Intent.StrategyID)
+		if sid == "" {
+			sid = "VWAP_PULLBACK"
+		}
+		if match(sid) {
+			symbols[sym] = struct{}{}
+		}
+	}
+	return len(symbols)
+}
+
 func (s *SimBroker) HasActiveOrderOrPosition(symbol string) bool {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
@@ -799,6 +834,10 @@ func (s *SimBroker) OnRealtimeTick(symbol string, bestBid, bestAsk, markPrice, t
 }
 
 func (s *SimBroker) Close() {}
+
+func (s *SimBroker) toProtectionConfigFor(strategyID string) protection.ProtectionConfig {
+	return protection.ResolveProtectionConfig(s.toProtectionConfig(), s.Cfg.StrategyExitProfiles, strings.TrimSpace(strategyID))
+}
 
 func (s *SimBroker) toProtectionConfig() protection.ProtectionConfig {
 	t1Long := s.Cfg.Tier1BETriggerLongATR

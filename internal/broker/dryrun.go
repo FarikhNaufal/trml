@@ -81,6 +81,7 @@ type DryRunConfig struct {
 	EntryOrderType           string
 	MaxEntryRepegAttempts    int
 	MaxEntryRepegDriftPct    float64
+	StrategyExitProfiles     map[string]protection.StrategyExitProfile
 }
 
 type TradeClosedRecord struct {
@@ -133,8 +134,9 @@ type DryRunBroker struct {
 	CircuitBreakerTripped   bool
 	PendingOrders         map[string]*VirtualPendingOrder
 	OpenPositions         map[string]*VirtualOpenPosition
-	OnTradeClosedFn       func(rec TradeClosedRecord)
-	OnCooldownRecordedFn  func(symbol string, closedAt time.Time, exitReason string)
+	OnTradeClosedFn               func(rec TradeClosedRecord)
+	OnCooldownRecordedFn          func(symbol string, closedAt time.Time, exitReason string)
+	OnStrategyCooldownRecordedFn  func(symbol, strategyID string, closedAt time.Time, exitReason string)
 	OnPositionSavedFn     func(pos VirtualOpenPosition)
 	OnPositionDeletedFn   func(clientOrderIDOrSymbol string)
 	GetExchangeFilterFn   func(symbol string) (model.ExchangeFilter, bool)
@@ -474,9 +476,14 @@ func (d *DryRunBroker) OnRealtimeTick(
 	d.Mu.Lock()
 	defer func() {
 		d.Mu.Unlock()
-		if len(closedRecs) > 0 && d.OnCooldownRecordedFn != nil {
+		if len(closedRecs) > 0 {
 			for _, rec := range closedRecs {
-				d.OnCooldownRecordedFn(rec.Symbol, rec.ClosedAt, rec.ExitReason)
+				if d.OnStrategyCooldownRecordedFn != nil {
+					d.OnStrategyCooldownRecordedFn(rec.Symbol, rec.StrategyID, rec.ClosedAt, rec.ExitReason)
+				}
+				if d.OnCooldownRecordedFn != nil {
+					d.OnCooldownRecordedFn(rec.Symbol, rec.ClosedAt, rec.ExitReason)
+				}
 			}
 		}
 	}()
@@ -707,12 +714,13 @@ func (d *DryRunBroker) OnRealtimeTick(
 		}
 
 		// 2. Partial Take Profit (Scale-Out) - Maker Limit execution
-		if tp1Touched && d.Cfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
+		protCfg := d.toProtectionConfigFor(pos.StrategyID)
+		if tp1Touched && protCfg.PartialTPEnabled && !pos.IsTP1Hit && !pos.TP1Price.IsZero() {
 			d.executePartialTP1Locked(pos, pos.TP1Price, d.Cfg.MakerFeeRate)
 		}
 
 		// 3. Full Take Profit
-		if tpFullTouched && !pos.TPPrice.IsZero() && (!d.Cfg.TrailingEnabled || !pos.IsTP1Hit) {
+		if tpFullTouched && !pos.TPPrice.IsZero() && (!protCfg.TrailingEnabled || !pos.IsTP1Hit) {
 			closedRecs = append(closedRecs, d.closePositionLocked(pos, pos.TPPrice, d.Cfg.TakerFeeRate, "TAKE_PROFIT"))
 			delete(d.PendingOrders, symbol)
 			return
@@ -725,7 +733,7 @@ func (d *DryRunBroker) OnRealtimeTick(
 				tickSize = f.TickSize
 			}
 		}
-		protDec := protection.EvaluatePositionProtection(pos.toSnapshot(tickSize), triggerRefPrice, d.toProtectionConfig())
+		protDec := protection.EvaluatePositionProtection(pos.toSnapshot(tickSize), triggerRefPrice, protCfg)
 		if protDec.ShouldUpdate {
 			pos.CurrentSLPrice = protDec.NewSLPrice
 			pos.IsBreakEvenMoved = true
@@ -740,7 +748,8 @@ func (d *DryRunBroker) OnRealtimeTick(
 		}
 
 		// 5. Underwater Stale-Loss Time-Cut
-		if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, triggerRefPrice, pos.OpenTime, now, d.Cfg.StaleLossExitDuration) {
+		staleDur := protection.ResolveStaleLossExitDuration(d.Cfg.StaleLossExitDuration, d.Cfg.StrategyExitProfiles, pos.StrategyID)
+		if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, triggerRefPrice, pos.OpenTime, now, staleDur) {
 			exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
 			closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_STALE_LOSS"))
 			delete(d.PendingOrders, symbol)
@@ -748,7 +757,8 @@ func (d *DryRunBroker) OnRealtimeTick(
 		}
 
 		// 6. Time-Stop Max Holding (termasuk SlippageRate agar paritas dengan market close & SimBroker)
-		if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
+		maxHoldDur := protection.ResolveMaxHoldingDuration(d.Cfg.MaxHoldingDuration, d.Cfg.StrategyExitProfiles, pos.StrategyID)
+		if maxHoldDur > 0 && now.Sub(pos.OpenTime) > maxHoldDur {
 			exitPrice := d.applyMarketExitSlippage(pos.Side, triggerRefPrice)
 			closedRecs = append(closedRecs, d.closePositionLocked(pos, exitPrice, d.Cfg.TakerFeeRate, "TIME_STOP_MAX_HOLDING"))
 			delete(d.PendingOrders, symbol)
@@ -867,7 +877,7 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 		// Ukuran posisi terlalu kecil untuk dipecah (atau MinNotional < 5 USDT).
 		// Anggap TP1 milestone tercapai: tandai IsTP1Hit, geser SL ke BE, biarkan 100% posisi berjalan sebagai runner.
 		pos.IsTP1Hit = true
-		newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(ef.TickSize), d.toProtectionConfig())
+		newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(ef.TickSize), d.toProtectionConfigFor(pos.StrategyID))
 		if pos.Side == model.SideLong {
 			if newSL.GreaterThan(pos.CurrentSLPrice) {
 				pos.CurrentSLPrice = newSL
@@ -921,7 +931,7 @@ func (d *DryRunBroker) executePartialTP1Locked(pos *VirtualOpenPosition, exitPri
 	pos.IsTP1Hit = true
 
 	// Pindahkan SL ke Break-Even via Unified Protection Engine
-	newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(ef.TickSize), d.toProtectionConfig())
+	newSL := protection.CalculateBreakEvenSL(pos.toSnapshot(ef.TickSize), d.toProtectionConfigFor(pos.StrategyID))
 	if pos.Side == model.SideLong {
 		if newSL.GreaterThan(pos.CurrentSLPrice) {
 			pos.CurrentSLPrice = newSL
@@ -1203,9 +1213,14 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 	d.Mu.Lock()
 	defer func() {
 		d.Mu.Unlock()
-		if len(closedRecs) > 0 && d.OnCooldownRecordedFn != nil {
+		if len(closedRecs) > 0 {
 			for _, rec := range closedRecs {
-				d.OnCooldownRecordedFn(rec.Symbol, rec.ClosedAt, rec.ExitReason)
+				if d.OnStrategyCooldownRecordedFn != nil {
+					d.OnStrategyCooldownRecordedFn(rec.Symbol, rec.StrategyID, rec.ClosedAt, rec.ExitReason)
+				}
+				if d.OnCooldownRecordedFn != nil {
+					d.OnCooldownRecordedFn(rec.Symbol, rec.ClosedAt, rec.ExitReason)
+				}
 			}
 		}
 	}()
@@ -1234,17 +1249,19 @@ func (d *DryRunBroker) CheckTimeouts(now time.Time) {
 		}
 	}
 
-	if d.Cfg.MaxHoldingDuration > 0 || d.Cfg.StaleLossExitDuration > 0 {
+	if d.Cfg.MaxHoldingDuration > 0 || d.Cfg.StaleLossExitDuration > 0 || len(d.Cfg.StrategyExitProfiles) > 0 {
 		for sym, pos := range d.OpenPositions {
 			markFresh := d.Cfg.MaxMarkStaleness <= 0 || pos.MarkUpdatedAt.IsZero() || now.Sub(pos.MarkUpdatedAt) <= d.Cfg.MaxMarkStaleness
 			if !markFresh {
 				continue
 			}
 			reason := ""
-			if d.Cfg.MaxHoldingDuration > 0 && now.Sub(pos.OpenTime) > d.Cfg.MaxHoldingDuration {
+			maxHoldDur := protection.ResolveMaxHoldingDuration(d.Cfg.MaxHoldingDuration, d.Cfg.StrategyExitProfiles, pos.StrategyID)
+			staleDur := protection.ResolveStaleLossExitDuration(d.Cfg.StaleLossExitDuration, d.Cfg.StrategyExitProfiles, pos.StrategyID)
+			if maxHoldDur > 0 && now.Sub(pos.OpenTime) > maxHoldDur {
 				reason = "TIME_STOP_MAX_HOLDING"
-			} else if d.Cfg.StaleLossExitDuration > 0 {
-				if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, pos.LastMarkPrice, pos.OpenTime, now, d.Cfg.StaleLossExitDuration) {
+			} else if staleDur > 0 {
+				if protection.ShouldTriggerStaleLossExit(pos.Side, pos.EntryPrice, pos.LastMarkPrice, pos.OpenTime, now, staleDur) {
 					reason = "TIME_STOP_STALE_LOSS"
 				}
 			}
@@ -1322,6 +1339,34 @@ func (d *DryRunBroker) GetActivePositions() []ActivePositionDTO {
 		return result[i].Symbol < result[j].Symbol
 	})
 	return result
+}
+
+// GetActiveSlotCountByFilter counts unique active symbols whose StrategyID satisfies match.
+func (d *DryRunBroker) GetActiveSlotCountByFilter(match func(strategyID string) bool) int {
+	if match == nil {
+		return d.GetActiveSlotCount()
+	}
+	d.Mu.Lock()
+	defer d.Mu.Unlock()
+	activeSymbols := make(map[string]struct{})
+	for sym, pos := range d.OpenPositions {
+		if pos != nil && match(normalizeBrokerStrategyID(pos.StrategyID)) {
+			activeSymbols[sym] = struct{}{}
+		}
+	}
+	for sym, ord := range d.PendingOrders {
+		if _, hasOpen := d.OpenPositions[sym]; hasOpen {
+			continue
+		}
+		if ord != nil && match(normalizeBrokerStrategyID(ord.Intent.StrategyID)) {
+			activeSymbols[sym] = struct{}{}
+		}
+	}
+	return len(activeSymbols)
+}
+
+func (d *DryRunBroker) toProtectionConfigFor(strategyID string) protection.ProtectionConfig {
+	return protection.ResolveProtectionConfig(d.toProtectionConfig(), d.Cfg.StrategyExitProfiles, normalizeBrokerStrategyID(strategyID))
 }
 
 func (d *DryRunBroker) toProtectionConfig() protection.ProtectionConfig {

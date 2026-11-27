@@ -26,6 +26,7 @@ func NeedsBTCMacroSnapshot(cfg EvaluatorConfig) bool {
 		cfg.BTCChopBlockShort ||
 		cfg.MacroRouter.Enabled ||
 		cfg.RelResidual.Enabled ||
+		cfg.MajorPod.IsEnabled() ||
 		(cfg.BTCChopRiskMult > 0 && cfg.BTCChopRiskMult < 1.0) ||
 		cfg.RS4hWeakThresholdPct < 0 ||
 		cfg.RS4hStrongThresholdPct > 0

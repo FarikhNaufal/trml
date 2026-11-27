@@ -86,10 +86,17 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 	if warmupBars <= 0 {
 		warmupBars = 200
 	}
+	htfEMA := cfg.EvalCfg.HTFEMAPeriod
+	if cfg.EvalCfg.MajorPod.IsEnabled() && htfEMA < 200 {
+		htfEMA = 200
+	}
 	leadBars := strategy.CalcRequiredHistoryBars(
-		barDur, warmupBars, cfg.EvalCfg.HTFEMAPeriod, cfg.EvalCfg.MarketBreadthLowThreshold > 0,
+		barDur, warmupBars, htfEMA, cfg.EvalCfg.MarketBreadthLowThreshold > 0,
 	)
 	warmupLead := time.Duration(leadBars) * barDur
+	if cfg.EvalCfg.MajorPod.IsEnabled() && warmupLead < 720*time.Hour {
+		warmupLead = 720 * time.Hour
+	}
 
 	var (
 		folds             []WalkForwardFold

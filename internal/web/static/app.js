@@ -148,7 +148,9 @@ function fmtStrategyShort(raw) {
     LIQ_SWEEP: 'SWEEP',
     EMA_PULLBACK: 'EMA',
     VWAP_BREAKDOWN: 'BRK',
-    STRUCTURE_BREAK: 'STRUCT'
+    STRUCTURE_BREAK: 'STRUCT',
+    MAJOR_RSMOM_SHORT: 'MAJ_S',
+    MAJOR_RSMOM_LONG: 'MAJ_L'
   };
   const key = String(raw || 'VWAP_PULLBACK').trim().toUpperCase();
   return map[key] || key.slice(0, 10);

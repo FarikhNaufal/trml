@@ -2,7 +2,9 @@ package strategy
 
 import (
 	"strings"
+	"time"
 
+	"github.com/shopspring/decimal"
 	"trml/internal/model"
 )
 
@@ -21,7 +23,26 @@ const (
 	StrategyIDVWAPBreakdown = "VWAP_BREAKDOWN"
 	// StrategyIDStructureBreak identifies the 5-bar pivot market-structure breakdown alpha.
 	StrategyIDStructureBreak = "STRUCTURE_BREAK"
+	// StrategyIDMajorRSMomShort identifies Pod #2: 1h Top-15 Majors Relative-Strength Momentum SHORT.
+	StrategyIDMajorRSMomShort = "MAJOR_RSMOM_SHORT"
+	// StrategyIDMajorRSMomLong identifies Pod #3: 1h Top-15 Majors Relative-Strength Momentum LONG.
+	StrategyIDMajorRSMomLong = "MAJOR_RSMOM_LONG"
 )
+
+// IsMajorPodStrategy reports whether id belongs to the 1h Major RS-Momentum pod (Pod #2 or Pod #3).
+func IsMajorPodStrategy(id string) bool {
+	trimmed := strings.ToUpper(strings.TrimSpace(id))
+	return trimmed == StrategyIDMajorRSMomShort || trimmed == StrategyIDMajorRSMomLong
+}
+
+// DefaultMajorPodSymbols returns a fresh slice of the 15 liquid major crypto pairs.
+func DefaultMajorPodSymbols() []string {
+	return []string{
+		"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+		"DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT",
+		"LTCUSDT", "TRXUSDT", "DOTUSDT", "NEARUSDT", "BCHUSDT",
+	}
+}
 
 // NormalizeStrategyID canonicalizes empty strategy identifiers to the primary strategy ID.
 func NormalizeStrategyID(id string) string {
@@ -164,6 +185,39 @@ type PortfolioDecision struct {
 	StrategyID string
 	Reason     string
 	SubReason  string
+}
+
+// MajorPodConfig configures Pod #2 (1h Majors RS-Momentum SHORT) and Pod #3 (1h Majors RS-Momentum LONG).
+type MajorPodConfig struct {
+	ShortEnabled        bool
+	LongEnabled         bool
+	Symbols             []string
+	MaxSlots            int
+	ShortRiskPct        decimal.Decimal
+	LongRiskPct         decimal.Decimal
+	RSWindowHours       int
+	BreakoutLookbackHrs int
+	ShortRSMinPct       float64
+	LongRSMinPct        float64
+	LongRSMaxPct        float64
+	MinDeltaZ           float64
+	LongMaxFundingRate  float64
+	ShortMinFundingRate float64
+	SLATRMultiplier     float64
+	TPATRMultiplier     float64
+	MinSLDistancePct    decimal.Decimal
+	TrailingEnabled     bool
+	TrailingActivateATR float64
+	TrailingDistanceATR float64
+	MaxHoldingDuration  time.Duration
+	StaleLossDuration   time.Duration
+	CooldownMinutes     int
+	EntryOrderType      string
+}
+
+// IsEnabled reports whether either side of the 1h Major RS-Momentum pod is enabled.
+func (m MajorPodConfig) IsEnabled() bool {
+	return m.ShortEnabled || m.LongEnabled
 }
 
 // AlphaEvaluator defines the isolated contract implemented by each modular alpha strategy.

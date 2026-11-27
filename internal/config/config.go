@@ -208,6 +208,7 @@ type Config struct {
 	EMAPullback                  EMAPullbackStrategyConfig
 	VWAPBreakdown                VWAPBreakdownStrategyConfig
 	StructureBreak               StructureBreakStrategyConfig
+	MajorPod                     MajorPodStrategyConfig
 }
 
 // SweepStrategyConfig memuat parameter strategi sekunder 1-Bar Liquidity Sweep SHORT-ONLY.
@@ -303,6 +304,56 @@ type StructureBreakStrategyConfig struct {
 	MinDeltaZ        float64
 	MaxEMA200DistATR float64
 	RiskMult         float64
+}
+
+// MajorPodStrategyConfig holds opt-in settings for Pod #2 (1h Majors RS-Momentum SHORT) and Pod #3 (1h Majors RS-Momentum LONG).
+type MajorPodStrategyConfig struct {
+	ShortEnabled         bool
+	LongEnabled          bool
+	Symbols              []string
+	MaxSlots             int
+	ShortRiskPct         decimal.Decimal
+	LongRiskPct          decimal.Decimal
+	RSWindowHours        int
+	BreakoutLookbackHrs  int
+	ShortRSMinPct        float64
+	LongRSMinPct         float64
+	LongRSMaxPct         float64
+	MinDeltaZ            float64
+	LongMaxFundingRate   float64
+	ShortMinFundingRate  float64
+	SLATRMultiplier      float64
+	TPATRMultiplier      float64
+	MinSLDistancePct     decimal.Decimal
+	TrailingEnabled      bool
+	TrailingActivateATR  float64
+	TrailingDistanceATR  float64
+	MaxHoldingDuration   time.Duration
+	StaleLossDuration    time.Duration
+	CooldownMinutes      int
+	EntryOrderType       string
+}
+
+// IsEnabled reports whether at least one side of the 1h Major RS-Momentum Pod is enabled.
+func (m MajorPodStrategyConfig) IsEnabled() bool {
+	return m.ShortEnabled || m.LongEnabled
+}
+
+const defaultMajorPodSymbolsCSV = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,SUIUSDT,LTCUSDT,TRXUSDT,DOTUSDT,NEARUSDT,BCHUSDT"
+
+func parseMajorPodSymbols(raw string) []string {
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]bool, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		sym := strings.ToUpper(strings.TrimSpace(p))
+		if sym == "" || seen[sym] {
+			continue
+		}
+		seen[sym] = true
+		out = append(out, sym)
+	}
+	return out
 }
 
 // loadDotEnvWithOverwrite membaca file .env secara otomatis ke environment variable proses.
@@ -1448,6 +1499,103 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid STRUCTURE_BREAK_RISK_MULT")
 	}
 
+	majorShortEnabled, err := parseBoolEnvStrict("MAJOR_RSMOM_SHORT_ENABLED", getEnv("MAJOR_RSMOM_SHORT_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	majorLongEnabled, err := parseBoolEnvStrict("MAJOR_RSMOM_LONG_ENABLED", getEnv("MAJOR_RSMOM_LONG_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	majorSymbols := parseMajorPodSymbols(getEnv("MAJOR_POD_SYMBOLS", defaultMajorPodSymbolsCSV))
+	if len(majorSymbols) == 0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_SYMBOLS (must contain at least 1 symbol)")
+	}
+	majorMaxSlots, err := strconv.Atoi(getEnv("MAJOR_POD_MAX_SLOTS", "3"))
+	if err != nil || majorMaxSlots < 1 || majorMaxSlots > 10 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_MAX_SLOTS (must be between 1 and 10)")
+	}
+	majorShortRiskPct, err := decimal.NewFromString(getEnv("MAJOR_RSMOM_SHORT_RISK_PCT", "0.0060"))
+	if err != nil || majorShortRiskPct.LessThan(decimal.NewFromFloat(0.0005)) || majorShortRiskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_SHORT_RISK_PCT (must be between 0.0005 and 0.05)")
+	}
+	majorLongRiskPct, err := decimal.NewFromString(getEnv("MAJOR_RSMOM_LONG_RISK_PCT", "0.0055"))
+	if err != nil || majorLongRiskPct.LessThan(decimal.NewFromFloat(0.0005)) || majorLongRiskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_LONG_RISK_PCT (must be between 0.0005 and 0.05)")
+	}
+	majorRSWin, err := strconv.Atoi(getEnv("MAJOR_POD_RS_WINDOW_HOURS", "24"))
+	if err != nil || majorRSWin < 4 || majorRSWin > 168 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_RS_WINDOW_HOURS (must be between 4 and 168)")
+	}
+	majorBreakLB, err := strconv.Atoi(getEnv("MAJOR_POD_BREAKOUT_LOOKBACK_HOURS", "12"))
+	if err != nil || majorBreakLB < 3 || majorBreakLB > 72 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_BREAKOUT_LOOKBACK_HOURS (must be between 3 and 72)")
+	}
+	majorShortRSMin, err := parseFloatEnv(getEnv("MAJOR_RSMOM_SHORT_RS_MIN_PCT", "3.0"))
+	if err != nil || majorShortRSMin < 0.5 || majorShortRSMin > 30.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_SHORT_RS_MIN_PCT (must be between 0.5 and 30.0)")
+	}
+	majorLongRSMin, err := parseFloatEnv(getEnv("MAJOR_RSMOM_LONG_RS_MIN_PCT", "4.5"))
+	if err != nil || majorLongRSMin < 0.5 || majorLongRSMin > 30.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_LONG_RS_MIN_PCT (must be between 0.5 and 30.0)")
+	}
+	majorLongRSMax, err := parseFloatEnv(getEnv("MAJOR_RSMOM_LONG_RS_MAX_PCT", "20.0"))
+	if err != nil || majorLongRSMax < majorLongRSMin || majorLongRSMax > 200.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_LONG_RS_MAX_PCT (must be >= MAJOR_RSMOM_LONG_RS_MIN_PCT and <= 200.0)")
+	}
+	majorMinDeltaZ, err := parseFloatEnv(getEnv("MAJOR_POD_MIN_DELTA_Z", "0.40"))
+	if err != nil || majorMinDeltaZ < 0.0 || majorMinDeltaZ > 5.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_MIN_DELTA_Z (must be between 0.0 and 5.0)")
+	}
+	majorLongMaxFR, err := parseFloatEnv(getEnv("MAJOR_RSMOM_LONG_MAX_FUNDING_RATE", "0.0001"))
+	if err != nil || majorLongMaxFR < -0.01 || majorLongMaxFR > 0.05 {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_LONG_MAX_FUNDING_RATE (must be between -0.01 and 0.05)")
+	}
+	majorShortMinFR, err := parseFloatEnv(getEnv("MAJOR_RSMOM_SHORT_MIN_FUNDING_RATE", "-1.0"))
+	if err != nil || majorShortMinFR < -1.0 || majorShortMinFR > 0.05 {
+		return nil, fmt.Errorf("config: invalid MAJOR_RSMOM_SHORT_MIN_FUNDING_RATE (must be between -1.0 and 0.05)")
+	}
+	majorSLMult, err := parseFloatEnv(getEnv("MAJOR_POD_SL_ATR_MULTIPLIER", "2.0"))
+	if err != nil || majorSLMult < 0.5 || majorSLMult > 10.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_SL_ATR_MULTIPLIER (must be between 0.5 and 10.0)")
+	}
+	majorTPMult, err := parseFloatEnv(getEnv("MAJOR_POD_TP_ATR_MULTIPLIER", "6.0"))
+	if err != nil || majorTPMult < 1.0 || majorTPMult > 25.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_TP_ATR_MULTIPLIER (must be between 1.0 and 25.0)")
+	}
+	majorMinSLPct, err := decimal.NewFromString(getEnv("MAJOR_POD_MIN_SL_DISTANCE_PCT", "0.0100"))
+	if err != nil || majorMinSLPct.LessThan(decimal.Zero) || majorMinSLPct.GreaterThan(decimal.NewFromFloat(0.20)) {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_MIN_SL_DISTANCE_PCT (must be between 0.0 and 0.20)")
+	}
+	majorTrailEnabled, err := parseBoolEnvStrict("MAJOR_POD_TRAILING_ENABLED", getEnv("MAJOR_POD_TRAILING_ENABLED", "true"))
+	if err != nil {
+		return nil, err
+	}
+	majorTrailAct, err := parseFloatEnv(getEnv("MAJOR_POD_TRAILING_ACTIVATE_ATR", "2.5"))
+	if err != nil || majorTrailAct < 0.5 || majorTrailAct > 15.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_TRAILING_ACTIVATE_ATR (must be between 0.5 and 15.0)")
+	}
+	majorTrailDist, err := parseFloatEnv(getEnv("MAJOR_POD_TRAILING_DISTANCE_ATR", "1.2"))
+	if err != nil || majorTrailDist < 0.2 || majorTrailDist > 10.0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_TRAILING_DISTANCE_ATR (must be between 0.2 and 10.0)")
+	}
+	majorMaxHold, err := time.ParseDuration(getEnv("MAJOR_POD_MAX_HOLDING_DURATION", "48h"))
+	if err != nil || majorMaxHold <= 0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_MAX_HOLDING_DURATION (must be > 0)")
+	}
+	majorStaleLoss, err := time.ParseDuration(getEnv("MAJOR_POD_STALE_LOSS_DURATION", "0s"))
+	if err != nil || majorStaleLoss < 0 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_STALE_LOSS_DURATION (must be >= 0)")
+	}
+	majorCooldownMins, err := strconv.Atoi(getEnv("MAJOR_POD_COOLDOWN_MINUTES", "240"))
+	if err != nil || majorCooldownMins < 0 || majorCooldownMins > 1440 {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_COOLDOWN_MINUTES (must be between 0 and 1440)")
+	}
+	majorEntryOrderType := strings.ToUpper(strings.TrimSpace(getEnv("MAJOR_POD_ENTRY_ORDER_TYPE", "MARKET")))
+	if majorEntryOrderType != "MARKET" && majorEntryOrderType != "LIMIT" {
+		return nil, fmt.Errorf("config: invalid MAJOR_POD_ENTRY_ORDER_TYPE '%s' (must be 'MARKET' or 'LIMIT')", majorEntryOrderType)
+	}
+
 	return &Config{
 		Env:                      env,
 		APIKey:                   apiKey,
@@ -1688,6 +1836,32 @@ func LoadConfigFile(envPath string) (*Config, error) {
 			MinDeltaZ:        structBrkMinDeltaZ,
 			MaxEMA200DistATR: structBrkMaxEMA200,
 			RiskMult:         structBrkRiskMult,
+		},
+		MajorPod: MajorPodStrategyConfig{
+			ShortEnabled:        majorShortEnabled,
+			LongEnabled:         majorLongEnabled,
+			Symbols:             majorSymbols,
+			MaxSlots:            majorMaxSlots,
+			ShortRiskPct:        majorShortRiskPct,
+			LongRiskPct:         majorLongRiskPct,
+			RSWindowHours:       majorRSWin,
+			BreakoutLookbackHrs: majorBreakLB,
+			ShortRSMinPct:       majorShortRSMin,
+			LongRSMinPct:        majorLongRSMin,
+			LongRSMaxPct:        majorLongRSMax,
+			MinDeltaZ:           majorMinDeltaZ,
+			LongMaxFundingRate:  majorLongMaxFR,
+			ShortMinFundingRate: majorShortMinFR,
+			SLATRMultiplier:     majorSLMult,
+			TPATRMultiplier:     majorTPMult,
+			MinSLDistancePct:    majorMinSLPct,
+			TrailingEnabled:     majorTrailEnabled,
+			TrailingActivateATR: majorTrailAct,
+			TrailingDistanceATR: majorTrailDist,
+			MaxHoldingDuration:  majorMaxHold,
+			StaleLossDuration:   majorStaleLoss,
+			CooldownMinutes:     majorCooldownMins,
+			EntryOrderType:      majorEntryOrderType,
 		},
 	}, nil
 }

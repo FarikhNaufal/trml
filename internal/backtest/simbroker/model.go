@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -43,9 +44,10 @@ type SimBrokerConfig struct {
 	TrailingEnabled          bool            // default true
 	TrailingActivateATR      float64         // default 1.10
 	TrailingDistanceATR      float64         // default 0.55
-	MaxHoldingDuration       time.Duration   // default 4 hours (48 bars 5m)
-	StaleLossExitDuration    time.Duration   // optional early exit for trades still underwater after duration
-	EquityModeCompounding    bool            // true: compounding, false: fixed start equity
+	MaxHoldingDuration       time.Duration                             // default 4 hours (48 bars 5m)
+	StaleLossExitDuration    time.Duration                             // optional early exit for trades still underwater after duration
+	EquityModeCompounding    bool                                      // true: compounding, false: fixed start equity
+	StrategyExitProfiles     map[string]protection.StrategyExitProfile // optional per-StrategyID exit overrides
 }
 
 // SimExecutionStats records execution microstructure telemetry across a backtest run.

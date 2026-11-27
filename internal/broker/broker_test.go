@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+	"trml/internal/broker/protection"
 	"trml/internal/model"
 )
 
@@ -6854,5 +6855,77 @@ func TestLiveBroker_ManualPartialCloseOver50PctAccountUpdateFirstPreservesSL(t *
 
 	if slCanceled3.Load() != 1 || b3.HasActiveOrderOrPosition("BTCUSDT") {
 		t.Fatalf("expected full manual close to cancel SL (1) and clear BTCUSDT state, got canceled=%d active=%v", slCanceled3.Load(), b3.HasActiveOrderOrPosition("BTCUSDT"))
+	}
+}
+
+func TestDryRunBroker_StrategyExitProfilesAndFilteredSlots(t *testing.T) {
+	t0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	d := NewDryRunBroker(decimal.NewFromFloat(1000.0), DryRunConfig{
+		MaxSlots:              9,
+		AccountLeverage:       10.0,
+		EntryOrderType:        "MARKET",
+		StaleLossExitDuration: 6 * time.Hour,
+		MaxHoldingDuration:    18 * time.Hour,
+		MaxMarkStaleness:      15 * time.Second,
+		StrategyExitProfiles: map[string]protection.StrategyExitProfile{
+			"MAJOR_RSMOM_LONG": {
+				HasOverride:           true,
+				TrailingEnabled:       true,
+				TrailingActivateATR:   2.5,
+				TrailingDistanceATR:   1.2,
+				StaleLossExitDuration: 0,
+				MaxHoldingDuration:    48 * time.Hour,
+			},
+		},
+	})
+	defer d.Close()
+
+	_, err := d.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "ALT_VWAP_1", Symbol: "ALTUSDT", Side: model.SideShort, StrategyID: "VWAP_PULLBACK",
+		Qty: decimal.NewFromFloat(1), LimitPrice: decimal.NewFromFloat(100), SLPrice: decimal.NewFromFloat(110),
+		TPPrice: decimal.NewFromFloat(80), ATRAtEntry: decimal.NewFromFloat(2), CreatedAt: t0,
+	})
+	if err != nil {
+		t.Fatalf("ALT submit err: %v", err)
+	}
+	_, err = d.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID: "SOL_MAJ_1", Symbol: "SOLUSDT", Side: model.SideLong, StrategyID: "MAJOR_RSMOM_LONG",
+		Qty: decimal.NewFromFloat(1), LimitPrice: decimal.NewFromFloat(100), SLPrice: decimal.NewFromFloat(90),
+		TPPrice: decimal.NewFromFloat(120), ATRAtEntry: decimal.NewFromFloat(2), CreatedAt: t0,
+	})
+	if err != nil {
+		t.Fatalf("SOL submit err: %v", err)
+	}
+
+	if majSlots := d.GetActiveSlotCountByFilter(func(s string) bool { return s == "MAJOR_RSMOM_LONG" }); majSlots != 1 {
+		t.Fatalf("expected 1 MAJOR_RSMOM_LONG slot, got %d", majSlots)
+	}
+	if nonMaj := d.GetActiveSlotCountByFilter(func(s string) bool { return s != "MAJOR_RSMOM_LONG" }); nonMaj != 1 {
+		t.Fatalf("expected 1 non-major slot, got %d", nonMaj)
+	}
+
+	// At t0+7h underwater: ALTUSDT closes on 6h stale-loss, SOLUSDT ignores 6h stale-loss
+	t7 := t0.Add(7 * time.Hour)
+	d.OnRealtimeTick("ALTUSDT", 100.9, 101.1, 101.0, 101.0, 1, false, t7)
+	d.OnRealtimeTick("SOLUSDT", 98.9, 99.1, 99.0, 99.0, 1, false, t7)
+	if d.HasActiveOrderOrPosition("ALTUSDT") {
+		t.Fatalf("expected ALTUSDT closed after 6h stale-loss")
+	}
+	if !d.HasActiveOrderOrPosition("SOLUSDT") {
+		t.Fatalf("expected SOLUSDT to remain open past 6h stale-loss")
+	}
+
+	// At t0+20h profitable (past 18h QMAX max hold): SOLUSDT STILL remains open (< 48h)
+	t20 := t0.Add(20 * time.Hour)
+	d.OnRealtimeTick("SOLUSDT", 101.9, 102.1, 102.0, 102.0, 1, false, t20)
+	if !d.HasActiveOrderOrPosition("SOLUSDT") {
+		t.Fatalf("expected SOLUSDT to remain open at 20h (< 48h)")
+	}
+
+	// At t0+49h: SOLUSDT closes on 48h max holding
+	t49 := t0.Add(49 * time.Hour)
+	d.OnRealtimeTick("SOLUSDT", 101.9, 102.1, 102.0, 102.0, 1, false, t49)
+	if d.HasActiveOrderOrPosition("SOLUSDT") {
+		t.Fatalf("expected SOLUSDT closed at 49h (> 48h)")
 	}
 }

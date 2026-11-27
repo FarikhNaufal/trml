@@ -57,11 +57,12 @@ type ReplayEngine struct {
 	cfg          ReplayConfig
 	evaluatorCfg strategy.EvaluatorConfig
 	broker       *simbroker.SimBroker
-	candleMap    map[string][]data.HistoricalCandle
-	filters      map[string]model.ExchangeFilter
-	fundingMgr   *data.FundingManager
-	oiMgr        *data.MetricsOIDownloader
-	lastExits    map[string]lastExitInfo
+	candleMap      map[string][]data.HistoricalCandle
+	filters        map[string]model.ExchangeFilter
+	fundingMgr     *data.FundingManager
+	oiMgr          *data.MetricsOIDownloader
+	lastExits      map[string]lastExitInfo
+	lastMajorExits map[string]lastExitInfo
 
 	clusterSL          *strategy.ClusterSLTracker
 	lastBreadthHourKey int64
@@ -106,10 +107,11 @@ func NewReplayEngine(
 		broker:        broker,
 		candleMap:     candleMap,
 		filters:       filters,
-		fundingMgr:    cfg.FundingMgr,
-		oiMgr:         cfg.OIMgr,
-		lastExits:     make(map[string]lastExitInfo),
-		clusterSL:     strategy.NewClusterSLTracker(cfg.PortfolioClusterSLCount, cfg.PortfolioClusterCooldown),
+		fundingMgr:     cfg.FundingMgr,
+		oiMgr:          cfg.OIMgr,
+		lastExits:      make(map[string]lastExitInfo),
+		lastMajorExits: make(map[string]lastExitInfo),
+		clusterSL:      strategy.NewClusterSLTracker(cfg.PortfolioClusterSLCount, cfg.PortfolioClusterCooldown),
 		RejectReasons: make(map[string]int64),
 	}
 }
@@ -152,10 +154,14 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 	if candleDur <= 0 {
 		candleDur = r.evaluatorCfg.CandleDuration
 	}
+	htfEMACap := r.evaluatorCfg.HTFEMAPeriod
+	if r.evaluatorCfg.MajorPod.IsEnabled() && htfEMACap < 200 {
+		htfEMACap = 200
+	}
 	bufferCap := strategy.CalcRequiredHistoryBars(
 		candleDur,
 		r.cfg.WarmupBars,
-		r.evaluatorCfg.HTFEMAPeriod,
+		htfEMACap,
 		r.evaluatorCfg.MarketBreadthLowThreshold > 0,
 	)
 	scanSim := NewScannerSimulator(r.cfg.ScannerCfg, r.filters, func(cList []model.Candle, lastClose float64) float64 {
@@ -170,6 +176,30 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 	var breakoutOrder []string
 	lastClosedTradeIdx := 0
 	var prevSimTime time.Time
+
+	majorPodEnabled := r.evaluatorCfg.MajorPod.IsEnabled()
+	var majorTrackSet map[string]bool
+	var majorHourlyCandles map[string][]model.Candle
+	hourlySubTail := 16
+	if candleDur > 0 && candleDur < time.Hour {
+		if req := int(time.Hour/candleDur) + 4; req > hourlySubTail {
+			hourlySubTail = req
+		}
+	}
+	if majorPodEnabled {
+		majorSyms := r.evaluatorCfg.MajorPod.Symbols
+		if len(majorSyms) == 0 {
+			majorSyms = strategy.DefaultMajorPodSymbols()
+		}
+		majorTrackSet = make(map[string]bool, len(majorSyms)+1)
+		majorTrackSet[r.cfg.BenchmarkSym] = true
+		for _, ms := range majorSyms {
+			if ms != "" {
+				majorTrackSet[ms] = true
+			}
+		}
+		majorHourlyCandles = make(map[string][]model.Candle, len(majorTrackSet))
+	}
 
 	for barIdx, simTime := range timeline {
 		select {
@@ -190,6 +220,25 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 			}
 		}
 
+		if majorPodEnabled && strategy.IsHourCloseTimestamp(simTime) {
+			for sym := range majorTrackSet {
+				if !closedAtSimTime[sym] {
+					continue
+				}
+				cList := rollingCandles[sym]
+				if len(cList) == 0 {
+					continue
+				}
+				startIdx := 0
+				if len(cList) > hourlySubTail {
+					startIdx = len(cList) - hourlySubTail
+				}
+				majorHourlyCandles[sym] = strategy.MergeCompletedHourlyCandle(
+					majorHourlyCandles[sym], cList[startIdx:], candleDur, strategy.MajorPodHourlyHistoryCap,
+				)
+			}
+		}
+
 		if !r.cfg.UnconstrainedMode {
 			r.broker.CheckIsolatedMarginLiquidation(0.005, simTime, int64(barIdx))
 			r.broker.CheckCrossMarginLiquidation(0.005, simTime, int64(barIdx))
@@ -202,7 +251,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 			// B. Prepare BTC macro snapshot and evaluate signals on active/watched symbols
 			btcSnap := r.buildBTCMacro(simTime, rollingCandles, rollingDeltas)
-			r.evaluateSignalsAtBar(simTime, sortedSymbols, primaryOrder, breakoutOrder, closedAtSimTime, watchedSymbols, breakoutSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, btcSnap)
+			r.evaluateSignalsAtBar(simTime, sortedSymbols, primaryOrder, breakoutOrder, closedAtSimTime, watchedSymbols, breakoutSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, majorHourlyCandles, btcSnap)
 		}
 
 		// C. Post-bar dynamic scan cadence: new watchlist activates on subsequent closed bars
@@ -391,10 +440,15 @@ func (r *ReplayEngine) syncLastExits(fromIdx int) int {
 		if tr.ExitReason == "PARTIAL_TAKE_PROFIT" {
 			continue
 		}
-		r.lastExits[tr.Symbol] = lastExitInfo{
+		info := lastExitInfo{
 			time:   tr.ExitTime,
 			reason: tr.ExitReason,
 		}
+		if strategy.IsMajorPodStrategy(tr.StrategyID) {
+			r.lastMajorExits[tr.Symbol] = info
+			continue
+		}
+		r.lastExits[tr.Symbol] = info
 		if r.clusterSL != nil {
 			r.clusterSL.RecordExit(tr.ExitTime, tr.ExitReason)
 		}
@@ -431,9 +485,16 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 	sweepExtraSymbols map[string]bool,
 	rollingCandles map[string][]model.Candle,
 	rollingDeltas map[string][]float64,
+	majorHourlyCandles map[string][]model.Candle,
 	btcSnap *model.MarketSnapshot,
 ) {
+	majorPodEnabled := r.evaluatorCfg.MajorPod.IsEnabled()
 	activeSlots := r.broker.GetActiveSlotCount()
+	if majorPodEnabled {
+		activeSlots = r.broker.GetActiveSlotCountByFilter(func(sid string) bool {
+			return !strategy.IsMajorPodStrategy(sid)
+		})
+	}
 	availBal := r.broker.GetAvailableBalanceUSDT()
 	totEq := r.broker.GetEffectiveTotalEquityUSDT()
 	isDailyBreached := r.broker.IsCircuitBreakerTripped() || (r.broker.GetDailyTotalDrawdownPct() <= r.evaluatorCfg.MaxDailyDrawdownPct)
@@ -564,7 +625,13 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 				r.RejectReasons["BROKER_SUBMIT_REJECTED"]++
 			}
 			if !r.cfg.UnconstrainedMode {
-				activeSlots = r.broker.GetActiveSlotCount()
+				if majorPodEnabled {
+					activeSlots = r.broker.GetActiveSlotCountByFilter(func(sid string) bool {
+						return !strategy.IsMajorPodStrategy(sid)
+					})
+				} else {
+					activeSlots = r.broker.GetActiveSlotCount()
+				}
 				if r.cfg.DeductPendingMargin {
 					availBal = r.broker.GetAvailableBalanceUSDT()
 				}
@@ -572,6 +639,133 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 		} else {
 			r.SignalsRejected++
 			r.RejectReasons[dec.Reason]++
+		}
+	}
+
+	if majorPodEnabled && strategy.IsHourCloseTimestamp(simTime) {
+		r.evaluateMajorPodAtHourClose(simTime, closedAtSimTime, rollingCandles, rollingDeltas, majorHourlyCandles, btcSnap, isDailyBreached, portDD)
+	}
+}
+
+type majorPodApprovedItem struct {
+	cand strategy.MajorRSMomCandidate
+	snap model.MarketSnapshot
+}
+
+func (r *ReplayEngine) evaluateMajorPodAtHourClose(
+	simTime time.Time,
+	closedAtSimTime map[string]bool,
+	rollingCandles map[string][]model.Candle,
+	rollingDeltas map[string][]float64,
+	majorHourlyCandles map[string][]model.Candle,
+	btcSnap *model.MarketSnapshot,
+	isDailyBreached bool,
+	portDD float64,
+) {
+	symbols := r.evaluatorCfg.MajorPod.Symbols
+	if len(symbols) == 0 {
+		symbols = strategy.DefaultMajorPodSymbols()
+	}
+
+	btcForMajor := btcSnap
+	if btcSnap != nil && len(majorHourlyCandles[r.cfg.BenchmarkSym]) > 0 {
+		cp := *btcSnap
+		cp.ClosedHourlyCandles = majorHourlyCandles[r.cfg.BenchmarkSym]
+		btcForMajor = &cp
+	}
+
+	var approved []majorPodApprovedItem
+	for _, sym := range symbols {
+		if sym == r.cfg.BenchmarkSym || !closedAtSimTime[sym] {
+			continue
+		}
+		cList, ok := rollingCandles[sym]
+		if !ok || len(cList) == 0 {
+			continue
+		}
+
+		exitInfo := r.lastMajorExits[sym]
+		if r.cfg.UnconstrainedMode {
+			exitInfo = lastExitInfo{}
+		}
+		fundingRate := r.cfg.FundingRate
+		if r.fundingMgr != nil {
+			fundingRate = r.fundingMgr.GetFundingRate(sym, simTime)
+		}
+
+		snap, evalCfg, _, okSnap := BuildSymbolSnapshot(
+			sym, simTime, cList, rollingDeltas[sym], r.filters[sym], exitInfo,
+			r.cfg.SpreadPct, fundingRate, OIModeOff, nil, r.evaluatorCfg,
+		)
+		if !okSnap {
+			continue
+		}
+		snap.PortfolioDrawdownPct = portDD
+		if len(majorHourlyCandles[sym]) > 0 {
+			snap.ClosedHourlyCandles = majorHourlyCandles[sym]
+		}
+		hasActive := r.broker.HasActiveOrderOrPosition(sym)
+
+		r.TotalSignalsEvaluated++
+		cand := strategy.EvaluateMajorRSMomCandidate(snap, btcForMajor, hasActive, isDailyBreached, evalCfg)
+		if !cand.Approved {
+			r.SignalsRejected++
+			r.RejectReasons[cand.Reason]++
+			continue
+		}
+		approved = append(approved, majorPodApprovedItem{cand: cand, snap: snap})
+	}
+
+	if len(approved) == 0 {
+		return
+	}
+	sort.Slice(approved, func(i, j int) bool {
+		if approved[i].cand.AbsRS24hPct != approved[j].cand.AbsRS24hPct {
+			return approved[i].cand.AbsRS24hPct > approved[j].cand.AbsRS24hPct
+		}
+		return approved[i].cand.Symbol < approved[j].cand.Symbol
+	})
+
+	maxMajorSlots := r.evaluatorCfg.MajorPod.MaxSlots
+	if maxMajorSlots <= 0 {
+		maxMajorSlots = 3
+	}
+	majorSlots := r.broker.GetActiveSlotCountByFilter(strategy.IsMajorPodStrategy)
+	totEq := r.broker.GetEffectiveTotalEquityUSDT()
+	availBal := r.broker.GetAvailableBalanceUSDT()
+	if r.cfg.UnconstrainedMode {
+		majorSlots = 0
+		availBal = decimal.NewFromFloat(1000000.0)
+	}
+
+	for _, item := range approved {
+		if !r.cfg.UnconstrainedMode && majorSlots >= maxMajorSlots {
+			r.SignalsRejected++
+			r.RejectReasons["MAJOR_POD_SLOTS_FULL"]++
+			continue
+		}
+		if r.broker.HasActiveOrderOrPosition(item.cand.Symbol) {
+			r.SignalsRejected++
+			r.RejectReasons["SYMBOL_ALREADY_ACTIVE"]++
+			continue
+		}
+		intent, okBuild, buildReason := strategy.BuildMajorRSMomOrderIntent(item.cand, item.snap, totEq, availBal, r.evaluatorCfg)
+		if !okBuild {
+			r.SignalsRejected++
+			r.RejectReasons[buildReason]++
+			continue
+		}
+		if okSub, _ := r.broker.SubmitLimitEntry(intent); okSub {
+			r.SignalsApproved++
+			if !r.cfg.UnconstrainedMode {
+				majorSlots = r.broker.GetActiveSlotCountByFilter(strategy.IsMajorPodStrategy)
+				if r.cfg.DeductPendingMargin {
+					availBal = r.broker.GetAvailableBalanceUSDT()
+				}
+			}
+		} else {
+			r.SignalsRejected++
+			r.RejectReasons["BROKER_SUBMIT_REJECTED"]++
 		}
 	}
 }
