@@ -225,7 +225,7 @@ func main() {
 		clusterSL:            strategy.NewClusterSLTracker(cfg.PortfolioClusterSLCount, time.Duration(cfg.PortfolioClusterCooldownMins)*time.Minute),
 		barEntries:           strategy.NewBarEntryTracker(cfg.MaxNewEntriesPerBar),
 		btcWaitTimeout:       1500 * time.Millisecond,
-		majorBatchWindow:     600 * time.Millisecond,
+		majorBatchWindow:     1800 * time.Millisecond,
 		evaluatorCfg:         evalCfg,
 		scannerCfg:           scanner.FromAppConfig(cfg, bootstrapBars),
 	}
@@ -483,6 +483,7 @@ func main() {
 			engine.liveBroker.PlaceEntryFn = client.PlaceLimitEntry
 		}
 		engine.liveBroker.PlaceMarketEntryFn = client.PlaceMarketEntry
+		engine.liveBroker.PlaceMarketEntryWithResultFn = client.PlaceMarketEntryWithResult
 		engine.liveBroker.PlaceAlgoOrderFn = client.PlaceAlgoOrder
 		engine.liveBroker.MarketCloseFn = client.PlaceMarketClose
 		engine.liveBroker.PlaceLimitCloseFn = client.PlaceLimitClose
@@ -960,7 +961,7 @@ func main() {
 						_ = client.CancelOrder(ctxC, sym, sp.TP1OrderID, sp.TP1ClientOrderID)
 						cancelC()
 					}
-					engine.recordSymbolExit(sym, time.Now().UTC(), "OFFLINE_CLOSED")
+					engine.recordSymbolExitForStrategy(sym, sp.StrategyID, time.Now().UTC(), "OFFLINE_CLOSED")
 					_ = repo.DeleteLivePosition(ctx, sym)
 				}
 			}
@@ -1051,6 +1052,7 @@ func main() {
 								}
 							}
 							engine.liveBroker.ClearSymbolState(sym)
+							engine.recordSymbolExitForStrategy(sym, "", time.Now().UTC(), "ORPHAN_EMERGENCY_CLOSE")
 						}
 					} else {
 						// Posisi memiliki SL aktif, DB gagal dimuat, verifikasi gagal (fail-safe: jangan blind close), atau policy=ADOPT
@@ -1292,12 +1294,14 @@ func main() {
 	// Tunggu sinyal shutdown
 	<-ctx.Done()
 	slog.Info("shutdown signal received, initiating graceful termination...")
-	engine.shuttingDown.Store(true)
 	engine.majorBatchMu.Lock()
+	engine.shuttingDown.Store(true)
 	if engine.majorBatchTimer != nil {
 		engine.majorBatchTimer.Stop()
 		engine.majorBatchTimer = nil
 	}
+	engine.majorBatchEntries = make(map[string]majorBatchEntry)
+	engine.majorBatchHour = time.Time{}
 	engine.majorBatchMu.Unlock()
 
 	if webServer != nil {
@@ -1611,6 +1615,9 @@ func (e *BotEngine) verifyLiveSymbolList(ctx context.Context, candidates []strin
 
 	targetLev := int(math.Round(e.cfg.Leverage))
 	verifiedWatched := make([]string, 0, len(candidates))
+	verifiedSet := make(map[string]bool, len(candidates))
+	var pendingVerify []string
+
 	for _, sym := range candidates {
 		e.verifiedMu.RLock()
 		alreadyVerified := e.verifiedSymbols[sym]
@@ -1624,44 +1631,83 @@ func (e *BotEngine) verifyLiveSymbolList(ctx context.Context, candidates []strin
 				st.Mu.Unlock()
 			}
 			e.statesMu.Unlock()
-			verifiedWatched = append(verifiedWatched, sym)
+			verifiedSet[sym] = true
 			continue
 		}
 
-		verifyCtx, verifyCancel := context.WithTimeout(ctx, 15*time.Second)
-		ok, err := e.client.InitAndVerifySymbolMarginAndLeverage(verifyCtx, sym, targetLev)
-		verifyCancel()
-		if err != nil || !ok {
-			if monitoredSet[sym] {
-				// Pertahankan stream simbol yang sedang punya posisi/order aktif agar monitoring markPrice/SL/TP tidak putus;
-				// tetap biarkan IsLeverageIsolatedVerified=false agar tidak membuka entry baru sebelum terverifikasi.
-				slog.Warn("symbol setup failed on actively monitored symbol; keeping stream feed without enabling new entries", "symbol", sym, "err", err)
-				verifiedWatched = append(verifiedWatched, sym)
-			} else {
-				slog.Warn("symbol setup failed; excluding unverified symbol from live trading", "symbol", sym, "err", err)
-				e.statesMu.Lock()
-				if sym != BenchmarkSymbol && !e.majorPodSet[sym] {
-					delete(e.activeStates, sym)
+		setCtx, setCancel := context.WithTimeout(ctx, 10*time.Second)
+		err := e.client.SetSymbolMarginAndLeverage(setCtx, sym, targetLev)
+		setCancel()
+		if err != nil {
+			slog.Warn("symbol margin/leverage setup failed; skipping verification", "symbol", sym, "err", err)
+			continue
+		}
+		pendingVerify = append(pendingVerify, sym)
+	}
+
+	if len(pendingVerify) > 0 {
+		bulkCtx, bulkCancel := context.WithTimeout(ctx, 15*time.Second)
+		risks, rErr := e.client.GetPositionRisk(bulkCtx, "")
+		bulkCancel()
+		if rErr != nil {
+			slog.Warn("bulk positionRisk verification failed; unverified pending symbols excluded from new entries", "count", len(pendingVerify), "err", rErr)
+		} else {
+			riskMap := make(map[string]exchange.PositionRiskResponse, len(risks))
+			for _, pr := range risks {
+				if pr.Symbol != "" {
+					riskMap[pr.Symbol] = pr
 				}
-				if updateWatchedCoins {
-					delete(e.primaryWatchedSet, sym)
-					delete(e.breakoutWatchedSet, sym)
-					delete(e.sweepExtraWatchedSet, sym)
+			}
+			for _, sym := range pendingVerify {
+				pr, found := riskMap[sym]
+				if !found {
+					continue
+				}
+				if pr.MarginType != "" && !strings.EqualFold(pr.MarginType, "isolated") {
+					slog.Warn("symbol marginType verification mismatch", "symbol", sym, "got", pr.MarginType)
+					continue
+				}
+				if pr.Leverage != "" {
+					if actualLev, convErr := strconv.Atoi(strings.TrimSpace(pr.Leverage)); convErr != nil || actualLev != targetLev {
+						slog.Warn("symbol leverage verification mismatch", "symbol", sym, "expected", targetLev, "got", pr.Leverage)
+						continue
+					}
+				}
+				verifiedSet[sym] = true
+				e.verifiedMu.Lock()
+				e.verifiedSymbols[sym] = true
+				e.verifiedMu.Unlock()
+				e.statesMu.Lock()
+				if st, exists := e.activeStates[sym]; exists {
+					st.Mu.Lock()
+					st.IsLeverageIsolatedVerified = true
+					st.Mu.Unlock()
 				}
 				e.statesMu.Unlock()
 			}
+		}
+	}
+
+	for _, sym := range candidates {
+		if verifiedSet[sym] {
+			verifiedWatched = append(verifiedWatched, sym)
+			continue
+		}
+		if monitoredSet[sym] {
+			slog.Warn("symbol setup failed on actively monitored symbol; keeping stream feed without enabling new entries", "symbol", sym)
+			verifiedWatched = append(verifiedWatched, sym)
 		} else {
-			e.verifiedMu.Lock()
-			e.verifiedSymbols[sym] = true
-			e.verifiedMu.Unlock()
+			slog.Warn("symbol setup failed; excluding unverified symbol from live trading", "symbol", sym)
 			e.statesMu.Lock()
-			if st, exists := e.activeStates[sym]; exists {
-				st.Mu.Lock()
-				st.IsLeverageIsolatedVerified = true
-				st.Mu.Unlock()
+			if sym != BenchmarkSymbol && !e.majorPodSet[sym] {
+				delete(e.activeStates, sym)
+			}
+			if updateWatchedCoins {
+				delete(e.primaryWatchedSet, sym)
+				delete(e.breakoutWatchedSet, sym)
+				delete(e.sweepExtraWatchedSet, sym)
 			}
 			e.statesMu.Unlock()
-			verifiedWatched = append(verifiedWatched, sym)
 		}
 	}
 	if updateWatchedCoins {
@@ -1951,6 +1997,9 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 			for _, k := range filteredKlines {
 				btcSt.ApplyClosedCandleLocked(k, e.scannerCfg.BootstrapCount, e.scannerCfg.DeltaWindow+1)
 			}
+			if e.evaluatorCfg.MajorPod.IsEnabled() {
+				e.updateHourlyHistoryFromStateLocked(BenchmarkSymbol, btcSt, filteredKlines[len(filteredKlines)-1], e.cfg.CandleDuration, true)
+			}
 			btcSt.Mu.Unlock()
 			e.notifyBTCCandleClosed(filteredKlines[len(filteredKlines)-1].OpenTime)
 		}
@@ -1971,7 +2020,10 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	// Jika mode Live, verifikasi One-Way mode dan leverage untuk simbol terpilih (M11 FIX & M4 Cache)
 	if !e.cfg.DryRun {
 		finalWatched = e.verifyLiveWatchlist(ctx, finalWatched)
-		if len(majorStreamSymbols) > 0 {
+		e.verifiedMu.RLock()
+		owOK := e.oneWayVerified
+		e.verifiedMu.RUnlock()
+		if owOK && len(majorStreamSymbols) > 0 {
 			majorStreamSymbols = e.verifyLiveSymbolList(ctx, majorStreamSymbols, false)
 		}
 	} else {
@@ -2128,6 +2180,12 @@ func (e *BotEngine) syncMajorPodStates(
 			} else if len(klines) > 0 {
 				if bsErr := scanner.BootstrapSymbolState(st, klines, e.exchangeNow(), bootCap, deltaCap, e.cfg.CandleDuration); bsErr != nil {
 					slog.Warn("major pod klines bootstrap failed", "symbol", sym, "err", bsErr)
+				} else {
+					st.Mu.Lock()
+					if len(st.ClosedCandles) > 0 {
+						e.updateHourlyHistoryFromStateLocked(sym, st, st.ClosedCandles[len(st.ClosedCandles)-1], e.cfg.CandleDuration, true)
+					}
+					st.Mu.Unlock()
 				}
 			}
 			e.syncHourlyCandlesForSymbol(scanCtx, sym, st, e.exchangeNow())
@@ -2444,9 +2502,7 @@ func (e *BotEngine) processClosedKlineWS(streamCtx context.Context, symbol strin
 	shouldDispatch := false
 	if !hasGap && (okApplied || alreadyIngestedLatest) {
 		shouldDispatch = st.MarkCandleEvaluatedLocked(candle.OpenTime)
-		if okApplied {
-			e.updateHourlyHistoryFromStateLocked(symbol, st, candle, expectedStep, false)
-		}
+		e.updateHourlyHistoryFromStateLocked(symbol, st, candle, expectedStep, false)
 	}
 	st.Mu.Unlock()
 
@@ -2576,6 +2632,9 @@ func (e *BotEngine) handleGappedClosedCandle(ctx context.Context, symbol string,
 	}
 	if triggerCandle.OpenTime.Equal(prevOpen) {
 		shouldDispatch := !st.HasRecentGapLocked(expectedStep) && st.MarkCandleEvaluatedLocked(triggerCandle.OpenTime)
+		if shouldDispatch {
+			e.updateHourlyHistoryFromStateLocked(symbol, st, triggerCandle, expectedStep, false)
+		}
 		st.Mu.Unlock()
 		if !shouldDispatch {
 			return
@@ -2584,13 +2643,16 @@ func (e *BotEngine) handleGappedClosedCandle(ctx context.Context, symbol string,
 			e.notifyBTCCandleClosed(triggerCandle.OpenTime)
 			return
 		}
-		e.evaluateAndLogClosedCandle(triggerCandle, st)
+		e.dispatchEvaluationsForClosedCandle(symbol, triggerCandle, st)
 		return
 	}
 	gapStep := triggerCandle.OpenTime.Sub(prevOpen)
 	if gapStep <= expectedStep {
 		okApplied := gapStep == expectedStep && st.ApplyClosedCandleLocked(triggerCandle, bootCap, deltaCap)
 		shouldDispatch := okApplied && !st.HasRecentGapLocked(expectedStep) && st.MarkCandleEvaluatedLocked(triggerCandle.OpenTime)
+		if shouldDispatch {
+			e.updateHourlyHistoryFromStateLocked(symbol, st, triggerCandle, expectedStep, false)
+		}
 		st.Mu.Unlock()
 		if !shouldDispatch {
 			return
@@ -2599,7 +2661,7 @@ func (e *BotEngine) handleGappedClosedCandle(ctx context.Context, symbol string,
 			e.notifyBTCCandleClosed(triggerCandle.OpenTime)
 			return
 		}
-		e.evaluateAndLogClosedCandle(triggerCandle, st)
+		e.dispatchEvaluationsForClosedCandle(symbol, triggerCandle, st)
 		return
 	}
 	st.Mu.Unlock()
@@ -3194,8 +3256,10 @@ func (e *BotEngine) syncHourlyCandlesForSymbol(ctx context.Context, sym string, 
 	if e == nil || st == nil || e.client == nil || !e.evaluatorCfg.MajorPod.IsEnabled() {
 		return
 	}
+	lastCompletedHourOpen := serverTime.UTC().Truncate(time.Hour).Add(-time.Hour)
 	st.Mu.Lock()
-	needSync := len(st.ClosedHourlyCandles) < strategy.MajorPodHourlyHistoryCap-5 || st.HasRecentHourlyGapLocked(48*time.Hour)
+	tailStale := len(st.ClosedHourlyCandles) == 0 || st.ClosedHourlyCandles[len(st.ClosedHourlyCandles)-1].OpenTime.Before(lastCompletedHourOpen)
+	needSync := tailStale || len(st.ClosedHourlyCandles) < strategy.MajorPodHourlyHistoryCap-5 || st.HasRecentHourlyGapLocked(48*time.Hour)
 	st.Mu.Unlock()
 	if !needSync {
 		return
@@ -3300,14 +3364,14 @@ func normalizeHourBatchTime(t time.Time) time.Time {
 }
 
 func (e *BotEngine) enqueueMajorPodHourCandle(candle model.Candle, st *model.SymbolState) {
-	if e == nil || st == nil || e.shuttingDown.Load() {
+	if e == nil || st == nil {
 		return
 	}
 	hourEnd := normalizeHourBatchTime(candle.CloseTime)
 	hourKey := hourEnd.Unix()
 	batchWin := e.majorBatchWindow
 	if batchWin <= 0 {
-		batchWin = 600 * time.Millisecond
+		batchWin = 1800 * time.Millisecond
 	}
 	expectedCnt := e.expectedMajorPodCount()
 
@@ -3315,18 +3379,24 @@ func (e *BotEngine) enqueueMajorPodHourCandle(candle model.Candle, st *model.Sym
 	var flushItems []majorBatchEntry
 
 	e.majorBatchMu.Lock()
+	if e.shuttingDown.Load() {
+		e.majorBatchMu.Unlock()
+		return
+	}
 	if e.majorBatchDispatched == nil {
 		e.majorBatchDispatched = make(map[int64]bool)
 	}
-	if e.majorBatchDispatched[hourKey] {
-		e.majorBatchMu.Unlock()
-		if !e.shuttingDown.Load() {
-			e.evalWg.Add(1)
-			go func(c model.Candle, s *model.SymbolState, h time.Time) {
-				defer e.evalWg.Done()
-				e.flushMajorPodBatchEntries(h, []majorBatchEntry{{candle: c, state: s}})
-			}(candle, st, hourEnd)
+	if e.majorBatchDispatched[hourKey] || (!e.majorBatchHour.IsZero() && hourEnd.Before(e.majorBatchHour)) {
+		dispatchedBefore := e.majorBatchDispatched[hourKey]
+		if !dispatchedBefore {
+			e.majorBatchDispatched[hourKey] = true
 		}
+		e.evalWg.Add(1)
+		e.majorBatchMu.Unlock()
+		go func(c model.Candle, s *model.SymbolState, h time.Time) {
+			defer e.evalWg.Done()
+			e.flushMajorPodBatchEntries(h, []majorBatchEntry{{candle: c, state: s}})
+		}(candle, st, hourEnd)
 		return
 	}
 
@@ -3383,17 +3453,21 @@ func (e *BotEngine) enqueueMajorPodHourCandle(candle model.Candle, st *model.Sym
 			delete(e.majorBatchDispatched, oldK)
 		}
 	}
+	if len(flushItems) > 0 {
+		e.evalWg.Add(1)
+	}
+	if len(readyItems) > 0 {
+		e.evalWg.Add(1)
+	}
 	e.majorBatchMu.Unlock()
 
-	if len(flushItems) > 0 && !e.shuttingDown.Load() {
-		e.evalWg.Add(1)
+	if len(flushItems) > 0 {
 		go func(h time.Time, items []majorBatchEntry) {
 			defer e.evalWg.Done()
 			e.flushMajorPodBatchEntries(h, items)
 		}(flushHour, flushItems)
 	}
-	if len(readyItems) > 0 && !e.shuttingDown.Load() {
-		e.evalWg.Add(1)
+	if len(readyItems) > 0 {
 		go func(h time.Time, items []majorBatchEntry) {
 			defer e.evalWg.Done()
 			e.flushMajorPodBatchEntries(h, items)
@@ -3402,12 +3476,12 @@ func (e *BotEngine) enqueueMajorPodHourCandle(candle model.Candle, st *model.Sym
 }
 
 func (e *BotEngine) triggerMajorBatchTimeout(targetHour time.Time) {
-	if e == nil || e.shuttingDown.Load() {
+	if e == nil {
 		return
 	}
 	var items []majorBatchEntry
 	e.majorBatchMu.Lock()
-	if !e.majorBatchHour.Equal(targetHour) || len(e.majorBatchEntries) == 0 {
+	if e.shuttingDown.Load() || !e.majorBatchHour.Equal(targetHour) || len(e.majorBatchEntries) == 0 {
 		e.majorBatchMu.Unlock()
 		return
 	}
@@ -3421,13 +3495,11 @@ func (e *BotEngine) triggerMajorBatchTimeout(targetHour time.Time) {
 	e.majorBatchEntries = make(map[string]majorBatchEntry)
 	e.majorBatchHour = time.Time{}
 	e.majorBatchTimer = nil
+	e.evalWg.Add(1)
 	e.majorBatchMu.Unlock()
 
-	if len(items) > 0 && !e.shuttingDown.Load() {
-		e.evalWg.Add(1)
-		defer e.evalWg.Done()
-		e.flushMajorPodBatchEntries(targetHour, items)
-	}
+	defer e.evalWg.Done()
+	e.flushMajorPodBatchEntries(targetHour, items)
 }
 
 type majorBatchAuditRecord struct {
@@ -3496,6 +3568,18 @@ func (e *BotEngine) flushMajorPodBatchEntries(batchHour time.Time, items []major
 			btcStaleSub = fmt.Sprintf("BTC_LATEST_%s_BEFORE_%s",
 				latestBTCOpen.UTC().Format(time.RFC3339),
 				refOpenTime.UTC().Format(time.RFC3339))
+		} else {
+			btcH := btcSnap.ClosedHourlyCandles
+			if len(btcH) == 0 {
+				btcH = strategy.ResampleCompletedHourlyStrict(btcSnap.ClosedCandles, e.cfg.CandleDuration)
+			}
+			if len(btcH) == 0 {
+				btcStaleOrMissing = true
+				btcStaleSub = "BTC_1H_HISTORY_EMPTY"
+			} else if normalizeHourBatchTime(btcH[len(btcH)-1].CloseTime).Before(batchHour) {
+				btcStaleOrMissing = true
+				btcStaleSub = "BTC_1H_BEHIND_BATCH_HOUR"
+			}
 		}
 	}
 
@@ -3529,11 +3613,13 @@ func (e *BotEngine) flushMajorPodBatchEntries(batchHour time.Time, items []major
 		snap.PortfolioDrawdownPct = portDD
 		snap.LastExitTime = time.Time{}
 		snap.LastExitReason = ""
+		isMajSym := e.isMajorPodSymbol(snap.Symbol)
+		inPod1 := e.isInPod1WatchSets(snap.Symbol)
 		e.cooldownMu.RLock()
 		if exitRec, exists := e.majorCooldownExits[snap.Symbol]; exists {
 			snap.LastExitTime = exitRec.ClosedAt
 			snap.LastExitReason = exitRec.ExitReason
-		} else if exitRec, exists := e.cooldownExits[snap.Symbol]; exists && e.isMajorPodSymbol(snap.Symbol) && !e.isInPod1WatchSets(snap.Symbol) {
+		} else if exitRec, exists := e.cooldownExits[snap.Symbol]; exists && isMajSym && !inPod1 {
 			// Legacy fallback when MajorPod history was hydrated without strategy separation
 			if strategy.IsMajorPodStrategy(exitRec.StrategyID) {
 				snap.LastExitTime = exitRec.ClosedAt
@@ -3542,11 +3628,20 @@ func (e *BotEngine) flushMajorPodBatchEntries(batchHour time.Time, items []major
 		}
 		e.cooldownMu.RUnlock()
 
+		symH := snap.ClosedHourlyCandles
+		if len(symH) == 0 {
+			symH = strategy.ResampleCompletedHourlyStrict(snap.ClosedCandles, e.cfg.CandleDuration)
+		}
+		symHourStale := len(symH) == 0 ||
+			normalizeHourBatchTime(symH[len(symH)-1].CloseTime).Before(batchHour)
+
 		var cand strategy.MajorRSMomCandidate
 		if accountStale {
 			cand = strategy.MajorRSMomCandidate{Symbol: snap.Symbol, StrategyID: strategy.StrategyIDMajorRSMomShort, Reason: "STALE_ACCOUNT_FEED", SubReason: "LIVE_ACCOUNT_SNAPSHOT_EXPIRED"}
 		} else if btcStaleOrMissing {
 			cand = strategy.MajorRSMomCandidate{Symbol: snap.Symbol, StrategyID: strategy.StrategyIDMajorRSMomShort, Reason: "STALE_BTC_MACRO_CANDLE", SubReason: btcStaleSub}
+		} else if symHourStale {
+			cand = strategy.MajorRSMomCandidate{Symbol: snap.Symbol, StrategyID: strategy.StrategyIDMajorRSMomShort, Reason: "STALE_SYM_1H_BAR", SubReason: "SYM_1H_BEHIND_BATCH_HOUR"}
 		} else {
 			cand = strategy.EvaluateMajorRSMomCandidate(snap, btcSnap, e.broker.HasActiveOrderOrPosition(snap.Symbol), isDailyBreached, e.evaluatorCfg)
 		}

@@ -253,7 +253,7 @@ func alignHourlyBTCBar(btcH []model.Candle, symHour model.Candle) (int, bool) {
 	if bestIdx < 0 {
 		return -1, false
 	}
-	if symHour.OpenTime.Sub(btcH[bestIdx].OpenTime) > time.Hour {
+	if symHour.OpenTime.Sub(btcH[bestIdx].OpenTime) >= time.Hour {
 		return bestIdx, false
 	}
 	return bestIdx, true
@@ -467,10 +467,16 @@ func EvaluateMajorRSMomCandidate(
 			cand.SubReason = fmt.Sprintf("DZ_%.2f_GT_-%.2f", dz, cfg.MajorPod.MinDeltaZ)
 			return cand
 		}
-		if cfg.MajorPod.ShortMinFundingRate > -0.99 && snap.FundingRate < cfg.MajorPod.ShortMinFundingRate {
-			cand.Reason = "MAJOR_SHORT_FUNDING_TOO_NEGATIVE"
-			cand.SubReason = fmt.Sprintf("FR_%.5f_LT_%.5f", snap.FundingRate, cfg.MajorPod.ShortMinFundingRate)
-			return cand
+		if cfg.MajorPod.ShortMinFundingRate > -0.99 {
+			if !isFiniteFloat(snap.FundingRate) {
+				cand.Reason = "INVALID_FUNDING_RATE"
+				return cand
+			}
+			if snap.FundingRate < cfg.MajorPod.ShortMinFundingRate {
+				cand.Reason = "MAJOR_SHORT_FUNDING_TOO_NEGATIVE"
+				cand.SubReason = fmt.Sprintf("FR_%.5f_LT_%.5f", snap.FundingRate, cfg.MajorPod.ShortMinFundingRate)
+				return cand
+			}
 		}
 		cand.Approved = true
 		cand.Reason = "SIGNAL_APPROVED"
@@ -506,6 +512,10 @@ func EvaluateMajorRSMomCandidate(
 		if dz < cfg.MajorPod.MinDeltaZ {
 			cand.Reason = "MAJOR_LONG_WEAK_DELTA_Z"
 			cand.SubReason = fmt.Sprintf("DZ_%.2f_LT_%.2f", dz, cfg.MajorPod.MinDeltaZ)
+			return cand
+		}
+		if !isFiniteFloat(snap.FundingRate) {
+			cand.Reason = "INVALID_FUNDING_RATE"
 			return cand
 		}
 		if snap.FundingRate > cfg.MajorPod.LongMaxFundingRate {

@@ -415,3 +415,74 @@ func TestMergeCompletedHourlyCandleAndPrecedence(t *testing.T) {
 		t.Fatalf("expected BTC full 500h EMA200 to keep regime SHORT (blocking LONG), got %+v", cand)
 	}
 }
+
+func TestMajorRSMom_Rejects1hStaleBTCAndNaNFunding(t *testing.T) {
+	base := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	endSym := base.Add(220 * time.Hour)
+	btc15m := buildSynthetic15mHourlySeries(base, 219, func(h int) float64 { return 100.0 + float64(h)*0.1 }, nil, nil, nil)
+	sol15m := buildSynthetic15mHourlySeries(base, 220, func(h int) float64 {
+		if h < 219 {
+			return 100.0
+		}
+		return 112.0
+	}, nil, nil, func(h int) float64 {
+		if h == 219 {
+			return 2_000_000.0
+		}
+		if h%2 == 0 {
+			return 100_000.0
+		}
+		return -100_000.0
+	})
+	cfg := EvaluatorConfig{
+		CandleDuration: 15 * time.Minute,
+		MajorPod: MajorPodConfig{
+			ShortEnabled:        true,
+			LongEnabled:         true,
+			Symbols:             []string{"BTCUSDT", "SOLUSDT"},
+			ShortRSMinPct:       3.0,
+			LongRSMinPct:        4.5,
+			LongRSMaxPct:        20.0,
+			RSWindowHours:       24,
+			BreakoutLookbackHrs: 12,
+			MinDeltaZ:           0.40,
+			LongMaxFundingRate:  0.0001,
+			ShortMinFundingRate: -1.0,
+		},
+	}
+	btcSnap := &model.MarketSnapshot{
+		Symbol:              "BTCUSDT",
+		Now:                 endSym,
+		ClosedCandles:       btc15m,
+		ClosedHourlyCandles: MergeCompletedHourlyCandle(nil, btc15m, 15*time.Minute, MajorPodHourlyHistoryCap),
+	}
+	solSnap := model.MarketSnapshot{
+		Symbol:              "SOLUSDT",
+		Now:                 endSym,
+		BestBid:             111.99,
+		BestAsk:             112.01,
+		BookUpdatedAt:       endSym,
+		MarkPrice:           112.0,
+		MarkPriceUpdatedAt:  endSym,
+		FundingRate:         0.0,
+		FundingUpdatedAt:    endSym,
+		ClosedCandles:       sol15m,
+		ClosedHourlyCandles: MergeCompletedHourlyCandle(nil, sol15m, 15*time.Minute, MajorPodHourlyHistoryCap),
+	}
+
+	// 1. BTC 1h history lagging 1 full hour behind SOL must be strictly rejected
+	staleCand := EvaluateMajorRSMomCandidate(solSnap, btcSnap, false, false, cfg)
+	if staleCand.Reason != "STALE_BTC_1H_BAR" {
+		t.Fatalf("expected 1h-stale BTC bar rejected with STALE_BTC_1H_BAR, got %+v", staleCand)
+	}
+
+	// 2. Align BTC to 220h above EMA200 and pass NaN FundingRate on LONG -> INVALID_FUNDING_RATE
+	btcFull := buildSynthetic15mHourlySeries(base, 220, func(h int) float64 { return 100.0 + float64(h)*0.1 }, nil, nil, nil)
+	btcSnap.ClosedCandles = btcFull
+	btcSnap.ClosedHourlyCandles = MergeCompletedHourlyCandle(nil, btcFull, 15*time.Minute, MajorPodHourlyHistoryCap)
+	solSnap.FundingRate = math.NaN()
+	nanCand := EvaluateMajorRSMomCandidate(solSnap, btcSnap, false, false, cfg)
+	if nanCand.Reason != "INVALID_FUNDING_RATE" {
+		t.Fatalf("expected NaN FundingRate rejected with INVALID_FUNDING_RATE, got %+v", nanCand)
+	}
+}

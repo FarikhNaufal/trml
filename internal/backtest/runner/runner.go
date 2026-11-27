@@ -189,6 +189,9 @@ func PrepareDataset(ctx context.Context, opts CommonOptions) (*LoadedDataset, er
 		if barLead := time.Duration(220) * candleDur; barLead > minLead {
 			minLead = barLead
 		}
+		if appCfg != nil && appCfg.MajorPod.IsEnabled() && minLead < 220*time.Hour {
+			minLead = 220 * time.Hour
+		}
 		if requiredFrom := todayStart.Add(-minLead); opts.From.IsZero() || opts.From.After(requiredFrom) {
 			opts.From = requiredFrom
 		}

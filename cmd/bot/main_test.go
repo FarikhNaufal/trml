@@ -1891,3 +1891,119 @@ func TestBotEngine_MajorPodHourCloseBatchRankingAndPod1Isolation(t *testing.T) {
 		t.Fatalf("unexpected 3-pod telemetry fields: %+v", telem)
 	}
 }
+
+func TestBotEngine_AlreadyIngestedUpdatesHourly_And_CooldownLockOrdering(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hourBase := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	ef := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinQty:      decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	btcSt := model.NewSymbolState(BenchmarkSymbol, ef, 200, 50)
+	solSt := model.NewSymbolState("SOLUSDT", ef, 200, 50)
+
+	// Simulate REST scan ingesting all 4 sub-bars of 10:00..11:00 UTC BEFORE WS delivers the :45 bar
+	var lastSolCandle model.Candle
+	for i := 0; i < 4; i++ {
+		ot := hourBase.Add(time.Duration(i) * 15 * time.Minute)
+		ct := ot.Add(15*time.Minute - time.Millisecond)
+		btcSt.ApplyClosedCandleLocked(model.Candle{
+			OpenTime: ot, CloseTime: ct,
+			Open: 90000, High: 90100, Low: 89900, Close: 90050, VolumeBase: 10, QuoteVolumeUSDT: 900000, TakerBuyQuoteUSDT: 450000,
+		}, 200, 50)
+		lastSolCandle = model.Candle{
+			OpenTime: ot, CloseTime: ct,
+			Open: 150, High: 151, Low: 149, Close: 150.5, VolumeBase: 100, QuoteVolumeUSDT: 15000, TakerBuyQuoteUSDT: 9000,
+		}
+		solSt.ApplyClosedCandleLocked(lastSolCandle, 200, 50)
+	}
+	if len(solSt.ClosedHourlyCandles) != 0 {
+		t.Fatalf("expected 0 hourly candles before WS duplicate arrival, got %d", len(solSt.ClosedHourlyCandles))
+	}
+
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(1000), broker.DryRunConfig{
+		MaxSlots:        9,
+		AccountLeverage: 10,
+	})
+	defer dry.Close()
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:         true,
+			CandleDuration: 15 * time.Minute,
+			MaxSlots:       6,
+		},
+		broker:           dry,
+		dryRunBroker:     dry,
+		hasCompletedScan: true,
+		majorPodSet:      map[string]bool{"SOLUSDT": true},
+		activeStates: map[string]*model.SymbolState{
+			BenchmarkSymbol: btcSt,
+			"SOLUSDT":       solSt,
+		},
+		cooldownExits: map[string]storage.RecentExitRecord{
+			"SOLUSDT": {Symbol: "SOLUSDT", StrategyID: "VWAP_PULLBACK", ClosedAt: hourBase, ExitReason: "STOP_LOSS"},
+		},
+		majorCooldownExits: make(map[string]storage.RecentExitRecord),
+		primaryWatchedSet:  make(map[string]bool),
+		breakoutWatchedSet: make(map[string]bool),
+		sweepExtraWatchedSet: make(map[string]bool),
+		evaluatorCfg: strategy.EvaluatorConfig{
+			CandleDuration: 15 * time.Minute,
+			MajorPod: strategy.MajorPodConfig{
+				ShortEnabled: true,
+				LongEnabled:  true,
+				Symbols:      []string{"SOLUSDT"},
+				MaxSlots:     3,
+			},
+		},
+		majorBatchWindow: 50 * time.Millisecond,
+	}
+
+	// WS delivers :45 candle which was already ingested by REST (alreadyIngestedLatest path)
+	eng.processClosedKlineWS(ctx, "SOLUSDT", lastSolCandle, "15m")
+	solSt.Mu.Lock()
+	hCount := len(solSt.ClosedHourlyCandles)
+	solSt.Mu.Unlock()
+	if hCount != 1 {
+		t.Fatalf("expected alreadyIngestedLatest path to merge 1h candle into ClosedHourlyCandles, got %d", hCount)
+	}
+
+	// Stress concurrent flushMajorPodBatchEntries + recordSymbolExitForStrategy + state write lock under -race (no AB-BA deadlock)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			eng.flushMajorPodBatchEntries(hourBase.Add(time.Hour), []majorBatchEntry{{candle: lastSolCandle, state: solSt}})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			eng.recordSymbolExitForStrategy("SOLUSDT", strategy.StrategyIDMajorRSMomShort, hourBase.Add(time.Duration(i)*time.Minute), "STOP_LOSS")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			eng.statesMu.Lock()
+			eng.hasCompletedScan = true
+			eng.statesMu.Unlock()
+		}
+	}()
+	wg.Wait()
+
+	// Verify shuttingDown blocks triggerMajorBatchTimeout atomically
+	eng.majorBatchMu.Lock()
+	eng.shuttingDown.Store(true)
+	eng.majorBatchHour = hourBase.Add(time.Hour)
+	eng.majorBatchEntries = map[string]majorBatchEntry{"SOLUSDT": {candle: lastSolCandle, state: solSt}}
+	eng.majorBatchMu.Unlock()
+	eng.triggerMajorBatchTimeout(hourBase.Add(time.Hour))
+	eng.evalWg.Wait()
+}

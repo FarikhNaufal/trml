@@ -101,6 +101,13 @@ func (c *Client) PlaceLimitEntry(ctx context.Context, intent model.OrderIntent) 
 
 // PlaceMarketEntry mengirimkan order MARKET ke Binance Futures (POST /fapi/v1/order)
 func (c *Client) PlaceMarketEntry(ctx context.Context, intent model.OrderIntent) (int64, error) {
+	orderID, _, _, _, err := c.PlaceMarketEntryWithResult(ctx, intent)
+	return orderID, err
+}
+
+// PlaceMarketEntryWithResult mengirimkan order MARKET dengan newOrderRespType=RESULT
+// agar broker dapat langsung memproses fill dan memasang SL/TP tanpa menunggu User Data WS.
+func (c *Client) PlaceMarketEntryWithResult(ctx context.Context, intent model.OrderIntent) (int64, decimal.Decimal, decimal.Decimal, model.OrderLifecycleStatus, error) {
 	params := url.Values{}
 	params.Set("symbol", intent.Symbol)
 	if intent.Side == model.SideLong {
@@ -109,20 +116,27 @@ func (c *Client) PlaceMarketEntry(ctx context.Context, intent model.OrderIntent)
 		params.Set("side", "SELL")
 	}
 	params.Set("type", "MARKET")
+	params.Set("newOrderRespType", "RESULT")
 	params.Set("quantity", intent.Qty.String())
 	params.Set("newClientOrderId", intent.ClientOrderID)
 
 	respBytes, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/order", params, true)
 	if err != nil {
-		return 0, fmt.Errorf("place market entry: %w (body: %s)", err, string(respBytes))
+		return 0, decimal.Zero, decimal.Zero, "", fmt.Errorf("place market entry: %w (body: %s)", err, string(respBytes))
 	}
 
 	var resp OrderResponse
 	if err := sonic.Unmarshal(respBytes, &resp); err != nil {
-		return 0, fmt.Errorf("place market entry: failed to decode response: %w", err)
+		return 0, decimal.Zero, decimal.Zero, "", fmt.Errorf("place market entry: failed to decode response: %w", err)
 	}
 
-	return resp.OrderID, nil
+	avgPrice, _ := decimal.NewFromString(resp.AvgPrice)
+	executedQty, _ := decimal.NewFromString(resp.ExecutedQty)
+	status := model.OrderLifecycleStatus(strings.ToUpper(strings.TrimSpace(resp.Status)))
+	if status == "" && executedQty.GreaterThan(decimal.Zero) {
+		status = model.StatusFilled
+	}
+	return resp.OrderID, avgPrice, executedQty, status, nil
 }
 
 // PlaceAlgoOrder mengirimkan order proteksi STOP_MARKET atau TAKE_PROFIT_MARKET (POST /fapi/v1/algoOrder)
@@ -390,9 +404,8 @@ func (c *Client) EnsureOneWayMode(ctx context.Context) error {
 	return nil
 }
 
-// InitAndVerifySymbolMarginAndLeverage memverifikasi isolasi margin dan leverage untuk satu simbol (tanpa GET positionSide/dual).
-func (c *Client) InitAndVerifySymbolMarginAndLeverage(ctx context.Context, symbol string, leverage int) (bool, error) {
-	// 1. Set Margin Type ISOLATED (abaikan error jika sudah ISOLATED / code -4046)
+// SetSymbolMarginAndLeverage mengatur tipe margin ISOLATED (abaikan -4046) dan leverage untuk satu simbol.
+func (c *Client) SetSymbolMarginAndLeverage(ctx context.Context, symbol string, leverage int) error {
 	marginParams := url.Values{}
 	marginParams.Set("symbol", symbol)
 	marginParams.Set("marginType", "ISOLATED")
@@ -401,17 +414,23 @@ func (c *Client) InitAndVerifySymbolMarginAndLeverage(ctx context.Context, symbo
 		var apiErr *APIError
 		isAlreadyIsolated := errors.As(err, &apiErr) && apiErr.Code == -4046
 		if !isAlreadyIsolated && !strings.Contains(err.Error(), "-4046") && !strings.Contains(err.Error(), "No need to change") {
-			return false, fmt.Errorf("failed to set margin type to ISOLATED: %w", err)
+			return fmt.Errorf("failed to set margin type to ISOLATED: %w", err)
 		}
 	}
 
-	// 2. Set Leverage
 	levParams := url.Values{}
 	levParams.Set("symbol", symbol)
 	levParams.Set("leverage", strconv.Itoa(leverage))
-	_, err = c.DoRequest(ctx, http.MethodPost, "/fapi/v1/leverage", levParams, true)
-	if err != nil {
-		return false, fmt.Errorf("failed to set leverage: %w", err)
+	if _, err := c.DoRequest(ctx, http.MethodPost, "/fapi/v1/leverage", levParams, true); err != nil {
+		return fmt.Errorf("failed to set leverage: %w", err)
+	}
+	return nil
+}
+
+// InitAndVerifySymbolMarginAndLeverage memverifikasi isolasi margin dan leverage untuk satu simbol (tanpa GET positionSide/dual).
+func (c *Client) InitAndVerifySymbolMarginAndLeverage(ctx context.Context, symbol string, leverage int) (bool, error) {
+	if err := c.SetSymbolMarginAndLeverage(ctx, symbol, leverage); err != nil {
+		return false, err
 	}
 
 	// 3. Verifikasi final state simbol di bursa (fail-closed)

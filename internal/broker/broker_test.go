@@ -6929,3 +6929,124 @@ func TestDryRunBroker_StrategyExitProfilesAndFilteredSlots(t *testing.T) {
 		t.Fatalf("expected SOLUSDT closed at 49h (> 48h)")
 	}
 }
+
+func TestBinanceLiveBroker_MarketEntryWithResultArmsProtectionSynchronously(t *testing.T) {
+	now := time.Now().UTC()
+	b := NewBinanceLiveBroker(LiveBrokerConfig{
+		MaxSlots:        9,
+		AccountLeverage: 10.0,
+		EntryOrderType:  "LIMIT", // QMAX default LIMIT, MajorPod overrides per-intent to MARKET
+		SlippageRate:    0.0002,
+		TakerFeeRate:    0.0005,
+		MakerFeeRate:    0.0002,
+		StrategyExitProfiles: map[string]protection.StrategyExitProfile{
+			"MAJOR_RSMOM_LONG": {
+				HasOverride:           true,
+				TrailingEnabled:       true,
+				TrailingActivateATR:   2.5,
+				TrailingDistanceATR:   1.2,
+				StaleLossExitDuration: 0,
+				MaxHoldingDuration:    48 * time.Hour,
+			},
+		},
+	})
+	b.AvailableBalanceUSDT = decimal.NewFromFloat(500)
+	b.WalletBalanceUSDT = decimal.NewFromFloat(500)
+	b.LastAccountUpdateTime = now
+	b.GetExchangeFilterFn = func(sym string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		}, true
+	}
+
+	// Verify fail-closed if MARKET intent submitted without MARKET adapters on LIMIT-default broker
+	if okFail, failErr := b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID:  "SOL_MKT_FAIL",
+		Symbol:         "SOLUSDT",
+		Side:           model.SideLong,
+		StrategyID:     "MAJOR_RSMOM_LONG",
+		EntryOrderType: "MARKET",
+		Qty:            decimal.NewFromFloat(1.0),
+		LimitPrice:     decimal.NewFromFloat(100.0),
+		SLPrice:        decimal.NewFromFloat(96.0),
+		TPPrice:        decimal.NewFromFloat(112.0),
+		ATRAtEntry:     decimal.NewFromFloat(2.0),
+		CreatedAt:      now,
+	}); okFail || failErr == nil {
+		b.Close()
+		t.Fatalf("expected fail-closed error when MARKET adapters missing, got ok=%v err=%v", okFail, failErr)
+	}
+
+	var algoMu sync.Mutex
+	var algoTypes []string
+	var algoSides []model.Side
+	var algoIDSeq atomic.Int64
+	algoIDSeq.Store(5000)
+
+	var savedPosMu sync.Mutex
+	var savedPositions []LiveOpenPosition
+
+	b.PlaceEntryFn = func(ctx context.Context, intent model.OrderIntent) (int64, error) {
+		t.Fatalf("LIMIT PlaceEntryFn must not be called for MARKET MajorPod intent")
+		return 0, nil
+	}
+	b.PlaceMarketEntryWithResultFn = func(ctx context.Context, intent model.OrderIntent) (int64, decimal.Decimal, decimal.Decimal, model.OrderLifecycleStatus, error) {
+		return 88001, decimal.NewFromFloat(100.20), intent.Qty, model.StatusFilled, nil
+	}
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		algoMu.Lock()
+		algoTypes = append(algoTypes, orderType)
+		algoSides = append(algoSides, side)
+		algoMu.Unlock()
+		return algoIDSeq.Add(1), nil
+	}
+	b.OnPositionSavedFn = func(pos LiveOpenPosition) {
+		savedPosMu.Lock()
+		savedPositions = append(savedPositions, pos)
+		savedPosMu.Unlock()
+	}
+
+	okSub, err := b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID:  "SOL_MKT_SYNC",
+		Symbol:         "SOLUSDT",
+		Side:           model.SideLong,
+		StrategyID:     "MAJOR_RSMOM_LONG",
+		EntryOrderType: "MARKET",
+		Qty:            decimal.NewFromFloat(1.5),
+		LimitPrice:     decimal.NewFromFloat(100.10),
+		SLPrice:        decimal.NewFromFloat(96.00),
+		TPPrice:        decimal.NewFromFloat(112.00),
+		ATRAtEntry:     decimal.NewFromFloat(2.00),
+		CreatedAt:      now,
+	})
+	if err != nil || !okSub {
+		b.Close()
+		t.Fatalf("SubmitLimitEntry MARKET failed: ok=%v err=%v", okSub, err)
+	}
+
+	// Duplicate User Data WS ORDER_TRADE_UPDATE must stay idempotent (no duplicate SL/TP algo orders)
+	b.HandleUserDataOrderUpdate("SOL_MKT_SYNC", 88001, "SOLUSDT", model.StatusFilled, decimal.NewFromFloat(1.5), decimal.NewFromFloat(100.20), decimal.Zero)
+	b.Close()
+
+	algoMu.Lock()
+	defer algoMu.Unlock()
+	if len(algoTypes) != 2 {
+		t.Fatalf("expected exactly 2 synchronous algo orders (STOP_MARKET + TAKE_PROFIT_MARKET), got %d: %v", len(algoTypes), algoTypes)
+	}
+	if algoSides[0] != model.SideShort || algoSides[1] != model.SideShort {
+		t.Fatalf("expected SELL/SHORT exit algo sides for LONG entry, got %v", algoSides)
+	}
+
+	savedPosMu.Lock()
+	defer savedPosMu.Unlock()
+	if len(savedPositions) == 0 {
+		t.Fatalf("expected OnPositionSavedFn invoked synchronously after MARKET fill")
+	}
+	lastSaved := savedPositions[len(savedPositions)-1]
+	if lastSaved.StrategyID != "MAJOR_RSMOM_LONG" || !lastSaved.ATRAtEntry.Equal(decimal.NewFromFloat(2.00)) {
+		t.Fatalf("expected persisted StrategyID=MAJOR_RSMOM_LONG and ATRAtEntry=2.00, got %+v", lastSaved)
+	}
+}

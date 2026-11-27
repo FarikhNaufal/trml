@@ -124,9 +124,10 @@ type BinanceLiveBroker struct {
 	ATRAtEntry          map[string]decimal.Decimal // symbol -> atr at entry
 	PeakPrices          map[string]decimal.Decimal // symbol -> highest (long) or lowest (short) mark price
 
-	PositionClientOrderIDs map[string]string          // symbol -> clientOrderID of original entry
-	PositionStrategyIDs    map[string]string          // symbol -> strategyID of original entry
-	ClosingReason          map[string]string          // symbol -> reason for closing (e.g. TIME_STOP_MAX_HOLDING)
+	PositionClientOrderIDs  map[string]string          // symbol -> clientOrderID of original entry
+	PositionStrategyIDs     map[string]string          // symbol -> strategyID of original entry
+	PositionEntryOrderTypes map[string]string          // symbol -> effective entry order type ("LIMIT" / "MARKET")
+	ClosingReason           map[string]string          // symbol -> reason for closing (e.g. TIME_STOP_MAX_HOLDING)
 	PositionUnrealizedPnLs map[string]decimal.Decimal // symbol -> latest unrealized PnL per symbol
 	LastMarkPrices         map[string]decimal.Decimal // symbol -> latest mark price from OnRealtimeTick
 	LastMarkUpdatedAt      map[string]time.Time       // symbol -> timestamp of latest mark price tick
@@ -143,9 +144,10 @@ type BinanceLiveBroker struct {
 	LastAccountPosPrevQty  map[string]decimal.Decimal // symbol -> pre-reduction position qty observed in ACCOUNT_UPDATE
 	lastAsyncRefresh       time.Time                  // debounce timestamp for background RefreshAccount
 
-	PlaceEntryFn             func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
-	PlaceMarketEntryFn       func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
-	PlaceAlgoOrderFn         func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (algoID int64, err error)
+	PlaceEntryFn                 func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
+	PlaceMarketEntryFn           func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, err error)
+	PlaceMarketEntryWithResultFn func(ctx context.Context, intent model.OrderIntent) (exchangeOrderID int64, avgPrice, executedQty decimal.Decimal, status model.OrderLifecycleStatus, err error)
+	PlaceAlgoOrderFn             func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (algoID int64, err error)
 	MarketCloseFn            func(ctx context.Context, symbol string, side model.Side, qty decimal.Decimal, clientOrderID string) (orderID int64, avgPrice, executedQty decimal.Decimal, err error)
 	PlaceLimitCloseFn        func(ctx context.Context, symbol string, side model.Side, qty, price decimal.Decimal, clientOrderID string) (orderID int64, actualClientOrderID string, err error)
 	CancelOrderFn            func(ctx context.Context, symbol string, exchangeOrderID int64, clientOrderID string) error
@@ -253,9 +255,10 @@ func NewBinanceLiveBroker(cfg LiveBrokerConfig) *BinanceLiveBroker {
 		ProtectionTiers:        make(map[string]int),
 		ATRAtEntry:             make(map[string]decimal.Decimal),
 		PeakPrices:             make(map[string]decimal.Decimal),
-		PositionClientOrderIDs: make(map[string]string),
-		PositionStrategyIDs:    make(map[string]string),
-		ClosingReason:          make(map[string]string),
+		PositionClientOrderIDs:  make(map[string]string),
+		PositionStrategyIDs:     make(map[string]string),
+		PositionEntryOrderTypes: make(map[string]string),
+		ClosingReason:           make(map[string]string),
 		PositionUnrealizedPnLs: make(map[string]decimal.Decimal),
 		LastMarkPrices:         make(map[string]decimal.Decimal),
 		LastMarkUpdatedAt:      make(map[string]time.Time),
@@ -728,6 +731,10 @@ func (b *BinanceLiveBroker) ReserveEntryIntent(intent model.OrderIntent) (bool, 
 	b.IsTP1Hits[intent.Symbol] = false
 	b.PositionClientOrderIDs[intent.Symbol] = intent.ClientOrderID
 	b.PositionStrategyIDs[intent.Symbol] = normalizeBrokerStrategyID(intent.StrategyID)
+	if b.PositionEntryOrderTypes == nil {
+		b.PositionEntryOrderTypes = make(map[string]string)
+	}
+	b.PositionEntryOrderTypes[intent.Symbol] = effectiveEntryOrderType(intent.EntryOrderType, b.Cfg.EntryOrderType)
 	return true, nil
 }
 
@@ -814,10 +821,21 @@ func (b *BinanceLiveBroker) submitReservedEntryWithParams(intent model.OrderInte
 	}
 
 	placeFn := b.PlaceEntryFn
-	if !isLimit && b.PlaceMarketEntryFn != nil {
-		placeFn = b.PlaceMarketEntryFn
+	if !isLimit {
+		if b.PlaceMarketEntryWithResultFn != nil {
+			placeFn = nil
+		} else if b.PlaceMarketEntryFn != nil {
+			placeFn = b.PlaceMarketEntryFn
+		} else if strings.EqualFold(b.Cfg.EntryOrderType, "MARKET") && b.PlaceEntryFn != nil {
+			placeFn = b.PlaceEntryFn
+		} else {
+			b.Mu.Lock()
+			b.rollbackReservedEntryLocked(intent.Symbol, intent.ClientOrderID)
+			b.Mu.Unlock()
+			return false, fmt.Errorf("PlaceMarketEntryFn adapter is not configured for MARKET intent")
+		}
 	}
-	if placeFn == nil {
+	if isLimit && placeFn == nil {
 		b.Mu.Lock()
 		b.rollbackReservedEntryLocked(intent.Symbol, intent.ClientOrderID)
 		b.Mu.Unlock()
@@ -826,10 +844,17 @@ func (b *BinanceLiveBroker) submitReservedEntryWithParams(intent model.OrderInte
 
 	currIntent := intent
 	var exchangeOrderID int64
+	var marketAvgPrice decimal.Decimal
+	var marketExecQty decimal.Decimal
+	var marketStatus model.OrderLifecycleStatus
 	var err error
 	for attempt := startAttempt; attempt <= maxRepegs; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		exchangeOrderID, err = placeFn(ctx, currIntent)
+		if !isLimit && b.PlaceMarketEntryWithResultFn != nil {
+			exchangeOrderID, marketAvgPrice, marketExecQty, marketStatus, err = b.PlaceMarketEntryWithResultFn(ctx, currIntent)
+		} else {
+			exchangeOrderID, err = placeFn(ctx, currIntent)
+		}
 		cancel()
 		if err == nil {
 			break
@@ -997,6 +1022,24 @@ func (b *BinanceLiveBroker) submitReservedEntryWithParams(intent model.OrderInte
 	}
 	b.Mu.Unlock()
 
+	// Untuk MARKET entry dengan respons RESULT langsung dari Binance, proses fill & pasang SL/TP
+	// secara sinkron tanpa menunggu User Data WS agar posisi tidak pernah terbuka tanpa proteksi.
+	if !isLimit && marketExecQty.GreaterThan(decimal.Zero) {
+		fillStatus := marketStatus
+		if fillStatus == "" {
+			fillStatus = model.StatusFilled
+		}
+		b.HandleUserDataOrderUpdate(
+			currIntent.ClientOrderID,
+			exchangeOrderID,
+			currIntent.Symbol,
+			fillStatus,
+			marketExecQty,
+			marketAvgPrice,
+			decimal.Zero,
+		)
+	}
+
 	return true, nil
 }
 
@@ -1090,6 +1133,7 @@ func (b *BinanceLiveBroker) rollbackReservedEntryLocked(symbol, clientOrderID st
 		if b.PositionClientOrderIDs[symbol] == clientOrderID {
 			delete(b.PositionClientOrderIDs, symbol)
 			delete(b.PositionStrategyIDs, symbol)
+			delete(b.PositionEntryOrderTypes, symbol)
 		}
 		b.clearSymbolTransientMetadataLocked(symbol)
 	}
@@ -1392,6 +1436,7 @@ func (b *BinanceLiveBroker) clearSymbolStateLocked(symbol string) {
 	delete(b.PositionEntryPrices, symbol)
 	delete(b.PositionClientOrderIDs, symbol)
 	delete(b.PositionStrategyIDs, symbol)
+	delete(b.PositionEntryOrderTypes, symbol)
 	delete(b.Protections, symbol)
 	delete(b.InitialQtys, symbol)
 	delete(b.InitialSLPrices, symbol)
@@ -1502,6 +1547,11 @@ func (b *BinanceLiveBroker) HandleAccountUpdateEvent(evt model.AccountUpdateEven
 	b.LastAccountUpdateTime = evt.EventTime
 
 	hasDecreasedOrClosed := false
+	type unprotectedClosedEntry struct {
+		symbol     string
+		strategyID string
+	}
+	var unprotectedClosed []unprotectedClosedEntry
 	if b.LastAccountPosPrevQty == nil {
 		b.LastAccountPosPrevQty = make(map[string]decimal.Decimal)
 	}
@@ -1525,9 +1575,17 @@ func (b *BinanceLiveBroker) HandleAccountUpdateEvent(evt model.AccountUpdateEven
 		} else {
 			hasDecreasedOrClosed = true
 			delete(b.LastAccountPosPrevQty, sym)
+			_, hadActive := b.ActivePositions[sym]
+			rawStrat := b.PositionStrategyIDs[sym]
 			delete(b.ActivePositions, sym)
 			delete(b.PositionUnrealizedPnLs, sym)
 			if _, hasProt := b.Protections[sym]; !hasProt {
+				if hadActive || rawStrat != "" {
+					unprotectedClosed = append(unprotectedClosed, unprotectedClosedEntry{
+						symbol:     sym,
+						strategyID: normalizeBrokerStrategyID(rawStrat),
+					})
+				}
 				b.clearSymbolStateLocked(sym)
 			}
 		}
@@ -1580,6 +1638,20 @@ func (b *BinanceLiveBroker) HandleAccountUpdateEvent(evt model.AccountUpdateEven
 		}
 	}
 	b.Mu.Unlock()
+
+	for _, uc := range unprotectedClosed {
+		b.notifyPositionDeleted(uc.symbol)
+		closedAt := evt.EventTime.UTC()
+		if closedAt.IsZero() {
+			closedAt = time.Now().UTC()
+		}
+		if b.OnStrategyCooldownRecordedFn != nil {
+			b.OnStrategyCooldownRecordedFn(uc.symbol, uc.strategyID, closedAt, "EXCHANGE_CLOSED")
+		}
+		if b.OnCooldownRecordedFn != nil {
+			b.OnCooldownRecordedFn(uc.symbol, closedAt, "EXCHANGE_CLOSED")
+		}
+	}
 
 	if triggerAsyncRefresh && b.FetchAccountFn != nil {
 		b.goAsync(func() {
@@ -1924,6 +1996,7 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdateDetailed(evt model.OrderTra
 	}
 
 	var tradeRec *TradeClosedRecord
+	var fallbackClosedSymbol, fallbackClosedStrat, fallbackClosedReason string
 	var algoOrdersToCancel []int64
 	var cancelSymbol string
 	var tp1OrderToCancel int64
@@ -2177,6 +2250,14 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdateDetailed(evt model.OrderTra
 				SignalAuditID: prot.SignalAuditID,
 			}
 		}
+		if tradeRec == nil {
+			fallbackClosedSymbol = symbol
+			fallbackClosedStrat = normalizeBrokerStrategyID(b.PositionStrategyIDs[symbol])
+			fallbackClosedReason = strings.TrimSpace(b.ClosingReason[symbol])
+			if fallbackClosedReason == "" {
+				fallbackClosedReason = "EXCHANGE_CLOSED"
+			}
+		}
 		entryOrdersToCancel = b.cleanupClosedPositionLocked(symbol)
 		delete(b.OrdersByClient, rec.ClientOrderID)
 		delete(b.OrdersByExchangeID, exchangeOrderID)
@@ -2195,6 +2276,15 @@ func (b *BinanceLiveBroker) HandleUserDataOrderUpdateDetailed(evt model.OrderTra
 			recCopy := *tradeRec
 			cb := b.OnTradeClosedFn
 			b.goAsync(func() { cb(recCopy) })
+		}
+	} else if fallbackClosedSymbol != "" {
+		b.notifyPositionDeleted(fallbackClosedSymbol)
+		closedAt := time.Now().UTC()
+		if b.OnStrategyCooldownRecordedFn != nil {
+			b.OnStrategyCooldownRecordedFn(fallbackClosedSymbol, fallbackClosedStrat, closedAt, fallbackClosedReason)
+		}
+		if b.OnCooldownRecordedFn != nil {
+			b.OnCooldownRecordedFn(fallbackClosedSymbol, closedAt, fallbackClosedReason)
 		}
 	}
 
@@ -2247,6 +2337,9 @@ func (b *BinanceLiveBroker) planProtectionSyncLocked(entryRec *model.LiveOrderRe
 
 	prot, exists := b.Protections[entryRec.Symbol]
 	if exists && prot.SLStatus == model.ProtectionAcked && prot.ProtectedQty.Equal(targetQty) {
+		return model.ProtectionPlanAction{}, false
+	}
+	if exists && prot.SLStatus == model.ProtectionPending && prot.InitialQty.Equal(entryRec.CumulativeFilledQty) && alreadyTP1.IsZero() {
 		return model.ProtectionPlanAction{}, false
 	}
 
@@ -3545,7 +3638,8 @@ func (b *BinanceLiveBroker) buildTP1TradeRecordLocked(
 		entryFee = totalEntryFee.Mul(ratio)
 	} else {
 		wasMaker, tracked := b.EntryWasMaker[symbol]
-		entryIsMaker := (tracked && wasMaker) || (!tracked && strings.EqualFold(b.Cfg.EntryOrderType, "LIMIT"))
+		effEntryType := effectiveEntryOrderType(b.PositionEntryOrderTypes[symbol], b.Cfg.EntryOrderType)
+		entryIsMaker := (tracked && wasMaker) || (!tracked && strings.EqualFold(effEntryType, "LIMIT"))
 		entryFee = ePrice.Mul(closedQty).Mul(decimal.NewFromFloat(b.effectiveFeeRate(entryIsMaker)))
 	}
 	netPnL := grossPnL.Sub(entryFee).Sub(exitFee)

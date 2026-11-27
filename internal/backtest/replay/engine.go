@@ -673,6 +673,10 @@ func (r *ReplayEngine) evaluateMajorPodAtHourClose(
 		cp.ClosedHourlyCandles = majorHourlyCandles[r.cfg.BenchmarkSym]
 		btcForMajor = &cp
 	}
+	simClose := simTime
+	if simClose.UnixMilli()%1000 == 999 {
+		simClose = simClose.Add(time.Millisecond)
+	}
 
 	var approved []majorPodApprovedItem
 	for _, sym := range symbols {
@@ -703,6 +707,22 @@ func (r *ReplayEngine) evaluateMajorPodAtHourClose(
 		snap.PortfolioDrawdownPct = portDD
 		if len(majorHourlyCandles[sym]) > 0 {
 			snap.ClosedHourlyCandles = majorHourlyCandles[sym]
+		}
+		if len(snap.ClosedHourlyCandles) > 0 {
+			lastH := snap.ClosedHourlyCandles[len(snap.ClosedHourlyCandles)-1]
+			hClose := lastH.CloseTime
+			if hClose.UnixMilli()%1000 == 999 {
+				hClose = hClose.Add(time.Millisecond)
+			}
+			if hClose.IsZero() {
+				hClose = lastH.OpenTime.Add(time.Hour)
+			}
+			if hClose.Before(simClose) {
+				r.TotalSignalsEvaluated++
+				r.SignalsRejected++
+				r.RejectReasons["STALE_SYM_1H_BAR"]++
+				continue
+			}
 		}
 		hasActive := r.broker.HasActiveOrderOrPosition(sym)
 
