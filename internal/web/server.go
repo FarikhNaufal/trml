@@ -18,6 +18,7 @@ import (
 
 type ScannerCoinDTO struct {
 	Symbol        string  `json:"symbol"`
+	Pod           string  `json:"pod,omitempty"`
 	MarkPrice     float64 `json:"mark_price"`
 	SessionVWAP   float64 `json:"session_vwap"`
 	DistVWAPPct   float64 `json:"dist_vwap_pct"`
@@ -44,6 +45,11 @@ type TelemetryDTO struct {
 	ScannerInterval      string  `json:"scanner_interval"`
 	AllowedSide          string  `json:"allowed_side"`
 	DisableOIFilter      bool    `json:"disable_oi_filter"`
+	MajorShortEnabled    bool    `json:"major_short_enabled,omitempty"`
+	MajorLongEnabled     bool    `json:"major_long_enabled,omitempty"`
+	MajorPodCount        int     `json:"major_pod_count,omitempty"`
+	MajorMaxSlots        int     `json:"major_max_slots,omitempty"`
+	CoreMaxSlots         int     `json:"core_max_slots,omitempty"`
 }
 
 type ScanDiagnosticsDTO struct {

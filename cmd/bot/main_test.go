@@ -1874,4 +1874,20 @@ func TestBotEngine_MajorPodHourCloseBatchRankingAndPod1Isolation(t *testing.T) {
 		t.Fatalf("expected ETHUSDT MajorPod exit recorded in majorCooldownExits")
 	}
 	eng.cooldownMu.RUnlock()
+
+	// Verify web dashboard feeds expose MajorPod symbols and 3-Pod telemetry without duplicating scanned coins
+	eng.statesMu.Lock()
+	eng.watchedCoins = []string{"SOLUSDT"}
+	eng.statesMu.Unlock()
+	coins := eng.getScannerCoins()
+	if len(coins) != 2 {
+		t.Fatalf("expected 2 deduplicated scanner coins (1 SCAN + 1 MAJOR), got %d: %+v", len(coins), coins)
+	}
+	if coins[0].Symbol != "SOLUSDT" || coins[0].Pod != "SCAN" || coins[1].Symbol != "ETHUSDT" || coins[1].Pod != "MAJOR" || coins[1].MarkPrice <= 0 {
+		t.Fatalf("unexpected pod attribution in getScannerCoins: %+v", coins)
+	}
+	telem := eng.getTelemetry()
+	if telem == nil || !telem.MajorShortEnabled || telem.MajorLongEnabled || telem.MajorPodCount != 2 || telem.MajorMaxSlots != 1 || telem.CoreMaxSlots != 6 {
+		t.Fatalf("unexpected 3-pod telemetry fields: %+v", telem)
+	}
 }

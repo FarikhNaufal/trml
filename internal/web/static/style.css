@@ -84,7 +84,8 @@
 html,
 body {
   height: 100dvh;
-  width: 100vw;
+  width: 100%;
+  max-width: 100vw;
   margin: 0;
   padding: 0;
   overflow: hidden;
@@ -114,8 +115,10 @@ body {
 /* Shell Grid: Fixed 3 vertical tracks, never overflows viewport */
 .tui-shell {
   height: 100dvh;
-  width: 100vw;
+  width: 100%;
+  max-width: 100vw;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
   background: var(--background0);
@@ -128,6 +131,8 @@ body {
   justify-content: space-between;
   gap: 10px;
   padding: 0 10px 0 0;
+  min-width: 0;
+  max-width: 100%;
   background: var(--background1);
   border-bottom: 1px solid var(--border-color);
   min-height: 34px;
@@ -398,8 +403,10 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   padding: 5px 10px;
+  min-width: 0;
   border-bottom: 1px solid var(--border-color);
   background: var(--background0);
   flex: 0 0 auto;
@@ -411,6 +418,9 @@ body {
   letter-spacing: 0.06em;
   color: var(--accent);
   white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tui-panel-meta {
@@ -804,6 +814,24 @@ body {
   color: var(--foreground1);
   background: var(--background0);
   border-color: var(--border-color);
+}
+
+.tag-pod-scan {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  margin-left: 5px;
+  font-size: 9px;
+  padding: 0 4px;
+}
+
+.tag-pod-maj {
+  color: var(--lavender);
+  background: var(--lavender-dim);
+  border-color: var(--lavender);
+  margin-left: 5px;
+  font-size: 9px;
+  padding: 0 4px;
 }
 
 .tui-empty-cell {
@@ -1228,10 +1256,18 @@ body {
   }
   .tui-tabs {
     width: 100%;
+    max-width: 100%;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tui-tabs::-webkit-scrollbar {
+    display: none;
   }
   .tui-viewport {
+    overflow-x: hidden;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     padding: 6px;
   }
   #view-desk.is-active {
@@ -1239,10 +1275,29 @@ body {
     flex-direction: column;
     overflow: visible;
     flex: none;
+    width: 100%;
+    min-width: 0;
+  }
+  .desk-band-top,
+  .desk-band-mid,
+  .desk-band-bot {
+    width: 100%;
+    min-width: 0;
   }
   .desk-band-top,
   .desk-band-bot {
     grid-template-columns: 1fr;
+  }
+  .tui-panel {
+    width: 100%;
+    min-width: 0;
+  }
+  .perf-body,
+  .macro-body {
+    overflow: visible;
+  }
+  .curve-wrap {
+    min-height: 120px;
   }
   .desk-band-mid,
   .desk-band-bot .tui-panel {
@@ -1251,5 +1306,121 @@ body {
   }
   .tui-hints {
     display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .tui-topbar {
+    padding: 0 6px 5px;
+    gap: 4px;
+  }
+  .tui-tab {
+    flex: 1 1 auto;
+    padding: 0 6px;
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    text-align: center;
+    height: 32px;
+  }
+  .tui-status-group {
+    width: 100%;
+    justify-content: flex-start;
+    gap: 4px;
+    padding: 2px 0;
+  }
+  .tui-pill {
+    padding: 2px 5px;
+    font-size: 9.5px;
+    letter-spacing: 0.02em;
+  }
+  .tui-theme-wrap {
+    padding: 1px 4px;
+    gap: 3px;
+  }
+  .tui-select-compact {
+    font-size: 10px;
+  }
+  .tui-btn {
+    padding: 0 7px;
+    font-size: 10px;
+  }
+  .tui-panel-head {
+    padding: 5px 8px;
+    gap: 4px 6px;
+  }
+  .tui-panel-title {
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+  }
+  .tui-panel-meta {
+    font-size: 9.5px;
+  }
+  .tui-panel-body {
+    padding: 7px 8px;
+  }
+  .perf-equity-num {
+    font-size: 21px;
+  }
+  .perf-metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 6px;
+  }
+  .perf-metrics-grid .metric-cell:nth-child(2n) {
+    border-right: none;
+  }
+  .bar-row,
+  .perf-bars .bar-row {
+    grid-template-columns: 74px minmax(0, 1fr) auto;
+    gap: 6px;
+  }
+  .perf-bars .bar-pct {
+    min-width: 0;
+    font-size: 9.5px;
+  }
+  .bar-label,
+  .bar-pct {
+    font-size: 9.5px;
+  }
+  .scan-diag-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    row-gap: 6px;
+  }
+  .scan-diag-grid .metric-cell:nth-child(3n) {
+    border-right: none;
+  }
+  .scan-diag-grid .metric-cell:nth-child(3n+1) {
+    padding-left: 0;
+  }
+  .log-line {
+    grid-template-columns: 52px 46px 74px minmax(0, 1fr);
+    gap: 4px;
+    font-size: 10.5px;
+    padding: 5px 4px;
+  }
+  .quick-copilot-bar {
+    gap: 4px;
+    padding: 5px 6px;
+  }
+  .quick-copilot-bar .tui-btn {
+    height: 24px;
+    padding: 0 4px;
+    font-size: 9.5px;
+    letter-spacing: 0.02em;
+  }
+  .tui-input-sm {
+    width: 120px;
+    max-width: 100%;
+    flex: 1 1 100px;
+  }
+  .tui-strip,
+  .tui-toolbar,
+  .tui-pager {
+    max-width: 100%;
+    min-width: 0;
+  }
+  .tui-statusbar {
+    padding: 4px 8px;
+    min-width: 0;
+    max-width: 100%;
   }
 }

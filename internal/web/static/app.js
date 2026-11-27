@@ -312,10 +312,41 @@ async function apiFetch(url, options = {}) {
   return data;
 }
 
+function getSavedPin() {
+  try {
+    const lsPin = localStorage.getItem('trml_pin') || '';
+    if (lsPin) return lsPin;
+    const ssPin = sessionStorage.getItem('trml_pin') || '';
+    if (ssPin) {
+      localStorage.setItem('trml_pin', ssPin);
+      return ssPin;
+    }
+  } catch (_) {}
+  return '';
+}
+
+function savePin(pin) {
+  try {
+    localStorage.setItem('trml_pin', pin);
+  } catch (_) {}
+  try {
+    sessionStorage.setItem('trml_pin', pin);
+  } catch (_) {}
+}
+
+function clearSavedPin() {
+  try {
+    localStorage.removeItem('trml_pin');
+  } catch (_) {}
+  try {
+    sessionStorage.removeItem('trml_pin');
+  } catch (_) {}
+}
+
 function handleUnauthorized() {
   state.pinVerified = false;
   state.storedPin = '';
-  try { sessionStorage.removeItem('trml_pin'); } catch (_) {}
+  clearSavedPin();
   stopPolling();
   showPinOverlay('Session locked or PIN invalid.');
 }
@@ -361,18 +392,24 @@ async function initAuth() {
     return true;
   }
 
-  try {
-    const cached = sessionStorage.getItem('trml_pin') || '';
-    if (cached) {
-      state.storedPin = cached;
+  const cached = getSavedPin();
+  if (cached) {
+    state.storedPin = cached;
+    try {
       await apiFetch('/api/summary');
       state.pinVerified = true;
       hidePinOverlay();
       return true;
+    } catch (err) {
+      if (err && err.status === 401) {
+        state.storedPin = '';
+        clearSavedPin();
+      } else {
+        state.pinVerified = true;
+        hidePinOverlay();
+        return true;
+      }
     }
-  } catch (_) {
-    state.storedPin = '';
-    try { sessionStorage.removeItem('trml_pin'); } catch (__) {}
   }
 
   state.pinVerified = false;
@@ -441,8 +478,21 @@ function renderSummary(data) {
   const sidePill = document.getElementById('pill-side');
   if (sidePill) {
     const side = String(telem.allowed_side || 'AUTO').toUpperCase();
-    sidePill.textContent = `SIDE: ${side}`;
-    sidePill.className = `tui-pill ${side === 'SHORT_ONLY' ? 'pill-red' : side === 'LONG_ONLY' ? 'pill-green' : 'pill-muted'}`;
+    const majShort = Boolean(telem.major_short_enabled);
+    const majLong = Boolean(telem.major_long_enabled);
+    if (majShort && majLong) {
+      sidePill.textContent = 'SIDE: S+L (3-POD)';
+      sidePill.className = 'tui-pill pill-cyan';
+    } else if (majLong && side === 'SHORT_ONLY') {
+      sidePill.textContent = 'SIDE: S+L (2-POD)';
+      sidePill.className = 'tui-pill pill-cyan';
+    } else if (majShort) {
+      sidePill.textContent = `SIDE: ${side === 'SHORT_ONLY' ? 'SHORT' : side} (2-POD)`;
+      sidePill.className = `tui-pill ${side === 'SHORT_ONLY' ? 'pill-red' : 'pill-cyan'}`;
+    } else {
+      sidePill.textContent = `SIDE: ${side}`;
+      sidePill.className = `tui-pill ${side === 'SHORT_ONLY' ? 'pill-red' : side === 'LONG_ONLY' ? 'pill-green' : 'pill-muted'}`;
+    }
   }
 
   // DESK Panel 1: Account & Performance
@@ -512,6 +562,23 @@ function renderSummary(data) {
     } else {
       clusterEl.textContent = 'CLEAR';
       clusterEl.className = 'mono-val c-green';
+    }
+  }
+
+  const podsEl = document.getElementById('macro-pods');
+  if (podsEl) {
+    const majS = Boolean(telem.major_short_enabled);
+    const majL = Boolean(telem.major_long_enabled);
+    if (majS || majL) {
+      const coreSlots = Number(telem.core_max_slots || 6);
+      const majSlots = Number(telem.major_max_slots || 3);
+      const majCount = Number(telem.major_pod_count || 14);
+      const majDir = majS && majL ? 'S/L' : majL ? 'L' : 'S';
+      podsEl.textContent = `CORE(${coreSlots}) + MAJ ${majDir}(${majSlots}) · ${majCount}M`;
+      podsEl.className = 'mono-val c-cyan';
+    } else {
+      podsEl.textContent = `CORE ONLY (${state.maxSlots})`;
+      podsEl.className = 'mono-val';
     }
   }
 
@@ -736,11 +803,24 @@ function renderWatchlistTable() {
   const badge = document.getElementById('scan-count-badge');
   const filter = state.scannerFilter.trim().toUpperCase();
 
+  let scanCount = 0;
+  let majCount = 0;
+  for (const c of state.lastScannerCoins) {
+    if (String(c.pod || '').toUpperCase() === 'MAJOR') majCount += 1;
+    else scanCount += 1;
+  }
+
   const list = filter
-    ? state.lastScannerCoins.filter((c) => String(c.symbol || '').toUpperCase().includes(filter))
+    ? state.lastScannerCoins.filter((c) => {
+        const sym = String(c.symbol || '').toUpperCase();
+        const pod = String(c.pod || '').toUpperCase();
+        return sym.includes(filter) || pod.includes(filter);
+      })
     : state.lastScannerCoins;
 
-  if (badge) badge.textContent = `[${state.lastScannerCoins.length}]`;
+  if (badge) {
+    badge.textContent = majCount > 0 ? `[${scanCount}+${majCount}M]` : `[${state.lastScannerCoins.length}]`;
+  }
   if (!tbody) return;
 
   if (list.length === 0) {
@@ -755,8 +835,12 @@ function renderWatchlistTable() {
     const dist = Number(c.dist_vwap_pct || 0);
     const natr = Number(c.natr_pct || 0);
     const fund = Number(c.funding_rate || 0);
+    const pod = String(c.pod || '').toUpperCase();
+    const podBadge = pod === 'MAJOR'
+      ? '<span class="tui-tag tag-pod-maj">MAJ</span>'
+      : (majCount > 0 ? '<span class="tui-tag tag-pod-scan">SCAN</span>' : '');
     return `<tr>
-      <td class="cell-symbol">${escapeHtml(c.symbol)}</td>
+      <td class="cell-symbol">${escapeHtml(c.symbol)}${podBadge}</td>
       <td class="num">${fmtPrice(c.mark_price)}</td>
       <td class="num ${dist < 0 ? 'c-red' : 'c-green'}">${fmtPct(dist, 2, true)}</td>
       <td class="num c-green">${fmtPct(natr, 2)}</td>
@@ -1269,7 +1353,7 @@ function wireEvents() {
         }
         state.storedPin = pin;
         state.pinVerified = true;
-        try { sessionStorage.setItem('trml_pin', pin); } catch (_) {}
+        savePin(pin);
         hidePinOverlay();
         await refreshActiveView();
         schedulePolling();

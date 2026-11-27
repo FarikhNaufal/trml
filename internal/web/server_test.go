@@ -1047,6 +1047,24 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 			t.Fatalf("static asset %s contains forbidden legacy text (v2.1/qmax/basecoat)", assetPath)
 		}
 	}
+
+	// Verify mobile clipping fixes, persistent PIN localStorage, and MajorPod watchlist badges in served assets
+	recCSS := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recCSS, httptest.NewRequest("GET", "/style.css", nil))
+	cssStr := recCSS.Body.String()
+	if !strings.Contains(cssStr, "grid-template-columns: minmax(0, 1fr)") || !strings.Contains(cssStr, "@media (max-width: 640px)") {
+		t.Fatalf("expected responsive mobile grid constraints in /style.css")
+	}
+
+	recJS := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(recJS, httptest.NewRequest("GET", "/app.js", nil))
+	jsStr := recJS.Body.String()
+	if !strings.Contains(jsStr, "localStorage.getItem('trml_pin')") || !strings.Contains(jsStr, "localStorage.setItem('trml_pin', pin)") {
+		t.Fatalf("expected persistent localStorage PIN storage in /app.js")
+	}
+	if !strings.Contains(jsStr, "tag-pod-maj") || !strings.Contains(jsStr, "SIDE: S+L (3-POD)") {
+		t.Fatalf("expected MajorPod watchlist badge and 3-POD pill formatting in /app.js")
+	}
 }
 
 func TestWebReader_GetEquityCurveAndServerDiagnostics(t *testing.T) {

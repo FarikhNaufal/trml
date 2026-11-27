@@ -1320,63 +1320,108 @@ func main() {
 	slog.Info("bot terminated gracefully")
 }
 
+func (e *BotEngine) buildScannerCoinDTO(sym, pod string) (web.ScannerCoinDTO, bool) {
+	e.statesMu.RLock()
+	st, exists := e.activeStates[sym]
+	e.statesMu.RUnlock()
+	if !exists || st == nil {
+		return web.ScannerCoinDTO{}, false
+	}
+
+	st.Mu.Lock()
+	mark := st.MarkPrice
+	if mark <= 0 {
+		if n := len(st.ClosedCandles); n > 0 {
+			mark = st.ClosedCandles[n-1].Close
+		} else if n := len(st.ClosedHourlyCandles); n > 0 {
+			mark = st.ClosedHourlyCandles[n-1].Close
+		}
+	}
+	vwap := st.CurrentSessionVWAP
+	if e.evaluatorCfg.RollingVWAPBars > 0 && len(st.ClosedCandles) > 0 {
+		if rv := indicator.CalculateRollingVWAP(st.ClosedCandles, e.evaluatorCfg.RollingVWAPBars); rv > 0 {
+			vwap = rv
+		}
+	}
+	spread := 0.0
+	if st.BestBid > 0 && st.BestAsk > 0 {
+		spread = ((st.BestAsk - st.BestBid) / st.BestBid) * 100.0
+	}
+	funding := st.FundingRate
+	var natr, rvol float64
+	if mark > 0 {
+		if len(st.ClosedCandles) >= 14 {
+			natr = (indicator.CalculateATR(st.ClosedCandles, 14) / mark) * 100.0
+		} else if len(st.ClosedHourlyCandles) >= 14 {
+			natr = (indicator.CalculateATR(st.ClosedHourlyCandles, 14) / mark) * 100.0
+		}
+	}
+	if len(st.ClosedCandles) >= 20 {
+		rvol = indicator.CalculateRVOL(st.ClosedCandles, 20)
+	} else if len(st.ClosedHourlyCandles) >= 20 {
+		rvol = indicator.CalculateRVOL(st.ClosedHourlyCandles, 20)
+	}
+	lastUpdate := st.MarkPriceUpdatedAt
+	st.Mu.Unlock()
+
+	distVWAP := 0.0
+	if vwap > 0 && mark > 0 {
+		distVWAP = ((mark - vwap) / vwap) * 100.0
+	}
+
+	return web.ScannerCoinDTO{
+		Symbol:        sym,
+		Pod:           pod,
+		MarkPrice:     mark,
+		SessionVWAP:   vwap,
+		DistVWAPPct:   distVWAP,
+		SpreadPct:     spread,
+		FundingRate:   funding,
+		NATRPct:       natr,
+		RVOL:          rvol,
+		LastUpdateUTC: lastUpdate.UTC().Format(time.RFC3339),
+	}, true
+}
+
+func (e *BotEngine) activeMajorPodSymbolList() []string {
+	if !e.evaluatorCfg.MajorPod.IsEnabled() {
+		return nil
+	}
+	if len(e.majorPodSymbols) > 0 {
+		return slices.Clone(e.majorPodSymbols)
+	}
+	out := make([]string, 0, len(e.evaluatorCfg.MajorPod.Symbols))
+	for _, sym := range e.evaluatorCfg.MajorPod.Symbols {
+		if sym != "" && sym != BenchmarkSymbol && !slices.Contains(out, sym) {
+			out = append(out, sym)
+		}
+	}
+	return out
+}
+
 func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 	e.statesMu.RLock()
 	coins := slices.Clone(e.watchedCoins)
 	e.statesMu.RUnlock()
 
-	result := make([]web.ScannerCoinDTO, 0, len(coins))
+	majorCoins := e.activeMajorPodSymbolList()
+	result := make([]web.ScannerCoinDTO, 0, len(coins)+len(majorCoins))
+	seen := make(map[string]struct{}, len(coins)+len(majorCoins))
+
 	for _, sym := range coins {
-		e.statesMu.RLock()
-		st, exists := e.activeStates[sym]
-		e.statesMu.RUnlock()
-		if !exists || st == nil {
+		if dto, ok := e.buildScannerCoinDTO(sym, "SCAN"); ok {
+			result = append(result, dto)
+			seen[sym] = struct{}{}
+		}
+	}
+	for _, sym := range majorCoins {
+		if _, dup := seen[sym]; dup {
 			continue
 		}
-
-		st.Mu.Lock()
-		mark := st.MarkPrice
-		vwap := st.CurrentSessionVWAP
-		if e.evaluatorCfg.RollingVWAPBars > 0 && len(st.ClosedCandles) > 0 {
-			if rv := indicator.CalculateRollingVWAP(st.ClosedCandles, e.evaluatorCfg.RollingVWAPBars); rv > 0 {
-				vwap = rv
-			}
+		if dto, ok := e.buildScannerCoinDTO(sym, "MAJOR"); ok {
+			result = append(result, dto)
+			seen[sym] = struct{}{}
 		}
-		spread := 0.0
-		if st.BestBid > 0 && st.BestAsk > 0 {
-			spread = ((st.BestAsk - st.BestBid) / st.BestBid) * 100.0
-		}
-		funding := st.FundingRate
-		candleLen := len(st.ClosedCandles)
-		var natr, rvol float64
-		if candleLen >= 14 {
-			atr := indicator.CalculateATR(st.ClosedCandles, 14)
-			if mark > 0 {
-				natr = (atr / mark) * 100.0
-			}
-		}
-		if candleLen >= 20 {
-			rvol = indicator.CalculateRVOL(st.ClosedCandles, 20)
-		}
-		lastUpdate := st.MarkPriceUpdatedAt
-		st.Mu.Unlock()
-
-		distVWAP := 0.0
-		if vwap > 0 && mark > 0 {
-			distVWAP = ((mark - vwap) / vwap) * 100.0
-		}
-
-		result = append(result, web.ScannerCoinDTO{
-			Symbol:        sym,
-			MarkPrice:     mark,
-			SessionVWAP:   vwap,
-			DistVWAPPct:   distVWAP,
-			SpreadPct:     spread,
-			FundingRate:   funding,
-			NATRPct:       natr,
-			RVOL:          rvol,
-			LastUpdateUTC: lastUpdate.UTC().Format(time.RFC3339),
-		})
 	}
 	return result
 }
@@ -1412,6 +1457,18 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 		}
 	}
 
+	majorSyms := e.activeMajorPodSymbolList()
+	coreSlots := 0
+	if e.cfg != nil {
+		coreSlots = e.cfg.MaxSlots
+	}
+	if coreSlots <= 0 {
+		coreSlots = e.evaluatorCfg.MaxSlots
+	}
+	if coreSlots <= 0 {
+		coreSlots = 6
+	}
+
 	return &web.TelemetryDTO{
 		MacroRegime:          string(macro.Regime),
 		MacroER:              macro.EfficiencyRatio,
@@ -1428,6 +1485,11 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 		ScannerInterval:      e.cfg.ScannerInterval.String(),
 		AllowedSide:          e.cfg.AllowedSide,
 		DisableOIFilter:      e.cfg.DisableOIFilter,
+		MajorShortEnabled:    e.evaluatorCfg.MajorPod.ShortEnabled,
+		MajorLongEnabled:     e.evaluatorCfg.MajorPod.LongEnabled,
+		MajorPodCount:        len(majorSyms),
+		MajorMaxSlots:        e.evaluatorCfg.MajorPod.MaxSlots,
+		CoreMaxSlots:         coreSlots,
 	}
 }
 
