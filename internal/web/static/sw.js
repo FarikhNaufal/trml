@@ -1,9 +1,9 @@
-const CACHE_NAME = 'trml-webtui-v18';
+const CACHE_NAME = 'trml-webtui-v20';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
-  '/style.css?v=18',
-  '/app.js?v=18',
+  '/style.css?v=20',
+  '/app.js?v=20',
   '/manifest.json',
   '/icon.svg',
   '/vendor/webtui-full.css',

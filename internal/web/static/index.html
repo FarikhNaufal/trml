@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="/vendor/webtui-theme-catppuccin.css" />
   <link rel="stylesheet" href="/vendor/webtui-theme-nord.css" />
   <link rel="stylesheet" href="/vendor/webtui-theme-gruvbox.css" />
-  <link rel="stylesheet" href="/style.css?v=18" />
+  <link rel="stylesheet" href="/style.css?v=20" />
 </head>
 <body>
   <div id="tui-toasts" class="tui-toasts" aria-live="polite" aria-atomic="true"></div>
@@ -83,52 +83,68 @@
           <article class="tui-panel">
             <div class="tui-panel-head">
               <span class="tui-panel-title">ACCOUNT_&amp;_PERFORMANCE</span>
-              <span id="perf-trades-badge" class="tui-panel-meta">0 TRADES</span>
+              <span class="perf-head-meta">
+                <span id="perf-trades-badge" class="tui-panel-meta">0 TRADES</span>
+                <span id="perf-tally" class="perf-tally">0W·0B·0L</span>
+              </span>
             </div>
             <div class="tui-panel-body perf-body">
-              <div class="perf-hero">
-                <div>
-                  <div class="tui-muted-xs">EFFECTIVE EQUITY</div>
+              <div class="perf-hero-card">
+                <div class="perf-hero-left">
+                  <div class="perf-micro-label">EFFECTIVE EQUITY</div>
                   <div id="perf-equity" class="perf-equity-num">$0.00</div>
+                  <div id="perf-avail-sub" class="perf-sub-meta">FREE $0.00 · 0% USED</div>
                 </div>
-                <div class="perf-roi-col">
+                <div class="perf-hero-right">
                   <div id="perf-net-pnl" class="perf-delta c-green">+$0.00</div>
-                  <div id="perf-peak-dd" class="tui-muted-xs">PEAK DD 0.00%</div>
+                  <div id="perf-roi-pct" class="perf-roi-pct c-green">+0.00% ROI</div>
+                  <div id="perf-peak-dd" class="perf-dd-pill">PEAK DD 0.00%</div>
                 </div>
               </div>
-              <div class="perf-metrics-grid">
-                <div class="metric-cell">
-                  <span class="metric-k">WIN RATE</span>
-                  <span id="perf-winrate" class="metric-v">0.0%</span>
+              <div class="perf-kpi-grid">
+                <div class="kpi-tile">
+                  <span class="kpi-k">WIN RATE</span>
+                  <span id="perf-winrate" class="kpi-v">0.0%</span>
                 </div>
-                <div class="metric-cell">
-                  <span class="metric-k">PROFIT FACTOR</span>
-                  <span id="perf-pf" class="metric-v c-cyan">0.00</span>
+                <div class="kpi-tile">
+                  <span class="kpi-k">PROFIT FACTOR</span>
+                  <span id="perf-pf" class="kpi-v c-cyan">0.00</span>
                 </div>
-                <div class="metric-cell">
-                  <span class="metric-k">REALIZED R:R</span>
-                  <span id="perf-rr" class="metric-v">0.00</span>
+                <div class="kpi-tile">
+                  <span class="kpi-k">REALIZED R:R</span>
+                  <span id="perf-rr" class="kpi-v">0.00</span>
                 </div>
-                <div class="metric-cell">
-                  <span class="metric-k">AVG WIN / LOSS</span>
-                  <span id="perf-avg-wl" class="metric-v">$0 / $0</span>
+                <div class="kpi-tile">
+                  <span class="kpi-k">AVG W / L</span>
+                  <span id="perf-avg-wl" class="kpi-v"><span class="c-green">$0.00</span><span class="tui-muted">/</span><span class="c-red">$0.00</span></span>
                 </div>
               </div>
-              <div class="perf-bars">
-                <div class="bar-row">
-                  <span class="bar-label">SLOT UTIL</span>
-                  <div class="bar-track"><div id="bar-slots" class="bar-fill fill-cyan" style="width:0%"></div></div>
-                  <span id="val-slots" class="bar-pct">0/3</span>
+              <div class="perf-gauges-grid">
+                <div class="gauge-row">
+                  <div class="gauge-top">
+                    <span class="gauge-k">SLOTS</span>
+                    <span id="val-slots" class="gauge-v">0 / 12</span>
+                  </div>
+                  <div id="slot-seg-meter" class="slot-seg-meter" aria-label="Slot utilization"></div>
+                  <div id="val-slots-pods" class="gauge-foot">C:0/6 · M:0/3 · T:0/3</div>
                 </div>
-                <div class="bar-row">
-                  <span class="bar-label">DAILY DD</span>
-                  <div class="bar-track"><div id="bar-dd" class="bar-fill fill-green" style="width:0%"></div></div>
-                  <span id="val-dd" class="bar-pct">0.00% / -5.0%</span>
-                </div>
-                <div class="bar-row">
-                  <span class="bar-label">AVAIL / USED</span>
-                  <div class="bar-track"><div id="bar-margin" class="bar-fill fill-amber" style="width:0%"></div></div>
-                  <span id="val-margin" class="bar-pct">$0.00 · 0%</span>
+                <div class="gauge-split">
+                  <div class="gauge-card">
+                    <div class="gauge-top">
+                      <span class="gauge-k">DAILY DD</span>
+                      <span id="val-dd" class="gauge-v">0.00%</span>
+                    </div>
+                    <div class="bar-track"><div id="bar-dd" class="bar-fill fill-green" style="width:0%"></div></div>
+                    <div id="val-dd-limit" class="gauge-foot">LIM -7.5%</div>
+                  </div>
+                  <div class="gauge-card">
+                    <div class="gauge-top">
+                      <span class="gauge-k">MARGIN</span>
+                      <span id="val-margin-pct" class="gauge-v">0%</span>
+                    </div>
+                    <div class="bar-track"><div id="bar-margin" class="bar-fill fill-cyan" style="width:0%"></div></div>
+                    <div id="val-margin" class="gauge-foot">$0.00 FREE</div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -154,24 +170,28 @@
               <span id="macro-regime-badge" class="tui-pill pill-lavender">UNKNOWN</span>
             </div>
             <div class="tui-panel-body macro-body">
-              <div class="macro-kv-list">
-                <div class="macro-kv">
-                  <span class="tui-muted-xs">BTC ER / VOL RATIO</span>
+              <div class="macro-kv-grid">
+                <div class="macro-kv-cell">
+                  <span class="tui-muted-xs">BTC ER / VOL</span>
                   <span id="macro-er-vol" class="mono-val">-- / --</span>
                 </div>
-                <div class="macro-kv">
-                  <span class="tui-muted-xs">BTC 24H RETURN</span>
+                <div class="macro-kv-cell">
+                  <span class="tui-muted-xs">BTC 24H</span>
                   <span id="macro-ret24" class="mono-val">--</span>
                 </div>
-                <div class="bar-row">
-                  <span class="bar-label">MKT BREADTH</span>
-                  <div class="bar-track"><div id="bar-breadth" class="bar-fill fill-cyan" style="width:0%"></div></div>
-                  <span id="val-breadth" class="bar-pct">--%</span>
+                <div class="macro-kv-cell">
+                  <span class="tui-muted-xs">BREADTH</span>
+                  <div class="macro-breadth-bar">
+                    <div class="bar-track"><div id="bar-breadth" class="bar-fill fill-cyan" style="width:0%"></div></div>
+                    <span id="val-breadth" class="bar-pct">--%</span>
+                  </div>
                 </div>
-                <div class="macro-kv">
-                  <span class="tui-muted-xs">CLUSTER SL GUARD</span>
+                <div class="macro-kv-cell">
+                  <span class="tui-muted-xs">CLUSTER SL</span>
                   <span id="macro-cluster" class="mono-val c-green">CLEAR</span>
                 </div>
+              </div>
+              <div class="macro-pods-block">
                 <div class="macro-kv">
                   <span class="tui-muted-xs">ACTIVE PODS</span>
                   <span id="macro-pods" class="mono-val c-cyan">CORE</span>
@@ -265,11 +285,11 @@
                 <thead>
                   <tr>
                     <th>SYMBOL</th>
-                    <th>STRATEGIES</th>
+                    <th>POD · STRATEGIES</th>
                     <th class="num">MARK</th>
-                    <th class="num">SIGNAL METRIC</th>
+                    <th class="num">SIGNAL</th>
                     <th class="num">VOL / ACT</th>
-                    <th class="num">SPREAD%</th>
+                    <th class="num">SPREAD</th>
                     <th class="num">FUNDING</th>
                   </tr>
                 </thead>
@@ -523,6 +543,6 @@
     </div>
   </dialog>
 
-  <script src="/app.js?v=18" defer></script>
+  <script src="/app.js?v=20" defer></script>
 </body>
 </html>

@@ -1074,6 +1074,9 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 	if !strings.Contains(recHTML.Body.String(), "data-scan-pod") {
 		t.Fatalf("expected pod filter controls (data-scan-pod) in /")
 	}
+	if !strings.Contains(recHTML.Body.String(), "slot-seg-meter") || !strings.Contains(recHTML.Body.String(), "perf-gauges-grid") {
+		t.Fatalf("expected redesigned Account & Performance slot-seg-meter and perf-gauges-grid in /")
+	}
 }
 
 func TestWebReader_GetEquityCurveAndServerDiagnostics(t *testing.T) {

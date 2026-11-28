@@ -537,34 +537,103 @@ function renderSummary(data) {
   }
 
   // DESK Panel 1: Account & Performance
-  setText('perf-trades-badge', `${Number(stats.total_trades || 0)} TRADES`);
+  const activePods = Array.isArray(telem.active_pods) ? telem.active_pods : [];
+  const totalTrades = Number(stats.total_trades || 0);
+  const winsCnt = Number(stats.wins_count || 0);
+  const beCnt = Number(stats.break_even_count || 0);
+  const lossesCnt = Number(stats.losses_count || 0);
+  setText('perf-trades-badge', `${totalTrades} TRADES`);
+  setText('perf-tally', `${winsCnt}W·${beCnt}B·${lossesCnt}L`);
+
   setText('perf-equity', fmtMoney(equity));
+  const marginUsedPct = equity > 0 ? Math.min(100, Math.max(0, Math.round(((equity - avail) / equity) * 100))) : 0;
+  setText('perf-avail-sub', `FREE ${fmtMoney(avail)} · ${marginUsedPct}% USED`);
+
+  const baselineEq = equity - netPnL;
+  const roiPct = baselineEq > 0 ? (netPnL / baselineEq) * 100 : 0;
   const perfNetEl = document.getElementById('perf-net-pnl');
   if (perfNetEl) {
     perfNetEl.textContent = fmtMoney(netPnL, true);
     perfNetEl.className = `perf-delta ${netPnL >= 0 ? 'c-green' : 'c-red'}`;
   }
-  setText('perf-peak-dd', `PEAK DD ${fmtPct(peakDdPct, 2)}`);
-  setText('perf-winrate', fmtPct(stats.win_rate_pct || 0, 1));
-  setText('perf-pf', Number(stats.profit_factor || 0).toFixed(2));
-  setText('perf-rr', Number(stats.realized_rr || 0).toFixed(2));
-  setText('perf-avg-wl', `${fmtMoney(stats.avg_win_usdt || 0)} / ${fmtMoney(Math.abs(stats.avg_loss_usdt || 0))}`);
+  const perfRoiEl = document.getElementById('perf-roi-pct');
+  if (perfRoiEl) {
+    perfRoiEl.textContent = `${fmtPct(roiPct, 2, true)} ROI`;
+    perfRoiEl.className = `perf-roi-pct ${netPnL >= 0 ? 'c-green' : 'c-red'}`;
+  }
+  const peakDdEl = document.getElementById('perf-peak-dd');
+  if (peakDdEl) {
+    const signedPeakDd = peakDdPct > 0 ? -peakDdPct : peakDdPct;
+    const isDd = signedPeakDd < -0.005;
+    peakDdEl.textContent = `PEAK DD ${isDd ? fmtPct(signedPeakDd, 2, true) : '0.00%'}`;
+    peakDdEl.className = `perf-dd-pill ${isDd ? 'dd-warn' : ''}`.trim();
+  }
 
-  const slotPct = Math.min(100, Math.round((state.activeSlotsCount / state.maxSlots) * 100));
-  setBar('bar-slots', slotPct, 'fill-cyan');
-  setText('val-slots', `${state.activeSlotsCount}/${state.maxSlots}`);
+  const wrVal = Number(stats.win_rate_pct || 0);
+  const wrEl = document.getElementById('perf-winrate');
+  if (wrEl) {
+    wrEl.textContent = fmtPct(wrVal, 1);
+    wrEl.className = `kpi-v ${totalTrades > 0 ? (wrVal >= 50 ? 'c-green' : 'c-red') : ''}`.trim();
+  }
+  const pfVal = Number(stats.profit_factor || 0);
+  const pfEl = document.getElementById('perf-pf');
+  if (pfEl) {
+    pfEl.textContent = pfVal.toFixed(2);
+    pfEl.className = `kpi-v ${pfVal >= 1.2 ? 'c-green' : pfVal > 0 && pfVal < 1 ? 'c-red' : 'c-cyan'}`;
+  }
+  setText('perf-rr', Number(stats.realized_rr || 0).toFixed(2));
+  const avgWlEl = document.getElementById('perf-avg-wl');
+  if (avgWlEl) {
+    const avgW = escapeHtml(fmtMoney(stats.avg_win_usdt || 0));
+    const avgL = escapeHtml(fmtMoney(Math.abs(stats.avg_loss_usdt || 0)));
+    avgWlEl.innerHTML = `<span class="c-green">${avgW}</span><span class="tui-muted">/</span><span class="c-red">${avgL}</span>`;
+  }
+
+  const podGroups = activePods.length > 0
+    ? activePods.map((p) => {
+        const id = String(p.id || 'CORE').toUpperCase();
+        return {
+          id,
+          short: id === 'MAJOR' ? 'M' : id === 'CTA' ? 'T' : 'C',
+          used: Math.max(0, Number(p.used_slots || 0)),
+          max: Math.max(0, Number(p.max_slots || 0)),
+          cls: id === 'MAJOR' ? 'seg-maj' : id === 'CTA' ? 'seg-cta' : 'seg-core',
+        };
+      })
+    : [{ id: 'CORE', short: 'C', used: state.activeSlotsCount, max: state.maxSlots, cls: 'seg-core' }];
+
+  setText('val-slots', `${state.activeSlotsCount} / ${state.maxSlots}`);
+  const slotMeterEl = document.getElementById('slot-seg-meter');
+  if (slotMeterEl) {
+    let segHtml = '';
+    podGroups.forEach((g) => {
+      if (g.max <= 0) return;
+      segHtml += `<div class="slot-seg-group" style="flex:${g.max}" title="${escapeHtml(`${g.id}: ${g.used}/${g.max}`)}">`;
+      for (let i = 0; i < g.max; i++) {
+        segHtml += `<span class="slot-seg ${i < g.used ? `is-used ${g.cls}` : ''}"></span>`;
+      }
+      segHtml += '</div>';
+    });
+    slotMeterEl.innerHTML = segHtml;
+  }
+  setText('val-slots-pods', podGroups.map((g) => `${g.short}:${g.used}/${g.max}`).join(' · '));
 
   const ddUsedPct = maxDdPct < 0 && ddPct < 0 ? Math.min(100, Math.round((Math.abs(ddPct) / Math.abs(maxDdPct)) * 100)) : 0;
   setBar('bar-dd', ddUsedPct, ddUsedPct >= 75 ? 'fill-red' : ddUsedPct >= 40 ? 'fill-amber' : 'fill-green');
   const valDdEl = document.getElementById('val-dd');
   if (valDdEl) {
-    valDdEl.textContent = `${fmtPct(ddPct, 2, true)} / ${fmtPct(maxDdPct, 1)}`;
-    valDdEl.className = `bar-pct ${ddPct <= maxDdPct * 0.7 ? 'c-red' : ddPct < 0 ? 'c-amber' : ''}`.trim();
+    valDdEl.textContent = ddPct < 0 ? fmtPct(ddPct, 2, true) : fmtPct(ddPct, 2);
+    valDdEl.className = `gauge-v ${ddPct <= maxDdPct * 0.7 ? 'c-red' : ddPct < 0 ? 'c-amber' : 'c-green'}`;
   }
+  setText('val-dd-limit', `LIM ${fmtPct(maxDdPct, 1)}`);
 
-  const marginUsedPct = equity > 0 ? Math.min(100, Math.max(0, Math.round(((equity - avail) / equity) * 100))) : 0;
-  setBar('bar-margin', marginUsedPct, marginUsedPct >= 75 ? 'fill-red' : 'fill-amber');
-  setText('val-margin', `${fmtMoney(avail)} · ${marginUsedPct}%`);
+  setBar('bar-margin', marginUsedPct, marginUsedPct >= 75 ? 'fill-red' : marginUsedPct >= 40 ? 'fill-amber' : 'fill-cyan');
+  const valMarginPctEl = document.getElementById('val-margin-pct');
+  if (valMarginPctEl) {
+    valMarginPctEl.textContent = `${marginUsedPct}%`;
+    valMarginPctEl.className = `gauge-v ${marginUsedPct >= 75 ? 'c-red' : marginUsedPct >= 40 ? 'c-amber' : ''}`.trim();
+  }
+  setText('val-margin', `${fmtMoney(avail)} FREE`);
 
   // DESK Panel 2: Equity Curve
   renderEquityCurve(Array.isArray(data.equity_curve) ? data.equity_curve : [], equity);
@@ -608,36 +677,45 @@ function renderSummary(data) {
 
   const podsEl = document.getElementById('macro-pods');
   if (podsEl) {
-    const majS = Boolean(telem.major_short_enabled);
-    const majL = Boolean(telem.major_long_enabled);
-    const ctaS = Boolean(telem.cta_short_enabled);
-    const ctaL = Boolean(telem.cta_long_enabled);
-    const coreSlots = Number(telem.core_max_slots || 6);
-    const parts = [`CORE(${coreSlots})`];
-    if (majS || majL) {
-      const majSlots = Number(telem.major_max_slots || 3);
-      const majCount = Number(telem.major_pod_count || 14);
-      const majDir = majS && majL ? 'S/L' : majL ? 'L' : 'S';
-      parts.push(`MAJ ${majDir}(${majSlots})·${majCount}M`);
-    }
-    if (ctaS || ctaL) {
-      const ctaSlots = Number(telem.cta_max_slots || 3);
-      const ctaCount = Number(telem.cta_pod_count || 30);
-      const ctaDir = ctaS && ctaL ? 'S/L' : ctaL ? 'L' : 'S';
-      parts.push(`CTA ${ctaDir}(${ctaSlots})·${ctaCount}C`);
-    }
-    if (parts.length > 1) {
-      podsEl.textContent = parts.join(' + ');
+    if (activePods.length > 0) {
+      const totalPodCount = activePods.reduce((acc, p) => {
+        const id = String(p.id || '').toUpperCase();
+        const sideStr = String(p.side || '').toUpperCase();
+        return acc + (id === 'MAJOR' && sideStr === 'S+L' ? 2 : 1);
+      }, 0);
+      podsEl.textContent = `${totalPodCount} PODS · ${state.maxSlots} SLOTS`;
       podsEl.className = 'mono-val c-cyan';
     } else {
-      podsEl.textContent = `CORE ONLY (${state.maxSlots})`;
-      podsEl.className = 'mono-val';
+      const majS = Boolean(telem.major_short_enabled);
+      const majL = Boolean(telem.major_long_enabled);
+      const ctaS = Boolean(telem.cta_short_enabled);
+      const ctaL = Boolean(telem.cta_long_enabled);
+      const coreSlots = Number(telem.core_max_slots || 6);
+      const parts = [`CORE(${coreSlots})`];
+      if (majS || majL) {
+        const majSlots = Number(telem.major_max_slots || 3);
+        const majCount = Number(telem.major_pod_count || 14);
+        const majDir = majS && majL ? 'S/L' : majL ? 'L' : 'S';
+        parts.push(`MAJ ${majDir}(${majSlots})·${majCount}M`);
+      }
+      if (ctaS || ctaL) {
+        const ctaSlots = Number(telem.cta_max_slots || 3);
+        const ctaCount = Number(telem.cta_pod_count || 30);
+        const ctaDir = ctaS && ctaL ? 'S/L' : ctaL ? 'L' : 'S';
+        parts.push(`CTA ${ctaDir}(${ctaSlots})·${ctaCount}C`);
+      }
+      if (parts.length > 1) {
+        podsEl.textContent = parts.join(' + ');
+        podsEl.className = 'mono-val c-cyan';
+      } else {
+        podsEl.textContent = `CORE ONLY (${state.maxSlots})`;
+        podsEl.className = 'mono-val';
+      }
     }
   }
 
   const podsListEl = document.getElementById('macro-pods-list');
   if (podsListEl) {
-    const activePods = Array.isArray(telem.active_pods) ? telem.active_pods : [];
     if (activePods.length > 0) {
       podsListEl.innerHTML = activePods.map((pod) => {
         const pid = String(pod.id || 'CORE').toUpperCase();
@@ -650,8 +728,8 @@ function renderSummary(data) {
         return `<div class="macro-pod-row">
           <div class="macro-pod-head">
             <span class="tui-tag ${badgeCls}">${escapeHtml(pid)}</span>
-            <span class="tui-muted-xs">${escapeHtml(pod.timeframe || '--')} · ${escapeHtml(pod.side || '--')}</span>
-            <span class="tui-muted-xs">${used}/${maxS}s · ${univ}c</span>
+            <span class="tui-muted-xs">${escapeHtml(pod.timeframe || '--')} ${escapeHtml(pod.side || '--')}</span>
+            <span class="tui-muted-xs">${used}/${maxS} · ${univ}c</span>
           </div>
           <div class="macro-pod-strats">${stratHtml}</div>
         </div>`;
@@ -925,19 +1003,18 @@ function renderWatchlistTable() {
     return;
   }
 
-  const showScanBadge = majCount > 0 || ctaCount > 0;
   tbody.innerHTML = list.map((c) => {
     const dist = Number(c.dist_vwap_pct || 0);
     const natr = Number(c.natr_pct || 0);
     const fund = Number(c.funding_rate || 0);
     const pod = String(c.pod || 'SCAN').toUpperCase();
-    const podBadges = renderPodTags(c.pods, pod, showScanBadge);
 
     const strats = Array.isArray(c.strategies) && c.strategies.length > 0
       ? c.strategies
       : [pod === 'MAJOR' ? 'MAJOR_RSMOM_SHORT' : pod === 'CTA' ? 'CTA_4H_SHORT' : 'VWAP_PULLBACK'];
     const tf = escapeHtml(c.timeframe || (pod === 'MAJOR' ? '1h' : pod === 'CTA' ? '4h' : '15m'));
-    const stratHtml = `<div class="strat-chip-group">${strats.map((s) => renderStrategyTag(s, false)).join('')}<span class="strat-tf">${tf}</span></div>`;
+    const tfTip = escapeHtml(`Primary signal timeframe (${tf})`);
+    const stratHtml = `<div class="strat-chip-group">${strats.map((s) => renderStrategyTag(s, false)).join('')}<span class="strat-tf" title="${tfTip}">${tf}</span></div>`;
 
     let metricHtml = '<span class="tui-muted">--</span>';
     if (c.metric_value) {
@@ -956,7 +1033,7 @@ function renderWatchlistTable() {
     }
 
     return `<tr>
-      <td class="cell-symbol">${escapeHtml(c.symbol)}${podBadges}</td>
+      <td class="cell-symbol">${escapeHtml(c.symbol)}</td>
       <td>${stratHtml}</td>
       <td class="num">${fmtPrice(c.mark_price)}</td>
       <td class="num">${metricHtml}</td>
@@ -1003,7 +1080,8 @@ function renderDeskSignalStream(signals) {
       <span class="tui-muted">${fmtShortTimeUTC(s.candle_open_time_utc || s.created_at_utc)}</span>
       <span class="${cls}">${tag}</span>
       <strong>${escapeHtml(s.symbol)}</strong>
-      <span class="log-reason">${renderStrategyTag(s.strategy_id, false)} ${escapeHtml(reason)}</span>
+      <span class="log-strat">${renderStrategyTag(s.strategy_id, false)}</span>
+      <span class="log-reason">${escapeHtml(reason)}</span>
     </div>`;
   }).join('');
 }
@@ -1165,12 +1243,14 @@ function openSignalDialog(signalId) {
 
   const isAppr = String(sig.decision || '').toUpperCase().startsWith('APPROV');
   const meta = getStrategyMeta(sig.strategy_id);
+  const coreTF = String(state.lastSummaryData?.telemetry?.timeframe || meta.tf || '15m').toUpperCase();
+  const displayTF = meta.pod === 'CORE' ? coreTF.toLowerCase() : meta.tf;
   const closeVal = Number(sig.close_price || 0);
   const atrVal = Number(sig.atr14 || 0);
   const atrPctStr = closeVal > 0 && atrVal > 0 ? ` (${((atrVal / closeVal) * 100).toFixed(2)}%)` : '';
 
   let stratRows = `
-      <div class="detail-kv"><span class="k">EMA200 (15M)</span><span class="v">${fmtPriceOrDash(sig.ema200)}</span></div>
+      <div class="detail-kv"><span class="k">EMA200 (${escapeHtml(coreTF)})</span><span class="v">${fmtPriceOrDash(sig.ema200)}</span></div>
       <div class="detail-kv"><span class="k">SESSION VWAP</span><span class="v">${fmtPriceOrDash(sig.session_vwap)}</span></div>
       <div class="detail-kv"><span class="k">ATR14</span><span class="v">${fmtPriceOrDash(atrVal)}${escapeHtml(atrPctStr)}</span></div>
       <div class="detail-kv"><span class="k">DELTA Z-SCORE</span><span class="v">${Number(sig.bar_delta_zscore || 0).toFixed(3)}</span></div>
@@ -1192,7 +1272,7 @@ function openSignalDialog(signalId) {
   bodyEl.innerHTML = `
     <div class="detail-kv-grid">
       <div class="detail-kv"><span class="k">CANDLE OPEN UTC</span><span class="v">${fmtUTC(sig.candle_open_time_utc || sig.created_at_utc)}</span></div>
-      <div class="detail-kv"><span class="k">POD / STRATEGY</span><span class="v">${escapeHtml(`${meta.pod} · ${meta.tf} · ${meta.id}`)}</span></div>
+      <div class="detail-kv"><span class="k">POD / STRATEGY</span><span class="v">${escapeHtml(`${meta.pod} · ${displayTF} · ${meta.id}`)}</span></div>
       <div class="detail-kv"><span class="k">DECISION</span><span class="v ${isAppr ? 'c-green' : 'c-red'}">${escapeHtml(sig.decision)}</span></div>
       <div class="detail-kv"><span class="k">REASON</span><span class="v">${escapeHtml(sig.reject_reason_code || 'SIGNAL_APPROVED')}</span></div>
       <div class="detail-kv"><span class="k">CLOSE</span><span class="v">${fmtPriceOrDash(sig.close_price)}</span></div>

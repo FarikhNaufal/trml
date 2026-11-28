@@ -1932,6 +1932,25 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 	breadthPct := e.marketBreadthPct
 	breadthValid := e.marketBreadthValid
 	watchedCnt := len(e.watchedCoins)
+	if e.hasCompletedScan && (len(e.primaryWatchedSet) > 0 || len(e.breakoutWatchedSet) > 0 || len(e.sweepExtraWatchedSet) > 0) {
+		coreSet := make(map[string]struct{}, len(e.primaryWatchedSet)+len(e.breakoutWatchedSet)+len(e.sweepExtraWatchedSet))
+		for s, ok := range e.primaryWatchedSet {
+			if ok {
+				coreSet[s] = struct{}{}
+			}
+		}
+		for s, ok := range e.breakoutWatchedSet {
+			if ok {
+				coreSet[s] = struct{}{}
+			}
+		}
+		for s, ok := range e.sweepExtraWatchedSet {
+			if ok {
+				coreSet[s] = struct{}{}
+			}
+		}
+		watchedCnt = len(coreSet)
+	}
 	e.statesMu.RUnlock()
 
 	var btcCandles []model.Candle
