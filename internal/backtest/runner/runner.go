@@ -192,6 +192,15 @@ func PrepareDataset(ctx context.Context, opts CommonOptions) (*LoadedDataset, er
 		if appCfg != nil && appCfg.MajorPod.IsEnabled() && minLead < 220*time.Hour {
 			minLead = 220 * time.Hour
 		}
+		if appCfg != nil && appCfg.CTAPod.IsEnabled() {
+			ctaLead := 240 * time.Hour
+			if strings.EqualFold(appCfg.CTAPod.Mode, "EMA_CROSS") {
+				ctaLead = 1000 * time.Hour
+			}
+			if minLead < ctaLead {
+				minLead = ctaLead
+			}
+		}
 		if requiredFrom := todayStart.Add(-minLead); opts.From.IsZero() || opts.From.After(requiredFrom) {
 			opts.From = requiredFrom
 		}
@@ -520,6 +529,9 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		if ds.AppCfg.MajorPod.IsEnabled() && ds.AppCfg.MajorPod.MaxSlots > 0 {
 			totalSlots += ds.AppCfg.MajorPod.MaxSlots
 		}
+		if ds.AppCfg.CTAPod.IsEnabled() && ds.AppCfg.CTAPod.MaxSlots > 0 {
+			totalSlots += ds.AppCfg.CTAPod.MaxSlots
+		}
 		brokerCfg.MaxSlots = totalSlots
 	}
 	if opts.OverrideCompounding != nil {
@@ -548,6 +560,8 @@ func BuildEngineConfigs(ds *LoadedDataset, opts RunOptions) (strategy.EvaluatorC
 		evalCfg.CooldownProfitMinutes = 0
 		evalCfg.MajorPod.MaxSlots = 1000
 		evalCfg.MajorPod.CooldownMinutes = 0
+		evalCfg.CTAPod.MaxSlots = 1000
+		evalCfg.CTAPod.CooldownMinutes = 0
 	}
 
 	warmup := opts.WarmupBars
@@ -1160,6 +1174,9 @@ func BuildSimBrokerConfigFromAppConfig(cfg *config.Config, equity float64) simbr
 	if cfg.MajorPod.IsEnabled() && cfg.MajorPod.MaxSlots > 0 {
 		totalSlots += cfg.MajorPod.MaxSlots
 	}
+	if cfg.CTAPod.IsEnabled() && cfg.CTAPod.MaxSlots > 0 {
+		totalSlots += cfg.CTAPod.MaxSlots
+	}
 
 	return simbroker.SimBrokerConfig{
 		InitialEquityUSDT:        eqDec,
@@ -1200,7 +1217,7 @@ func BuildSimBrokerConfigFromAppConfig(cfg *config.Config, equity float64) simbr
 		MaxHoldingDuration:       maxHold,
 		StaleLossExitDuration:    cfg.StaleLossExitDuration,
 		EquityModeCompounding:    cfg.EquityModeCompounding,
-		StrategyExitProfiles:     strategy.BuildMajorPodExitProfiles(cfg),
+		StrategyExitProfiles:     strategy.BuildAllPodExitProfiles(cfg),
 	}
 }
 

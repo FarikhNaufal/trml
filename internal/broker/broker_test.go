@@ -7050,3 +7050,99 @@ func TestBinanceLiveBroker_MarketEntryWithResultArmsProtectionSynchronously(t *t
 		t.Fatalf("expected persisted StrategyID=MAJOR_RSMOM_LONG and ATRAtEntry=2.00, got %+v", lastSaved)
 	}
 }
+
+func TestLiveBroker_ChandelierNoTP_SkipsTPAlgoAndRestoresCleanly(t *testing.T) {
+	cfg := LiveBrokerConfig{
+		MaxSlots:            3,
+		MaxDailyDrawdownPct: -0.03,
+		MaxAccountStaleness: 60 * time.Second,
+		LimitOrderTimeout:   45 * time.Second,
+		StrategyExitProfiles: map[string]protection.StrategyExitProfile{
+			"CTA_4H_SHORT": {
+				HasOverride:         true,
+				TrailingEnabled:     true,
+				ChandelierTrailing:  true,
+				TrailingActivateATR: 0.0,
+				TrailingDistanceATR: 3.0,
+				MaxHoldingDuration:  240 * time.Hour,
+			},
+		},
+	}
+	b := NewBinanceLiveBroker(cfg)
+	now := time.Now().UTC()
+	b.HandleAccountUpdate(decimal.NewFromFloat(10000), decimal.Zero, decimal.NewFromFloat(10000), nil, now)
+	b.GetExchangeFilterFn = func(symbol string) (model.ExchangeFilter, bool) {
+		return model.ExchangeFilter{
+			TickSize:    decimal.NewFromFloat(0.01),
+			StepSize:    decimal.NewFromFloat(0.1),
+			MinQty:      decimal.NewFromFloat(0.1),
+			MinNotional: decimal.NewFromFloat(5.0),
+		}, true
+	}
+
+	var algoMu sync.Mutex
+	var algoTypes []string
+	var algoIDSeq atomic.Int64
+	algoIDSeq.Store(7000)
+
+	b.PlaceMarketEntryWithResultFn = func(ctx context.Context, intent model.OrderIntent) (int64, decimal.Decimal, decimal.Decimal, model.OrderLifecycleStatus, error) {
+		return 99001, decimal.NewFromFloat(100.00), intent.Qty, model.StatusFilled, nil
+	}
+	b.PlaceAlgoOrderFn = func(ctx context.Context, symbol string, side model.Side, orderType string, qty, triggerPrice decimal.Decimal, clientAlgoID string) (int64, error) {
+		algoMu.Lock()
+		algoTypes = append(algoTypes, orderType)
+		algoMu.Unlock()
+		return algoIDSeq.Add(1), nil
+	}
+
+	okSub, err := b.SubmitLimitEntry(model.OrderIntent{
+		ClientOrderID:  "CTA_SHORT_NOTP",
+		Symbol:         "LINKUSDT",
+		Side:           model.SideShort,
+		StrategyID:     "CTA_4H_SHORT",
+		EntryOrderType: "MARKET",
+		Qty:            decimal.NewFromFloat(2.0),
+		LimitPrice:     decimal.NewFromFloat(100.00),
+		SLPrice:        decimal.NewFromFloat(106.00),
+		TPPrice:        decimal.Zero,
+		ATRAtEntry:     decimal.NewFromFloat(2.00),
+		CreatedAt:      now,
+	})
+	if err != nil || !okSub {
+		b.Close()
+		t.Fatalf("SubmitLimitEntry CTA MARKET failed: ok=%v err=%v", okSub, err)
+	}
+	b.Close()
+
+	algoMu.Lock()
+	if len(algoTypes) != 1 || algoTypes[0] != "STOP_MARKET" {
+		algoMu.Unlock()
+		t.Fatalf("expected only STOP_MARKET algo order when Chandelier TPPrice=0, got %v", algoTypes)
+	}
+	algoMu.Unlock()
+
+	// Verify RestoreOpenPosition marks TPStatus Acked (not Failed) when Chandelier TPPrice=0
+	b2 := NewBinanceLiveBroker(cfg)
+	defer b2.Close()
+	b2.RestoreOpenPosition(&LiveOpenPosition{
+		Symbol:         "LINKUSDT",
+		Side:           model.SideShort,
+		StrategyID:     "CTA_4H_SHORT",
+		Qty:            decimal.NewFromFloat(2.0),
+		ProtectedQty:   decimal.NewFromFloat(2.0),
+		EntryPrice:     decimal.NewFromFloat(100.00),
+		SLOrderID:      7001,
+		SLClientAlgoID: "ALGO_SL_TEST",
+		SLPrice:        decimal.NewFromFloat(106.00),
+		InitialSLPrice: decimal.NewFromFloat(106.00),
+		TPOrderID:      0,
+		TPPrice:        decimal.Zero,
+		ATRAtEntry:     decimal.NewFromFloat(2.00),
+	})
+	b2.Mu.Lock()
+	prot := b2.Protections["LINKUSDT"]
+	b2.Mu.Unlock()
+	if prot == nil || prot.SLStatus != model.ProtectionAcked || prot.TPStatus != model.ProtectionAcked {
+		t.Fatalf("expected SLStatus=Acked and TPStatus=Acked after restore of Chandelier no-TP position, got %+v", prot)
+	}
+}

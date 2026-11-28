@@ -50,6 +50,11 @@ type TelemetryDTO struct {
 	MajorPodCount        int     `json:"major_pod_count,omitempty"`
 	MajorMaxSlots        int     `json:"major_max_slots,omitempty"`
 	CoreMaxSlots         int     `json:"core_max_slots,omitempty"`
+	CTAShortEnabled      bool    `json:"cta_short_enabled,omitempty"`
+	CTALongEnabled       bool    `json:"cta_long_enabled,omitempty"`
+	CTAPodMode           string  `json:"cta_pod_mode,omitempty"`
+	CTAPodCount          int     `json:"cta_pod_count,omitempty"`
+	CTAMaxSlots          int     `json:"cta_max_slots,omitempty"`
 }
 
 type ScanDiagnosticsDTO struct {

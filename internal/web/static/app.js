@@ -150,7 +150,9 @@ function fmtStrategyShort(raw) {
     VWAP_BREAKDOWN: 'BRK',
     STRUCTURE_BREAK: 'STRUCT',
     MAJOR_RSMOM_SHORT: 'MAJ_S',
-    MAJOR_RSMOM_LONG: 'MAJ_L'
+    MAJOR_RSMOM_LONG: 'MAJ_L',
+    CTA_4H_SHORT: 'CTA_S',
+    CTA_4H_LONG: 'CTA_L'
   };
   const key = String(raw || 'VWAP_PULLBACK').trim().toUpperCase();
   return map[key] || key.slice(0, 10);
@@ -480,7 +482,17 @@ function renderSummary(data) {
     const side = String(telem.allowed_side || 'AUTO').toUpperCase();
     const majShort = Boolean(telem.major_short_enabled);
     const majLong = Boolean(telem.major_long_enabled);
-    if (majShort && majLong) {
+    const ctaShort = Boolean(telem.cta_short_enabled);
+    const ctaLong = Boolean(telem.cta_long_enabled);
+    const ctaOn = ctaShort || ctaLong;
+    if (ctaOn) {
+      const hasShort = side === 'SHORT_ONLY' || side === 'AUTO' || majShort || ctaShort;
+      const hasLong = side === 'LONG_ONLY' || side === 'AUTO' || majLong || ctaLong;
+      const dirLabel = hasShort && hasLong ? 'S+L' : hasShort ? 'SHORT' : 'LONG';
+      const pods = 1 + (majShort ? 1 : 0) + (majLong ? 1 : 0) + 1;
+      sidePill.textContent = `SIDE: ${dirLabel} (${pods}-POD)`;
+      sidePill.className = `tui-pill ${dirLabel === 'S+L' ? 'pill-cyan' : dirLabel === 'SHORT' ? 'pill-red' : 'pill-green'}`;
+    } else if (majShort && majLong) {
       sidePill.textContent = 'SIDE: S+L (3-POD)';
       sidePill.className = 'tui-pill pill-cyan';
     } else if (majLong && side === 'SHORT_ONLY') {
@@ -569,12 +581,24 @@ function renderSummary(data) {
   if (podsEl) {
     const majS = Boolean(telem.major_short_enabled);
     const majL = Boolean(telem.major_long_enabled);
+    const ctaS = Boolean(telem.cta_short_enabled);
+    const ctaL = Boolean(telem.cta_long_enabled);
+    const coreSlots = Number(telem.core_max_slots || 6);
+    const parts = [`CORE(${coreSlots})`];
     if (majS || majL) {
-      const coreSlots = Number(telem.core_max_slots || 6);
       const majSlots = Number(telem.major_max_slots || 3);
       const majCount = Number(telem.major_pod_count || 14);
       const majDir = majS && majL ? 'S/L' : majL ? 'L' : 'S';
-      podsEl.textContent = `CORE(${coreSlots}) + MAJ ${majDir}(${majSlots}) · ${majCount}M`;
+      parts.push(`MAJ ${majDir}(${majSlots})·${majCount}M`);
+    }
+    if (ctaS || ctaL) {
+      const ctaSlots = Number(telem.cta_max_slots || 3);
+      const ctaCount = Number(telem.cta_pod_count || 30);
+      const ctaDir = ctaS && ctaL ? 'S/L' : ctaL ? 'L' : 'S';
+      parts.push(`CTA ${ctaDir}(${ctaSlots})·${ctaCount}C`);
+    }
+    if (parts.length > 1) {
+      podsEl.textContent = parts.join(' + ');
       podsEl.className = 'mono-val c-cyan';
     } else {
       podsEl.textContent = `CORE ONLY (${state.maxSlots})`;
@@ -730,7 +754,7 @@ function renderActivePositions(positions, scanInterval) {
       <td class="num">${fmtPrice(pos.entry_price)}</td>
       <td class="num">${fmtPrice(pos.mark_price)}</td>
       <td>${fmtPrice(pos.sl_price)}${tier ? ` <span class="c-amber">${escapeHtml(tier)}</span>` : ''}</td>
-      <td class="num">${fmtPrice(pos.tp_price)}</td>
+      <td class="num">${Number(pos.tp_price || 0) <= 0 ? '<span class="tui-muted">TRAIL</span>' : fmtPrice(pos.tp_price)}</td>
       <td class="num ${pnlCls}">${fmtMoney(pnl, true)}</td>
       <td class="num ${pnlCls}">${fmtPct(roe, 1, true)}</td>
       <td class="num tui-muted">${fmtDuration(pos.duration_sec)}</td>
@@ -805,8 +829,11 @@ function renderWatchlistTable() {
 
   let scanCount = 0;
   let majCount = 0;
+  let ctaCount = 0;
   for (const c of state.lastScannerCoins) {
-    if (String(c.pod || '').toUpperCase() === 'MAJOR') majCount += 1;
+    const podUp = String(c.pod || '').toUpperCase();
+    if (podUp === 'MAJOR') majCount += 1;
+    else if (podUp === 'CTA') ctaCount += 1;
     else scanCount += 1;
   }
 
@@ -819,7 +846,14 @@ function renderWatchlistTable() {
     : state.lastScannerCoins;
 
   if (badge) {
-    badge.textContent = majCount > 0 ? `[${scanCount}+${majCount}M]` : `[${state.lastScannerCoins.length}]`;
+    if (majCount > 0 || ctaCount > 0) {
+      const suffix = [];
+      if (majCount > 0) suffix.push(`${majCount}M`);
+      if (ctaCount > 0) suffix.push(`${ctaCount}C`);
+      badge.textContent = `[${scanCount}+${suffix.join('+')}]`;
+    } else {
+      badge.textContent = `[${state.lastScannerCoins.length}]`;
+    }
   }
   if (!tbody) return;
 
@@ -838,7 +872,9 @@ function renderWatchlistTable() {
     const pod = String(c.pod || '').toUpperCase();
     const podBadge = pod === 'MAJOR'
       ? '<span class="tui-tag tag-pod-maj">MAJ</span>'
-      : (majCount > 0 ? '<span class="tui-tag tag-pod-scan">SCAN</span>' : '');
+      : pod === 'CTA'
+        ? '<span class="tui-tag tag-pod-cta">CTA</span>'
+        : ((majCount > 0 || ctaCount > 0) ? '<span class="tui-tag tag-pod-scan">SCAN</span>' : '');
     return `<tr>
       <td class="cell-symbol">${escapeHtml(c.symbol)}${podBadge}</td>
       <td class="num">${fmtPrice(c.mark_price)}</td>

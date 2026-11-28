@@ -46,6 +46,9 @@ type BotEngine struct {
 	sweepExtraWatchedSet   map[string]bool
 	majorPodSymbols        []string
 	majorPodSet            map[string]bool
+	ctaPodSymbols          []string
+	ctaPodSet              map[string]bool
+	ctaQuoteCache          map[string]ctaCachedQuote
 	lastStreamSymbols      []string
 	hasCompletedScan       bool
 	lastScanStats          scanner.ScanStats
@@ -61,6 +64,7 @@ type BotEngine struct {
 	cooldownMu         sync.RWMutex
 	cooldownExits      map[string]storage.RecentExitRecord
 	majorCooldownExits map[string]storage.RecentExitRecord
+	ctaCooldownExits   map[string]storage.RecentExitRecord
 
 	clusterSL  *strategy.ClusterSLTracker
 	barEntries *strategy.BarEntryTracker
@@ -96,9 +100,20 @@ type BotEngine struct {
 	majorBatchDispatched map[int64]bool
 	majorBatchWindow     time.Duration
 
+	cta4hMu            sync.Mutex
+	cta4hCandles       map[string][]model.Candle
+	ctaLastEvalBarUnix atomic.Int64
+
 	shuttingDown atomic.Bool
 	evalSubmitMu sync.Mutex
 	evalWg       sync.WaitGroup
+}
+
+type ctaCachedQuote struct {
+	MarkPrice   float64
+	FundingRate float64
+	SpreadPct   float64
+	UpdatedAt   time.Time
 }
 
 type majorBatchEntry struct {
@@ -197,7 +212,10 @@ func main() {
 	if evalCfg.MajorPod.IsEnabled() && evalCfg.MajorPod.MaxSlots > 0 {
 		effectiveMaxSlots += evalCfg.MajorPod.MaxSlots
 	}
-	majorExitProfiles := strategy.BuildMajorPodExitProfiles(cfg)
+	if evalCfg.CTAPod.IsEnabled() && evalCfg.CTAPod.MaxSlots > 0 {
+		effectiveMaxSlots += evalCfg.CTAPod.MaxSlots
+	}
+	allExitProfiles := strategy.BuildAllPodExitProfiles(cfg)
 	var majorSyms []string
 	var majorSet map[string]bool
 	if evalCfg.MajorPod.IsEnabled() {
@@ -220,9 +238,13 @@ func main() {
 		sweepExtraWatchedSet: make(map[string]bool),
 		majorPodSymbols:      majorSyms,
 		majorPodSet:          majorSet,
+		ctaPodSet:            make(map[string]bool),
+		ctaQuoteCache:        make(map[string]ctaCachedQuote),
 		exchangeFilters:      make(map[string]model.ExchangeFilter),
 		cooldownExits:        make(map[string]storage.RecentExitRecord),
 		majorCooldownExits:   make(map[string]storage.RecentExitRecord),
+		ctaCooldownExits:     make(map[string]storage.RecentExitRecord),
+		cta4hCandles:         make(map[string][]model.Candle),
 		verifiedSymbols:      make(map[string]bool),
 		oiBootAttemptAt:      make(map[string]time.Time),
 		clusterSL:            strategy.NewClusterSLTracker(cfg.PortfolioClusterSLCount, time.Duration(cfg.PortfolioClusterCooldownMins)*time.Minute),
@@ -238,8 +260,11 @@ func main() {
 	if cfg.MajorPod.IsEnabled() && cfg.MajorPod.CooldownMinutes > cooldownLookbackMins {
 		cooldownLookbackMins = cfg.MajorPod.CooldownMinutes
 	}
+	if cfg.CTAPod.IsEnabled() && cfg.CTAPod.CooldownMinutes > cooldownLookbackMins {
+		cooldownLookbackMins = cfg.CTAPod.CooldownMinutes
+	}
 	cooldownCutoff := time.Now().UTC().Add(-time.Duration(cooldownLookbackMins) * time.Minute)
-	if cfg.MajorPod.IsEnabled() {
+	if cfg.MajorPod.IsEnabled() || cfg.CTAPod.IsEnabled() {
 		if pod1Exits, err := repo.GetRecentExitsByPodForMode(ctx, stateMode, false, cooldownCutoff); err == nil && len(pod1Exits) > 0 {
 			engine.cooldownMu.Lock()
 			for sym, exitRec := range pod1Exits {
@@ -248,13 +273,25 @@ func main() {
 			engine.cooldownMu.Unlock()
 			slog.Info("hydrated Pod #1 cooldowns from trade ledger", "mode", stateMode, "count", len(pod1Exits), "since", cooldownCutoff)
 		}
-		if majExits, err := repo.GetRecentExitsByPodForMode(ctx, stateMode, true, cooldownCutoff); err == nil && len(majExits) > 0 {
-			engine.cooldownMu.Lock()
-			for sym, exitRec := range majExits {
-				engine.majorCooldownExits[sym] = exitRec
+		if cfg.MajorPod.IsEnabled() {
+			if majExits, err := repo.GetRecentExitsByPodForMode(ctx, stateMode, true, cooldownCutoff); err == nil && len(majExits) > 0 {
+				engine.cooldownMu.Lock()
+				for sym, exitRec := range majExits {
+					engine.majorCooldownExits[sym] = exitRec
+				}
+				engine.cooldownMu.Unlock()
+				slog.Info("hydrated MajorPod cooldowns from trade ledger", "mode", stateMode, "count", len(majExits), "since", cooldownCutoff)
 			}
-			engine.cooldownMu.Unlock()
-			slog.Info("hydrated MajorPod cooldowns from trade ledger", "mode", stateMode, "count", len(majExits), "since", cooldownCutoff)
+		}
+		if cfg.CTAPod.IsEnabled() {
+			if ctaExits, err := repo.GetRecentCTAPodExitsForMode(ctx, stateMode, cooldownCutoff); err == nil && len(ctaExits) > 0 {
+				engine.cooldownMu.Lock()
+				for sym, exitRec := range ctaExits {
+					engine.ctaCooldownExits[sym] = exitRec
+				}
+				engine.cooldownMu.Unlock()
+				slog.Info("hydrated CTAPod cooldowns from trade ledger", "mode", stateMode, "count", len(ctaExits), "since", cooldownCutoff)
+			}
 		}
 	} else if recentExits, err := repo.GetRecentExitsForMode(ctx, stateMode, cooldownCutoff); err == nil && len(recentExits) > 0 {
 		engine.cooldownMu.Lock()
@@ -332,7 +369,7 @@ func main() {
 			EntryOrderType:           cfg.EntryOrderType,
 			MaxEntryRepegAttempts:    resolveBrokerRepegAttempts(cfg.EntryRepegMaxAttempts),
 			MaxEntryRepegDriftPct:    cfg.EntryRepegMaxDriftPct,
-			StrategyExitProfiles:     majorExitProfiles,
+			StrategyExitProfiles:     allExitProfiles,
 		}
 		engine.dryRunBroker = broker.NewDryRunBroker(initialEquity, dryRunCfg)
 		defer engine.dryRunBroker.Close()
@@ -476,7 +513,7 @@ func main() {
 			EntryOrderType:           cfg.EntryOrderType,
 			MaxEntryRepegAttempts:    resolveBrokerRepegAttempts(cfg.EntryRepegMaxAttempts),
 			MaxEntryRepegDriftPct:    cfg.EntryRepegMaxDriftPct,
-			StrategyExitProfiles:     majorExitProfiles,
+			StrategyExitProfiles:     allExitProfiles,
 		}
 		engine.liveBroker = broker.NewBinanceLiveBroker(liveCfg)
 		defer engine.liveBroker.Close()
@@ -1120,6 +1157,32 @@ func main() {
 		}
 	}()
 
+	// Worker 1b: Pod #4 4h CTA Trend Following Scheduler (sinkron tepat setelah bar 4h UTC tutup)
+	if cfg.CTAPod.IsEnabled() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slog.Info("CTA 4h scheduler active",
+				"mode", cfg.CTAPod.Mode,
+				"topN", cfg.CTAPod.TopN,
+				"maxSlots", cfg.CTAPod.MaxSlots,
+				"short", cfg.CTAPod.ShortEnabled,
+				"long", cfg.CTAPod.LongEnabled,
+			)
+			for {
+				delay := nextCTAEvalDelay(engine.exchangeNow())
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+					engine.evaluateCTAPodCycle(ctx)
+				}
+			}
+		}()
+	}
+
 	// Worker 2: Periodic Open Interest Poller (skip jika DISABLE_OI_FILTER=true)
 	if !cfg.DisableOIFilter {
 		wg.Add(1)
@@ -1406,14 +1469,31 @@ func (e *BotEngine) activeMajorPodSymbolList() []string {
 	return out
 }
 
+func (e *BotEngine) activeCTAPodSymbolList() []string {
+	if !e.evaluatorCfg.CTAPod.IsEnabled() {
+		return nil
+	}
+	e.statesMu.RLock()
+	defer e.statesMu.RUnlock()
+	if len(e.ctaPodSymbols) == 0 {
+		return nil
+	}
+	return slices.Clone(e.ctaPodSymbols)
+}
+
 func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 	e.statesMu.RLock()
 	coins := slices.Clone(e.watchedCoins)
+	ctaSyms := slices.Clone(e.ctaPodSymbols)
+	ctaQuotes := make(map[string]ctaCachedQuote, len(e.ctaQuoteCache))
+	for k, v := range e.ctaQuoteCache {
+		ctaQuotes[k] = v
+	}
 	e.statesMu.RUnlock()
 
 	majorCoins := e.activeMajorPodSymbolList()
-	result := make([]web.ScannerCoinDTO, 0, len(coins)+len(majorCoins))
-	seen := make(map[string]struct{}, len(coins)+len(majorCoins))
+	result := make([]web.ScannerCoinDTO, 0, len(coins)+len(majorCoins)+len(ctaSyms))
+	seen := make(map[string]struct{}, len(coins)+len(majorCoins)+len(ctaSyms))
 
 	for _, sym := range coins {
 		if dto, ok := e.buildScannerCoinDTO(sym, "SCAN"); ok {
@@ -1427,6 +1507,27 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 		}
 		if dto, ok := e.buildScannerCoinDTO(sym, "MAJOR"); ok {
 			result = append(result, dto)
+			seen[sym] = struct{}{}
+		}
+	}
+	for _, sym := range ctaSyms {
+		if _, dup := seen[sym]; dup {
+			continue
+		}
+		if dto, ok := e.buildScannerCoinDTO(sym, "CTA"); ok {
+			result = append(result, dto)
+			seen[sym] = struct{}{}
+			continue
+		}
+		if q, okQ := ctaQuotes[sym]; okQ {
+			result = append(result, web.ScannerCoinDTO{
+				Symbol:        sym,
+				Pod:           "CTA",
+				MarkPrice:     q.MarkPrice,
+				SpreadPct:     q.SpreadPct,
+				FundingRate:   q.FundingRate,
+				LastUpdateUTC: q.UpdatedAt.UTC().Format(time.RFC3339),
+			})
 			seen[sym] = struct{}{}
 		}
 	}
@@ -1465,6 +1566,7 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 	}
 
 	majorSyms := e.activeMajorPodSymbolList()
+	ctaSyms := e.activeCTAPodSymbolList()
 	coreSlots := 0
 	if e.cfg != nil {
 		coreSlots = e.cfg.MaxSlots
@@ -1497,6 +1599,11 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 		MajorPodCount:        len(majorSyms),
 		MajorMaxSlots:        e.evaluatorCfg.MajorPod.MaxSlots,
 		CoreMaxSlots:         coreSlots,
+		CTAShortEnabled:      e.evaluatorCfg.CTAPod.ShortEnabled,
+		CTALongEnabled:       e.evaluatorCfg.CTAPod.LongEnabled,
+		CTAPodMode:           e.evaluatorCfg.CTAPod.Mode,
+		CTAPodCount:          len(ctaSyms),
+		CTAMaxSlots:          e.evaluatorCfg.CTAPod.MaxSlots,
 	}
 }
 
@@ -2017,8 +2124,20 @@ func (e *BotEngine) runMarketScan(ctx context.Context) {
 	if e.evaluatorCfg.MajorPod.IsEnabled() {
 		majorStreamSymbols = e.syncMajorPodStates(scanCtx, filters, bookMap, serverTime)
 	}
+	ctaCount := 0
+	if e.evaluatorCfg.CTAPod.IsEnabled() {
+		var premMap map[string]exchange.PremiumIndexQuote
+		if e.client != nil {
+			if pm, pErr := e.client.FetchPremiumIndexMap(scanCtx); pErr == nil {
+				premMap = pm
+			} else {
+				slog.Warn("CTA pod scan failed to fetch premiumIndex quotes", "err", pErr)
+			}
+		}
+		ctaCount = len(e.refreshCTAPodUniverse(filters, volMap, bookMap, premMap, serverTime))
+	}
 
-	slog.Info("market scan completed", "selectedCount", len(finalWatched), "symbols", finalWatched, "majorPodCount", len(majorStreamSymbols))
+	slog.Info("market scan completed", "selectedCount", len(finalWatched), "symbols", finalWatched, "majorPodCount", len(majorStreamSymbols), "ctaPodCount", ctaCount)
 
 	// Jika mode Live, verifikasi One-Way mode dan leverage untuk simbol terpilih (M11 FIX & M4 Cache)
 	if !e.cfg.DryRun {
@@ -2857,6 +2976,23 @@ func (e *BotEngine) recordSymbolExitForStrategy(symbol, strategyID string, close
 	if symbol == "" || exitReason == "" || exitReason == "PARTIAL_TAKE_PROFIT" {
 		return
 	}
+	if strategy.IsCTAPodStrategy(strategyID) {
+		e.cooldownMu.Lock()
+		if e.ctaCooldownExits == nil {
+			e.ctaCooldownExits = make(map[string]storage.RecentExitRecord)
+		}
+		prev, exists := e.ctaCooldownExits[symbol]
+		if !exists || !closedAt.Before(prev.ClosedAt) {
+			e.ctaCooldownExits[symbol] = storage.RecentExitRecord{
+				Symbol:     symbol,
+				StrategyID: strategyID,
+				ClosedAt:   closedAt,
+				ExitReason: exitReason,
+			}
+		}
+		e.cooldownMu.Unlock()
+		return
+	}
 	isMajor := strategy.IsMajorPodStrategy(strategyID) ||
 		(strings.TrimSpace(strategyID) == "" && e.evaluatorCfg.MajorPod.IsEnabled() && e.isMajorPodSymbol(symbol) && !e.isInPod1WatchSets(symbol))
 
@@ -3421,10 +3557,10 @@ func (e *BotEngine) getActiveNonMajorSlots() int {
 	if e == nil || e.broker == nil {
 		return 0
 	}
-	if e.evaluatorCfg.MajorPod.IsEnabled() {
+	if e.evaluatorCfg.MajorPod.IsEnabled() || e.evaluatorCfg.CTAPod.IsEnabled() {
 		if fc, ok := e.broker.(podSlotCounter); ok {
 			return fc.GetActiveSlotCountByFilter(func(sid string) bool {
-				return !strategy.IsMajorPodStrategy(sid)
+				return !strategy.IsMajorPodStrategy(sid) && !strategy.IsCTAPodStrategy(sid)
 			})
 		}
 	}
@@ -3437,6 +3573,16 @@ func (e *BotEngine) getActiveMajorSlots() int {
 	}
 	if fc, ok := e.broker.(podSlotCounter); ok {
 		return fc.GetActiveSlotCountByFilter(strategy.IsMajorPodStrategy)
+	}
+	return e.broker.GetActiveSlotCount()
+}
+
+func (e *BotEngine) getActiveCTASlots() int {
+	if e == nil || e.broker == nil {
+		return 0
+	}
+	if fc, ok := e.broker.(podSlotCounter); ok {
+		return fc.GetActiveSlotCountByFilter(strategy.IsCTAPodStrategy)
 	}
 	return e.broker.GetActiveSlotCount()
 }
@@ -3930,6 +4076,612 @@ func (e *BotEngine) flushMajorPodBatchEntries(batchHour time.Time, items []major
 				e.attachSignalAuditID(rec.intent.Symbol, rec.intent.ClientOrderID, sigID)
 			}
 		}
+	}
+}
+
+func nextCTAEvalDelay(now time.Time) time.Duration {
+	utcNow := now.UTC()
+	target := utcNow.Truncate(4 * time.Hour).Add(6 * time.Second)
+	for !target.After(utcNow) {
+		target = target.Add(4 * time.Hour)
+	}
+	return target.Sub(utcNow)
+}
+
+func selectCTATopNSymbols(
+	filters map[string]model.ExchangeFilter,
+	volMap map[string]float64,
+	topN int,
+	minVolUSDT float64,
+) []string {
+	if len(filters) == 0 || len(volMap) == 0 {
+		return nil
+	}
+	if topN <= 0 {
+		topN = 30
+	}
+	type volEntry struct {
+		sym string
+		vol float64
+	}
+	ranked := make([]volEntry, 0, len(filters))
+	for sym := range filters {
+		vol := volMap[sym]
+		if math.IsNaN(vol) || math.IsInf(vol, 0) || vol < minVolUSDT {
+			continue
+		}
+		ranked = append(ranked, volEntry{sym: sym, vol: vol})
+	}
+	slices.SortFunc(ranked, func(a, b volEntry) int {
+		if a.vol != b.vol {
+			if a.vol > b.vol {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.sym, b.sym)
+	})
+	if len(ranked) > topN {
+		ranked = ranked[:topN]
+	}
+	out := make([]string, len(ranked))
+	for i, r := range ranked {
+		out[i] = r.sym
+	}
+	return out
+}
+
+func (e *BotEngine) refreshCTAPodUniverse(
+	filters map[string]model.ExchangeFilter,
+	volMap map[string]float64,
+	bookMap map[string]model.BookQuote,
+	premMap map[string]exchange.PremiumIndexQuote,
+	now time.Time,
+) []string {
+	if e == nil || !e.evaluatorCfg.CTAPod.IsEnabled() {
+		return nil
+	}
+	syms := selectCTATopNSymbols(filters, volMap, e.evaluatorCfg.CTAPod.TopN, e.evaluatorCfg.CTAPod.MinVolume24hUSDT)
+	set := make(map[string]bool, len(syms))
+	quotes := make(map[string]ctaCachedQuote, len(syms))
+	for _, sym := range syms {
+		set[sym] = true
+		var q ctaCachedQuote
+		q.UpdatedAt = now
+		if bq, okB := bookMap[sym]; okB && bq.BestBid > 0 && bq.BestAsk > bq.BestBid {
+			q.SpreadPct = ((bq.BestAsk - bq.BestBid) / bq.BestBid) * 100.0
+			q.MarkPrice = (bq.BestBid + bq.BestAsk) / 2.0
+		}
+		if pq, okP := premMap[sym]; okP {
+			if pq.MarkPrice > 0 {
+				q.MarkPrice = pq.MarkPrice
+			}
+			q.FundingRate = pq.LastFundingRate
+		}
+		quotes[sym] = q
+	}
+	e.statesMu.Lock()
+	e.ctaPodSymbols = syms
+	e.ctaPodSet = set
+	e.ctaQuoteCache = quotes
+	e.statesMu.Unlock()
+	return syms
+}
+
+func (e *BotEngine) evaluateCTAPodCycle(ctx context.Context) {
+	if e == nil || !e.evaluatorCfg.CTAPod.IsEnabled() || e.shuttingDown.Load() || e.broker == nil || e.client == nil {
+		return
+	}
+	now := e.exchangeNow()
+	barEndUTC := now.UTC().Truncate(4 * time.Hour)
+	barKey := barEndUTC.Unix()
+	lastKey := e.ctaLastEvalBarUnix.Load()
+	if barKey <= lastKey {
+		return
+	}
+	if !e.ctaLastEvalBarUnix.CompareAndSwap(lastKey, barKey) {
+		return
+	}
+
+	e.evalWg.Add(1)
+	defer e.evalWg.Done()
+
+	ctaCtx, ctaCancel := context.WithTimeout(ctx, 90*time.Second)
+	defer ctaCancel()
+
+	filters, err := e.client.FetchExchangeInfo(ctaCtx)
+	if err != nil {
+		slog.Warn("CTA 4h cycle: failed to fetch exchange info", "err", err)
+		e.ctaLastEvalBarUnix.CompareAndSwap(barKey, lastKey)
+		return
+	}
+	e.filtersMu.Lock()
+	e.exchangeFilters = filters
+	e.filtersMu.Unlock()
+
+	volMap, err := e.client.Fetch24hTickers(ctaCtx)
+	if err != nil {
+		slog.Warn("CTA 4h cycle: failed to fetch 24h tickers", "err", err)
+		e.ctaLastEvalBarUnix.CompareAndSwap(barKey, lastKey)
+		return
+	}
+	bookMap, err := e.client.FetchBookTickers(ctaCtx)
+	if err != nil {
+		slog.Warn("CTA 4h cycle: failed to fetch book tickers", "err", err)
+		e.ctaLastEvalBarUnix.CompareAndSwap(barKey, lastKey)
+		return
+	}
+	premMap, err := e.client.FetchPremiumIndexMap(ctaCtx)
+	if err != nil {
+		slog.Warn("CTA 4h cycle: failed to fetch premiumIndex quotes", "err", err)
+		e.ctaLastEvalBarUnix.CompareAndSwap(barKey, lastKey)
+		return
+	}
+
+	if e.cfg != nil && !e.cfg.DryRun && e.liveBroker != nil && e.liveBroker.IsAccountStale(e.exchangeNow()) {
+		rCtx, rCancel := context.WithTimeout(ctaCtx, 3*time.Second)
+		_ = e.liveBroker.RefreshAccount(rCtx)
+		rCancel()
+	}
+
+	fetch4hFn := func(sym string, limit int) []model.Candle {
+		k, kErr := e.client.FetchKlines(ctaCtx, sym, "4h", limit)
+		if kErr != nil {
+			slog.Warn("CTA 4h cycle: kline fetch failed", "symbol", sym, "limit", limit, "err", kErr)
+			return nil
+		}
+		return k
+	}
+	e.evaluateCTABarWithData(ctx, barEndUTC, filters, volMap, bookMap, premMap, fetch4hFn)
+}
+
+type ctaAuditRecord struct {
+	sym           string
+	snap          model.MarketSnapshot
+	cand          strategy.CTA4hCandidate
+	candles4h     []model.Candle
+	intent        model.OrderIntent
+	approved      bool
+	decision      string
+	reason        string
+	subReason     string
+	needLiveNet   bool
+	liveOrigLimit decimal.Decimal
+	liveStartAtt  int
+}
+
+func (e *BotEngine) evaluateCTABarWithData(
+	ctx context.Context,
+	barEndUTC time.Time,
+	filters map[string]model.ExchangeFilter,
+	volMap map[string]float64,
+	bookMap map[string]model.BookQuote,
+	premMap map[string]exchange.PremiumIndexQuote,
+	fetch4hFn func(symbol string, limit int) []model.Candle,
+) {
+	if e == nil || !e.evaluatorCfg.CTAPod.IsEnabled() || e.shuttingDown.Load() || e.broker == nil {
+		return
+	}
+	now := e.exchangeNow()
+	barOpenUTC := barEndUTC.Add(-4 * time.Hour)
+	ctaSyms := e.refreshCTAPodUniverse(filters, volMap, bookMap, premMap, now)
+	if len(ctaSyms) == 0 {
+		slog.Info("CTA 4h cycle: empty universe above min volume")
+		return
+	}
+
+	candlesBySym := make(map[string][]model.Candle, len(ctaSyms))
+	if fetch4hFn != nil {
+		var mu sync.Mutex
+		workers := 5
+		if len(ctaSyms) < workers {
+			workers = len(ctaSyms)
+		}
+		symCh := make(chan string, len(ctaSyms))
+		for _, s := range ctaSyms {
+			symCh <- s
+		}
+		close(symCh)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for sym := range symCh {
+					if ctx != nil && ctx.Err() != nil {
+						return
+					}
+					e.cta4hMu.Lock()
+					existing := slices.Clone(e.cta4hCandles[sym])
+					e.cta4hMu.Unlock()
+
+					needFull := len(existing) < strategy.CTAPod4hHistoryCap-20
+					if !needFull && len(existing) > 1 {
+						lastOpen := existing[len(existing)-1].OpenTime
+						if barOpenUTC.Sub(lastOpen) > 48*time.Hour {
+							needFull = true
+						}
+					}
+					limit := 24
+					if needFull {
+						limit = strategy.CTAPod4hHistoryCap
+					}
+					var merged []model.Candle
+					if len(existing) > 0 && existing[len(existing)-1].OpenTime.Equal(barOpenUTC) && len(existing) >= strategy.CTAPod4hHistoryCap-20 {
+						merged = existing
+					} else {
+						raw := fetch4hFn(sym, limit)
+						if valid, vErr := model.ValidateAndFilterCandles(raw, barEndUTC, 4*time.Hour); vErr == nil && len(valid) > 0 {
+							merged = mergeCTACandles(existing, valid, strategy.CTAPod4hHistoryCap)
+							e.cta4hMu.Lock()
+							if e.cta4hCandles == nil {
+								e.cta4hCandles = make(map[string][]model.Candle)
+							}
+							e.cta4hCandles[sym] = merged
+							e.cta4hMu.Unlock()
+						} else {
+							merged = existing
+						}
+					}
+					if len(merged) > 0 {
+						mu.Lock()
+						candlesBySym[sym] = merged
+						mu.Unlock()
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	e.cta4hMu.Lock()
+	for sym := range e.cta4hCandles {
+		keep := false
+		for _, target := range ctaSyms {
+			if target == sym {
+				keep = true
+				break
+			}
+		}
+		if !keep && !e.broker.HasActiveOrderOrPosition(sym) {
+			delete(e.cta4hCandles, sym)
+		}
+	}
+	e.cta4hMu.Unlock()
+
+	buildRecs := func() ([]ctaAuditRecord, []ctaAuditRecord, decimal.Decimal, decimal.Decimal) {
+		evalNow := e.exchangeNow()
+		accountStale := e.cfg != nil && !e.cfg.DryRun && e.liveBroker != nil && e.liveBroker.IsAccountStale(evalNow)
+		totEq := e.broker.GetEffectiveTotalEquityUSDT()
+		availBal := e.broker.GetAvailableBalanceUSDT()
+		portDD := e.broker.GetDrawdownFromPeakPct()
+		sizingEquity := totEq
+		if e.cfg != nil && !e.cfg.EquityModeCompounding && e.cfg.InitialEquity.GreaterThan(decimal.Zero) {
+			sizingEquity = e.cfg.InitialEquity
+		}
+		maxDailyDD := e.evaluatorCfg.MaxDailyDrawdownPct
+		if e.cfg != nil && e.cfg.MaxDailyDrawdown < 0 {
+			maxDailyDD = e.cfg.MaxDailyDrawdown
+		}
+		isDailyBreached := e.broker.IsCircuitBreakerTripped() || (e.broker.GetDailyTotalDrawdownPct() <= maxDailyDD)
+
+		var approved []ctaAuditRecord
+		var rejected []ctaAuditRecord
+
+		for _, sym := range ctaSyms {
+			c4h := candlesBySym[sym]
+			bq, hasBook := bookMap[sym]
+			pq, hasPrem := premMap[sym]
+			snap := model.MarketSnapshot{
+				Symbol:               sym,
+				Filter:               filters[sym],
+				Now:                  evalNow,
+				BestBid:              bq.BestBid,
+				BestAsk:              bq.BestAsk,
+				MarkPrice:            pq.MarkPrice,
+				FundingRate:          pq.LastFundingRate,
+				PortfolioDrawdownPct: portDD,
+			}
+			if hasBook && bq.BestBid > 0 && bq.BestAsk > bq.BestBid {
+				snap.BookUpdatedAt = evalNow
+			}
+			if hasPrem && pq.MarkPrice > 0 {
+				snap.MarkPriceUpdatedAt = evalNow
+				snap.FundingUpdatedAt = evalNow
+			} else if snap.BestBid > 0 && snap.BestAsk > snap.BestBid {
+				snap.MarkPrice = (snap.BestBid + snap.BestAsk) / 2.0
+				snap.MarkPriceUpdatedAt = evalNow
+			}
+			e.cooldownMu.RLock()
+			if exitRec, okC := e.ctaCooldownExits[sym]; okC {
+				snap.LastExitTime = exitRec.ClosedAt
+				snap.LastExitReason = exitRec.ExitReason
+			}
+			e.cooldownMu.RUnlock()
+
+			var cand strategy.CTA4hCandidate
+			if accountStale {
+				cand = strategy.CTA4hCandidate{Symbol: sym, StrategyID: strategy.StrategyIDCTA4hShort, Reason: "STALE_ACCOUNT_FEED", SubReason: "LIVE_ACCOUNT_SNAPSHOT_EXPIRED"}
+			} else if len(c4h) == 0 || !c4h[len(c4h)-1].OpenTime.Equal(barOpenUTC) {
+				cand = strategy.CTA4hCandidate{Symbol: sym, StrategyID: strategy.StrategyIDCTA4hShort, Reason: "STALE_4H_CANDLE", SubReason: "4H_BAR_NOT_READY"}
+			} else {
+				cand = strategy.EvaluateCTA4hCandidate(snap, c4h, e.broker.HasActiveOrderOrPosition(sym), isDailyBreached, e.evaluatorCfg)
+			}
+
+			rec := ctaAuditRecord{
+				sym:       sym,
+				snap:      snap,
+				cand:      cand,
+				candles4h: c4h,
+				decision:  "REJECT",
+				reason:    cand.Reason,
+				subReason: cand.SubReason,
+			}
+			if cand.Approved {
+				approved = append(approved, rec)
+			} else {
+				rejected = append(rejected, rec)
+			}
+		}
+
+		slices.SortFunc(approved, func(a, b ctaAuditRecord) int {
+			if a.cand.Score != b.cand.Score {
+				if a.cand.Score > b.cand.Score {
+					return -1
+				}
+				return 1
+			}
+			return strings.Compare(a.cand.Symbol, b.cand.Symbol)
+		})
+		return approved, rejected, sizingEquity, availBal
+	}
+
+	var verifiedApprovedSet map[string]bool
+	if e.cfg != nil && !e.cfg.DryRun {
+		preApproved, _, _, _ := buildRecs()
+		if len(preApproved) > 0 {
+			approvedSyms := make([]string, 0, len(preApproved))
+			for _, rec := range preApproved {
+				approvedSyms = append(approvedSyms, rec.sym)
+			}
+			verified := e.verifyLiveSymbolList(ctx, approvedSyms, false)
+			verifiedApprovedSet = make(map[string]bool, len(verified))
+			for _, s := range verified {
+				verifiedApprovedSet[s] = true
+			}
+		}
+	}
+
+	e.evalSubmitMu.Lock()
+	approved, rejected, sizingEquity, availBal := buildRecs()
+	var finalResults []ctaAuditRecord
+	finalResults = append(finalResults, rejected...)
+
+	maxCTASlots := e.evaluatorCfg.CTAPod.MaxSlots
+	if maxCTASlots <= 0 {
+		maxCTASlots = 3
+	}
+	ctaSlots := e.getActiveCTASlots()
+
+	for i := range approved {
+		rec := approved[i]
+		if verifiedApprovedSet != nil && !verifiedApprovedSet[rec.sym] {
+			rec.decision = "REJECT"
+			rec.reason = "LIVE_SYMBOL_SETUP_FAILED"
+			finalResults = append(finalResults, rec)
+			continue
+		}
+		if ctaSlots >= maxCTASlots {
+			rec.decision = "REJECT"
+			rec.reason = "CTA_POD_SLOTS_FULL"
+			rec.subReason = fmt.Sprintf("SLOTS_%d_MAX_%d", ctaSlots, maxCTASlots)
+			finalResults = append(finalResults, rec)
+			continue
+		}
+		if e.broker.HasActiveOrderOrPosition(rec.sym) {
+			rec.decision = "REJECT"
+			rec.reason = "SYMBOL_ALREADY_ACTIVE"
+			finalResults = append(finalResults, rec)
+			continue
+		}
+
+		intent, okBuild, buildReason := strategy.BuildCTA4hOrderIntent(rec.cand, rec.snap, sizingEquity, availBal, e.evaluatorCfg)
+		if !okBuild {
+			rec.decision = "REJECT"
+			rec.reason = buildReason
+			finalResults = append(finalResults, rec)
+			continue
+		}
+
+		if e.liveBroker != nil {
+			prepared, prepErr := e.liveBroker.PreparePreSubmitIntent(intent)
+			if prepErr != nil {
+				rec.decision = "REJECT"
+				rec.reason = "BROKER_REJECTED"
+				rec.subReason = prepErr.Error()
+				finalResults = append(finalResults, rec)
+				continue
+			}
+			startAttempt := 0
+			if !prepared.LimitPrice.Equal(intent.LimitPrice) {
+				startAttempt = 1
+			}
+			reserved, reserveErr := e.liveBroker.ReserveEntryIntent(prepared)
+			if !reserved || reserveErr != nil {
+				rec.decision = "REJECT"
+				rec.reason = "BROKER_REJECTED"
+				if reserveErr != nil {
+					rec.subReason = reserveErr.Error()
+				}
+				finalResults = append(finalResults, rec)
+				continue
+			}
+			rec.intent = prepared
+			rec.approved = true
+			rec.decision = "APPROVE"
+			rec.reason = "SIGNAL_APPROVED"
+			rec.needLiveNet = true
+			rec.liveOrigLimit = intent.LimitPrice
+			rec.liveStartAtt = startAttempt
+			ctaSlots = e.getActiveCTASlots()
+			availBal = e.broker.GetAvailableBalanceUSDT()
+		} else {
+			reserved, submitErr := e.broker.SubmitLimitEntry(intent)
+			if reserved && submitErr == nil {
+				rec.intent = intent
+				rec.approved = true
+				rec.decision = "APPROVE"
+				rec.reason = "SIGNAL_APPROVED"
+				ctaSlots = e.getActiveCTASlots()
+				availBal = e.broker.GetAvailableBalanceUSDT()
+				slog.Info("CTA POD ENTRY ACCEPTED", "symbol", intent.Symbol, "side", intent.Side, "strategyID", intent.StrategyID, "score", rec.cand.Score, "qty", intent.Qty, "price", intent.LimitPrice)
+			} else {
+				rec.decision = "REJECT"
+				rec.reason = "BROKER_REJECTED"
+				if submitErr != nil {
+					rec.subReason = submitErr.Error()
+				}
+			}
+		}
+		finalResults = append(finalResults, rec)
+	}
+	e.evalSubmitMu.Unlock()
+
+	var acceptedRecs []ctaAuditRecord
+	for i := range finalResults {
+		rec := &finalResults[i]
+		if rec.needLiveNet && e.liveBroker != nil {
+			submitted, submitErr := e.liveBroker.SubmitReservedEntryWithParams(rec.intent, rec.liveOrigLimit, rec.liveStartAtt)
+			if submitted && submitErr == nil {
+				slog.Info("CTA POD LIVE ENTRY SUBMITTED", "symbol", rec.intent.Symbol, "side", rec.intent.Side, "strategyID", rec.intent.StrategyID, "score", rec.cand.Score)
+			} else {
+				rec.approved = false
+				rec.decision = "REJECT"
+				rec.reason = "BROKER_REJECTED"
+				if submitErr != nil {
+					rec.subReason = submitErr.Error()
+				}
+			}
+		}
+		if rec.approved {
+			acceptedRecs = append(acceptedRecs, *rec)
+		}
+
+		evalSide := string(rec.cand.Side)
+		if evalSide == "" {
+			evalSide = "NONE"
+		}
+		spreadPct := 0.0
+		if rec.snap.BestBid > 0 && rec.snap.BestAsk > rec.snap.BestBid {
+			spreadPct = ((rec.snap.BestAsk - rec.snap.BestBid) / rec.snap.BestBid) * 100.0
+		}
+		var limF, slF, tpF float64
+		if rec.approved {
+			limF, _ = rec.intent.LimitPrice.Float64()
+			slF, _ = rec.intent.SLPrice.Float64()
+			tpF, _ = rec.intent.TPPrice.Float64()
+		}
+		if e.repo != nil {
+			sigID, logErr := e.repo.LogSignalAudit(
+				context.Background(),
+				barOpenUTC,
+				rec.sym,
+				evalSide,
+				rec.cand.Close4h,
+				rec.cand.EMA200_4h,
+				rec.cand.EMA36_4h,
+				rec.cand.ATR14_4h,
+				0.0,
+				0.0,
+				rec.snap.FundingRate,
+				spreadPct,
+				0.0,
+				rec.cand.Score,
+				limF,
+				slF,
+				tpF,
+				rec.decision,
+				rec.reason,
+				rec.subReason,
+				strategy.NormalizeStrategyID(rec.cand.StrategyID),
+			)
+			if logErr != nil {
+				slog.Error("failed to log CTA pod signal audit", "symbol", rec.sym, "err", logErr)
+			} else if rec.approved && sigID > 0 {
+				e.attachSignalAuditID(rec.intent.Symbol, rec.intent.ClientOrderID, sigID)
+			}
+		}
+	}
+
+	if len(acceptedRecs) > 0 {
+		e.ensureActiveCTAStreamSymbols(ctx, acceptedRecs)
+	}
+	slog.Info("CTA 4h cycle completed", "barOpenUTC", barOpenUTC.UTC().Format(time.RFC3339), "evaluated", len(ctaSyms), "approved", len(acceptedRecs))
+}
+
+func mergeCTACandles(existing, incoming []model.Candle, capBars int) []model.Candle {
+	byOpen := make(map[int64]model.Candle, len(existing)+len(incoming))
+	for _, c := range existing {
+		byOpen[c.OpenTime.UnixMilli()] = c
+	}
+	for _, c := range incoming {
+		byOpen[c.OpenTime.UnixMilli()] = c
+	}
+	out := make([]model.Candle, 0, len(byOpen))
+	for _, c := range byOpen {
+		out = append(out, c)
+	}
+	slices.SortFunc(out, func(a, b model.Candle) int {
+		return a.OpenTime.Compare(b.OpenTime)
+	})
+	if capBars > 0 && len(out) > capBars {
+		out = append([]model.Candle(nil), out[len(out)-capBars:]...)
+	}
+	return out
+}
+
+func (e *BotEngine) ensureActiveCTAStreamSymbols(ctx context.Context, recs []ctaAuditRecord) {
+	if e == nil || len(recs) == 0 {
+		return
+	}
+	bootCap := e.scannerCfg.BootstrapCount
+	if bootCap <= 0 {
+		bootCap = 1000
+	}
+	deltaCap := e.scannerCfg.DeltaWindow + 1
+	if deltaCap <= 0 {
+		deltaCap = 51
+	}
+
+	var addedToStream bool
+	e.statesMu.Lock()
+	for _, rec := range recs {
+		st, exists := e.activeStates[rec.sym]
+		if !exists || st == nil {
+			st = model.NewSymbolState(rec.sym, rec.snap.Filter, bootCap, deltaCap)
+			st.TargetOIInterval = e.cfg.CandleDuration
+			st.IsLeverageIsolatedVerified = true
+			e.activeStates[rec.sym] = st
+		}
+		st.Mu.Lock()
+		st.BestBid = rec.snap.BestBid
+		st.BestAsk = rec.snap.BestAsk
+		st.BookUpdatedAt = rec.snap.BookUpdatedAt
+		st.MarkPrice = rec.snap.MarkPrice
+		st.MarkPriceUpdatedAt = rec.snap.MarkPriceUpdatedAt
+		st.FundingRate = rec.snap.FundingRate
+		st.FundingUpdatedAt = rec.snap.FundingUpdatedAt
+		st.Mu.Unlock()
+		if !slices.Contains(e.lastStreamSymbols, rec.sym) {
+			e.lastStreamSymbols = append(e.lastStreamSymbols, rec.sym)
+			addedToStream = true
+		}
+	}
+	streamCopy := slices.Clone(e.lastStreamSymbols)
+	e.statesMu.Unlock()
+
+	if addedToStream && ctx != nil && ctx.Err() == nil && e.cfg != nil && e.cfg.WSPublicURL != "" {
+		e.restartMarketStream(ctx, streamCopy)
 	}
 }
 

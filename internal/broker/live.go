@@ -379,7 +379,8 @@ func (b *BinanceLiveBroker) RestoreOpenPosition(pos *LiveOpenPosition) {
 		slStatus = model.ProtectionFailed
 	}
 	tpStatus := model.ProtectionAcked
-	if (!partialTPEnabled || !trailingEnabled) && (pos.TPOrderID == 0 || pos.TPPrice.IsZero()) {
+	needTP := !protCfg.ChandelierTrailing || !pos.TPPrice.IsZero()
+	if needTP && (!partialTPEnabled || !trailingEnabled) && (pos.TPOrderID == 0 || pos.TPPrice.IsZero()) {
 		tpStatus = model.ProtectionFailed
 	}
 
@@ -2365,6 +2366,9 @@ func (b *BinanceLiveBroker) planProtectionSyncLocked(entryRec *model.LiveOrderRe
 	protCfg := b.toProtectionConfigFor(stratID)
 
 	needTP := !protCfg.PartialTPEnabled || !protCfg.TrailingEnabled
+	if protCfg.ChandelierTrailing && entryRec.TPPrice.LessThanOrEqual(decimal.Zero) {
+		needTP = false
+	}
 	action := model.ProtectionPlanAction{
 		Symbol:            entryRec.Symbol,
 		Generation:        gen,

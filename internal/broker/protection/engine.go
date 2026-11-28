@@ -31,6 +31,7 @@ type ProtectionConfig struct {
 	Tier2ProfitLockATR       float64
 	Tier2ProfitLockOffsetATR float64
 	TrailingEnabled          bool
+	ChandelierTrailing       bool
 	TrailingActivateATR      float64
 	TrailingDistanceATR      float64
 	PartialTPEnabled         bool
@@ -40,7 +41,7 @@ type ProtectionConfig struct {
 	SlippageRate             decimal.Decimal
 }
 
-// StrategyExitProfile overrides exit & protection rules for a specific StrategyID (e.g., 1h MajorPod strategies)
+// StrategyExitProfile overrides exit & protection rules for a specific StrategyID (e.g., 1h MajorPod / 4h CTAPod strategies)
 // without affecting the base QMAX strategy configuration.
 type StrategyExitProfile struct {
 	HasOverride            bool
@@ -48,6 +49,7 @@ type StrategyExitProfile struct {
 	Tier1BEEnabled         bool
 	Tier2ProfitLockEnabled bool
 	TrailingEnabled        bool
+	ChandelierTrailing     bool
 	TrailingActivateATR    float64
 	TrailingDistanceATR    float64
 	StaleLossExitDuration  time.Duration
@@ -68,6 +70,7 @@ func ResolveProtectionConfig(base ProtectionConfig, profiles map[string]Strategy
 	out.Tier1BEEnabled = prof.Tier1BEEnabled
 	out.Tier2ProfitLockEnabled = prof.Tier2ProfitLockEnabled
 	out.TrailingEnabled = prof.TrailingEnabled
+	out.ChandelierTrailing = prof.ChandelierTrailing
 	out.TrailingActivateATR = prof.TrailingActivateATR
 	out.TrailingDistanceATR = prof.TrailingDistanceATR
 	return out
@@ -175,8 +178,8 @@ func EvaluatePositionProtection(pos PositionSnapshot, currentPrice decimal.Decim
 		t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2Offset))
 		t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1LongTrigger))
 
-		// Tier 3: Trailing Stop Ratchet untuk Runner
-		canTrail := cfg.TrailingEnabled && pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(trailActivateDist)
+		// Tier 3: Trailing Stop Ratchet untuk Runner (atau Chandelier langsung dari peak saat ChandelierTrailing=true)
+		canTrail := cfg.TrailingEnabled && (cfg.ChandelierTrailing || pos.PeakPrice.Sub(pos.EntryPrice).GreaterThanOrEqual(trailActivateDist))
 		if cfg.PartialTPEnabled {
 			canTrail = canTrail && pos.IsTP1Hit
 		}
@@ -232,8 +235,8 @@ func EvaluatePositionProtection(pos PositionSnapshot, currentPrice decimal.Decim
 	t2OffsetDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t2Offset))
 	t1TriggerDist := pos.ATRAtEntry.Mul(decimal.NewFromFloat(t1ShortTrigger))
 
-	// Tier 3: Trailing Stop Ratchet untuk Runner
-	canTrail := cfg.TrailingEnabled && pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(trailActivateDist)
+	// Tier 3: Trailing Stop Ratchet untuk Runner (atau Chandelier langsung dari peak saat ChandelierTrailing=true)
+	canTrail := cfg.TrailingEnabled && (cfg.ChandelierTrailing || pos.EntryPrice.Sub(pos.PeakPrice).GreaterThanOrEqual(trailActivateDist))
 	if cfg.PartialTPEnabled {
 		canTrail = canTrail && pos.IsTP1Hit
 	}

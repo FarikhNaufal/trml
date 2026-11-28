@@ -209,6 +209,7 @@ type Config struct {
 	VWAPBreakdown                VWAPBreakdownStrategyConfig
 	StructureBreak               StructureBreakStrategyConfig
 	MajorPod                     MajorPodStrategyConfig
+	CTAPod                       CTAPodStrategyConfig
 }
 
 // SweepStrategyConfig memuat parameter strategi sekunder 1-Bar Liquidity Sweep SHORT-ONLY.
@@ -337,6 +338,40 @@ type MajorPodStrategyConfig struct {
 // IsEnabled reports whether at least one side of the 1h Major RS-Momentum Pod is enabled.
 func (m MajorPodStrategyConfig) IsEnabled() bool {
 	return m.ShortEnabled || m.LongEnabled
+}
+
+// CTAPodStrategyConfig holds opt-in settings for Pod #4 (4h CTA Trend Following).
+type CTAPodStrategyConfig struct {
+	ShortEnabled        bool
+	LongEnabled         bool
+	Mode                string
+	TopN                int
+	MinVolume24hUSDT    float64
+	MaxSlots            int
+	ShortRiskPct        decimal.Decimal
+	LongRiskPct         decimal.Decimal
+	DonchianLookback    int
+	EMAFast             int
+	EMASlow             int
+	EMATrend            int
+	ShortMinFundingRate float64
+	LongMaxFundingRate  float64
+	SLATRMultiplier     float64
+	TPATRMultiplier     float64
+	MinSLDistancePct    decimal.Decimal
+	TrailingEnabled     bool
+	ChandelierTrailing  bool
+	TrailingActivateATR float64
+	TrailingDistanceATR float64
+	MaxHoldingDuration  time.Duration
+	StaleLossDuration   time.Duration
+	CooldownMinutes     int
+	EntryOrderType      string
+}
+
+// IsEnabled reports whether at least one side of the 4h CTA Trend Following pod is enabled.
+func (c CTAPodStrategyConfig) IsEnabled() bool {
+	return c.ShortEnabled || c.LongEnabled
 }
 
 const defaultMajorPodSymbolsCSV = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,SUIUSDT,LTCUSDT,TRXUSDT,DOTUSDT,NEARUSDT,BCHUSDT"
@@ -1596,6 +1631,109 @@ func LoadConfigFile(envPath string) (*Config, error) {
 		return nil, fmt.Errorf("config: invalid MAJOR_POD_ENTRY_ORDER_TYPE '%s' (must be 'MARKET' or 'LIMIT')", majorEntryOrderType)
 	}
 
+	ctaShortEnabled, err := parseBoolEnvStrict("CTA_POD_SHORT_ENABLED", getEnv("CTA_POD_SHORT_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	ctaLongEnabled, err := parseBoolEnvStrict("CTA_POD_LONG_ENABLED", getEnv("CTA_POD_LONG_ENABLED", "false"))
+	if err != nil {
+		return nil, err
+	}
+	ctaMode := strings.ToUpper(strings.TrimSpace(getEnv("CTA_POD_MODE", "DON20")))
+	switch ctaMode {
+	case "DON20", "DON40", "DONCHIAN", "EMA_CROSS":
+	default:
+		return nil, fmt.Errorf("config: invalid CTA_POD_MODE '%s' (must be DON20, DON40, DONCHIAN, or EMA_CROSS)", ctaMode)
+	}
+	ctaTopN, err := strconv.Atoi(getEnv("CTA_POD_TOP_N", "25"))
+	if err != nil || ctaTopN < 1 || ctaTopN > 100 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_TOP_N (must be between 1 and 100)")
+	}
+	ctaMinVol, err := parseFloatEnv(getEnv("CTA_POD_MIN_VOLUME_24H_USDT", "25000000"))
+	if err != nil || ctaMinVol < 0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_MIN_VOLUME_24H_USDT (must be >= 0)")
+	}
+	ctaMaxSlots, err := strconv.Atoi(getEnv("CTA_POD_MAX_SLOTS", "3"))
+	if err != nil || ctaMaxSlots < 1 || ctaMaxSlots > 10 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_MAX_SLOTS (must be between 1 and 10)")
+	}
+	ctaShortRiskPct, err := decimal.NewFromString(getEnv("CTA_POD_SHORT_RISK_PCT", "0.0060"))
+	if err != nil || ctaShortRiskPct.LessThan(decimal.NewFromFloat(0.0005)) || ctaShortRiskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid CTA_POD_SHORT_RISK_PCT (must be between 0.0005 and 0.05)")
+	}
+	ctaLongRiskPct, err := decimal.NewFromString(getEnv("CTA_POD_LONG_RISK_PCT", "0.0060"))
+	if err != nil || ctaLongRiskPct.LessThan(decimal.NewFromFloat(0.0005)) || ctaLongRiskPct.GreaterThan(decimal.NewFromFloat(0.05)) {
+		return nil, fmt.Errorf("config: invalid CTA_POD_LONG_RISK_PCT (must be between 0.0005 and 0.05)")
+	}
+	ctaDonLB, err := strconv.Atoi(getEnv("CTA_POD_DONCHIAN_LOOKBACK", "20"))
+	if err != nil || ctaDonLB < 5 || ctaDonLB > 100 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_DONCHIAN_LOOKBACK (must be between 5 and 100)")
+	}
+	ctaEMAFast, err := strconv.Atoi(getEnv("CTA_POD_EMA_FAST", "12"))
+	if err != nil || ctaEMAFast < 3 || ctaEMAFast > 50 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_EMA_FAST (must be between 3 and 50)")
+	}
+	ctaEMASlow, err := strconv.Atoi(getEnv("CTA_POD_EMA_SLOW", "36"))
+	if err != nil || ctaEMASlow <= ctaEMAFast || ctaEMASlow > 200 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_EMA_SLOW (must be > CTA_POD_EMA_FAST and <= 200)")
+	}
+	ctaEMATrend, err := strconv.Atoi(getEnv("CTA_POD_EMA_TREND", "200"))
+	if err != nil || ctaEMATrend < 50 || ctaEMATrend > 400 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_EMA_TREND (must be between 50 and 400)")
+	}
+	ctaShortMinFR, err := parseFloatEnv(getEnv("CTA_POD_SHORT_MIN_FUNDING_RATE", "-0.0002"))
+	if err != nil || ctaShortMinFR < -1.0 || ctaShortMinFR > 0.05 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_SHORT_MIN_FUNDING_RATE (must be between -1.0 and 0.05)")
+	}
+	ctaLongMaxFR, err := parseFloatEnv(getEnv("CTA_POD_LONG_MAX_FUNDING_RATE", "0.0002"))
+	if err != nil || ctaLongMaxFR < -0.01 || ctaLongMaxFR > 0.05 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_LONG_MAX_FUNDING_RATE (must be between -0.01 and 0.05)")
+	}
+	ctaSLMult, err := parseFloatEnv(getEnv("CTA_POD_SL_ATR_MULTIPLIER", "3.0"))
+	if err != nil || ctaSLMult < 0.5 || ctaSLMult > 10.0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_SL_ATR_MULTIPLIER (must be between 0.5 and 10.0)")
+	}
+	ctaTPMult, err := parseFloatEnv(getEnv("CTA_POD_TP_ATR_MULTIPLIER", "0.0"))
+	if err != nil || ctaTPMult < 0.0 || ctaTPMult > 30.0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_TP_ATR_MULTIPLIER (must be between 0.0 and 30.0)")
+	}
+	ctaMinSLPct, err := decimal.NewFromString(getEnv("CTA_POD_MIN_SL_DISTANCE_PCT", "0.0200"))
+	if err != nil || ctaMinSLPct.LessThan(decimal.Zero) || ctaMinSLPct.GreaterThan(decimal.NewFromFloat(0.20)) {
+		return nil, fmt.Errorf("config: invalid CTA_POD_MIN_SL_DISTANCE_PCT (must be between 0.0 and 0.20)")
+	}
+	ctaTrailEnabled, err := parseBoolEnvStrict("CTA_POD_TRAILING_ENABLED", getEnv("CTA_POD_TRAILING_ENABLED", "true"))
+	if err != nil {
+		return nil, err
+	}
+	ctaChandelier, err := parseBoolEnvStrict("CTA_POD_CHANDELIER_TRAILING", getEnv("CTA_POD_CHANDELIER_TRAILING", "true"))
+	if err != nil {
+		return nil, err
+	}
+	ctaTrailAct, err := parseFloatEnv(getEnv("CTA_POD_TRAILING_ACTIVATE_ATR", "0.0"))
+	if err != nil || ctaTrailAct < 0.0 || ctaTrailAct > 15.0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_TRAILING_ACTIVATE_ATR (must be between 0.0 and 15.0)")
+	}
+	ctaTrailDist, err := parseFloatEnv(getEnv("CTA_POD_TRAILING_DISTANCE_ATR", "3.0"))
+	if err != nil || ctaTrailDist < 0.2 || ctaTrailDist > 10.0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_TRAILING_DISTANCE_ATR (must be between 0.2 and 10.0)")
+	}
+	ctaMaxHold, err := time.ParseDuration(getEnv("CTA_POD_MAX_HOLDING_DURATION", "240h"))
+	if err != nil || ctaMaxHold <= 0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_MAX_HOLDING_DURATION (must be > 0)")
+	}
+	ctaStaleLoss, err := time.ParseDuration(getEnv("CTA_POD_STALE_LOSS_DURATION", "0s"))
+	if err != nil || ctaStaleLoss < 0 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_STALE_LOSS_DURATION (must be >= 0)")
+	}
+	ctaCooldownMins, err := strconv.Atoi(getEnv("CTA_POD_COOLDOWN_MINUTES", "240"))
+	if err != nil || ctaCooldownMins < 0 || ctaCooldownMins > 2880 {
+		return nil, fmt.Errorf("config: invalid CTA_POD_COOLDOWN_MINUTES (must be between 0 and 2880)")
+	}
+	ctaEntryOrderType := strings.ToUpper(strings.TrimSpace(getEnv("CTA_POD_ENTRY_ORDER_TYPE", "MARKET")))
+	if ctaEntryOrderType != "MARKET" && ctaEntryOrderType != "LIMIT" {
+		return nil, fmt.Errorf("config: invalid CTA_POD_ENTRY_ORDER_TYPE '%s' (must be 'MARKET' or 'LIMIT')", ctaEntryOrderType)
+	}
+
 	return &Config{
 		Env:                      env,
 		APIKey:                   apiKey,
@@ -1862,6 +2000,33 @@ func LoadConfigFile(envPath string) (*Config, error) {
 			StaleLossDuration:   majorStaleLoss,
 			CooldownMinutes:     majorCooldownMins,
 			EntryOrderType:      majorEntryOrderType,
+		},
+		CTAPod: CTAPodStrategyConfig{
+			ShortEnabled:        ctaShortEnabled,
+			LongEnabled:         ctaLongEnabled,
+			Mode:                ctaMode,
+			TopN:                ctaTopN,
+			MinVolume24hUSDT:    ctaMinVol,
+			MaxSlots:            ctaMaxSlots,
+			ShortRiskPct:        ctaShortRiskPct,
+			LongRiskPct:         ctaLongRiskPct,
+			DonchianLookback:    ctaDonLB,
+			EMAFast:             ctaEMAFast,
+			EMASlow:             ctaEMASlow,
+			EMATrend:            ctaEMATrend,
+			ShortMinFundingRate: ctaShortMinFR,
+			LongMaxFundingRate:  ctaLongMaxFR,
+			SLATRMultiplier:     ctaSLMult,
+			TPATRMultiplier:     ctaTPMult,
+			MinSLDistancePct:    ctaMinSLPct,
+			TrailingEnabled:     ctaTrailEnabled,
+			ChandelierTrailing:  ctaChandelier,
+			TrailingActivateATR: ctaTrailAct,
+			TrailingDistanceATR: ctaTrailDist,
+			MaxHoldingDuration:  ctaMaxHold,
+			StaleLossDuration:   ctaStaleLoss,
+			CooldownMinutes:     ctaCooldownMins,
+			EntryOrderType:      ctaEntryOrderType,
 		},
 	}, nil
 }

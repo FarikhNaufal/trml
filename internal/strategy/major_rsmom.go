@@ -3,7 +3,6 @@ package strategy
 import (
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"time"
 
@@ -48,143 +47,11 @@ func IsHourCloseTimestamp(t time.Time) bool {
 	return norm.Minute() == 0 && norm.Second() == 0
 }
 
-type hourlyResampleBucket struct {
-	candle   model.Candle
-	count    int
-	seenOpen map[int64]bool
-}
-
 // ResampleCompletedHourlyStrict deterministically aggregates closed sub-hourly (or 1h) candles into complete UTC 1h bars.
 // When expectedSubStep is strictly less than 1 hour, a bucket must contain all expected sub-bars to be emitted, matching
 // causal multi-timeframe research parity and preventing partial-hour bar leakage.
 func ResampleCompletedHourlyStrict(candles []model.Candle, expectedSubStep time.Duration) []model.Candle {
-	if len(candles) == 0 {
-		return nil
-	}
-
-	requiredBars := 0
-	if expectedSubStep > 0 && expectedSubStep < time.Hour && (time.Hour%expectedSubStep == 0) {
-		requiredBars = int(time.Hour / expectedSubStep)
-	}
-
-	var inferredStep time.Duration
-	var prevOpen time.Time
-	for _, c := range candles {
-		ref := c.OpenTime
-		if ref.IsZero() {
-			ref = c.CloseTime
-		}
-		if ref.IsZero() {
-			continue
-		}
-		if !prevOpen.IsZero() && ref.After(prevOpen) {
-			step := ref.Sub(prevOpen)
-			if inferredStep == 0 || step < inferredStep {
-				inferredStep = step
-			}
-		}
-		prevOpen = ref
-	}
-
-	buckets := make(map[int64]*hourlyResampleBucket, len(candles)/4+1)
-	keys := make([]int64, 0, len(candles)/4+1)
-
-	for _, c := range candles {
-		ref := c.OpenTime
-		if ref.IsZero() {
-			ref = c.CloseTime
-		}
-		if ref.IsZero() || !isFinitePositive(c.Open) || !isFinitePositive(c.High) ||
-			!isFinitePositive(c.Low) || !isFinitePositive(c.Close) || c.Low > c.High {
-			continue
-		}
-		volBase := c.VolumeBase
-		if !isFiniteFloat(volBase) || volBase < 0 {
-			volBase = 0
-		}
-		quoteVol := c.QuoteVolumeUSDT
-		if !isFiniteFloat(quoteVol) || quoteVol < 0 {
-			quoteVol = 0
-		}
-		takerQuote := c.TakerBuyQuoteUSDT
-		if !isFiniteFloat(takerQuote) || takerQuote < 0 {
-			takerQuote = 0
-		}
-
-		hourKey := (ref.UTC().Unix() / 3600) * 3600
-		cClose := c.CloseTime
-		if cClose.IsZero() && inferredStep > 0 {
-			cClose = c.OpenTime.Add(inferredStep)
-		}
-
-		b, ok := buckets[hourKey]
-		if !ok {
-			openT := time.Unix(hourKey, 0).UTC()
-			b = &hourlyResampleBucket{
-				candle: model.Candle{
-					OpenTime:          openT,
-					CloseTime:         cClose,
-					Open:              c.Open,
-					High:              c.High,
-					Low:               c.Low,
-					Close:             c.Close,
-					VolumeBase:        volBase,
-					QuoteVolumeUSDT:   quoteVol,
-					TakerBuyQuoteUSDT: takerQuote,
-				},
-				seenOpen: make(map[int64]bool, 4),
-			}
-			if !c.OpenTime.IsZero() {
-				b.seenOpen[c.OpenTime.UTC().UnixMilli()] = true
-			}
-			b.count = 1
-			buckets[hourKey] = b
-			keys = append(keys, hourKey)
-			continue
-		}
-
-		if !c.OpenTime.IsZero() {
-			ms := c.OpenTime.UTC().UnixMilli()
-			if b.seenOpen[ms] {
-				continue
-			}
-			b.seenOpen[ms] = true
-		}
-
-		if c.High > b.candle.High {
-			b.candle.High = c.High
-		}
-		if c.Low < b.candle.Low {
-			b.candle.Low = c.Low
-		}
-		b.candle.Close = c.Close
-		if cClose.After(b.candle.CloseTime) {
-			b.candle.CloseTime = cClose
-		}
-		b.candle.VolumeBase += volBase
-		b.candle.QuoteVolumeUSDT += quoteVol
-		b.candle.TakerBuyQuoteUSDT += takerQuote
-		b.count++
-	}
-
-	if len(keys) == 0 {
-		return nil
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-	out := make([]model.Candle, 0, len(keys))
-	for _, k := range keys {
-		b := buckets[k]
-		if requiredBars > 0 && b.count != requiredBars {
-			continue
-		}
-		hourAlmostDone := b.candle.OpenTime.Add(time.Hour - time.Minute)
-		if !b.candle.CloseTime.IsZero() && b.candle.CloseTime.Before(hourAlmostDone) {
-			continue
-		}
-		out = append(out, b.candle)
-	}
-	return out
+	return resampleCompletedIntervalStrict(candles, time.Hour, expectedSubStep)
 }
 
 // MajorPodHourlyHistoryCap retains 1000 completed 1h bars (~41.7 days) so 1h EMA(200) converges cleanly (<0.04% seed residual).
@@ -192,42 +59,7 @@ const MajorPodHourlyHistoryCap = 1000
 
 // MergeCompletedHourlyCandle resamples recent sub-hourly bars into completed UTC 1h candles and appends strictly newer bars onto existing, capped to maxBars.
 func MergeCompletedHourlyCandle(existing []model.Candle, recentSubCandles []model.Candle, expectedSubStep time.Duration, maxBars int) []model.Candle {
-	completed := ResampleCompletedHourlyStrict(recentSubCandles, expectedSubStep)
-	if len(completed) == 0 {
-		return existing
-	}
-
-	var lastOpen time.Time
-	if len(existing) > 0 {
-		lastOpen = existing[len(existing)-1].OpenTime
-	}
-	appended := 0
-	for _, c := range completed {
-		if !lastOpen.IsZero() && !c.OpenTime.After(lastOpen) {
-			continue
-		}
-		appended++
-	}
-	if appended == 0 {
-		if maxBars > 0 && len(existing) > maxBars {
-			return append([]model.Candle(nil), existing[len(existing)-maxBars:]...)
-		}
-		return existing
-	}
-
-	out := make([]model.Candle, len(existing), len(existing)+appended)
-	copy(out, existing)
-	for _, c := range completed {
-		if !lastOpen.IsZero() && !c.OpenTime.After(lastOpen) {
-			continue
-		}
-		out = append(out, c)
-		lastOpen = c.OpenTime
-	}
-	if maxBars > 0 && len(out) > maxBars {
-		out = append([]model.Candle(nil), out[len(out)-maxBars:]...)
-	}
-	return out
+	return mergeCompletedIntervalCandle(existing, recentSubCandles, time.Hour, expectedSubStep, maxBars)
 }
 
 func alignHourlyBTCBar(btcH []model.Candle, symHour model.Candle) (int, bool) {
@@ -292,44 +124,9 @@ func EvaluateMajorRSMomCandidate(
 		cand.Reason = "BENCHMARK_SYMBOL_SKIPPED"
 		return cand
 	}
-	if isDailyBreached {
-		cand.Reason = "CIRCUIT_BREAKER_ACTIVE"
-		return cand
-	}
-	if hasActiveSymbol {
-		cand.Reason = "SYMBOL_ALREADY_ACTIVE"
-		return cand
-	}
-	if cfg.MajorPod.CooldownMinutes > 0 && !snap.LastExitTime.IsZero() {
-		cdDur := time.Duration(cfg.MajorPod.CooldownMinutes) * time.Minute
-		if snap.Now.Sub(snap.LastExitTime) < cdDur {
-			remSec := int(cdDur.Seconds() - snap.Now.Sub(snap.LastExitTime).Seconds())
-			cand.Reason = "SYMBOL_IN_COOLDOWN"
-			cand.SubReason = fmt.Sprintf("COOLDOWN_ACTIVE_%ds_REMAINING", remSec)
-			return cand
-		}
-	}
-
-	if snap.BookUpdatedAt.IsZero() || (cfg.MaxBookStaleness > 0 && snap.Now.Sub(snap.BookUpdatedAt) > cfg.MaxBookStaleness) {
-		cand.Reason = "STALE_BBO_FEED"
-		return cand
-	}
-	if snap.MarkPriceUpdatedAt.IsZero() || (cfg.MaxMarkStaleness > 0 && snap.Now.Sub(snap.MarkPriceUpdatedAt) > cfg.MaxMarkStaleness) {
-		cand.Reason = "STALE_MARK_PRICE_FEED"
-		return cand
-	}
-	if snap.FundingUpdatedAt.IsZero() || (cfg.MaxDataStaleness > 0 && snap.Now.Sub(snap.FundingUpdatedAt) > cfg.MaxDataStaleness) {
-		cand.Reason = "STALE_FUNDING_FEED"
-		return cand
-	}
-	if !isFinitePositive(snap.BestBid) || !isFinitePositive(snap.BestAsk) || snap.BestAsk <= snap.BestBid {
-		cand.Reason = "INVALID_BID_ASK"
-		return cand
-	}
-	spreadPct := ((snap.BestAsk - snap.BestBid) / snap.BestBid) * 100.0
-	if !isFiniteFloat(spreadPct) || (cfg.MaxSpreadPct > 0 && spreadPct > cfg.MaxSpreadPct) {
-		cand.Reason = "SPREAD_EXCEEDED"
-		cand.SubReason = fmt.Sprintf("SPREAD_%.3f%%_MAX_%.3f%%", spreadPct, cfg.MaxSpreadPct)
+	if ok, reason, sub := evaluatePodPreGuards(snap, hasActiveSymbol, isDailyBreached, cfg.MajorPod.CooldownMinutes, cfg); !ok {
+		cand.Reason = reason
+		cand.SubReason = sub
 		return cand
 	}
 
@@ -570,19 +367,7 @@ func BuildMajorRSMomOrderIntent(
 	if cand.Side == model.SideLong {
 		riskPct = cfg.MajorPod.LongRiskPct
 	}
-	if cfg.DDThrottleTier2ThresholdPct > 0 && isFinitePositive(cfg.DDThrottleTier2RiskMult) && cfg.DDThrottleTier2RiskMult < 1.0 &&
-		snap.PortfolioDrawdownPct >= cfg.DDThrottleTier2ThresholdPct {
-		riskPct = riskPct.Mul(decimal.NewFromFloat(cfg.DDThrottleTier2RiskMult))
-	} else if cfg.DDThrottleThresholdPct > 0 && isFinitePositive(cfg.DDThrottleRiskMult) && cfg.DDThrottleRiskMult < 1.0 &&
-		snap.PortfolioDrawdownPct >= cfg.DDThrottleThresholdPct {
-		riskPct = riskPct.Mul(decimal.NewFromFloat(cfg.DDThrottleRiskMult))
-	}
-	if isFinitePositive(cfg.MaxEffectiveRiskPerTradePct) {
-		capDec := decimal.NewFromFloat(cfg.MaxEffectiveRiskPerTradePct)
-		if riskPct.GreaterThan(capDec) {
-			riskPct = capDec
-		}
-	}
+	riskPct = applyPortfolioDDThrottleAndCap(riskPct, snap, cfg)
 
 	slMult := cfg.MajorPod.SLATRMultiplier
 	if slMult <= 0 {

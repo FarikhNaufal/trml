@@ -888,4 +888,150 @@ func TestReplayEngine_MajorPodRetainsOver320HourlyBars(t *testing.T) {
 	}
 }
 
+func make15mFor4hHistSeries(sym string, t0 time.Time, total4h int, close4hFn func(b int) float64) []data.HistoricalCandle {
+	out := make([]data.HistoricalCandle, 0, total4h*16)
+	for b := 0; b < total4h; b++ {
+		c4 := close4hFn(b)
+		for q := 0; q < 16; q++ {
+			idx := b*16 + q
+			openT := t0.Add(time.Duration(idx) * 15 * time.Minute)
+			closeT := openT.Add(15*time.Minute - time.Millisecond)
+			hi := c4 * 1.004
+			lo := c4 * 0.996
+			c := c4
+			if q < 15 {
+				c = c4 * 1.001
+			}
+			out = append(out, data.HistoricalCandle{
+				Symbol:            sym,
+				OpenTime:          openT,
+				CloseTime:         closeT,
+				Open:              c4,
+				High:              hi,
+				Low:               lo,
+				Close:             c,
+				Volume:              30_000,
+				QuoteVolume:         3_000_000, // 96 bars * 3M = 288M 24h volume
+				TakerBuyQuoteVolume: 1_400_000,
+			})
+		}
+	}
+	return out
+}
+
+func TestReplayEngine_CTAPodSlotAndClusterIsolation(t *testing.T) {
+	t0 := time.Date(2025, 4, 1, 0, 0, 0, 0, time.UTC)
+	total4h := 50
+	// Build SOLUSDT breaking down at the 49th 4h bar; ETHUSDT breaking down even stronger so rank wins ETH with MaxSlots=1.
+	solBars := make15mFor4hHistSeries("SOLUSDT", t0, total4h, func(b int) float64 {
+		if b < 48 {
+			return 100.0
+		}
+		if b == 48 {
+			return 94.0
+		}
+		return 94.0
+	})
+	ethBars := make15mFor4hHistSeries("ETHUSDT", t0, total4h, func(b int) float64 {
+		if b < 48 {
+			return 200.0
+		}
+		if b == 48 {
+			return 184.0 // 8% break vs 6% on SOL -> higher Score, fits 10x lev 8% guard (~3 ATR < 8%)
+		}
+		return 184.0
+	})
+	f := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.01),
+		StepSize:    decimal.NewFromFloat(0.01),
+		MinQty:      decimal.NewFromFloat(0.01),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	evalCfg := strategy.EvaluatorConfig{
+		CandleDuration:      15 * time.Minute,
+		MaxSlots:            1,
+		MaxDailyDrawdownPct: -0.20,
+		EMAPeriod:           200,
+		ATRPeriod:           14,
+		MaxSpreadPct:        0.25,
+		DisableVWAP:         true,
+		DisableOIFilter:     true,
+		MaxBookStaleness:    5 * time.Second,
+		MaxMarkStaleness:    15 * time.Second,
+		MaxDataStaleness:    20 * time.Minute,
+		CTAPod: strategy.CTAPodConfig{
+			ShortEnabled:        true,
+			Mode:                "DON20",
+			TopN:                25,
+			MinVolume24hUSDT:    25_000_000,
+			MaxSlots:            1,
+			ShortRiskPct:        decimal.NewFromFloat(0.006),
+			DonchianLookback:    20,
+			EMAFast:             12,
+			EMASlow:             36,
+			EMATrend:            200,
+			ShortMinFundingRate: -0.0002,
+			LongMaxFundingRate:  0.0002,
+			SLATRMultiplier:     3.0,
+			TPATRMultiplier:     0.0,
+			MinSLDistancePct:    decimal.NewFromFloat(0.02),
+			TrailingEnabled:     true,
+			ChandelierTrailing:  true,
+			TrailingDistanceATR: 3.0,
+			MaxHoldingDuration:  240 * time.Hour,
+			CooldownMinutes:     240,
+			EntryOrderType:      "MARKET",
+		},
+		Sizing: strategy.SizingConfig{
+			MaxSlotMarginFraction:          decimal.NewFromFloat(0.22),
+			AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+			AccountLeverage:                10.0,
+			MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+			TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+			SlippageRate:                   decimal.NewFromFloat(0.0002),
+		},
+	}
+	sim := simbroker.NewSimBroker(simbroker.SimBrokerConfig{
+		InitialEquityUSDT: decimal.NewFromFloat(1000.0),
+		CandleDuration:    15 * time.Minute,
+		MaxSlots:          2,
+		AccountLeverage:   10.0,
+		EntryOrderType:    "MARKET",
+		StrategyExitProfiles: map[string]protection.StrategyExitProfile{
+			strategy.StrategyIDCTA4hShort: {
+				HasOverride:         true,
+				TrailingEnabled:     true,
+				ChandelierTrailing:  true,
+				TrailingDistanceATR: 3.0,
+				MaxHoldingDuration:  240 * time.Hour,
+			},
+		},
+	})
+	eng := NewReplayEngine(ReplayConfig{
+		WarmupBars:               47 * 16,
+		DynamicScannerEnabled:    false,
+		SettleOpenPositionsAtEnd: true,
+		PortfolioClusterSLCount:  1,
+		PortfolioClusterCooldown: 90 * time.Minute,
+	}, evalCfg, sim, map[string][]data.HistoricalCandle{
+		"ETHUSDT": ethBars,
+		"SOLUSDT": solBars,
+	}, map[string]model.ExchangeFilter{
+		"ETHUSDT": f,
+		"SOLUSDT": f,
+	})
+	if err := eng.Run(context.Background()); err != nil {
+		t.Fatalf("replay run failed: %v", err)
+	}
+	if len(sim.ClosedTrades) != 1 || sim.ClosedTrades[0].Symbol != "ETHUSDT" || sim.ClosedTrades[0].StrategyID != strategy.StrategyIDCTA4hShort {
+		t.Fatalf("expected 1 CTA ETHUSDT trade under MaxSlots=1, got %+v (rejects=%+v)", sim.ClosedTrades, eng.RejectReasons)
+	}
+	if eng.RejectReasons["CTA_POD_SLOTS_FULL"] == 0 {
+		t.Fatalf("expected SOLUSDT rejected by CTA_POD_SLOTS_FULL, got %+v", eng.RejectReasons)
+	}
+	if paused, _ := eng.clusterSL.IsPaused(t0.Add(time.Duration(total4h) * 4 * time.Hour)); paused {
+		t.Fatalf("expected CTA exit NOT to trigger Pod #1 clusterSL pause")
+	}
+}
+
 

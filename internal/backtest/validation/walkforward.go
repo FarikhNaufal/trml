@@ -6,6 +6,7 @@ import (
 	"math"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -96,6 +97,15 @@ func RunWalkForward(ctx context.Context, cfg WalkForwardConfig) (WalkForwardRepo
 	warmupLead := time.Duration(leadBars) * barDur
 	if cfg.EvalCfg.MajorPod.IsEnabled() && warmupLead < 720*time.Hour {
 		warmupLead = 720 * time.Hour
+	}
+	if cfg.EvalCfg.CTAPod.IsEnabled() {
+		ctaLead := 240 * time.Hour
+		if strings.EqualFold(cfg.EvalCfg.CTAPod.Mode, "EMA_CROSS") {
+			ctaLead = 1000 * time.Hour
+		}
+		if warmupLead < ctaLead {
+			warmupLead = ctaLead
+		}
 	}
 
 	var (

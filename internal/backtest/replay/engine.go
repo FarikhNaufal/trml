@@ -63,6 +63,7 @@ type ReplayEngine struct {
 	oiMgr          *data.MetricsOIDownloader
 	lastExits      map[string]lastExitInfo
 	lastMajorExits map[string]lastExitInfo
+	lastCTAExits   map[string]lastExitInfo
 
 	clusterSL          *strategy.ClusterSLTracker
 	lastBreadthHourKey int64
@@ -111,6 +112,7 @@ func NewReplayEngine(
 		oiMgr:          cfg.OIMgr,
 		lastExits:      make(map[string]lastExitInfo),
 		lastMajorExits: make(map[string]lastExitInfo),
+		lastCTAExits:   make(map[string]lastExitInfo),
 		clusterSL:      strategy.NewClusterSLTracker(cfg.PortfolioClusterSLCount, cfg.PortfolioClusterCooldown),
 		RejectReasons: make(map[string]int64),
 	}
@@ -201,6 +203,18 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 		majorHourlyCandles = make(map[string][]model.Candle, len(majorTrackSet))
 	}
 
+	ctaPodEnabled := r.evaluatorCfg.CTAPod.IsEnabled()
+	var cta4hCandles map[string][]model.Candle
+	cta4hSubTail := 20
+	if candleDur > 0 && candleDur < 4*time.Hour {
+		if req := int((4*time.Hour)/candleDur) + 4; req > cta4hSubTail {
+			cta4hSubTail = req
+		}
+	}
+	if ctaPodEnabled {
+		cta4hCandles = make(map[string][]model.Candle, len(sortedSymbols))
+	}
+
 	for barIdx, simTime := range timeline {
 		select {
 		case <-ctx.Done():
@@ -238,6 +252,24 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 				)
 			}
 		}
+		if ctaPodEnabled && strategy.Is4HourCloseTimestamp(simTime) {
+			for _, sym := range sortedSymbols {
+				if !closedAtSimTime[sym] {
+					continue
+				}
+				cList := rollingCandles[sym]
+				if len(cList) == 0 {
+					continue
+				}
+				startIdx := 0
+				if len(cList) > cta4hSubTail {
+					startIdx = len(cList) - cta4hSubTail
+				}
+				cta4hCandles[sym] = strategy.MergeCompleted4HourlyCandle(
+					cta4hCandles[sym], cList[startIdx:], candleDur, strategy.CTAPod4hHistoryCap,
+				)
+			}
+		}
 
 		if !r.cfg.UnconstrainedMode {
 			r.broker.CheckIsolatedMarginLiquidation(0.005, simTime, int64(barIdx))
@@ -251,7 +283,7 @@ func (r *ReplayEngine) Run(ctx context.Context) error {
 
 			// B. Prepare BTC macro snapshot and evaluate signals on active/watched symbols
 			btcSnap := r.buildBTCMacro(simTime, rollingCandles, rollingDeltas)
-			r.evaluateSignalsAtBar(simTime, sortedSymbols, primaryOrder, breakoutOrder, closedAtSimTime, watchedSymbols, breakoutSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, majorHourlyCandles, btcSnap)
+			r.evaluateSignalsAtBar(simTime, sortedSymbols, primaryOrder, breakoutOrder, closedAtSimTime, watchedSymbols, breakoutSymbols, sweepExtraSymbols, rollingCandles, rollingDeltas, majorHourlyCandles, cta4hCandles, btcSnap)
 		}
 
 		// C. Post-bar dynamic scan cadence: new watchlist activates on subsequent closed bars
@@ -448,6 +480,10 @@ func (r *ReplayEngine) syncLastExits(fromIdx int) int {
 			r.lastMajorExits[tr.Symbol] = info
 			continue
 		}
+		if strategy.IsCTAPodStrategy(tr.StrategyID) {
+			r.lastCTAExits[tr.Symbol] = info
+			continue
+		}
 		r.lastExits[tr.Symbol] = info
 		if r.clusterSL != nil {
 			r.clusterSL.RecordExit(tr.ExitTime, tr.ExitReason)
@@ -486,13 +522,15 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 	rollingCandles map[string][]model.Candle,
 	rollingDeltas map[string][]float64,
 	majorHourlyCandles map[string][]model.Candle,
+	cta4hCandles map[string][]model.Candle,
 	btcSnap *model.MarketSnapshot,
 ) {
 	majorPodEnabled := r.evaluatorCfg.MajorPod.IsEnabled()
+	ctaPodEnabled := r.evaluatorCfg.CTAPod.IsEnabled()
 	activeSlots := r.broker.GetActiveSlotCount()
-	if majorPodEnabled {
+	if majorPodEnabled || ctaPodEnabled {
 		activeSlots = r.broker.GetActiveSlotCountByFilter(func(sid string) bool {
-			return !strategy.IsMajorPodStrategy(sid)
+			return !strategy.IsMajorPodStrategy(sid) && !strategy.IsCTAPodStrategy(sid)
 		})
 	}
 	availBal := r.broker.GetAvailableBalanceUSDT()
@@ -625,9 +663,9 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 				r.RejectReasons["BROKER_SUBMIT_REJECTED"]++
 			}
 			if !r.cfg.UnconstrainedMode {
-				if majorPodEnabled {
+				if majorPodEnabled || ctaPodEnabled {
 					activeSlots = r.broker.GetActiveSlotCountByFilter(func(sid string) bool {
-						return !strategy.IsMajorPodStrategy(sid)
+						return !strategy.IsMajorPodStrategy(sid) && !strategy.IsCTAPodStrategy(sid)
 					})
 				} else {
 					activeSlots = r.broker.GetActiveSlotCount()
@@ -644,6 +682,9 @@ func (r *ReplayEngine) evaluateSignalsAtBar(
 
 	if majorPodEnabled && strategy.IsHourCloseTimestamp(simTime) {
 		r.evaluateMajorPodAtHourClose(simTime, closedAtSimTime, rollingCandles, rollingDeltas, majorHourlyCandles, btcSnap, isDailyBreached, portDD)
+	}
+	if ctaPodEnabled && strategy.Is4HourCloseTimestamp(simTime) {
+		r.evaluateCTAPodAt4hClose(simTime, sortedSymbols, closedAtSimTime, rollingCandles, rollingDeltas, cta4hCandles, isDailyBreached, portDD)
 	}
 }
 
@@ -779,6 +820,194 @@ func (r *ReplayEngine) evaluateMajorPodAtHourClose(
 			r.SignalsApproved++
 			if !r.cfg.UnconstrainedMode {
 				majorSlots = r.broker.GetActiveSlotCountByFilter(strategy.IsMajorPodStrategy)
+				if r.cfg.DeductPendingMargin {
+					availBal = r.broker.GetAvailableBalanceUSDT()
+				}
+			}
+		} else {
+			r.SignalsRejected++
+			r.RejectReasons["BROKER_SUBMIT_REJECTED"]++
+		}
+	}
+}
+
+type ctaPodLiquidSym struct {
+	sym  string
+	qv24 float64
+}
+
+type ctaPodApprovedItem struct {
+	cand strategy.CTA4hCandidate
+	snap model.MarketSnapshot
+}
+
+func (r *ReplayEngine) evaluateCTAPodAt4hClose(
+	simTime time.Time,
+	sortedSymbols []string,
+	closedAtSimTime map[string]bool,
+	rollingCandles map[string][]model.Candle,
+	rollingDeltas map[string][]float64,
+	cta4hCandles map[string][]model.Candle,
+	isDailyBreached bool,
+	portDD float64,
+) {
+	simClose := effectiveEvalTime(simTime)
+	candleDur := r.cfg.ScannerCfg.CandleDuration
+	if candleDur <= 0 {
+		candleDur = r.evaluatorCfg.CandleDuration
+	}
+	if candleDur <= 0 {
+		candleDur = 15 * time.Minute
+	}
+	bars24h := int((24 * time.Hour) / candleDur)
+	if bars24h <= 0 {
+		bars24h = 96
+	}
+	minBars24h := (bars24h * 5) / 6 // 80 of 96 bars on 15m
+	if minBars24h < 1 {
+		minBars24h = 1
+	}
+	windowStart := simClose.Add(-24 * time.Hour)
+
+	minVol := r.evaluatorCfg.CTAPod.MinVolume24hUSDT
+	if minVol <= 0 {
+		minVol = 25_000_000.0
+	}
+	topN := r.evaluatorCfg.CTAPod.TopN
+	if topN <= 0 {
+		topN = 25
+	}
+
+	liquid := make([]ctaPodLiquidSym, 0, len(sortedSymbols))
+	for _, sym := range sortedSymbols {
+		if !closedAtSimTime[sym] {
+			continue
+		}
+		cList := rollingCandles[sym]
+		if len(cList) < minBars24h {
+			continue
+		}
+		qv24 := 0.0
+		cnt24 := 0
+		for i := len(cList) - 1; i >= 0; i-- {
+			if cList[i].OpenTime.Before(windowStart) {
+				break
+			}
+			qv24 += cList[i].QuoteVolumeUSDT
+			cnt24++
+		}
+		if cnt24 < minBars24h || qv24 < minVol {
+			continue
+		}
+		liquid = append(liquid, ctaPodLiquidSym{sym: sym, qv24: qv24})
+	}
+	if len(liquid) == 0 {
+		return
+	}
+	sort.Slice(liquid, func(i, j int) bool {
+		if liquid[i].qv24 != liquid[j].qv24 {
+			return liquid[i].qv24 > liquid[j].qv24
+		}
+		return liquid[i].sym < liquid[j].sym
+	})
+	if len(liquid) > topN {
+		liquid = liquid[:topN]
+	}
+
+	var approved []ctaPodApprovedItem
+	for _, item := range liquid {
+		sym := item.sym
+		sym4h := cta4hCandles[sym]
+		if len(sym4h) == 0 {
+			r.TotalSignalsEvaluated++
+			r.SignalsRejected++
+			r.RejectReasons["INSUFFICIENT_4H_HISTORY"]++
+			continue
+		}
+		last4h := sym4h[len(sym4h)-1]
+		h4Close := effectiveEvalTime(last4h.CloseTime)
+		if h4Close.IsZero() {
+			h4Close = last4h.OpenTime.Add(4 * time.Hour)
+		}
+		if h4Close.Before(simClose) {
+			r.TotalSignalsEvaluated++
+			r.SignalsRejected++
+			r.RejectReasons["STALE_SYM_4H_BAR"]++
+			continue
+		}
+
+		exitInfo := r.lastCTAExits[sym]
+		if r.cfg.UnconstrainedMode {
+			exitInfo = lastExitInfo{}
+		}
+		fundingRate := r.cfg.FundingRate
+		if r.fundingMgr != nil {
+			fundingRate = r.fundingMgr.GetFundingRate(sym, simTime)
+		}
+
+		snap, evalCfg, _, okSnap := BuildSymbolSnapshot(
+			sym, simTime, rollingCandles[sym], rollingDeltas[sym], r.filters[sym], exitInfo,
+			r.cfg.SpreadPct, fundingRate, OIModeOff, nil, r.evaluatorCfg,
+		)
+		if !okSnap {
+			continue
+		}
+		snap.PortfolioDrawdownPct = portDD
+		hasActive := r.broker.HasActiveOrderOrPosition(sym)
+
+		r.TotalSignalsEvaluated++
+		cand := strategy.EvaluateCTA4hCandidate(snap, sym4h, hasActive, isDailyBreached, evalCfg)
+		if !cand.Approved {
+			r.SignalsRejected++
+			r.RejectReasons[cand.Reason]++
+			continue
+		}
+		approved = append(approved, ctaPodApprovedItem{cand: cand, snap: snap})
+	}
+
+	if len(approved) == 0 {
+		return
+	}
+	sort.Slice(approved, func(i, j int) bool {
+		if approved[i].cand.Score != approved[j].cand.Score {
+			return approved[i].cand.Score > approved[j].cand.Score
+		}
+		return approved[i].cand.Symbol < approved[j].cand.Symbol
+	})
+
+	maxCTASlots := r.evaluatorCfg.CTAPod.MaxSlots
+	if maxCTASlots <= 0 {
+		maxCTASlots = 3
+	}
+	ctaSlots := r.broker.GetActiveSlotCountByFilter(strategy.IsCTAPodStrategy)
+	totEq := r.broker.GetEffectiveTotalEquityUSDT()
+	availBal := r.broker.GetAvailableBalanceUSDT()
+	if r.cfg.UnconstrainedMode {
+		ctaSlots = 0
+		availBal = decimal.NewFromFloat(1000000.0)
+	}
+
+	for _, item := range approved {
+		if !r.cfg.UnconstrainedMode && ctaSlots >= maxCTASlots {
+			r.SignalsRejected++
+			r.RejectReasons["CTA_POD_SLOTS_FULL"]++
+			continue
+		}
+		if r.broker.HasActiveOrderOrPosition(item.cand.Symbol) {
+			r.SignalsRejected++
+			r.RejectReasons["SYMBOL_ALREADY_ACTIVE"]++
+			continue
+		}
+		intent, okBuild, buildReason := strategy.BuildCTA4hOrderIntent(item.cand, item.snap, totEq, availBal, r.evaluatorCfg)
+		if !okBuild {
+			r.SignalsRejected++
+			r.RejectReasons[buildReason]++
+			continue
+		}
+		if okSub, _ := r.broker.SubmitLimitEntry(intent); okSub {
+			r.SignalsApproved++
+			if !r.cfg.UnconstrainedMode {
+				ctaSlots = r.broker.GetActiveSlotCountByFilter(strategy.IsCTAPodStrategy)
 				if r.cfg.DeductPendingMargin {
 					availBal = r.broker.GetAvailableBalanceUSDT()
 				}

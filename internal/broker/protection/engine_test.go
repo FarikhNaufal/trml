@@ -320,3 +320,53 @@ func TestResolveStrategyExitProfiles(t *testing.T) {
 	}
 }
 
+func TestEvaluatePositionProtection_ChandelierTrailing(t *testing.T) {
+	baseCfg := ProtectionConfig{
+		TrailingEnabled:     true,
+		ChandelierTrailing:  false,
+		TrailingActivateATR: 0.0, // legacy non-chandelier fallback -> 1.50 ATR
+		TrailingDistanceATR: 3.0,
+		PartialTPEnabled:    false,
+	}
+	shortPos := PositionSnapshot{
+		Symbol:         "SOLUSDT",
+		Side:           model.SideShort,
+		EntryPrice:     decimal.NewFromFloat(100.0),
+		CurrentSLPrice: decimal.NewFromFloat(106.0), // 3.0 * ATR (ATR=2.0)
+		InitialSLPrice: decimal.NewFromFloat(106.0),
+		PeakPrice:      decimal.NewFromFloat(98.0), // +1.0 ATR MFE (below 1.50 activation)
+		ATRAtEntry:     decimal.NewFromFloat(2.0),
+		TickSize:       decimal.NewFromFloat(0.01),
+	}
+
+	// Non-chandelier mode still respects 1.50 ATR activation fallback
+	decLegacy := EvaluatePositionProtection(shortPos, decimal.NewFromFloat(98.5), baseCfg)
+	if decLegacy.ShouldUpdate {
+		t.Fatalf("expected non-chandelier with TrailingActivateATR=0 to wait until 1.5 ATR, got %+v", decLegacy)
+	}
+
+	// Chandelier mode ratchets immediately from peak (98.0 + 3*2.0 = 104.0 < 106.0)
+	chandCfg := baseCfg
+	chandCfg.ChandelierTrailing = true
+	decChand := EvaluatePositionProtection(shortPos, decimal.NewFromFloat(98.5), chandCfg)
+	if !decChand.ShouldUpdate || decChand.NewTier != Tier3TrailingRatchet || !decChand.NewSLPrice.Equal(decimal.NewFromFloat(104.0)) {
+		t.Fatalf("expected immediate SHORT Chandelier ratchet to 104.0, got %+v", decChand)
+	}
+
+	// LONG symmetry check: Peak 102.0 - 3*2.0 = 96.0 > 94.0
+	longPos := PositionSnapshot{
+		Symbol:         "BTCUSDT",
+		Side:           model.SideLong,
+		EntryPrice:     decimal.NewFromFloat(100.0),
+		CurrentSLPrice: decimal.NewFromFloat(94.0),
+		InitialSLPrice: decimal.NewFromFloat(94.0),
+		PeakPrice:      decimal.NewFromFloat(102.0),
+		ATRAtEntry:     decimal.NewFromFloat(2.0),
+		TickSize:       decimal.NewFromFloat(0.01),
+	}
+	decLong := EvaluatePositionProtection(longPos, decimal.NewFromFloat(101.5), chandCfg)
+	if !decLong.ShouldUpdate || decLong.NewTier != Tier3TrailingRatchet || !decLong.NewSLPrice.Equal(decimal.NewFromFloat(96.0)) {
+		t.Fatalf("expected immediate LONG Chandelier ratchet to 96.0, got %+v", decLong)
+	}
+}
+

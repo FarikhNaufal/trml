@@ -1892,6 +1892,208 @@ func TestBotEngine_MajorPodHourCloseBatchRankingAndPod1Isolation(t *testing.T) {
 	}
 }
 
+func TestBotEngine_CTAPod4hCycleRankingAndIsolation(t *testing.T) {
+	db, err := storage.OpenDB(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	repo := storage.NewRepository(db)
+
+	barEndUTC := time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC) // Evaluates 04:00..08:00 4h closed bar
+	bars := 220
+	start4h := barEndUTC.Add(-time.Duration(bars) * 4 * time.Hour)
+
+	makeCTA4hSeries := func(basePrice, prevBumpPct, currDropPct float64) []model.Candle {
+		out := make([]model.Candle, bars)
+		for i := 0; i < bars; i++ {
+			ot := start4h.Add(time.Duration(i) * 4 * time.Hour)
+			ct := ot.Add(4*time.Hour - time.Millisecond)
+			closePx := basePrice
+			if i >= bars-10 && i <= bars-2 {
+				closePx = basePrice * (1.0 + prevBumpPct)
+			} else if i == bars-1 {
+				closePx = basePrice * (1.0 - currDropPct)
+			}
+			out[i] = model.Candle{
+				OpenTime:  ot,
+				CloseTime: ct,
+				Open:      closePx * 1.001,
+				High:      closePx * 1.003,
+				Low:       closePx * 0.997,
+				Close:     closePx,
+			}
+		}
+		return out
+	}
+
+	// LINK drops sharper at final 4h bar than AVAX so both cross EMA12 < EMA36 < EMA200_4h, LINK scores higher
+	link4h := makeCTA4hSeries(20.0, 0.01, 0.06)
+	avax4h := makeCTA4hSeries(40.0, 0.01, 0.03)
+
+	filter := model.ExchangeFilter{
+		TickSize:    decimal.NewFromFloat(0.001),
+		StepSize:    decimal.NewFromFloat(0.1),
+		MinQty:      decimal.NewFromFloat(0.1),
+		MinNotional: decimal.NewFromFloat(5.0),
+	}
+	ctaProfile := strategy.BuildCTAPodExitProfiles(&config.Config{
+		CTAPod: config.CTAPodStrategyConfig{
+			ShortEnabled:        true,
+			Mode:                "EMA_CROSS",
+			MaxSlots:            1,
+			TrailingEnabled:     true,
+			ChandelierTrailing:  true,
+			TrailingActivateATR: 0.0,
+			TrailingDistanceATR: 3.0,
+			MaxHoldingDuration:  240 * time.Hour,
+		},
+	})
+	dry := broker.NewDryRunBroker(decimal.NewFromFloat(1000.0), broker.DryRunConfig{
+		MaxSlots:             7,
+		MaxDailyDrawdownPct:  -0.075,
+		AccountLeverage:      10.0,
+		LimitOrderTimeout:    45 * time.Second,
+		MaxHoldingDuration:   8 * time.Hour,
+		EntryOrderType:       "MARKET",
+		TakerFeeRate:         0.0005,
+		MakerFeeRate:         0.0002,
+		SlippageRate:         0.0002,
+		StrategyExitProfiles: ctaProfile,
+	})
+	defer dry.Close()
+
+	eng := &BotEngine{
+		cfg: &config.Config{
+			DryRun:                  true,
+			InitialEquity:           decimal.NewFromFloat(1000.0),
+			EquityModeCompounding:   true,
+			MaxSlots:                6,
+			MaxDailyDrawdown:        -0.075,
+			Timeframe:               "15m",
+			CandleDuration:          15 * time.Minute,
+			PortfolioClusterSLCount: 2,
+		},
+		repo:             repo,
+		broker:           dry,
+		dryRunBroker:     dry,
+		activeStates:     make(map[string]*model.SymbolState),
+		ctaPodSet:        make(map[string]bool),
+		ctaQuoteCache:    make(map[string]ctaCachedQuote),
+		cooldownExits:    make(map[string]storage.RecentExitRecord),
+		ctaCooldownExits: make(map[string]storage.RecentExitRecord),
+		cta4hCandles:     make(map[string][]model.Candle),
+		clusterSL:        strategy.NewClusterSLTracker(2, time.Hour),
+		evaluatorCfg: strategy.EvaluatorConfig{
+			CandleDuration:   15 * time.Minute,
+			MaxSlots:         6,
+			MaxSpreadPct:     0.20,
+			MaxBookStaleness: 30 * time.Second,
+			MaxMarkStaleness: 30 * time.Second,
+			MaxDataStaleness: 30 * time.Minute,
+			CTAPod: strategy.CTAPodConfig{
+				ShortEnabled:        true,
+				LongEnabled:         false,
+				Mode:                "EMA_CROSS",
+				TopN:                30,
+				MinVolume24hUSDT:    25_000_000,
+				MaxSlots:            1, // Force ranking selection between LINKUSDT and AVAXUSDT
+				ShortRiskPct:        decimal.NewFromFloat(0.006),
+				LongRiskPct:         decimal.NewFromFloat(0.006),
+				DonchianLookback:    20,
+				EMAFast:             12,
+				EMASlow:             36,
+				EMATrend:            200,
+				ShortMinFundingRate: -0.0002,
+				LongMaxFundingRate:  0.0002,
+				SLATRMultiplier:     3.0,
+				TPATRMultiplier:     0.0,
+				MinSLDistancePct:    decimal.NewFromFloat(0.02),
+				TrailingEnabled:     true,
+				ChandelierTrailing:  true,
+				TrailingActivateATR: 0.0,
+				TrailingDistanceATR: 3.0,
+				MaxHoldingDuration:  240 * time.Hour,
+				CooldownMinutes:     240,
+				EntryOrderType:      "MARKET",
+			},
+			Sizing: strategy.SizingConfig{
+				MaxSlotMarginFraction:          decimal.NewFromFloat(0.25),
+				AvailableBalanceBufferFraction: decimal.NewFromFloat(0.90),
+				AccountLeverage:                10.0,
+				MakerFeeRate:                   decimal.NewFromFloat(0.0002),
+				TakerFeeRate:                   decimal.NewFromFloat(0.0005),
+				SlippageRate:                   decimal.NewFromFloat(0.0002),
+			},
+		},
+	}
+
+	filters := map[string]model.ExchangeFilter{
+		"LINKUSDT": filter,
+		"AVAXUSDT": filter,
+		"LOWVOL":   filter,
+	}
+	volMap := map[string]float64{
+		"LINKUSDT": 120_000_000,
+		"AVAXUSDT": 95_000_000,
+		"LOWVOL":   5_000_000, // Rejected by MinVolume24hUSDT
+	}
+	bookMap := map[string]model.BookQuote{
+		"LINKUSDT": {BestBid: 18.79, BestAsk: 18.81},
+		"AVAXUSDT": {BestBid: 38.79, BestAsk: 38.81},
+	}
+	premMap := map[string]exchange.PremiumIndexQuote{
+		"LINKUSDT": {Symbol: "LINKUSDT", MarkPrice: 18.80, LastFundingRate: 0.0001},
+		"AVAXUSDT": {Symbol: "AVAXUSDT", MarkPrice: 38.80, LastFundingRate: 0.0001},
+	}
+
+	eng.evaluateCTABarWithData(context.Background(), barEndUTC, filters, volMap, bookMap, premMap, func(sym string, limit int) []model.Candle {
+		if sym == "LINKUSDT" {
+			return link4h
+		}
+		if sym == "AVAXUSDT" {
+			return avax4h
+		}
+		return nil
+	})
+
+	positions := dry.GetActivePositions()
+	if len(positions) != 1 || positions[0].Symbol != "LINKUSDT" || positions[0].StrategyID != strategy.StrategyIDCTA4hShort || positions[0].TPPrice != 0 {
+		t.Fatalf("expected stronger CTA score LINKUSDT SHORT with TPPrice=0 under MaxSlots=1, got %+v", positions)
+	}
+	if nonMaj := eng.getActiveNonMajorSlots(); nonMaj != 0 {
+		t.Fatalf("expected Pod #1 slot count still 0 (isolated from CTAPod), got %d", nonMaj)
+	}
+	if ctaCnt := eng.getActiveCTASlots(); ctaCnt != 1 {
+		t.Fatalf("expected CTAPod slot count 1, got %d", ctaCnt)
+	}
+
+	// Verify CTA exits stay isolated from Pod #1 ClusterSLTracker and Pod #1 / MajorPod cooldowns
+	eng.recordSymbolExitForStrategy("LINKUSDT", strategy.StrategyIDCTA4hShort, barEndUTC, "STOP_LOSS")
+	eng.recordSymbolExitForStrategy("AVAXUSDT", strategy.StrategyIDCTA4hLong, barEndUTC.Add(time.Minute), "STOP_LOSS")
+	if paused, _ := eng.clusterSL.IsPaused(barEndUTC.Add(2 * time.Minute)); paused {
+		t.Fatalf("expected CTA Pod exits not to pause Pod #1 ClusterSLTracker")
+	}
+	eng.cooldownMu.RLock()
+	_, leakedPod1 := eng.cooldownExits["LINKUSDT"]
+	_, leakedMaj := eng.majorCooldownExits["LINKUSDT"]
+	_, okCTA := eng.ctaCooldownExits["LINKUSDT"]
+	eng.cooldownMu.RUnlock()
+	if leakedPod1 || leakedMaj || !okCTA {
+		t.Fatalf("expected CTA exit isolated strictly to ctaCooldownExits (pod1=%v maj=%v cta=%v)", leakedPod1, leakedMaj, okCTA)
+	}
+
+	// Verify web dashboard feeds expose CTA symbols and telemetry without duplicating active coins
+	coins := eng.getScannerCoins()
+	if len(coins) != 2 || coins[0].Symbol != "LINKUSDT" || coins[0].Pod != "CTA" {
+		t.Fatalf("expected 2 CTA scanner coins led by LINKUSDT, got %+v", coins)
+	}
+	telem := eng.getTelemetry()
+	if telem == nil || !telem.CTAShortEnabled || telem.CTALongEnabled || telem.CTAPodMode != "EMA_CROSS" || telem.CTAPodCount != 2 || telem.CTAMaxSlots != 1 {
+		t.Fatalf("unexpected 4-pod telemetry CTA fields: %+v", telem)
+	}
+}
+
 func TestBotEngine_AlreadyIngestedUpdatesHourly_And_CooldownLockOrdering(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

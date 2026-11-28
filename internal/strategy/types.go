@@ -27,12 +27,22 @@ const (
 	StrategyIDMajorRSMomShort = "MAJOR_RSMOM_SHORT"
 	// StrategyIDMajorRSMomLong identifies Pod #3: 1h Top-15 Majors Relative-Strength Momentum LONG.
 	StrategyIDMajorRSMomLong = "MAJOR_RSMOM_LONG"
+	// StrategyIDCTA4hShort identifies Pod #4 SHORT: 4h CTA Multi-Day Trend Following.
+	StrategyIDCTA4hShort = "CTA_4H_SHORT"
+	// StrategyIDCTA4hLong identifies Pod #4 LONG: 4h CTA Multi-Day Trend Following.
+	StrategyIDCTA4hLong = "CTA_4H_LONG"
 )
 
 // IsMajorPodStrategy reports whether id belongs to the 1h Major RS-Momentum pod (Pod #2 or Pod #3).
 func IsMajorPodStrategy(id string) bool {
 	trimmed := strings.ToUpper(strings.TrimSpace(id))
 	return trimmed == StrategyIDMajorRSMomShort || trimmed == StrategyIDMajorRSMomLong
+}
+
+// IsCTAPodStrategy reports whether id belongs to the 4h CTA Trend Following pod (Pod #4).
+func IsCTAPodStrategy(id string) bool {
+	trimmed := strings.ToUpper(strings.TrimSpace(id))
+	return trimmed == StrategyIDCTA4hShort || trimmed == StrategyIDCTA4hLong
 }
 
 // DefaultMajorPodSymbols returns a fresh slice of the 15 liquid major crypto pairs.
@@ -218,6 +228,40 @@ type MajorPodConfig struct {
 // IsEnabled reports whether either side of the 1h Major RS-Momentum pod is enabled.
 func (m MajorPodConfig) IsEnabled() bool {
 	return m.ShortEnabled || m.LongEnabled
+}
+
+// CTAPodConfig configures Pod #4 (4h CTA Trend Following).
+type CTAPodConfig struct {
+	ShortEnabled        bool
+	LongEnabled         bool
+	Mode                string
+	TopN                int
+	MinVolume24hUSDT    float64
+	MaxSlots            int
+	ShortRiskPct        decimal.Decimal
+	LongRiskPct         decimal.Decimal
+	DonchianLookback    int
+	EMAFast             int
+	EMASlow             int
+	EMATrend            int
+	ShortMinFundingRate float64
+	LongMaxFundingRate  float64
+	SLATRMultiplier     float64
+	TPATRMultiplier     float64
+	MinSLDistancePct    decimal.Decimal
+	TrailingEnabled     bool
+	ChandelierTrailing  bool
+	TrailingActivateATR float64
+	TrailingDistanceATR float64
+	MaxHoldingDuration  time.Duration
+	StaleLossDuration   time.Duration
+	CooldownMinutes     int
+	EntryOrderType      string
+}
+
+// IsEnabled reports whether either side of the 4h CTA Trend Following pod is enabled.
+func (c CTAPodConfig) IsEnabled() bool {
+	return c.ShortEnabled || c.LongEnabled
 }
 
 // AlphaEvaluator defines the isolated contract implemented by each modular alpha strategy.

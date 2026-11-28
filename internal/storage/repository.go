@@ -96,6 +96,7 @@ type Repository interface {
 	GetRecentExits(ctx context.Context, since time.Time) (map[string]RecentExitRecord, error)
 	GetRecentExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error)
 	GetRecentExitsByPodForMode(ctx context.Context, mode string, majorPodOnly bool, since time.Time) (map[string]RecentExitRecord, error)
+	GetRecentCTAPodExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error)
 	GetPeakEquityForMode(ctx context.Context, mode string) (decimal.Decimal, bool, error)
 	GetRecentStopLossTimes(ctx context.Context, since time.Time) ([]time.Time, error)
 	GetRecentStopLossTimesForMode(ctx context.Context, mode string, since time.Time) ([]time.Time, error)
@@ -788,16 +789,25 @@ func (r *SQLiteRepository) GetRecentExits(ctx context.Context, since time.Time) 
 // GetRecentExitsForMode mengambil record penutupan posisi terakhir untuk tiap simbol sejak waktu 'since',
 // terisolasi ke mode ('DRY_RUN' / 'LIVE') bila diisi dan selalu mengabaikan baris PARTIAL_TAKE_PROFIT pada outer join.
 func (r *SQLiteRepository) GetRecentExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error) {
-	return r.queryRecentExitsForMode(ctx, mode, nil, since)
+	return r.queryRecentExitsForMode(ctx, mode, "", since)
 }
 
 // GetRecentExitsByPodForMode returns the latest closed-position exit per symbol scoped to either MajorPod strategies (majorPodOnly=true)
 // or Pod #1 strategies (majorPodOnly=false), ensuring restarts keep per-pod cooldown histories strictly isolated.
 func (r *SQLiteRepository) GetRecentExitsByPodForMode(ctx context.Context, mode string, majorPodOnly bool, since time.Time) (map[string]RecentExitRecord, error) {
-	return r.queryRecentExitsForMode(ctx, mode, &majorPodOnly, since)
+	scope := "CORE"
+	if majorPodOnly {
+		scope = "MAJOR"
+	}
+	return r.queryRecentExitsForMode(ctx, mode, scope, since)
 }
 
-func (r *SQLiteRepository) queryRecentExitsForMode(ctx context.Context, mode string, majorPodOnly *bool, since time.Time) (map[string]RecentExitRecord, error) {
+// GetRecentCTAPodExitsForMode returns the latest closed-position exit per symbol scoped strictly to CTA 4h Pod strategies.
+func (r *SQLiteRepository) GetRecentCTAPodExitsForMode(ctx context.Context, mode string, since time.Time) (map[string]RecentExitRecord, error) {
+	return r.queryRecentExitsForMode(ctx, mode, "CTA", since)
+}
+
+func (r *SQLiteRepository) queryRecentExitsForMode(ctx context.Context, mode string, podScope string, since time.Time) (map[string]RecentExitRecord, error) {
 	sinceStr := formatSQLiteTime(since)
 	whereClauses := []string{"exit_reason != 'PARTIAL_TAKE_PROFIT'", "closed_at_utc >= ?"}
 	outerClauses := []string{"t.exit_reason != 'PARTIAL_TAKE_PROFIT'"}
@@ -812,14 +822,16 @@ func (r *SQLiteRepository) queryRecentExitsForMode(ctx context.Context, mode str
 		innerArgs = append(innerArgs, normMode)
 		outerArgs = append(outerArgs, normMode)
 	}
-	if majorPodOnly != nil {
-		if *majorPodOnly {
-			whereClauses = append(whereClauses, "strategy_id IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
-			outerClauses = append(outerClauses, "t.strategy_id IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
-		} else {
-			whereClauses = append(whereClauses, "COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
-			outerClauses = append(outerClauses, "COALESCE(t.strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
-		}
+	switch podScope {
+	case "MAJOR":
+		whereClauses = append(whereClauses, "strategy_id IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
+		outerClauses = append(outerClauses, "t.strategy_id IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG')")
+	case "CTA":
+		whereClauses = append(whereClauses, "strategy_id IN ('CTA_4H_SHORT', 'CTA_4H_LONG')")
+		outerClauses = append(outerClauses, "t.strategy_id IN ('CTA_4H_SHORT', 'CTA_4H_LONG')")
+	case "CORE":
+		whereClauses = append(whereClauses, "COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG', 'CTA_4H_SHORT', 'CTA_4H_LONG')")
+		outerClauses = append(outerClauses, "COALESCE(t.strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG', 'CTA_4H_SHORT', 'CTA_4H_LONG')")
 	}
 
 	query := fmt.Sprintf(`
@@ -931,13 +943,13 @@ func (r *SQLiteRepository) GetRecentStopLossTimesForMode(ctx context.Context, mo
 		normMode := normalizeDailyStateMode(mode)
 		rows, err = r.db.conn.QueryContext(
 			ctx,
-			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG') AND mode = ? AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
+			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG', 'CTA_4H_SHORT', 'CTA_4H_LONG') AND mode = ? AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
 			normMode, sinceStr,
 		)
 	} else {
 		rows, err = r.db.conn.QueryContext(
 			ctx,
-			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG') AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
+			`SELECT closed_at_utc FROM trade_ledger WHERE exit_reason = 'STOP_LOSS' AND COALESCE(strategy_id, '') NOT IN ('MAJOR_RSMOM_SHORT', 'MAJOR_RSMOM_LONG', 'CTA_4H_SHORT', 'CTA_4H_LONG') AND closed_at_utc >= ? ORDER BY closed_at_utc ASC;`,
 			sinceStr,
 		)
 	}

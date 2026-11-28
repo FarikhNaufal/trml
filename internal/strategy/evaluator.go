@@ -103,6 +103,7 @@ type EvaluatorConfig struct {
 	VWAPBreakdown   VWAPBreakdownConfig
 	StructureBreak  StructureBreakConfig
 	MajorPod        MajorPodConfig
+	CTAPod          CTAPodConfig
 	MacroRouter     MacroRegimeRouterConfig
 	FundingEnvelope           FundingEnvelopeConfig
 	RollingVWAPBars           int
@@ -289,6 +290,33 @@ func FromAppConfig(cfg *config.Config) EvaluatorConfig {
 			StaleLossDuration:   cfg.MajorPod.StaleLossDuration,
 			CooldownMinutes:     cfg.MajorPod.CooldownMinutes,
 			EntryOrderType:      cfg.MajorPod.EntryOrderType,
+		},
+		CTAPod: CTAPodConfig{
+			ShortEnabled:        cfg.CTAPod.ShortEnabled,
+			LongEnabled:         cfg.CTAPod.LongEnabled,
+			Mode:                cfg.CTAPod.Mode,
+			TopN:                cfg.CTAPod.TopN,
+			MinVolume24hUSDT:    cfg.CTAPod.MinVolume24hUSDT,
+			MaxSlots:            cfg.CTAPod.MaxSlots,
+			ShortRiskPct:        cfg.CTAPod.ShortRiskPct,
+			LongRiskPct:         cfg.CTAPod.LongRiskPct,
+			DonchianLookback:    cfg.CTAPod.DonchianLookback,
+			EMAFast:             cfg.CTAPod.EMAFast,
+			EMASlow:             cfg.CTAPod.EMASlow,
+			EMATrend:            cfg.CTAPod.EMATrend,
+			ShortMinFundingRate: cfg.CTAPod.ShortMinFundingRate,
+			LongMaxFundingRate:  cfg.CTAPod.LongMaxFundingRate,
+			SLATRMultiplier:     cfg.CTAPod.SLATRMultiplier,
+			TPATRMultiplier:     cfg.CTAPod.TPATRMultiplier,
+			MinSLDistancePct:    cfg.CTAPod.MinSLDistancePct,
+			TrailingEnabled:     cfg.CTAPod.TrailingEnabled,
+			ChandelierTrailing:  cfg.CTAPod.ChandelierTrailing,
+			TrailingActivateATR: cfg.CTAPod.TrailingActivateATR,
+			TrailingDistanceATR: cfg.CTAPod.TrailingDistanceATR,
+			MaxHoldingDuration:  cfg.CTAPod.MaxHoldingDuration,
+			StaleLossDuration:   cfg.CTAPod.StaleLossDuration,
+			CooldownMinutes:     cfg.CTAPod.CooldownMinutes,
+			EntryOrderType:      cfg.CTAPod.EntryOrderType,
 		},
 		MacroRouter: MacroRegimeRouterConfig{
 			Enabled:              cfg.MacroRouter.Enabled,

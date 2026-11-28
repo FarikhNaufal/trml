@@ -864,3 +864,36 @@ func TestCancelOrderWithResult_ParsesExecutedQtyAndAvgPrice(t *testing.T) {
 		t.Fatalf("unexpected CancelOrderWithResult record: %+v", rec)
 	}
 }
+
+func TestFetchPremiumIndexMap_ParsesQuotesAndSkipsInvalid(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/fapi/v1/premiumIndex" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"symbol":"btcusdt","markPrice":"90123.4","indexPrice":"90100.0","lastFundingRate":"-0.00015","nextFundingTime":1764000000000},
+			{"symbol":"BADUSDT","markPrice":"0","indexPrice":"10","lastFundingRate":"0.0001","nextFundingTime":0},
+			{"symbol":"ETHUSDT","markPrice":"3200.5","indexPrice":"bad","lastFundingRate":"0.00025","nextFundingTime":1764000000000}
+		]`))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "", "")
+	m, err := client.FetchPremiumIndexMap(context.Background())
+	if err != nil {
+		t.Fatalf("FetchPremiumIndexMap failed: %v", err)
+	}
+	if len(m) != 2 {
+		t.Fatalf("expected 2 valid premium index entries, got %d: %+v", len(m), m)
+	}
+	btc := m["BTCUSDT"]
+	if btc.MarkPrice != 90123.4 || btc.IndexPrice != 90100.0 || btc.LastFundingRate != -0.00015 || btc.NextFundingTime.IsZero() {
+		t.Fatalf("unexpected BTCUSDT quote: %+v", btc)
+	}
+	eth := m["ETHUSDT"]
+	if eth.MarkPrice != 3200.5 || eth.IndexPrice != 0 || eth.LastFundingRate != 0.00025 {
+		t.Fatalf("unexpected ETHUSDT quote: %+v", eth)
+	}
+}

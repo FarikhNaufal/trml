@@ -23,6 +23,7 @@ type SizingConfig struct {
 	AvailableBalanceBufferFraction decimal.Decimal
 	EntryOrderType                 string
 	DisablePartialTP               bool
+	DisableTakeProfit              bool
 }
 
 // BuildSafeDecimalOrderIntent menghitung ukuran lot presisi dengan proteksi friksi fee, slippage,
@@ -52,7 +53,7 @@ func BuildSafeDecimalOrderIntent(
 	}
 
 	if !isFinitePositive(rawEntry) || !isFinitePositive(atr14) || !isFinitePositive(slMult) ||
-		!isFinitePositive(cfg.TPMultiplier) || !isFinitePositive(cfg.AccountLeverage) ||
+		(!cfg.DisableTakeProfit && !isFinitePositive(cfg.TPMultiplier)) || !isFinitePositive(cfg.AccountLeverage) ||
 		(!cfg.DisablePartialTP && !isFinitePositive(tp1Mult)) {
 		return model.OrderIntent{}, false
 	}
@@ -73,12 +74,15 @@ func BuildSafeDecimalOrderIntent(
 		}
 	}
 
-	tpDist := atrDec.Mul(decimal.NewFromFloat(cfg.TPMultiplier))
-	// Jaga rasio Risk-to-Reward: pastikan tpDist tidak lebih kecil dari slDist * (TPMultiplier / SLMultiplier)
-	if slMult > 0 && cfg.TPMultiplier > 0 {
-		minTPDist := slDist.Mul(decimal.NewFromFloat(cfg.TPMultiplier / slMult))
-		if tpDist.LessThan(minTPDist) {
-			tpDist = minTPDist
+	var tpDist decimal.Decimal
+	if !cfg.DisableTakeProfit {
+		tpDist = atrDec.Mul(decimal.NewFromFloat(cfg.TPMultiplier))
+		// Jaga rasio Risk-to-Reward: pastikan tpDist tidak lebih kecil dari slDist * (TPMultiplier / SLMultiplier)
+		if slMult > 0 && cfg.TPMultiplier > 0 {
+			minTPDist := slDist.Mul(decimal.NewFromFloat(cfg.TPMultiplier / slMult))
+			if tpDist.LessThan(minTPDist) {
+				tpDist = minTPDist
+			}
 		}
 	}
 
@@ -91,9 +95,11 @@ func BuildSafeDecimalOrderIntent(
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
-		tpPrice, err = model.QuantizePrice(entryPrice.Add(tpDist), snap.Filter.TickSize, true)
-		if err != nil {
-			return model.OrderIntent{}, false
+		if !cfg.DisableTakeProfit {
+			tpPrice, err = model.QuantizePrice(entryPrice.Add(tpDist), snap.Filter.TickSize, true)
+			if err != nil {
+				return model.OrderIntent{}, false
+			}
 		}
 		if !cfg.DisablePartialTP {
 			tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
@@ -107,9 +113,11 @@ func BuildSafeDecimalOrderIntent(
 		if err != nil {
 			return model.OrderIntent{}, false
 		}
-		tpPrice, err = model.QuantizePrice(entryPrice.Sub(tpDist), snap.Filter.TickSize, false)
-		if err != nil {
-			return model.OrderIntent{}, false
+		if !cfg.DisableTakeProfit {
+			tpPrice, err = model.QuantizePrice(entryPrice.Sub(tpDist), snap.Filter.TickSize, false)
+			if err != nil {
+				return model.OrderIntent{}, false
+			}
 		}
 		if !cfg.DisablePartialTP {
 			tp1Dist := atrDec.Mul(decimal.NewFromFloat(tp1Mult))
@@ -120,16 +128,30 @@ func BuildSafeDecimalOrderIntent(
 		}
 	}
 
-	// Validasi Urutan Harga: SL berlawanan sisi, TP searah profit, dan bila PartialTP aktif TP1 di antara Entry & TP2.
+	// Validasi Urutan Harga: SL berlawanan sisi, TP searah profit (jika aktif), dan bila PartialTP aktif TP1 di antara Entry & TP2 (atau >/< Entry bila TP2 nonaktif).
 	if side == model.SideLong {
-		if slPrice.GreaterThanOrEqual(entryPrice) || tpPrice.LessThanOrEqual(entryPrice) ||
-			(!cfg.DisablePartialTP && tp1Price.GreaterThanOrEqual(tpPrice)) {
+		if slPrice.GreaterThanOrEqual(entryPrice) {
 			return model.OrderIntent{}, false
 		}
-	} else {
-		if slPrice.LessThanOrEqual(entryPrice) || tpPrice.GreaterThanOrEqual(entryPrice) ||
-			(!cfg.DisablePartialTP && tp1Price.LessThanOrEqual(tpPrice)) {
+		if !cfg.DisableTakeProfit && tpPrice.LessThanOrEqual(entryPrice) {
 			return model.OrderIntent{}, false
+		}
+		if !cfg.DisablePartialTP {
+			if tp1Price.LessThanOrEqual(entryPrice) || (!cfg.DisableTakeProfit && tp1Price.GreaterThanOrEqual(tpPrice)) {
+				return model.OrderIntent{}, false
+			}
+		}
+	} else {
+		if slPrice.LessThanOrEqual(entryPrice) {
+			return model.OrderIntent{}, false
+		}
+		if !cfg.DisableTakeProfit && tpPrice.GreaterThanOrEqual(entryPrice) {
+			return model.OrderIntent{}, false
+		}
+		if !cfg.DisablePartialTP {
+			if tp1Price.GreaterThanOrEqual(entryPrice) || (!cfg.DisableTakeProfit && tp1Price.LessThanOrEqual(tpPrice)) {
+				return model.OrderIntent{}, false
+			}
 		}
 	}
 

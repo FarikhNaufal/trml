@@ -1065,6 +1065,9 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 	if !strings.Contains(jsStr, "tag-pod-maj") || !strings.Contains(jsStr, "SIDE: S+L (3-POD)") {
 		t.Fatalf("expected MajorPod watchlist badge and 3-POD pill formatting in /app.js")
 	}
+	if !strings.Contains(jsStr, "tag-pod-cta") || !strings.Contains(jsStr, "CTA_4H_SHORT") || !strings.Contains(jsStr, "TRAIL") || !strings.Contains(jsStr, "-POD)") {
+		t.Fatalf("expected CTAPod watchlist badge, CTA_4H_SHORT label, TRAIL TP label, and dynamic POD pill formatting in /app.js")
+	}
 }
 
 func TestWebReader_GetEquityCurveAndServerDiagnostics(t *testing.T) {

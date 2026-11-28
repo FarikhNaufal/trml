@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -140,6 +141,66 @@ func (c *Client) FetchBookTickers(ctx context.Context) (map[string]model.BookQuo
 	}
 
 	return bookMap, nil
+}
+
+// PremiumIndexQuote merepresentasikan mark price, index price, dan funding rate terkini per simbol perpetual.
+type PremiumIndexQuote struct {
+	Symbol          string
+	MarkPrice       float64
+	IndexPrice      float64
+	LastFundingRate float64
+	NextFundingTime time.Time
+}
+
+// FetchPremiumIndexMap mengambil mark price dan lastFundingRate seluruh simbol perpetual sekaligus via /fapi/v1/premiumIndex.
+func (c *Client) FetchPremiumIndexMap(ctx context.Context) (map[string]PremiumIndexQuote, error) {
+	respBytes, err := c.DoRequest(ctx, http.MethodGet, "/fapi/v1/premiumIndex", nil, false)
+	if err != nil {
+		return nil, fmt.Errorf("premiumIndex: %w", err)
+	}
+
+	var list []struct {
+		Symbol          string `json:"symbol"`
+		MarkPrice       string `json:"markPrice"`
+		IndexPrice      string `json:"indexPrice"`
+		LastFundingRate string `json:"lastFundingRate"`
+		NextFundingTime int64  `json:"nextFundingTime"`
+	}
+	if err := sonic.Unmarshal(respBytes, &list); err != nil {
+		return nil, fmt.Errorf("decode premiumIndex: %w", err)
+	}
+
+	out := make(map[string]PremiumIndexQuote, len(list))
+	for _, item := range list {
+		sym := strings.ToUpper(strings.TrimSpace(item.Symbol))
+		if sym == "" {
+			continue
+		}
+		mark, errM := strconv.ParseFloat(strings.TrimSpace(item.MarkPrice), 64)
+		index, errI := strconv.ParseFloat(strings.TrimSpace(item.IndexPrice), 64)
+		fr, errF := strconv.ParseFloat(strings.TrimSpace(item.LastFundingRate), 64)
+		if errM != nil || math.IsNaN(mark) || math.IsInf(mark, 0) || mark <= 0 {
+			continue
+		}
+		if errI != nil || math.IsNaN(index) || math.IsInf(index, 0) {
+			index = 0
+		}
+		if errF != nil || math.IsNaN(fr) || math.IsInf(fr, 0) {
+			fr = 0
+		}
+		var nextFT time.Time
+		if item.NextFundingTime > 0 {
+			nextFT = time.UnixMilli(item.NextFundingTime).UTC()
+		}
+		out[sym] = PremiumIndexQuote{
+			Symbol:          sym,
+			MarkPrice:       mark,
+			IndexPrice:      index,
+			LastFundingRate: fr,
+			NextFundingTime: nextFT,
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) fetchKlinesPage(ctx context.Context, symbol, interval string, limit int, endTimeMs int64) ([]model.Candle, error) {
