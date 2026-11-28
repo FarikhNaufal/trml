@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1886,9 +1887,18 @@ func TestBotEngine_MajorPodHourCloseBatchRankingAndPod1Isolation(t *testing.T) {
 	if coins[0].Symbol != "SOLUSDT" || coins[0].Pod != "SCAN" || coins[1].Symbol != "ETHUSDT" || coins[1].Pod != "MAJOR" || coins[1].MarkPrice <= 0 {
 		t.Fatalf("unexpected pod attribution in getScannerCoins: %+v", coins)
 	}
+	if coins[0].Timeframe != "15m" || coins[0].MetricLabel != "VWAP" || !slices.Contains(coins[0].Pods, "SCAN") || !slices.Contains(coins[0].Pods, "MAJOR") || !slices.Contains(coins[0].Strategies, strategy.StrategyIDMajorRSMomShort) {
+		t.Fatalf("expected normalized multi-pod/strategy attribution on SOLUSDT, got %+v", coins[0])
+	}
+	if coins[1].Timeframe != "1h" || coins[1].MetricLabel != "RS24H" || !strings.Contains(coins[1].MetricValue, "%") || !strings.HasPrefix(coins[1].VolLabel, "1h ") {
+		t.Fatalf("expected normalized 1h RS24H & ATR metrics on MajorPod ETHUSDT, got %+v", coins[1])
+	}
 	telem := eng.getTelemetry()
 	if telem == nil || !telem.MajorShortEnabled || telem.MajorLongEnabled || telem.MajorPodCount != 2 || telem.MajorMaxSlots != 1 || telem.CoreMaxSlots != 6 {
 		t.Fatalf("unexpected 3-pod telemetry fields: %+v", telem)
+	}
+	if len(telem.ActivePods) != 2 || telem.ActivePods[0].ID != "CORE" || telem.ActivePods[1].ID != "MAJOR" || telem.ActivePods[1].UsedSlots != 1 {
+		t.Fatalf("unexpected normalized ActivePods on 3-pod telemetry: %+v", telem.ActivePods)
 	}
 }
 
@@ -2088,9 +2098,15 @@ func TestBotEngine_CTAPod4hCycleRankingAndIsolation(t *testing.T) {
 	if len(coins) != 2 || coins[0].Symbol != "LINKUSDT" || coins[0].Pod != "CTA" {
 		t.Fatalf("expected 2 CTA scanner coins led by LINKUSDT, got %+v", coins)
 	}
+	if coins[0].Timeframe != "4h" || coins[0].MetricLabel != "EMA12/36" || !strings.Contains(coins[0].MetricValue, "%") || !strings.HasPrefix(coins[0].VolLabel, "4h ") || !slices.Contains(coins[0].Strategies, strategy.StrategyIDCTA4hShort) {
+		t.Fatalf("expected normalized 4h EMA12/36 CTA metrics on LINKUSDT, got %+v", coins[0])
+	}
 	telem := eng.getTelemetry()
 	if telem == nil || !telem.CTAShortEnabled || telem.CTALongEnabled || telem.CTAPodMode != "EMA_CROSS" || telem.CTAPodCount != 2 || telem.CTAMaxSlots != 1 {
 		t.Fatalf("unexpected 4-pod telemetry CTA fields: %+v", telem)
+	}
+	if len(telem.ActivePods) != 2 || telem.ActivePods[1].ID != "CTA" || telem.ActivePods[1].Timeframe != "4h" || telem.ActivePods[1].UsedSlots != 1 || telem.ActivePods[1].Universe != 2 {
+		t.Fatalf("unexpected normalized ActivePods on 4-pod telemetry: %+v", telem.ActivePods)
 	}
 }
 

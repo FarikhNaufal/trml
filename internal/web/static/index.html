@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="/vendor/webtui-theme-catppuccin.css" />
   <link rel="stylesheet" href="/vendor/webtui-theme-nord.css" />
   <link rel="stylesheet" href="/vendor/webtui-theme-gruvbox.css" />
-  <link rel="stylesheet" href="/style.css?v=17" />
+  <link rel="stylesheet" href="/style.css?v=18" />
 </head>
 <body>
   <div id="tui-toasts" class="tui-toasts" aria-live="polite" aria-atomic="true"></div>
@@ -176,6 +176,7 @@
                   <span class="tui-muted-xs">ACTIVE PODS</span>
                   <span id="macro-pods" class="mono-val c-cyan">CORE</span>
                 </div>
+                <div id="macro-pods-list" class="macro-pod-list"></div>
               </div>
               <div class="scan-diag-section">
                 <div class="scan-diag-head">
@@ -250,6 +251,12 @@
             <div class="tui-panel-head">
               <span class="tui-panel-title">LIVE_WATCHLIST_SCANNER <span id="scan-count-badge" class="c-cyan">[0]</span></span>
               <div class="tui-head-controls">
+                <div class="tui-seg tui-seg-xs" role="group" aria-label="Filter watchlist by pod">
+                  <button type="button" class="tui-seg-btn is-active" data-scan-pod="ALL">ALL</button>
+                  <button type="button" class="tui-seg-btn" data-scan-pod="SCAN">CORE</button>
+                  <button type="button" class="tui-seg-btn" data-scan-pod="MAJOR">MAJ</button>
+                  <button type="button" class="tui-seg-btn" data-scan-pod="CTA">CTA</button>
+                </div>
                 <input id="scanner-filter" type="search" class="tui-input-sm" placeholder="/ filter coin" aria-label="Filter watchlist" />
               </div>
             </div>
@@ -258,10 +265,10 @@
                 <thead>
                   <tr>
                     <th>SYMBOL</th>
+                    <th>STRATEGIES</th>
                     <th class="num">MARK</th>
-                    <th class="num">VWAP DIST</th>
-                    <th class="num">NATR%</th>
-                    <th class="num">RVOL</th>
+                    <th class="num">SIGNAL METRIC</th>
+                    <th class="num">VOL / ACT</th>
                     <th class="num">SPREAD%</th>
                     <th class="num">FUNDING</th>
                   </tr>
@@ -312,17 +319,25 @@
           </div>
           <select id="sig-strategy-filter" class="tui-select-sm" aria-label="Filter signal strategy">
             <option value="ALL">STRAT: ALL</option>
-            <option value="VWAP_PULLBACK">VWAP_PULLBACK</option>
-            <option value="VOL_BREAKOUT">VOL_BREAKOUT</option>
-            <option value="MAJOR_RSMOM_SHORT">MAJOR_RSMOM_SHORT</option>
-            <option value="MAJOR_RSMOM_LONG">MAJOR_RSMOM_LONG</option>
-            <option value="CTA_4H_SHORT">CTA_4H_SHORT</option>
-            <option value="CTA_4H_LONG">CTA_4H_LONG</option>
-            <option value="EMA_PULLBACK">EMA_PULLBACK</option>
-            <option value="VWAP_BREAKDOWN">VWAP_BREAKDOWN</option>
-            <option value="STRUCTURE_BREAK">STRUCTURE_BREAK</option>
-            <option value="LIQUIDITY_SWEEP_SHORT">LIQ_SWEEP</option>
-            <option value="REL_RESIDUAL">REL_RESIDUAL</option>
+            <optgroup label="POD #1 · CORE 15m">
+              <option value="VWAP_PULLBACK">VWAP_PULLBACK</option>
+              <option value="VOL_BREAKOUT">VOL_BREAKOUT</option>
+            </optgroup>
+            <optgroup label="POD #2-3 · MAJOR 1h">
+              <option value="MAJOR_RSMOM_SHORT">MAJOR_RSMOM_SHORT</option>
+              <option value="MAJOR_RSMOM_LONG">MAJOR_RSMOM_LONG</option>
+            </optgroup>
+            <optgroup label="POD #4 · CTA 4h">
+              <option value="CTA_4H_SHORT">CTA_4H_SHORT</option>
+              <option value="CTA_4H_LONG">CTA_4H_LONG</option>
+            </optgroup>
+            <optgroup label="OPT-IN / LEGACY">
+              <option value="EMA_PULLBACK">EMA_PULLBACK</option>
+              <option value="VWAP_BREAKDOWN">VWAP_BREAKDOWN</option>
+              <option value="STRUCTURE_BREAK">STRUCTURE_BREAK</option>
+              <option value="LIQUIDITY_SWEEP_SHORT">LIQ_SWEEP</option>
+              <option value="REL_RESIDUAL">REL_RESIDUAL</option>
+            </optgroup>
           </select>
           <input id="sig-symbol-filter" type="search" class="tui-input-sm" placeholder="/ symbol (e.g. SOLUSDT)" aria-label="Filter signal symbol" />
         </div>
@@ -335,12 +350,12 @@
                   <th>TIME UTC</th>
                   <th>SYMBOL</th>
                   <th>SIDE</th>
-                  <th>STRAT</th>
+                  <th>STRATEGY</th>
                   <th class="num">CLOSE</th>
-                  <th class="num">EMA200</th>
-                  <th class="num">VWAP</th>
-                  <th class="num">DELTA Z</th>
-                  <th class="num">RVOL</th>
+                  <th class="num">TREND (EMA200)</th>
+                  <th class="num">REF (VWAP/E36)</th>
+                  <th class="num">SIGNAL (ΔZ/SC)</th>
+                  <th class="num">ACT (RVOL/RS)</th>
                   <th class="num">SPREAD%</th>
                   <th>DECISION</th>
                   <th>REASON</th>
@@ -384,17 +399,25 @@
           </div>
           <select id="led-strategy-filter" class="tui-select-sm" aria-label="Filter trade strategy">
             <option value="ALL">STRAT: ALL</option>
-            <option value="VWAP_PULLBACK">VWAP_PULLBACK</option>
-            <option value="VOL_BREAKOUT">VOL_BREAKOUT</option>
-            <option value="MAJOR_RSMOM_SHORT">MAJOR_RSMOM_SHORT</option>
-            <option value="MAJOR_RSMOM_LONG">MAJOR_RSMOM_LONG</option>
-            <option value="CTA_4H_SHORT">CTA_4H_SHORT</option>
-            <option value="CTA_4H_LONG">CTA_4H_LONG</option>
-            <option value="EMA_PULLBACK">EMA_PULLBACK</option>
-            <option value="VWAP_BREAKDOWN">VWAP_BREAKDOWN</option>
-            <option value="STRUCTURE_BREAK">STRUCTURE_BREAK</option>
-            <option value="LIQUIDITY_SWEEP_SHORT">LIQ_SWEEP</option>
-            <option value="REL_RESIDUAL">REL_RESIDUAL</option>
+            <optgroup label="POD #1 · CORE 15m">
+              <option value="VWAP_PULLBACK">VWAP_PULLBACK</option>
+              <option value="VOL_BREAKOUT">VOL_BREAKOUT</option>
+            </optgroup>
+            <optgroup label="POD #2-3 · MAJOR 1h">
+              <option value="MAJOR_RSMOM_SHORT">MAJOR_RSMOM_SHORT</option>
+              <option value="MAJOR_RSMOM_LONG">MAJOR_RSMOM_LONG</option>
+            </optgroup>
+            <optgroup label="POD #4 · CTA 4h">
+              <option value="CTA_4H_SHORT">CTA_4H_SHORT</option>
+              <option value="CTA_4H_LONG">CTA_4H_LONG</option>
+            </optgroup>
+            <optgroup label="OPT-IN / LEGACY">
+              <option value="EMA_PULLBACK">EMA_PULLBACK</option>
+              <option value="VWAP_BREAKDOWN">VWAP_BREAKDOWN</option>
+              <option value="STRUCTURE_BREAK">STRUCTURE_BREAK</option>
+              <option value="LIQUIDITY_SWEEP_SHORT">LIQ_SWEEP</option>
+              <option value="REL_RESIDUAL">REL_RESIDUAL</option>
+            </optgroup>
           </select>
         </div>
 
@@ -500,6 +523,6 @@
     </div>
   </dialog>
 
-  <script src="/app.js?v=17" defer></script>
+  <script src="/app.js?v=18" defer></script>
 </body>
 </html>

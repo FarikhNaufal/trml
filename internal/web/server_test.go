@@ -1068,6 +1068,12 @@ func TestServer_SummaryTelemetryAndImmutableVendorAssets(t *testing.T) {
 	if !strings.Contains(jsStr, "tag-pod-cta") || !strings.Contains(jsStr, "CTA_4H_SHORT") || !strings.Contains(jsStr, "TRAIL") || !strings.Contains(jsStr, "-POD)") {
 		t.Fatalf("expected CTAPod watchlist badge, CTA_4H_SHORT label, TRAIL TP label, and dynamic POD pill formatting in /app.js")
 	}
+	if !strings.Contains(jsStr, "STRATEGY_META") || !strings.Contains(jsStr, "macro-pods-list") || !strings.Contains(jsStr, "tag-strat-bo") || !strings.Contains(jsStr, "renderStrategyTag") || !strings.Contains(jsStr, "E36") || !strings.Contains(jsStr, "RS 24H VS BTC") {
+		t.Fatalf("expected normalized STRATEGY_META, macro-pods-list, strategy tags, and normalized RS/E36 formatting in /app.js")
+	}
+	if !strings.Contains(recHTML.Body.String(), "data-scan-pod") {
+		t.Fatalf("expected pod filter controls (data-scan-pod) in /")
+	}
 }
 
 func TestWebReader_GetEquityCurveAndServerDiagnostics(t *testing.T) {

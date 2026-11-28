@@ -1391,6 +1391,14 @@ func main() {
 }
 
 func (e *BotEngine) buildScannerCoinDTO(sym, pod string) (web.ScannerCoinDTO, bool) {
+	return e.buildScannerCoinDTOWithContext(sym, pod, nil, nil, nil, nil, nil, nil, nil)
+}
+
+func (e *BotEngine) buildScannerCoinDTOWithContext(
+	sym, pod string,
+	btcHourly []model.Candle,
+	primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet map[string]bool,
+) (web.ScannerCoinDTO, bool) {
 	e.statesMu.RLock()
 	st, exists := e.activeStates[sym]
 	e.statesMu.RUnlock()
@@ -1439,9 +1447,19 @@ func (e *BotEngine) buildScannerCoinDTO(sym, pod string) (web.ScannerCoinDTO, bo
 		distVWAP = ((mark - vwap) / vwap) * 100.0
 	}
 
+	pods, strats := e.resolveCoinPodsAndStrategies(sym, pod, primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet)
+	tf, mLabel, mVal, mTone, vLabel := e.resolveScannerCoinMetrics(sym, pod, st, btcHourly, mark, vwap, distVWAP, natr, rvol)
+
 	return web.ScannerCoinDTO{
 		Symbol:        sym,
 		Pod:           pod,
+		Pods:          pods,
+		Strategies:    strats,
+		Timeframe:     tf,
+		MetricLabel:   mLabel,
+		MetricValue:   mVal,
+		MetricTone:    mTone,
+		VolLabel:      vLabel,
 		MarkPrice:     mark,
 		SessionVWAP:   vwap,
 		DistVWAPPct:   distVWAP,
@@ -1451,6 +1469,316 @@ func (e *BotEngine) buildScannerCoinDTO(sym, pod string) (web.ScannerCoinDTO, bo
 		RVOL:          rvol,
 		LastUpdateUTC: lastUpdate.UTC().Format(time.RFC3339),
 	}, true
+}
+
+func appendUniqueStr(dst []string, items ...string) []string {
+	for _, it := range items {
+		if it == "" || slices.Contains(dst, it) {
+			continue
+		}
+		dst = append(dst, it)
+	}
+	return dst
+}
+
+func (e *BotEngine) activeCoreStrategyIDs() []string {
+	var out []string
+	if e == nil {
+		return nil
+	}
+	if e.evaluatorCfg.VolBreakout.Enabled && e.evaluatorCfg.BreakoutPriorityFirst {
+		out = appendUniqueStr(out, strategy.StrategyIDVolBreakout)
+	}
+	if !e.evaluatorCfg.DisableVWAP {
+		out = appendUniqueStr(out, strategy.StrategyIDVWAPPullback)
+	}
+	if e.evaluatorCfg.VolBreakout.Enabled && !e.evaluatorCfg.BreakoutPriorityFirst {
+		out = appendUniqueStr(out, strategy.StrategyIDVolBreakout)
+	}
+	if e.evaluatorCfg.Sweep.Enabled {
+		out = appendUniqueStr(out, strategy.StrategyIDLiquiditySweep)
+	}
+	if e.evaluatorCfg.RelResidual.Enabled {
+		out = appendUniqueStr(out, strategy.StrategyIDRelResidual)
+	}
+	if e.evaluatorCfg.EMAPullback.Enabled {
+		out = appendUniqueStr(out, strategy.StrategyIDEMAPullback)
+	}
+	if e.evaluatorCfg.VWAPBreakdown.Enabled {
+		out = appendUniqueStr(out, strategy.StrategyIDVWAPBreakdown)
+	}
+	if e.evaluatorCfg.StructureBreak.Enabled {
+		out = appendUniqueStr(out, strategy.StrategyIDStructureBreak)
+	}
+	if len(out) == 0 {
+		out = append(out, strategy.StrategyIDVWAPPullback)
+	}
+	return out
+}
+
+func (e *BotEngine) coreStrategiesForSymbol(sym string, primarySet, breakoutSet, sweepSet map[string]bool) []string {
+	all := e.activeCoreStrategyIDs()
+	if len(primarySet) == 0 && len(breakoutSet) == 0 && len(sweepSet) == 0 {
+		return all
+	}
+	inPrimary := primarySet[sym]
+	inBO := breakoutSet[sym]
+	inSweep := sweepSet[sym]
+	if !inPrimary && !inBO && !inSweep {
+		return all
+	}
+	var out []string
+	for _, sid := range all {
+		switch sid {
+		case strategy.StrategyIDVolBreakout:
+			if inBO || inPrimary {
+				out = appendUniqueStr(out, sid)
+			}
+		case strategy.StrategyIDLiquiditySweep:
+			if inSweep || inPrimary {
+				out = appendUniqueStr(out, sid)
+			}
+		default:
+			if inPrimary {
+				out = appendUniqueStr(out, sid)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return all
+	}
+	return out
+}
+
+func (e *BotEngine) majorStrategiesEnabled() []string {
+	if e == nil {
+		return nil
+	}
+	var out []string
+	if e.evaluatorCfg.MajorPod.ShortEnabled {
+		out = append(out, strategy.StrategyIDMajorRSMomShort)
+	}
+	if e.evaluatorCfg.MajorPod.LongEnabled {
+		out = append(out, strategy.StrategyIDMajorRSMomLong)
+	}
+	return out
+}
+
+func (e *BotEngine) ctaStrategiesEnabled() []string {
+	if e == nil {
+		return nil
+	}
+	var out []string
+	if e.evaluatorCfg.CTAPod.ShortEnabled {
+		out = append(out, strategy.StrategyIDCTA4hShort)
+	}
+	if e.evaluatorCfg.CTAPod.LongEnabled {
+		out = append(out, strategy.StrategyIDCTA4hLong)
+	}
+	return out
+}
+
+func (e *BotEngine) resolveCoinPodsAndStrategies(
+	sym, primaryPod string,
+	primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet map[string]bool,
+) (pods, strats []string) {
+	if watchedSet[sym] || primaryPod == "SCAN" {
+		pods = appendUniqueStr(pods, "SCAN")
+		strats = appendUniqueStr(strats, e.coreStrategiesForSymbol(sym, primarySet, breakoutSet, sweepSet)...)
+	}
+	if majorSet[sym] || primaryPod == "MAJOR" {
+		pods = appendUniqueStr(pods, "MAJOR")
+		strats = appendUniqueStr(strats, e.majorStrategiesEnabled()...)
+	}
+	if ctaSet[sym] || primaryPod == "CTA" {
+		pods = appendUniqueStr(pods, "CTA")
+		strats = appendUniqueStr(strats, e.ctaStrategiesEnabled()...)
+	}
+	return pods, strats
+}
+
+func (e *BotEngine) coreTimeframeLabel() string {
+	if e != nil && e.cfg != nil && strings.TrimSpace(e.cfg.Timeframe) != "" {
+		return strings.TrimSpace(e.cfg.Timeframe)
+	}
+	return "15m"
+}
+
+func (e *BotEngine) resolveScannerCoinMetrics(
+	sym, pod string,
+	st *model.SymbolState,
+	btcHourly []model.Candle,
+	mark, vwap, distVWAP, natr, rvol float64,
+) (tf, mLabel, mVal, mTone, vLabel string) {
+	switch pod {
+	case "MAJOR":
+		mLabel, mVal, mTone, vLabel = e.computeMajorCoinMetrics(st, btcHourly, mark)
+		return "1h", mLabel, mVal, mTone, vLabel
+	case "CTA":
+		mLabel, mVal, mTone, vLabel = e.computeCTACoinMetrics(sym, mark)
+		return "4h", mLabel, mVal, mTone, vLabel
+	default:
+		tf = e.coreTimeframeLabel()
+		mLabel = "VWAP"
+		mVal = "--"
+		mTone = "muted"
+		if vwap > 0 && mark > 0 {
+			mVal = fmt.Sprintf("%+.2f%%", distVWAP)
+			if distVWAP < 0 {
+				mTone = "neg"
+			} else if distVWAP > 0 {
+				mTone = "pos"
+			}
+		}
+		vLabel = "--"
+		if natr > 0 {
+			vLabel = fmt.Sprintf("%.2f%% · %.2fx", natr, rvol)
+		}
+		return tf, mLabel, mVal, mTone, vLabel
+	}
+}
+
+func (e *BotEngine) computeMajorCoinMetrics(st *model.SymbolState, btcHourly []model.Candle, mark float64) (mLabel, mVal, mTone, vLabel string) {
+	mLabel = "RS24H"
+	mVal = "WARM 1H"
+	mTone = "muted"
+	vLabel = "1h --"
+	if st == nil {
+		return
+	}
+	st.Mu.Lock()
+	hourly := slices.Clone(st.ClosedHourlyCandles)
+	var subCandles []model.Candle
+	if len(hourly) == 0 && len(st.ClosedCandles) > 0 {
+		subCandles = slices.Clone(st.ClosedCandles)
+	}
+	st.Mu.Unlock()
+	if len(hourly) == 0 && len(subCandles) > 0 {
+		step := time.Duration(0)
+		if e != nil && e.cfg != nil {
+			step = e.cfg.CandleDuration
+		}
+		hourly = strategy.ResampleCompletedHourlyStrict(subCandles, step)
+	}
+	if len(hourly) == 0 {
+		return
+	}
+	if len(hourly) >= 15 && mark > 0 {
+		if atr1h := indicator.CalculateATR(hourly, 14); atr1h > 0 {
+			vLabel = fmt.Sprintf("1h %.2f%%", (atr1h/mark)*100.0)
+		}
+	}
+	rsWin := e.evaluatorCfg.MajorPod.RSWindowHours
+	if rsWin <= 0 {
+		rsWin = 24
+	}
+	if len(hourly) > rsWin && len(btcHourly) > rsWin {
+		aNow := hourly[len(hourly)-1].Close
+		aPrev := hourly[len(hourly)-1-rsWin].Close
+		bNow := btcHourly[len(btcHourly)-1].Close
+		bPrev := btcHourly[len(btcHourly)-1-rsWin].Close
+		if aPrev > 0 && bPrev > 0 && aNow > 0 && bNow > 0 {
+			rs := ((aNow/aPrev - 1.0) - (bNow/bPrev - 1.0)) * 100.0
+			mVal = fmt.Sprintf("%+.2f%%", rs)
+			if rs < 0 {
+				mTone = "neg"
+			} else {
+				mTone = "pos"
+			}
+		}
+	}
+	return
+}
+
+func (e *BotEngine) computeCTACoinMetrics(sym string, mark float64) (mLabel, mVal, mTone, vLabel string) {
+	emaFast := e.evaluatorCfg.CTAPod.EMAFast
+	if emaFast <= 0 {
+		emaFast = 12
+	}
+	emaSlow := e.evaluatorCfg.CTAPod.EMASlow
+	if emaSlow <= 0 {
+		emaSlow = 36
+	}
+	emaTrend := e.evaluatorCfg.CTAPod.EMATrend
+	if emaTrend <= 0 {
+		emaTrend = 200
+	}
+	mode := strings.ToUpper(strings.TrimSpace(e.evaluatorCfg.CTAPod.Mode))
+	if mode == "" || mode == "EMA_CROSS" {
+		mLabel = fmt.Sprintf("EMA%d/%d", emaFast, emaSlow)
+	} else {
+		mLabel = mode
+	}
+	mVal = "WAIT 4H"
+	mTone = "muted"
+	vLabel = "4h --"
+
+	e.cta4hMu.Lock()
+	c4h := slices.Clone(e.cta4hCandles[sym])
+	e.cta4hMu.Unlock()
+	if len(c4h) == 0 {
+		return
+	}
+	if atr4h, okA := indicator.CalculateATRSafe(c4h, 14); okA && atr4h > 0 && mark > 0 {
+		vLabel = fmt.Sprintf("4h %.2f%%", (atr4h/mark)*100.0)
+	}
+	reqBars := emaSlow + 1
+	if reqBars < 15 {
+		reqBars = 15
+	}
+	if len(c4h) < reqBars {
+		return
+	}
+	if mode == "" || mode == "EMA_CROSS" {
+		eFast, okF := indicator.CalculateEMASafe(c4h, emaFast)
+		eSlow, okS := indicator.CalculateEMASafe(c4h, emaSlow)
+		if !okF || !okS || eSlow <= 0 {
+			return
+		}
+		diffPct := ((eFast - eSlow) / eSlow) * 100.0
+		trendTag := ""
+		if e200, ok200 := indicator.CalculateEMASafe(c4h, emaTrend); ok200 && e200 > 0 {
+			if c4h[len(c4h)-1].Close < e200 {
+				trendTag = " <200"
+			} else {
+				trendTag = " >200"
+			}
+		}
+		mVal = fmt.Sprintf("%+.2f%%%s", diffPct, trendTag)
+		if diffPct < 0 {
+			mTone = "neg"
+		} else {
+			mTone = "pos"
+		}
+		return
+	}
+	donLB := e.evaluatorCfg.CTAPod.DonchianLookback
+	if donLB <= 0 {
+		donLB = 20
+	}
+	if len(c4h) > donLB {
+		lo := c4h[len(c4h)-2].Low
+		hi := c4h[len(c4h)-2].High
+		for _, bar := range c4h[len(c4h)-1-donLB : len(c4h)-1] {
+			if bar.Low < lo {
+				lo = bar.Low
+			}
+			if bar.High > hi {
+				hi = bar.High
+			}
+		}
+		close4h := c4h[len(c4h)-1].Close
+		if hi > lo && close4h > 0 {
+			posPct := ((close4h - lo) / (hi - lo)) * 100.0
+			mVal = fmt.Sprintf("POS %.0f%%", posPct)
+			if posPct < 50 {
+				mTone = "neg"
+			} else {
+				mTone = "pos"
+			}
+		}
+	}
+	return
 }
 
 func (e *BotEngine) activeMajorPodSymbolList() []string {
@@ -1481,22 +1809,64 @@ func (e *BotEngine) activeCTAPodSymbolList() []string {
 	return slices.Clone(e.ctaPodSymbols)
 }
 
+func cloneBoolSet(src map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(src))
+	for k, v := range src {
+		if v {
+			out[k] = true
+		}
+	}
+	return out
+}
+
 func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 	e.statesMu.RLock()
 	coins := slices.Clone(e.watchedCoins)
+	primarySet := cloneBoolSet(e.primaryWatchedSet)
+	breakoutSet := cloneBoolSet(e.breakoutWatchedSet)
+	sweepSet := cloneBoolSet(e.sweepExtraWatchedSet)
 	ctaSyms := slices.Clone(e.ctaPodSymbols)
+	ctaSet := cloneBoolSet(e.ctaPodSet)
 	ctaQuotes := make(map[string]ctaCachedQuote, len(e.ctaQuoteCache))
 	for k, v := range e.ctaQuoteCache {
 		ctaQuotes[k] = v
 	}
+	btcSt := e.activeStates[BenchmarkSymbol]
 	e.statesMu.RUnlock()
 
+	var btcHourly []model.Candle
+	if btcSt != nil {
+		btcSt.Mu.Lock()
+		btcHourly = slices.Clone(btcSt.ClosedHourlyCandles)
+		var btcSub []model.Candle
+		if len(btcHourly) == 0 && len(btcSt.ClosedCandles) > 0 {
+			btcSub = slices.Clone(btcSt.ClosedCandles)
+		}
+		btcSt.Mu.Unlock()
+		if len(btcHourly) == 0 && len(btcSub) > 0 {
+			step := time.Duration(0)
+			if e.cfg != nil {
+				step = e.cfg.CandleDuration
+			}
+			btcHourly = strategy.ResampleCompletedHourlyStrict(btcSub, step)
+		}
+	}
+
+	watchedSet := make(map[string]bool, len(coins))
+	for _, s := range coins {
+		watchedSet[s] = true
+	}
 	majorCoins := e.activeMajorPodSymbolList()
+	majorSet := make(map[string]bool, len(majorCoins))
+	for _, s := range majorCoins {
+		majorSet[s] = true
+	}
+
 	result := make([]web.ScannerCoinDTO, 0, len(coins)+len(majorCoins)+len(ctaSyms))
 	seen := make(map[string]struct{}, len(coins)+len(majorCoins)+len(ctaSyms))
 
 	for _, sym := range coins {
-		if dto, ok := e.buildScannerCoinDTO(sym, "SCAN"); ok {
+		if dto, ok := e.buildScannerCoinDTOWithContext(sym, "SCAN", btcHourly, primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet); ok {
 			result = append(result, dto)
 			seen[sym] = struct{}{}
 		}
@@ -1505,7 +1875,7 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 		if _, dup := seen[sym]; dup {
 			continue
 		}
-		if dto, ok := e.buildScannerCoinDTO(sym, "MAJOR"); ok {
+		if dto, ok := e.buildScannerCoinDTOWithContext(sym, "MAJOR", btcHourly, primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet); ok {
 			result = append(result, dto)
 			seen[sym] = struct{}{}
 		}
@@ -1514,15 +1884,24 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 		if _, dup := seen[sym]; dup {
 			continue
 		}
-		if dto, ok := e.buildScannerCoinDTO(sym, "CTA"); ok {
+		if dto, ok := e.buildScannerCoinDTOWithContext(sym, "CTA", btcHourly, primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet); ok {
 			result = append(result, dto)
 			seen[sym] = struct{}{}
 			continue
 		}
 		if q, okQ := ctaQuotes[sym]; okQ {
+			pods, strats := e.resolveCoinPodsAndStrategies(sym, "CTA", primarySet, breakoutSet, sweepSet, watchedSet, majorSet, ctaSet)
+			mLabel, mVal, mTone, vLabel := e.computeCTACoinMetrics(sym, q.MarkPrice)
 			result = append(result, web.ScannerCoinDTO{
 				Symbol:        sym,
 				Pod:           "CTA",
+				Pods:          pods,
+				Strategies:    strats,
+				Timeframe:     "4h",
+				MetricLabel:   mLabel,
+				MetricValue:   mVal,
+				MetricTone:    mTone,
+				VolLabel:      vLabel,
 				MarkPrice:     q.MarkPrice,
 				SpreadPct:     q.SpreadPct,
 				FundingRate:   q.FundingRate,
@@ -1534,11 +1913,25 @@ func (e *BotEngine) getScannerCoins() []web.ScannerCoinDTO {
 	return result
 }
 
+func formatPodSideDir(shortOn, longOn bool) string {
+	if shortOn && longOn {
+		return "S+L"
+	}
+	if longOn {
+		return "LONG"
+	}
+	if shortOn {
+		return "SHORT"
+	}
+	return "OFF"
+}
+
 func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 	e.statesMu.RLock()
 	btcSt := e.activeStates[BenchmarkSymbol]
 	breadthPct := e.marketBreadthPct
 	breadthValid := e.marketBreadthValid
+	watchedCnt := len(e.watchedCoins)
 	e.statesMu.RUnlock()
 
 	var btcCandles []model.Candle
@@ -1568,14 +1961,68 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 	majorSyms := e.activeMajorPodSymbolList()
 	ctaSyms := e.activeCTAPodSymbolList()
 	coreSlots := 0
+	var scanInt, allowedSide string
+	var disableOI bool
 	if e.cfg != nil {
 		coreSlots = e.cfg.MaxSlots
+		scanInt = e.cfg.ScannerInterval.String()
+		allowedSide = e.cfg.AllowedSide
+		disableOI = e.cfg.DisableOIFilter
 	}
 	if coreSlots <= 0 {
 		coreSlots = e.evaluatorCfg.MaxSlots
 	}
 	if coreSlots <= 0 {
 		coreSlots = 6
+	}
+	if allowedSide == "" {
+		allowedSide = e.evaluatorCfg.AllowedSide
+	}
+	coreSideLabel := strings.ToUpper(strings.TrimSpace(allowedSide))
+	switch coreSideLabel {
+	case "SHORT_ONLY":
+		coreSideLabel = "SHORT"
+	case "LONG_ONLY":
+		coreSideLabel = "LONG"
+	case "":
+		coreSideLabel = "AUTO"
+	}
+
+	activePods := []web.ActivePodDTO{
+		{
+			ID:         "CORE",
+			Label:      "POD #1 CORE",
+			Timeframe:  e.coreTimeframeLabel(),
+			Side:       coreSideLabel,
+			Strategies: e.activeCoreStrategyIDs(),
+			MaxSlots:   coreSlots,
+			UsedSlots:  e.getActiveNonMajorSlots(),
+			Universe:   watchedCnt,
+		},
+	}
+	if e.evaluatorCfg.MajorPod.IsEnabled() {
+		activePods = append(activePods, web.ActivePodDTO{
+			ID:         "MAJOR",
+			Label:      "POD #2-3 MAJOR",
+			Timeframe:  "1h",
+			Side:       formatPodSideDir(e.evaluatorCfg.MajorPod.ShortEnabled, e.evaluatorCfg.MajorPod.LongEnabled),
+			Strategies: e.majorStrategiesEnabled(),
+			MaxSlots:   e.evaluatorCfg.MajorPod.MaxSlots,
+			UsedSlots:  e.getActiveMajorSlots(),
+			Universe:   len(majorSyms),
+		})
+	}
+	if e.evaluatorCfg.CTAPod.IsEnabled() {
+		activePods = append(activePods, web.ActivePodDTO{
+			ID:         "CTA",
+			Label:      "POD #4 CTA",
+			Timeframe:  "4h",
+			Side:       formatPodSideDir(e.evaluatorCfg.CTAPod.ShortEnabled, e.evaluatorCfg.CTAPod.LongEnabled),
+			Strategies: e.ctaStrategiesEnabled(),
+			MaxSlots:   e.evaluatorCfg.CTAPod.MaxSlots,
+			UsedSlots:  e.getActiveCTASlots(),
+			Universe:   len(ctaSyms),
+		})
 	}
 
 	return &web.TelemetryDTO{
@@ -1590,10 +2037,10 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 		MarketBreadthValid:   breadthValid,
 		ClusterSLPaused:      clusterPaused,
 		ClusterSLUntilUTC:    clusterUntilUTC,
-		Timeframe:            e.cfg.Timeframe,
-		ScannerInterval:      e.cfg.ScannerInterval.String(),
-		AllowedSide:          e.cfg.AllowedSide,
-		DisableOIFilter:      e.cfg.DisableOIFilter,
+		Timeframe:            e.coreTimeframeLabel(),
+		ScannerInterval:      scanInt,
+		AllowedSide:          allowedSide,
+		DisableOIFilter:      disableOI,
 		MajorShortEnabled:    e.evaluatorCfg.MajorPod.ShortEnabled,
 		MajorLongEnabled:     e.evaluatorCfg.MajorPod.LongEnabled,
 		MajorPodCount:        len(majorSyms),
@@ -1604,6 +2051,7 @@ func (e *BotEngine) getTelemetry() *web.TelemetryDTO {
 		CTAPodMode:           e.evaluatorCfg.CTAPod.Mode,
 		CTAPodCount:          len(ctaSyms),
 		CTAMaxSlots:          e.evaluatorCfg.CTAPod.MaxSlots,
+		ActivePods:           activePods,
 	}
 }
 

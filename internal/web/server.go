@@ -17,16 +17,34 @@ import (
 )
 
 type ScannerCoinDTO struct {
-	Symbol        string  `json:"symbol"`
-	Pod           string  `json:"pod,omitempty"`
-	MarkPrice     float64 `json:"mark_price"`
-	SessionVWAP   float64 `json:"session_vwap"`
-	DistVWAPPct   float64 `json:"dist_vwap_pct"`
-	SpreadPct     float64 `json:"spread_pct"`
-	FundingRate   float64 `json:"funding_rate"`
-	NATRPct       float64 `json:"natr_pct"`
-	RVOL          float64 `json:"rvol"`
-	LastUpdateUTC string  `json:"last_update_utc"`
+	Symbol        string   `json:"symbol"`
+	Pod           string   `json:"pod,omitempty"`
+	Pods          []string `json:"pods,omitempty"`
+	Strategies    []string `json:"strategies,omitempty"`
+	Timeframe     string   `json:"timeframe,omitempty"`
+	MetricLabel   string   `json:"metric_label,omitempty"`
+	MetricValue   string   `json:"metric_value,omitempty"`
+	MetricTone    string   `json:"metric_tone,omitempty"`
+	VolLabel      string   `json:"vol_label,omitempty"`
+	MarkPrice     float64  `json:"mark_price"`
+	SessionVWAP   float64  `json:"session_vwap"`
+	DistVWAPPct   float64  `json:"dist_vwap_pct"`
+	SpreadPct     float64  `json:"spread_pct"`
+	FundingRate   float64  `json:"funding_rate"`
+	NATRPct       float64  `json:"natr_pct"`
+	RVOL          float64  `json:"rvol"`
+	LastUpdateUTC string   `json:"last_update_utc"`
+}
+
+type ActivePodDTO struct {
+	ID         string   `json:"id"`
+	Label      string   `json:"label"`
+	Timeframe  string   `json:"timeframe"`
+	Side       string   `json:"side"`
+	Strategies []string `json:"strategies"`
+	MaxSlots   int      `json:"max_slots"`
+	UsedSlots  int      `json:"used_slots"`
+	Universe   int      `json:"universe"`
 }
 
 type TelemetryDTO struct {
@@ -52,9 +70,10 @@ type TelemetryDTO struct {
 	CoreMaxSlots         int     `json:"core_max_slots,omitempty"`
 	CTAShortEnabled      bool    `json:"cta_short_enabled,omitempty"`
 	CTALongEnabled       bool    `json:"cta_long_enabled,omitempty"`
-	CTAPodMode           string  `json:"cta_pod_mode,omitempty"`
-	CTAPodCount          int     `json:"cta_pod_count,omitempty"`
-	CTAMaxSlots          int     `json:"cta_max_slots,omitempty"`
+	CTAPodMode           string         `json:"cta_pod_mode,omitempty"`
+	CTAPodCount          int            `json:"cta_pod_count,omitempty"`
+	CTAMaxSlots          int            `json:"cta_max_slots,omitempty"`
+	ActivePods           []ActivePodDTO `json:"active_pods,omitempty"`
 }
 
 type ScanDiagnosticsDTO struct {

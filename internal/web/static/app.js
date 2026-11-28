@@ -24,6 +24,7 @@ const state = {
   lastScannerCoins: [],
   lastScanDiagnostics: null,
   scannerFilter: '',
+  scannerPodFilter: 'ALL',
 
   signalsPage: 1,
   signalsLimit: 25,
@@ -139,23 +140,51 @@ function fmtShortTimeUTC(iso) {
   return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
-function fmtStrategyShort(raw) {
-  const map = {
-    VWAP_PULLBACK: 'VWAP',
-    VOL_BREAKOUT: 'VOL_BO',
-    REL_RESIDUAL: 'REL',
-    LIQUIDITY_SWEEP_SHORT: 'SWEEP',
-    LIQ_SWEEP: 'SWEEP',
-    EMA_PULLBACK: 'EMA',
-    VWAP_BREAKDOWN: 'BRK',
-    STRUCTURE_BREAK: 'STRUCT',
-    MAJOR_RSMOM_SHORT: 'MAJ_S',
-    MAJOR_RSMOM_LONG: 'MAJ_L',
-    CTA_4H_SHORT: 'CTA_S',
-    CTA_4H_LONG: 'CTA_L'
-  };
+const STRATEGY_META = {
+  VWAP_PULLBACK:         { short: 'VWAP',   name: 'VWAP Pullback & Orderflow Bounce', pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-core' },
+  VOL_BREAKOUT:          { short: 'VOL_BO', name: 'Volatility Compression Breakout',  pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-bo' },
+  REL_RESIDUAL:          { short: 'REL',    name: 'Relative Residual vs BTC',         pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-core' },
+  LIQUIDITY_SWEEP_SHORT: { short: 'SWEEP',  name: '1-Bar Liquidity Sweep SHORT',      pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-bo' },
+  LIQ_SWEEP:             { short: 'SWEEP',  name: '1-Bar Liquidity Sweep SHORT',      pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-bo' },
+  EMA_PULLBACK:          { short: 'EMA',    name: 'Stacked EMA Continuation Pullback',pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-core' },
+  VWAP_BREAKDOWN:        { short: 'BRK',    name: 'Failed Relief VWAP Breakdown',     pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-bo' },
+  STRUCTURE_BREAK:       { short: 'STRUCT', name: 'Pivot Structure Breakdown',        pod: 'CORE',  tf: '15m', tagCls: 'tag-strat-bo' },
+  MAJOR_RSMOM_SHORT:     { short: 'MAJ_S',  name: 'Major 1h RS-Momentum SHORT',       pod: 'MAJOR', tf: '1h',  tagCls: 'tag-pod-maj' },
+  MAJOR_RSMOM_LONG:      { short: 'MAJ_L',  name: 'Major 1h RS-Momentum LONG',        pod: 'MAJOR', tf: '1h',  tagCls: 'tag-pod-maj' },
+  CTA_4H_SHORT:          { short: 'CTA_S',  name: 'CTA 4h Trend Following SHORT',     pod: 'CTA',   tf: '4h',  tagCls: 'tag-pod-cta' },
+  CTA_4H_LONG:           { short: 'CTA_L',  name: 'CTA 4h Trend Following LONG',      pod: 'CTA',   tf: '4h',  tagCls: 'tag-pod-cta' }
+};
+
+function getStrategyMeta(raw) {
   const key = String(raw || 'VWAP_PULLBACK').trim().toUpperCase();
-  return map[key] || key.slice(0, 10);
+  if (STRATEGY_META[key]) return { id: key, ...STRATEGY_META[key] };
+  return { id: key, short: key.slice(0, 10), name: key, pod: 'CORE', tf: '15m', tagCls: 'tag-muted' };
+}
+
+function fmtStrategyShort(raw) {
+  return getStrategyMeta(raw).short;
+}
+
+function renderStrategyTag(raw, showTF = false) {
+  const m = getStrategyMeta(raw);
+  const label = showTF ? `${m.short} ${m.tf}` : m.short;
+  return `<span class="tui-tag ${m.tagCls}" title="${escapeHtml(`${m.name} (${m.tf})`)}">${escapeHtml(label)}</span>`;
+}
+
+function fmtPriceOrDash(val) {
+  const n = Number(val || 0);
+  if (!Number.isFinite(n) || n <= 0) return '<span class="tui-muted">--</span>';
+  return fmtPrice(n);
+}
+
+function renderPodTags(pods, primaryPod, showScanBadge) {
+  const list = Array.isArray(pods) && pods.length > 0 ? pods : [primaryPod || 'SCAN'];
+  return list.map((rawPod) => {
+    const p = String(rawPod || 'SCAN').toUpperCase();
+    if (p === 'MAJOR') return '<span class="tui-tag tag-pod-maj">MAJ</span>';
+    if (p === 'CTA') return '<span class="tui-tag tag-pod-cta">CTA</span>';
+    return showScanBadge ? '<span class="tui-tag tag-pod-scan">SCAN</span>' : '';
+  }).join('');
 }
 
 function fmtTierLabel(pos) {
@@ -606,6 +635,32 @@ function renderSummary(data) {
     }
   }
 
+  const podsListEl = document.getElementById('macro-pods-list');
+  if (podsListEl) {
+    const activePods = Array.isArray(telem.active_pods) ? telem.active_pods : [];
+    if (activePods.length > 0) {
+      podsListEl.innerHTML = activePods.map((pod) => {
+        const pid = String(pod.id || 'CORE').toUpperCase();
+        const badgeCls = pid === 'MAJOR' ? 'tag-pod-maj' : pid === 'CTA' ? 'tag-pod-cta' : 'tag-pod-scan';
+        const strats = Array.isArray(pod.strategies) ? pod.strategies : [];
+        const stratHtml = strats.map((s) => renderStrategyTag(s, false)).join('');
+        const used = Number(pod.used_slots || 0);
+        const maxS = Number(pod.max_slots || 0);
+        const univ = Number(pod.universe || 0);
+        return `<div class="macro-pod-row">
+          <div class="macro-pod-head">
+            <span class="tui-tag ${badgeCls}">${escapeHtml(pid)}</span>
+            <span class="tui-muted-xs">${escapeHtml(pod.timeframe || '--')} · ${escapeHtml(pod.side || '--')}</span>
+            <span class="tui-muted-xs">${used}/${maxS}s · ${univ}c</span>
+          </div>
+          <div class="macro-pod-strats">${stratHtml}</div>
+        </div>`;
+      }).join('');
+    } else {
+      podsListEl.innerHTML = '';
+    }
+  }
+
   // Active Positions Table & Copilot Selector
   const positions = Array.isArray(data.positions) ? data.positions : [];
   renderActivePositions(positions, telem.scanner_interval || '15m');
@@ -749,7 +804,7 @@ function renderActivePositions(positions, scanInterval) {
     return `<tr data-pos-symbol="${sym}" class="${isSelected ? 'is-selected' : ''}">
       <td class="cell-symbol">${sym}</td>
       <td><span class="tui-tag ${sideTagCls}">${escapeHtml(side)}</span></td>
-      <td class="tui-muted">${escapeHtml(fmtStrategyShort(pos.strategy_id))}</td>
+      <td>${renderStrategyTag(pos.strategy_id, false)}</td>
       <td class="num">${fmtQty(pos.qty)}</td>
       <td class="num">${fmtPrice(pos.entry_price)}</td>
       <td class="num">${fmtPrice(pos.mark_price)}</td>
@@ -826,24 +881,29 @@ function renderWatchlistTable() {
   const tbody = document.getElementById('scanner-tbody');
   const badge = document.getElementById('scan-count-badge');
   const filter = state.scannerFilter.trim().toUpperCase();
+  const podFilter = String(state.scannerPodFilter || 'ALL').toUpperCase();
 
   let scanCount = 0;
   let majCount = 0;
   let ctaCount = 0;
   for (const c of state.lastScannerCoins) {
-    const podUp = String(c.pod || '').toUpperCase();
+    const podUp = String(c.pod || 'SCAN').toUpperCase();
     if (podUp === 'MAJOR') majCount += 1;
     else if (podUp === 'CTA') ctaCount += 1;
     else scanCount += 1;
   }
 
-  const list = filter
-    ? state.lastScannerCoins.filter((c) => {
-        const sym = String(c.symbol || '').toUpperCase();
-        const pod = String(c.pod || '').toUpperCase();
-        return sym.includes(filter) || pod.includes(filter);
-      })
-    : state.lastScannerCoins;
+  const list = state.lastScannerCoins.filter((c) => {
+    const primaryPod = String(c.pod || 'SCAN').toUpperCase();
+    const pods = Array.isArray(c.pods) && c.pods.length > 0 ? c.pods.map((p) => String(p).toUpperCase()) : [primaryPod];
+    if (podFilter !== 'ALL' && !pods.includes(podFilter)) {
+      return false;
+    }
+    if (!filter) return true;
+    const sym = String(c.symbol || '').toUpperCase();
+    const strats = Array.isArray(c.strategies) ? c.strategies.join(' ').toUpperCase() : '';
+    return sym.includes(filter) || pods.join(' ').includes(filter) || strats.includes(filter);
+  });
 
   if (badge) {
     if (majCount > 0 || ctaCount > 0) {
@@ -858,29 +918,49 @@ function renderWatchlistTable() {
   if (!tbody) return;
 
   if (list.length === 0) {
-    const emptyMsg = filter
-      ? `No watched coins matching "${escapeHtml(filter)}".`
+    const emptyMsg = filter || podFilter !== 'ALL'
+      ? `No watched coins matching ${podFilter !== 'ALL' ? `pod=${escapeHtml(podFilter)}` : ''}${filter ? ` "${escapeHtml(filter)}"` : ''}.`
       : 'No watched coins on current scan.';
     tbody.innerHTML = `<tr><td colspan="7" class="tui-empty-cell">${emptyMsg}</td></tr>`;
     return;
   }
 
+  const showScanBadge = majCount > 0 || ctaCount > 0;
   tbody.innerHTML = list.map((c) => {
     const dist = Number(c.dist_vwap_pct || 0);
     const natr = Number(c.natr_pct || 0);
     const fund = Number(c.funding_rate || 0);
-    const pod = String(c.pod || '').toUpperCase();
-    const podBadge = pod === 'MAJOR'
-      ? '<span class="tui-tag tag-pod-maj">MAJ</span>'
-      : pod === 'CTA'
-        ? '<span class="tui-tag tag-pod-cta">CTA</span>'
-        : ((majCount > 0 || ctaCount > 0) ? '<span class="tui-tag tag-pod-scan">SCAN</span>' : '');
+    const pod = String(c.pod || 'SCAN').toUpperCase();
+    const podBadges = renderPodTags(c.pods, pod, showScanBadge);
+
+    const strats = Array.isArray(c.strategies) && c.strategies.length > 0
+      ? c.strategies
+      : [pod === 'MAJOR' ? 'MAJOR_RSMOM_SHORT' : pod === 'CTA' ? 'CTA_4H_SHORT' : 'VWAP_PULLBACK'];
+    const tf = escapeHtml(c.timeframe || (pod === 'MAJOR' ? '1h' : pod === 'CTA' ? '4h' : '15m'));
+    const stratHtml = `<div class="strat-chip-group">${strats.map((s) => renderStrategyTag(s, false)).join('')}<span class="strat-tf">${tf}</span></div>`;
+
+    let metricHtml = '<span class="tui-muted">--</span>';
+    if (c.metric_value) {
+      const toneCls = c.metric_tone === 'neg' ? 'c-red' : c.metric_tone === 'pos' ? 'c-green' : 'tui-muted';
+      metricHtml = `<span class="metric-k-inline">${escapeHtml(c.metric_label || '')}</span> <span class="${toneCls}">${escapeHtml(c.metric_value)}</span>`;
+    } else if (pod === 'SCAN' && Number(c.session_vwap || 0) > 0) {
+      metricHtml = `<span class="metric-k-inline">VWAP</span> <span class="${dist < 0 ? 'c-red' : 'c-green'}">${fmtPct(dist, 2, true)}</span>`;
+    }
+
+    let volHtml = '<span class="tui-muted">--</span>';
+    if (c.vol_label && c.vol_label !== '--') {
+      const cls = c.vol_label.includes('--') ? 'tui-muted' : 'c-green';
+      volHtml = `<span class="${cls}">${escapeHtml(c.vol_label)}</span>`;
+    } else if (pod === 'SCAN' && natr > 0) {
+      volHtml = `<span class="c-green">${fmtPct(natr, 2)}</span> <span class="tui-muted">· ${Number(c.rvol || 0).toFixed(2)}x</span>`;
+    }
+
     return `<tr>
-      <td class="cell-symbol">${escapeHtml(c.symbol)}${podBadge}</td>
+      <td class="cell-symbol">${escapeHtml(c.symbol)}${podBadges}</td>
+      <td>${stratHtml}</td>
       <td class="num">${fmtPrice(c.mark_price)}</td>
-      <td class="num ${dist < 0 ? 'c-red' : 'c-green'}">${fmtPct(dist, 2, true)}</td>
-      <td class="num c-green">${fmtPct(natr, 2)}</td>
-      <td class="num">${Number(c.rvol || 0).toFixed(2)}x</td>
+      <td class="num">${metricHtml}</td>
+      <td class="num">${volHtml}</td>
       <td class="num tui-muted">${fmtPct(c.spread_pct || 0, 3)}</td>
       <td class="num ${fund > 0 ? 'c-red' : 'c-green'}">${fmtFunding(fund)}</td>
     </tr>`;
@@ -923,7 +1003,7 @@ function renderDeskSignalStream(signals) {
       <span class="tui-muted">${fmtShortTimeUTC(s.candle_open_time_utc || s.created_at_utc)}</span>
       <span class="${cls}">${tag}</span>
       <strong>${escapeHtml(s.symbol)}</strong>
-      <span class="log-reason">${escapeHtml(fmtStrategyShort(s.strategy_id))} · ${escapeHtml(reason)}</span>
+      <span class="log-reason">${renderStrategyTag(s.strategy_id, false)} ${escapeHtml(reason)}</span>
     </div>`;
   }).join('');
 }
@@ -957,17 +1037,37 @@ function renderSignalsTable(data) {
     const side = String(s.side || '').toUpperCase() || '--';
     const sideTagCls = side === 'LONG' ? 'tag-long' : side === 'SHORT' ? 'tag-short' : 'tag-muted';
     const reason = s.reject_reason_code ? `${s.reject_reason_code}${s.reject_sub_reason ? ` (${s.reject_sub_reason})` : ''}` : 'SIGNAL_APPROVED';
+    const meta = getStrategyMeta(s.strategy_id);
+    const refVal = Number(s.session_vwap || 0);
+    const dzVal = Number(s.bar_delta_zscore || 0);
+    const rvolVal = Number(s.rvol || 0);
+    const impVal = Number(s.impulse_atr_mult || 0);
+
+    let refCell = fmtPriceOrDash(refVal);
+    let sigCell = dzVal.toFixed(2);
+    let actCell = `${rvolVal.toFixed(2)}x`;
+    if (meta.pod === 'CTA') {
+      refCell = refVal > 0 ? `<span class="metric-k-inline">E36</span> ${fmtPrice(refVal)}` : '<span class="tui-muted">--</span>';
+      sigCell = impVal !== 0 ? `<span class="metric-k-inline">SC</span> ${impVal.toFixed(2)}` : '<span class="tui-muted">--</span>';
+      actCell = '<span class="tui-muted">--</span>';
+    } else if (meta.pod === 'MAJOR') {
+      refCell = '<span class="tui-muted">--</span>';
+      sigCell = `<span class="metric-k-inline">ΔZ</span> ${dzVal.toFixed(2)}`;
+      actCell = impVal !== 0
+        ? `<span class="metric-k-inline">RS</span> <span class="${impVal < 0 ? 'c-red' : 'c-green'}">${fmtPct(impVal, 2, true)}</span>`
+        : '<span class="tui-muted">--</span>';
+    }
 
     return `<tr data-signal-id="${escapeHtml(s.id)}">
       <td class="cell-time">${fmtUTC(s.candle_open_time_utc || s.created_at_utc)}</td>
       <td class="cell-symbol">${escapeHtml(s.symbol)}</td>
       <td><span class="tui-tag ${sideTagCls}">${escapeHtml(side)}</span></td>
-      <td class="tui-muted">${escapeHtml(fmtStrategyShort(s.strategy_id))}</td>
-      <td class="num">${fmtPrice(s.close_price)}</td>
-      <td class="num tui-muted">${fmtPrice(s.ema200)}</td>
-      <td class="num tui-muted">${fmtPrice(s.session_vwap)}</td>
-      <td class="num">${Number(s.bar_delta_zscore || 0).toFixed(2)}</td>
-      <td class="num">${Number(s.rvol || 0).toFixed(2)}x</td>
+      <td>${renderStrategyTag(s.strategy_id, true)}</td>
+      <td class="num">${fmtPriceOrDash(s.close_price)}</td>
+      <td class="num tui-muted">${fmtPriceOrDash(s.ema200)}</td>
+      <td class="num tui-muted">${refCell}</td>
+      <td class="num">${sigCell}</td>
+      <td class="num">${actCell}</td>
       <td class="num tui-muted">${fmtPct(s.spread_pct || 0, 3)}</td>
       <td><span class="tui-tag ${decTagCls}">${decLabel}</span></td>
       <td class="cell-reason" title="${escapeHtml(reason)}">${escapeHtml(reason)}</td>
@@ -1034,7 +1134,7 @@ function renderLedgerTable(data) {
       <td class="cell-time">${fmtUTC(t.closed_at_utc)}</td>
       <td class="cell-symbol">${escapeHtml(t.symbol)}</td>
       <td><span class="tui-tag ${sideTagCls}">${escapeHtml(side)}</span></td>
-      <td class="tui-muted">${escapeHtml(fmtStrategyShort(t.strategy_id))}</td>
+      <td>${renderStrategyTag(t.strategy_id, false)}</td>
       <td class="num">${fmtQty(t.qty)}</td>
       <td class="num">${fmtPrice(t.entry_price)}</td>
       <td class="num">${fmtPrice(t.exit_price)}</td>
@@ -1064,19 +1164,39 @@ function openSignalDialog(signalId) {
   if (titleEl) titleEl.textContent = `SIGNAL_AUDIT // ${sig.symbol} (${sig.decision})`;
 
   const isAppr = String(sig.decision || '').toUpperCase().startsWith('APPROV');
+  const meta = getStrategyMeta(sig.strategy_id);
+  const closeVal = Number(sig.close_price || 0);
+  const atrVal = Number(sig.atr14 || 0);
+  const atrPctStr = closeVal > 0 && atrVal > 0 ? ` (${((atrVal / closeVal) * 100).toFixed(2)}%)` : '';
+
+  let stratRows = `
+      <div class="detail-kv"><span class="k">EMA200 (15M)</span><span class="v">${fmtPriceOrDash(sig.ema200)}</span></div>
+      <div class="detail-kv"><span class="k">SESSION VWAP</span><span class="v">${fmtPriceOrDash(sig.session_vwap)}</span></div>
+      <div class="detail-kv"><span class="k">ATR14</span><span class="v">${fmtPriceOrDash(atrVal)}${escapeHtml(atrPctStr)}</span></div>
+      <div class="detail-kv"><span class="k">DELTA Z-SCORE</span><span class="v">${Number(sig.bar_delta_zscore || 0).toFixed(3)}</span></div>
+      <div class="detail-kv"><span class="k">RVOL / OI DELTA</span><span class="v">${Number(sig.rvol || 0).toFixed(2)}x / ${fmtPct(sig.oi_delta_pct || 0, 2, true)}</span></div>`;
+  if (meta.pod === 'CTA') {
+    stratRows = `
+      <div class="detail-kv"><span class="k">EMA200 (4H)</span><span class="v">${fmtPriceOrDash(sig.ema200)}</span></div>
+      <div class="detail-kv"><span class="k">EMA36 (4H)</span><span class="v">${fmtPriceOrDash(sig.session_vwap)}</span></div>
+      <div class="detail-kv"><span class="k">ATR14 (4H)</span><span class="v">${fmtPriceOrDash(atrVal)}${escapeHtml(atrPctStr)}</span></div>
+      <div class="detail-kv"><span class="k">EMA CROSS SCORE</span><span class="v">${Number(sig.impulse_atr_mult || 0).toFixed(3)} ATR</span></div>`;
+  } else if (meta.pod === 'MAJOR') {
+    stratRows = `
+      <div class="detail-kv"><span class="k">EMA200 (1H)</span><span class="v">${fmtPriceOrDash(sig.ema200)}</span></div>
+      <div class="detail-kv"><span class="k">ATR14 (1H)</span><span class="v">${fmtPriceOrDash(atrVal)}${escapeHtml(atrPctStr)}</span></div>
+      <div class="detail-kv"><span class="k">RS 24H VS BTC</span><span class="v">${fmtPct(sig.impulse_atr_mult || 0, 2, true)}</span></div>
+      <div class="detail-kv"><span class="k">DELTA Z (1H)</span><span class="v">${Number(sig.bar_delta_zscore || 0).toFixed(3)}</span></div>`;
+  }
+
   bodyEl.innerHTML = `
     <div class="detail-kv-grid">
       <div class="detail-kv"><span class="k">CANDLE OPEN UTC</span><span class="v">${fmtUTC(sig.candle_open_time_utc || sig.created_at_utc)}</span></div>
-      <div class="detail-kv"><span class="k">STRATEGY</span><span class="v">${escapeHtml(sig.strategy_id || 'VWAP_PULLBACK')}</span></div>
+      <div class="detail-kv"><span class="k">POD / STRATEGY</span><span class="v">${escapeHtml(`${meta.pod} · ${meta.tf} · ${meta.id}`)}</span></div>
       <div class="detail-kv"><span class="k">DECISION</span><span class="v ${isAppr ? 'c-green' : 'c-red'}">${escapeHtml(sig.decision)}</span></div>
       <div class="detail-kv"><span class="k">REASON</span><span class="v">${escapeHtml(sig.reject_reason_code || 'SIGNAL_APPROVED')}</span></div>
-      <div class="detail-kv"><span class="k">CLOSE</span><span class="v">${fmtPrice(sig.close_price)}</span></div>
-      <div class="detail-kv"><span class="k">EMA200</span><span class="v">${fmtPrice(sig.ema200)}</span></div>
-      <div class="detail-kv"><span class="k">SESSION VWAP</span><span class="v">${fmtPrice(sig.session_vwap)}</span></div>
-      <div class="detail-kv"><span class="k">ATR14</span><span class="v">${fmtPrice(sig.atr14)}</span></div>
-      <div class="detail-kv"><span class="k">DELTA Z-SCORE</span><span class="v">${Number(sig.bar_delta_zscore || 0).toFixed(3)}</span></div>
-      <div class="detail-kv"><span class="k">RVOL</span><span class="v">${Number(sig.rvol || 0).toFixed(2)}x</span></div>
-      <div class="detail-kv"><span class="k">OI DELTA</span><span class="v">${fmtPct(sig.oi_delta_pct || 0, 2, true)}</span></div>
+      <div class="detail-kv"><span class="k">CLOSE</span><span class="v">${fmtPriceOrDash(sig.close_price)}</span></div>
+      ${stratRows}
       <div class="detail-kv"><span class="k">SPREAD / FUNDING</span><span class="v">${fmtPct(sig.spread_pct || 0, 3)} / ${fmtFunding(sig.funding_rate)}</span></div>
     </div>
     ${sig.reject_sub_reason ? `<div class="scan-diag-box"><div class="tui-muted-xs">SUB-REASON DETAIL</div><div>${escapeHtml(sig.reject_sub_reason)}</div></div>` : ''}
@@ -1425,7 +1545,15 @@ function wireEvents() {
     });
   }
 
-  // Scanner inline filter
+  // Scanner inline filter & Pod filter
+  document.querySelectorAll('[data-scan-pod]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-scan-pod]').forEach((b) => b.classList.toggle('is-active', b === btn));
+      state.scannerPodFilter = btn.dataset.scanPod || 'ALL';
+      renderWatchlistTable();
+    });
+  });
+
   const scanFilter = document.getElementById('scanner-filter');
   if (scanFilter) {
     scanFilter.addEventListener('input', (e) => {
