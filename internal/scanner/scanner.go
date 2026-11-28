@@ -78,6 +78,7 @@ type ScannerConfig struct {
 	RollingVWAPBars               int
 	ComputeMarketBreadth          bool
 	AllowedSide                   string
+	Sequential                    bool
 }
 
 // FromAppConfig builds a ScannerConfig from application config while applying safe defaults.
@@ -493,251 +494,249 @@ func RunBulkMarketScannerPartitioned(
 		breadthAbove   bool
 	}
 
-	resultsChan := make(chan scanResult, len(symbolsToScan))
-	workerCount := scannerWorkerConcurrency
-	if len(symbolsToScan) < workerCount {
-		workerCount = len(symbolsToScan)
-	}
-	if workerCount < 1 {
-		workerCount = 1
-	}
-	sem := make(chan struct{}, workerCount)
-	var wg sync.WaitGroup
-
-	for _, sym := range symbolsToScan {
-		wg.Add(1)
-		pf := preFlags[sym]
-		go func(symbol string, flags preScreenFlags) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			var rawKlines []model.Candle
-			if fetchKlinesFn != nil {
-				rawKlines = fetchKlinesFn(symbol, klineLimit)
-			}
-			if rawKlines == nil {
-				if !flags.allowPrimary && !flags.allowBreakout {
-					resultsChan <- scanResult{breadthOnly: true}
-					return
-				}
-				resultsChan <- scanResult{reject: scanRejectKlineFetch}
-				return
-			}
-			if len(rawKlines) < cfg.EMAPeriod+1 {
-				if !flags.allowPrimary && !flags.allowBreakout {
-					resultsChan <- scanResult{breadthOnly: true}
-					return
-				}
-				resultsChan <- scanResult{reject: scanRejectKlineShort}
-				return
-			}
-			validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime, cfg.CandleDuration)
-			if err != nil {
-				if !flags.allowPrimary && !flags.allowBreakout {
-					resultsChan <- scanResult{breadthOnly: true}
-					return
-				}
-				resultsChan <- scanResult{reject: scanRejectKlineInvalid}
-				return
-			}
-			var breadthCounted, breadthAbove bool
-			if flags.includeBreadth {
-				breadthAbove, breadthCounted = strategy.IsAboveHourlyEMA200(validKlines)
-			}
+	evalSymbol := func(symbol string, flags preScreenFlags) scanResult {
+		var rawKlines []model.Candle
+		if fetchKlinesFn != nil {
+			rawKlines = fetchKlinesFn(symbol, klineLimit)
+		}
+		if rawKlines == nil {
 			if !flags.allowPrimary && !flags.allowBreakout {
-				resultsChan <- scanResult{
-					breadthOnly:    true,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
+				return scanResult{breadthOnly: true}
 			}
-			if len(validKlines) < cfg.EMAPeriod+1 {
-				resultsChan <- scanResult{
-					reject:         scanRejectKlineShort,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
+			return scanResult{reject: scanRejectKlineFetch}
+		}
+		if len(rawKlines) < cfg.EMAPeriod+1 {
+			if !flags.allowPrimary && !flags.allowBreakout {
+				return scanResult{breadthOnly: true}
 			}
+			return scanResult{reject: scanRejectKlineShort}
+		}
+		validKlines, err := model.ValidateAndFilterCandles(rawKlines, serverTime, cfg.CandleDuration)
+		if err != nil {
+			if !flags.allowPrimary && !flags.allowBreakout {
+				return scanResult{breadthOnly: true}
+			}
+			return scanResult{reject: scanRejectKlineInvalid}
+		}
+		var breadthCounted, breadthAbove bool
+		if flags.includeBreadth {
+			breadthAbove, breadthCounted = strategy.IsAboveHourlyEMA200(validKlines)
+		}
+		if !flags.allowPrimary && !flags.allowBreakout {
+			return scanResult{
+				breadthOnly:    true,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
+			}
+		}
+		if len(validKlines) < cfg.EMAPeriod+1 {
+			return scanResult{
+				reject:         scanRejectKlineShort,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
+			}
+		}
 
-			atr14 := indicator.CalculateATR(validKlines, cfg.ATRPeriod)
-			if math.IsNaN(atr14) || math.IsInf(atr14, 0) || atr14 <= 0 {
-				resultsChan <- scanResult{
-					reject:         scanRejectATR,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
+		atr14 := indicator.CalculateATR(validKlines, cfg.ATRPeriod)
+		if math.IsNaN(atr14) || math.IsInf(atr14, 0) || atr14 <= 0 {
+			return scanResult{
+				reject:         scanRejectATR,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
 			}
-			lastClose := validKlines[len(validKlines)-1].Close
-			if math.IsNaN(lastClose) || math.IsInf(lastClose, 0) || lastClose <= 0 {
-				resultsChan <- scanResult{
-					reject:         scanRejectKlineInvalid,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
+		}
+		lastClose := validKlines[len(validKlines)-1].Close
+		if math.IsNaN(lastClose) || math.IsInf(lastClose, 0) || lastClose <= 0 {
+			return scanResult{
+				reject:         scanRejectKlineInvalid,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
 			}
-			natrPct := (atr14 / lastClose) * 100.0
-			if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) {
-				resultsChan <- scanResult{
-					reject:         scanRejectNATR,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
+		}
+		natrPct := (atr14 / lastClose) * 100.0
+		if math.IsNaN(natrPct) || math.IsInf(natrPct, 0) {
+			return scanResult{
+				reject:         scanRejectNATR,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
 			}
+		}
 
-			pNATROK := flags.allowPrimary && natrPct >= cfg.MinNATRPct && natrPct <= cfg.MaxNATRPct
-			bNATROK := flags.allowBreakout && natrPct >= boMinNATR && natrPct <= boMaxNATR
-			if !pNATROK && !bNATROK {
-				resultsChan <- scanResult{
-					reject:         scanRejectNATR,
+		pNATROK := flags.allowPrimary && natrPct >= cfg.MinNATRPct && natrPct <= cfg.MaxNATRPct
+		bNATROK := flags.allowBreakout && natrPct >= boMinNATR && natrPct <= boMaxNATR
+		if !pNATROK && !bNATROK {
+			return scanResult{
+				reject:         scanRejectNATR,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
+			}
+		}
+
+		var ema200 float64
+		var hasEMA200 bool
+		if sideFilter == "SHORT_ONLY" || sideFilter == "LONG_ONLY" {
+			ema200 = indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
+			hasEMA200 = !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0
+			sideHeadroom := scannerSideEMAHeadroomATR * atr14
+			if hasEMA200 && ((sideFilter == "SHORT_ONLY" && lastClose > ema200+sideHeadroom) || (sideFilter == "LONG_ONLY" && lastClose < ema200-sideHeadroom)) {
+				return scanResult{
+					reject:         scanRejectSide,
 					breadthCounted: breadthCounted,
 					breadthAbove:   breadthAbove,
 				}
-				return
 			}
+		}
 
-			var ema200 float64
-			var hasEMA200 bool
-			if sideFilter == "SHORT_ONLY" || sideFilter == "LONG_ONLY" {
-				ema200 = indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
-				hasEMA200 = !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0
-				sideHeadroom := scannerSideEMAHeadroomATR * atr14
-				if hasEMA200 && ((sideFilter == "SHORT_ONLY" && lastClose > ema200+sideHeadroom) || (sideFilter == "LONG_ONLY" && lastClose < ema200-sideHeadroom)) {
-					resultsChan <- scanResult{
-						reject:         scanRejectSide,
-						breadthCounted: breadthCounted,
-						breadthAbove:   breadthAbove,
+		var distVWAPATR float64
+		var sessionVWAP float64
+		needVWAP := ((cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") && pNATROK) || (cfg.BreakoutMaxScannerVWAPDistATR > 0 && bNATROK)
+		if needVWAP {
+			sessionVWAP = indicator.CalculateEffectiveVWAP(validKlines, cfg.RollingVWAPBars)
+			if !math.IsNaN(sessionVWAP) && !math.IsInf(sessionVWAP, 0) && sessionVWAP > 0 {
+				distVWAPATR = math.Abs(lastClose-sessionVWAP) / atr14
+			} else {
+				sessionVWAP = 0
+			}
+		}
+
+		var sweepExtra *Candidate
+		pVWAPOK := pNATROK
+		if pVWAPOK && (cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") {
+			if sessionVWAP <= 0 {
+				pVWAPOK = false
+			} else if cfg.MaxScannerVWAPDistATR > 0 && distVWAPATR > cfg.MaxScannerVWAPDistATR {
+				pVWAPOK = false
+				if cfg.SweepExtendedVWAP && lastClose <= sessionVWAP {
+					if !hasEMA200 {
+						ema200 = indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
+						hasEMA200 = !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0
 					}
-					return
-				}
-			}
-
-			var distVWAPATR float64
-			var sessionVWAP float64
-			needVWAP := ((cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") && pNATROK) || (cfg.BreakoutMaxScannerVWAPDistATR > 0 && bNATROK)
-			if needVWAP {
-				sessionVWAP = indicator.CalculateEffectiveVWAP(validKlines, cfg.RollingVWAPBars)
-				if !math.IsNaN(sessionVWAP) && !math.IsInf(sessionVWAP, 0) && sessionVWAP > 0 {
-					distVWAPATR = math.Abs(lastClose-sessionVWAP) / atr14
-				} else {
-					sessionVWAP = 0
-				}
-			}
-
-			var sweepExtra *Candidate
-			pVWAPOK := pNATROK
-			if pVWAPOK && (cfg.MaxScannerVWAPDistATR > 0 || rankMode == "pullback") {
-				if sessionVWAP <= 0 {
-					pVWAPOK = false
-				} else if cfg.MaxScannerVWAPDistATR > 0 && distVWAPATR > cfg.MaxScannerVWAPDistATR {
-					pVWAPOK = false
-					if cfg.SweepExtendedVWAP && lastClose <= sessionVWAP {
-						if !hasEMA200 {
-							ema200 = indicator.CalculateEMA(validKlines, cfg.EMAPeriod)
-							hasEMA200 = !math.IsNaN(ema200) && !math.IsInf(ema200, 0) && ema200 > 0
-						}
-						if hasEMA200 && lastClose < ema200 {
-							rvolExt := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
-							if !math.IsNaN(rvolExt) && !math.IsInf(rvolExt, 0) {
-								liqB := computeLiquidityLogBonus(vol24hMap[symbol], cfg.MinVolume24hUSDT)
-								sweepExtra = &Candidate{
-									Symbol:  symbol,
-									RVOL:    rvolExt,
-									Score:   0.50*liqB + 0.25*math.Min(rvolExt, 2.0),
-									Candles: validKlines,
-								}
+					if hasEMA200 && lastClose < ema200 {
+						rvolExt := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
+						if !math.IsNaN(rvolExt) && !math.IsInf(rvolExt, 0) {
+							liqB := computeLiquidityLogBonus(vol24hMap[symbol], cfg.MinVolume24hUSDT)
+							sweepExtra = &Candidate{
+								Symbol:  symbol,
+								RVOL:    rvolExt,
+								Score:   0.50*liqB + 0.25*math.Min(rvolExt, 2.0),
+								Candles: validKlines,
 							}
 						}
 					}
 				}
 			}
+		}
 
-			bVWAPOK := bNATROK
-			if bVWAPOK && cfg.BreakoutMaxScannerVWAPDistATR > 0 {
-				if sessionVWAP <= 0 || distVWAPATR > cfg.BreakoutMaxScannerVWAPDistATR {
-					bVWAPOK = false
-				}
+		bVWAPOK := bNATROK
+		if bVWAPOK && cfg.BreakoutMaxScannerVWAPDistATR > 0 {
+			if sessionVWAP <= 0 || distVWAPATR > cfg.BreakoutMaxScannerVWAPDistATR {
+				bVWAPOK = false
 			}
+		}
 
-			if !pVWAPOK && !bVWAPOK {
-				resultsChan <- scanResult{
-					reject:         scanRejectVWAPDist,
-					sweepCand:      sweepExtra,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
-			}
-
-			rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
-			if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
-				resultsChan <- scanResult{
-					reject:         scanRejectATR,
-					breadthCounted: breadthCounted,
-					breadthAbove:   breadthAbove,
-				}
-				return
-			}
-
-			var pCand *Candidate
-			if pVWAPOK {
-				score := rvol
-				if rankMode == "pullback" {
-					score = computePullbackScore(cfg, rvol, distVWAPATR, natrPct, vol24hMap[symbol])
-				}
-				pCand = &Candidate{
-					Symbol:    symbol,
-					RVOL:      rvol,
-					Score:     score,
-					Candles:   validKlines,
-					IsPrimary: rvol >= cfg.MinRVOL,
-				}
-			}
-
-			var bCand *Candidate
-			if bVWAPOK {
-				atr60 := indicator.CalculateATR(validKlines, 60)
-				compRatio := 1.0
-				if !math.IsNaN(atr60) && !math.IsInf(atr60, 0) && atr60 > 0 {
-					compRatio = atr14 / atr60
-				}
-				squeezeScore := math.Max(0.0, 1.20-compRatio)
-				liqBonus := computeLiquidityLogBonus(vol24hMap[symbol], boMinVol)
-				bCand = &Candidate{
-					Symbol:  symbol,
-					RVOL:    rvol,
-					Score:   0.65*squeezeScore + 0.35*liqBonus,
-					Candles: validKlines,
-				}
-			}
-
-			rej := scanValid
-			if pCand == nil {
-				// Record primary-bucket rejection telemetry when only breakout matched
-				if flags.allowPrimary && !pNATROK {
-					rej = scanRejectNATR
-				} else if flags.allowPrimary && !pVWAPOK {
-					rej = scanRejectVWAPDist
-				}
-			}
-			resultsChan <- scanResult{
-				cand:           pCand,
-				boCand:         bCand,
+		if !pVWAPOK && !bVWAPOK {
+			return scanResult{
+				reject:         scanRejectVWAPDist,
 				sweepCand:      sweepExtra,
-				reject:         rej,
 				breadthCounted: breadthCounted,
 				breadthAbove:   breadthAbove,
 			}
-		}(sym, pf)
+		}
+
+		rvol := indicator.CalculateRVOL(validKlines, cfg.RVOLLookback)
+		if math.IsNaN(rvol) || math.IsInf(rvol, 0) {
+			return scanResult{
+				reject:         scanRejectATR,
+				breadthCounted: breadthCounted,
+				breadthAbove:   breadthAbove,
+			}
+		}
+
+		var pCand *Candidate
+		if pVWAPOK {
+			score := rvol
+			if rankMode == "pullback" {
+				score = computePullbackScore(cfg, rvol, distVWAPATR, natrPct, vol24hMap[symbol])
+			}
+			pCand = &Candidate{
+				Symbol:    symbol,
+				RVOL:      rvol,
+				Score:     score,
+				Candles:   validKlines,
+				IsPrimary: rvol >= cfg.MinRVOL,
+			}
+		}
+
+		var bCand *Candidate
+		if bVWAPOK {
+			atr60 := indicator.CalculateATR(validKlines, 60)
+			compRatio := 1.0
+			if !math.IsNaN(atr60) && !math.IsInf(atr60, 0) && atr60 > 0 {
+				compRatio = atr14 / atr60
+			}
+			squeezeScore := math.Max(0.0, 1.20-compRatio)
+			liqBonus := computeLiquidityLogBonus(vol24hMap[symbol], boMinVol)
+			bCand = &Candidate{
+				Symbol:  symbol,
+				RVOL:    rvol,
+				Score:   0.65*squeezeScore + 0.35*liqBonus,
+				Candles: validKlines,
+			}
+		}
+
+		rej := scanValid
+		if pCand == nil {
+			// Record primary-bucket rejection telemetry when only breakout matched
+			if flags.allowPrimary && !pNATROK {
+				rej = scanRejectNATR
+			} else if flags.allowPrimary && !pVWAPOK {
+				rej = scanRejectVWAPDist
+			}
+		}
+		return scanResult{
+			cand:           pCand,
+			boCand:         bCand,
+			sweepCand:      sweepExtra,
+			reject:         rej,
+			breadthCounted: breadthCounted,
+			breadthAbove:   breadthAbove,
+		}
 	}
 
-	wg.Wait()
-	close(resultsChan)
+	results := make([]scanResult, 0, len(symbolsToScan))
+	if cfg.Sequential {
+		for _, sym := range symbolsToScan {
+			results = append(results, evalSymbol(sym, preFlags[sym]))
+		}
+	} else {
+		resultsChan := make(chan scanResult, len(symbolsToScan))
+		workerCount := scannerWorkerConcurrency
+		if len(symbolsToScan) < workerCount {
+			workerCount = len(symbolsToScan)
+		}
+		if workerCount < 1 {
+			workerCount = 1
+		}
+		sem := make(chan struct{}, workerCount)
+		var wg sync.WaitGroup
+
+		for _, sym := range symbolsToScan {
+			wg.Add(1)
+			pf := preFlags[sym]
+			go func(symbol string, flags preScreenFlags) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				resultsChan <- evalSymbol(symbol, flags)
+			}(sym, pf)
+		}
+
+		wg.Wait()
+		close(resultsChan)
+		for res := range resultsChan {
+			results = append(results, res)
+		}
+	}
 
 	fallbackFloor := cfg.MinFallbackRVOL
 	if fallbackFloor <= 0 {
@@ -746,7 +745,7 @@ func RunBulkMarketScannerPartitioned(
 
 	breadthTotal := 0
 	breadthAboveCount := 0
-	for res := range resultsChan {
+	for _, res := range results {
 		if res.breadthCounted {
 			breadthTotal++
 			if res.breadthAbove {
@@ -835,6 +834,9 @@ func RunBulkMarketScannerPartitioned(
 	}
 
 	bootstrapCand := func(cand Candidate) bool {
+		if activeStates == nil {
+			return true
+		}
 		st, exists := activeStates[cand.Symbol]
 		if !exists {
 			st = model.NewSymbolState(cand.Symbol, perpetualFilters[cand.Symbol], cfg.BootstrapCount, cfg.DeltaWindow+1)

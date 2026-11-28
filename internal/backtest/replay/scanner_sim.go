@@ -45,6 +45,8 @@ func NewScannerSimulator(
 	filters map[string]model.ExchangeFilter,
 	spreadFn func([]model.Candle, float64) float64,
 ) *ScannerSimulator {
+	cfg.ComputeMarketBreadth = false
+	cfg.Sequential = true
 	return &ScannerSimulator{
 		cfg:           cfg,
 		filters:       filters,
@@ -72,7 +74,6 @@ func (s *ScannerSimulator) RunCyclePartitioned(
 ) (map[string]bool, map[string]bool) {
 	vol24hMap := make(map[string]float64, len(rollingCandles))
 	bookMap := make(map[string]model.BookQuote, len(rollingCandles))
-	activeStates := make(map[string]*model.SymbolState)
 
 	bars24h := 288
 	if s.cfg.CandleDuration > 0 {
@@ -80,6 +81,12 @@ func (s *ScannerSimulator) RunCyclePartitioned(
 	}
 	if bars24h <= 0 {
 		bars24h = 288
+	}
+
+	effectiveMinVol := s.cfg.MinVolume24hUSDT
+	if s.cfg.BreakoutScannerEnabled && s.cfg.BreakoutMinVolume24hUSDT > 0 &&
+		(effectiveMinVol <= 0 || s.cfg.BreakoutMinVolume24hUSDT < effectiveMinVol) {
+		effectiveMinVol = s.cfg.BreakoutMinVolume24hUSDT
 	}
 
 	for _, sym := range sortedSymbols {
@@ -105,6 +112,9 @@ func (s *ScannerSimulator) RunCyclePartitioned(
 		}
 		vol24hMap[sym] = sumVol
 
+		if sym == scanner.BenchmarkSymbol || (effectiveMinVol > 0 && sumVol < effectiveMinVol) {
+			continue
+		}
 		lastClose := cList[len(cList)-1].Close
 		symSpread := s.spreadFn(cList, lastClose)
 		bookMap[sym] = model.BookQuote{
@@ -127,7 +137,7 @@ func (s *ScannerSimulator) RunCyclePartitioned(
 
 	scanRes := scanner.RunBulkMarketScannerPartitioned(
 		s.cfg,
-		activeStates,
+		nil,
 		s.filters,
 		vol24hMap,
 		bookMap,

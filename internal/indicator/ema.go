@@ -58,7 +58,8 @@ func CalculateATRSafe(candles []model.Candle, period int) (float64, bool) {
 	if len(candles) < period+1 || period <= 0 {
 		return 0.0, false
 	}
-	trs := make([]float64, len(candles)-1)
+	sumTR := 0.0
+	atr := 0.0
 	for i := 1; i < len(candles); i++ {
 		if math.IsNaN(candles[i].High) || math.IsNaN(candles[i].Low) || math.IsNaN(candles[i].Close) ||
 			math.IsNaN(candles[i-1].Close) || math.IsInf(candles[i].High, 0) || math.IsInf(candles[i].Low, 0) ||
@@ -72,20 +73,17 @@ func CalculateATRSafe(candles []model.Candle, period int) (float64, bool) {
 		if math.IsNaN(tr) || math.IsInf(tr, 0) || tr < 0 {
 			return 0.0, false
 		}
-		trs[i-1] = tr
-	}
-
-	sumTR := 0.0
-	for i := 0; i < period; i++ {
-		sumTR += trs[i]
-	}
-	atr := sumTR / float64(period)
-	if math.IsNaN(atr) || math.IsInf(atr, 0) || atr <= 0 {
-		return 0.0, false
-	}
-
-	for i := period; i < len(trs); i++ {
-		atr = ((atr * float64(period-1)) + trs[i]) / float64(period)
+		if i <= period {
+			sumTR += tr
+			if i == period {
+				atr = sumTR / float64(period)
+				if math.IsNaN(atr) || math.IsInf(atr, 0) || atr <= 0 {
+					return 0.0, false
+				}
+			}
+		} else {
+			atr = ((atr * float64(period-1)) + tr) / float64(period)
+		}
 	}
 	if math.IsNaN(atr) || math.IsInf(atr, 0) || atr <= 0 {
 		return 0.0, false

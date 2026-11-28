@@ -33,15 +33,20 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time, expectedStep .
 		strictGapHorizon = targetStep
 	}
 	var lastClosedOpenTime time.Time
-	for _, c := range raw {
+	for i := len(raw) - 1; i >= 0; i-- {
+		c := raw[i]
 		if c.CloseTime.Before(serverTime) || c.CloseTime.Equal(serverTime) {
 			lastClosedOpenTime = c.OpenTime
+			break
 		}
 	}
 
+	prefixLen := 0
+	contiguous := true
 	var valid []Candle
 	for i, c := range raw {
 		if !c.CloseTime.Before(serverTime) && !c.CloseTime.Equal(serverTime) {
+			contiguous = false
 			continue // Lewati candle aktif yang belum tertutup
 		}
 		if isInvalidFloat(c.Open) || isInvalidFloat(c.High) || isInvalidFloat(c.Low) || isInvalidFloat(c.Close) {
@@ -59,8 +64,20 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time, expectedStep .
 		if c.VolumeBase < 0 || c.QuoteVolumeUSDT < 0 || c.TakerBuyQuoteUSDT < 0 {
 			return nil, fmt.Errorf("candle index %d has negative volume", i)
 		}
-		if len(valid) > 0 {
-			prev := valid[len(valid)-1]
+
+		var prev Candle
+		hasPrev := false
+		if valid != nil {
+			if len(valid) > 0 {
+				prev = valid[len(valid)-1]
+				hasPrev = true
+			}
+		} else if prefixLen > 0 {
+			prev = raw[prefixLen-1]
+			hasPrev = true
+		}
+
+		if hasPrev {
 			if !c.OpenTime.After(prev.OpenTime) {
 				return nil, fmt.Errorf("candle non-monotonic timestamp at index %d", i)
 			}
@@ -74,7 +91,22 @@ func ValidateAndFilterCandles(raw []Candle, serverTime time.Time, expectedStep .
 				return nil, fmt.Errorf("candle gap alignment invalid: step %v not multiple of %v", step, targetStep)
 			}
 		}
+
+		if contiguous {
+			prefixLen++
+			continue
+		}
+		if valid == nil {
+			valid = make([]Candle, prefixLen, len(raw))
+			copy(valid, raw[:prefixLen])
+		}
 		valid = append(valid, c)
+	}
+	if valid == nil {
+		if prefixLen == 0 {
+			return nil, nil
+		}
+		return raw[:prefixLen:prefixLen], nil
 	}
 	return valid, nil
 }

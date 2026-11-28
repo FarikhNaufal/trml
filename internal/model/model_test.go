@@ -602,3 +602,63 @@ func TestSymbolState_MarkCandleEvaluatedAndResetPreservesEvaluated(t *testing.T)
 		t.Fatalf("expected newer t2 evaluation to return true")
 	}
 }
+
+func TestValidateAndFilterCandles_ZeroCopyCapacityAndMidUnclosedFallback(t *testing.T) {
+	step := 5 * time.Minute
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	makeCandle := func(open time.Time) Candle {
+		return Candle{
+			OpenTime:        open,
+			CloseTime:       open.Add(step - time.Millisecond),
+			Open:            100,
+			High:            101,
+			Low:             99,
+			Close:           100.5,
+			VolumeBase:      10,
+			QuoteVolumeUSDT: 1000,
+		}
+	}
+
+	// 1. Contiguous closed prefix followed by trailing unclosed candle uses full-slice expression
+	// so appending to the returned slice never overwrites raw's trailing slot.
+	c0 := makeCandle(now.Add(-2 * step))
+	c1 := makeCandle(now.Add(-1 * step))
+	unclosedTail := makeCandle(now)
+	raw := []Candle{c0, c1, unclosedTail}
+
+	valid, err := ValidateAndFilterCandles(raw, now, step)
+	if err != nil {
+		t.Fatalf("unexpected error on trailing unclosed candle: %v", err)
+	}
+	if len(valid) != 2 || cap(valid) != 2 {
+		t.Fatalf("expected len=2 cap=2 for capped zero-copy prefix, got len=%d cap=%d", len(valid), cap(valid))
+	}
+	mutated := append(valid, makeCandle(now.Add(5*time.Hour)))
+	if len(mutated) != 3 || !raw[2].OpenTime.Equal(unclosedTail.OpenTime) {
+		t.Fatalf("append mutated original raw trailing element; raw[2]=%v expected=%v", raw[2].OpenTime, unclosedTail.OpenTime)
+	}
+
+	// 2. Non-contiguous case with non-empty prefix (prefixLen > 0 before mid unclosed slot) materializes cleanly.
+	hStep := time.Hour
+	old0 := makeCandle(now.Add(-30 * hStep))
+	old0.CloseTime = old0.OpenTime.Add(hStep - time.Millisecond)
+	midUnclosed := makeCandle(now.Add(-29 * hStep))
+	midUnclosed.CloseTime = now.Add(time.Minute)
+	old2 := makeCandle(now.Add(-28 * hStep))
+	old2.CloseTime = old2.OpenTime.Add(hStep - time.Millisecond)
+
+	rawSplit := []Candle{old0, midUnclosed, old2}
+	for h := 27; h >= 1; h-- {
+		c := makeCandle(now.Add(-time.Duration(h) * hStep))
+		c.CloseTime = c.OpenTime.Add(hStep - time.Millisecond)
+		rawSplit = append(rawSplit, c)
+	}
+	splitValid, splitErr := ValidateAndFilterCandles(rawSplit, now, hStep)
+	if splitErr != nil {
+		t.Fatalf("unexpected error with mid unclosed outside 24h: %v", splitErr)
+	}
+	if len(splitValid) != len(rawSplit)-1 || !splitValid[0].OpenTime.Equal(old0.OpenTime) || !splitValid[1].OpenTime.Equal(old2.OpenTime) {
+		t.Fatalf("unexpected split valid result len=%d", len(splitValid))
+	}
+}

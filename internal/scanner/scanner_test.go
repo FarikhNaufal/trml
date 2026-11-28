@@ -1156,3 +1156,85 @@ func TestScannerFromAppConfigDefaultsAndTelemetrySeparation(t *testing.T) {
 		t.Fatalf("expected BookMissing=1, SpreadRejected=1, KlineFetchFailed=1, KlineFetchOrShort=1; got %+v", res.Stats)
 	}
 }
+
+func TestRunBulkMarketScannerPartitioned_SequentialAndNilStatesMatchConcurrent(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	f := model.ExchangeFilter{TickSize: decimal.NewFromFloat(0.01), StepSize: decimal.NewFromFloat(0.1)}
+	syms := []string{"AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"}
+	filters := make(map[string]model.ExchangeFilter, len(syms))
+	volMap := make(map[string]float64, len(syms))
+	bookMap := make(map[string]model.BookQuote, len(syms))
+	candlesBySym := make(map[string][]model.Candle, len(syms))
+
+	for idx, sym := range syms {
+		filters[sym] = f
+		volMap[sym] = float64(50_000_000 + idx*20_000_000)
+		price := 100.0 + float64(idx)*0.1
+		bookMap[sym] = model.BookQuote{BestBid: price - 0.01, BestAsk: price + 0.01}
+
+		series := make([]model.Candle, 220)
+		for i := 0; i < 220; i++ {
+			openT := now.Add(time.Duration(i-220) * 15 * time.Minute)
+			baseVol := 1000.0
+			if i == 219 {
+				baseVol = float64(2500 + idx*300)
+			}
+			series[i] = model.Candle{
+				OpenTime:          openT,
+				CloseTime:         openT.Add(15*time.Minute - time.Millisecond),
+				Open:              price,
+				High:              price * 1.007,
+				Low:               price * 0.993,
+				Close:             price,
+				VolumeBase:        baseVol,
+				QuoteVolumeUSDT:   baseVol * price,
+				TakerBuyQuoteUSDT: baseVol * price * 0.5,
+			}
+		}
+		candlesBySym[sym] = series
+	}
+	fetchFn := func(sym string, limit int) []model.Candle {
+		c := candlesBySym[sym]
+		if len(c) > limit {
+			return c[len(c)-limit:]
+		}
+		return c
+	}
+
+	baseCfg := ScannerConfig{
+		MinVolume24hUSDT:      25_000_000,
+		MaxSpreadPct:          0.10,
+		MinRVOL:               1.50,
+		MinFallbackRVOL:       0.50,
+		RVOLLookback:          20,
+		MinNATRPct:            0.50,
+		MaxNATRPct:            3.00,
+		MaxScannerVWAPDistATR: 2.50,
+		ATRPeriod:             14,
+		EMAPeriod:             200,
+		MaxWatchedCoins:       10,
+		BootstrapCount:        219,
+		DeltaWindow:           50,
+		CandleDuration:        15 * time.Minute,
+		RankingMode:           "pullback",
+	}
+
+	concStates := make(map[string]*model.SymbolState)
+	resConc := RunBulkMarketScannerPartitioned(baseCfg, concStates, filters, volMap, bookMap, fetchFn, now)
+
+	seqCfg := baseCfg
+	seqCfg.Sequential = true
+	resSeq := RunBulkMarketScannerPartitioned(seqCfg, nil, filters, volMap, bookMap, fetchFn, now)
+
+	if resConc.Stats != resSeq.Stats {
+		t.Fatalf("stats mismatch: conc=%+v seq=%+v", resConc.Stats, resSeq.Stats)
+	}
+	if len(resConc.Primary) == 0 || len(resConc.Primary) != len(resSeq.Primary) {
+		t.Fatalf("primary length mismatch: conc=%v seq=%v", resConc.Primary, resSeq.Primary)
+	}
+	for i := range resConc.Primary {
+		if resConc.Primary[i] != resSeq.Primary[i] {
+			t.Fatalf("primary order mismatch at %d: conc=%v seq=%v", i, resConc.Primary, resSeq.Primary)
+		}
+	}
+}
